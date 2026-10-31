@@ -1,10 +1,11 @@
-// A smoke test against the real `claude`, which needs it installed and logged in, and costs a
-// cent or so: AGENT_THREADS_LIVE=1 pnpm test. (CLAUDE_BIN names another binary.)
+// Smoke tests against the real `claude` and `codex`, which need them installed and logged in, and
+// cost a cent or so: AGENT_THREADS_LIVE=1 pnpm test. (CLAUDE_BIN names another claude.)
 
 import { describe, expect, it } from "vitest";
 import type { ToolCall } from "@dire-kiwi/agent-threads-protocol";
 import { AgentThreads } from "../agent-threads.js";
 import { claudeCode } from "../claude/driver.js";
+import { codex } from "../codex/driver.js";
 import { direct, type Spawner } from "../spawner.js";
 import { defineTool } from "../tools.js";
 import { tempDir } from "./spec.js";
@@ -67,4 +68,55 @@ describe.skipIf(!process.env.AGENT_THREADS_LIVE)("live Claude Code", () => {
       await sdk.close();
     }
   });
+});
+
+// The same against the real `codex` (CODEX_BIN names another binary, CODEX_MODEL another model),
+// with a CODEX_HOME of the test's own that has the user's login linked in.
+describe.skipIf(!process.env.AGENT_THREADS_LIVE)("live Codex", () => {
+  for (const appTools of ["dynamic", "mcp"] as const) {
+    it(`replies, and calls an app tool (${appTools === "dynamic" ? "a dynamic tool" : "on the loopback MCP server"})`, { timeout: 180_000 }, async () => {
+      const sdk = new AgentThreads({
+        harnesses: { codex: codex({ bin: process.env.CODEX_BIN ?? "codex", home: tempDir(), appTools }) },
+        tools: [
+          defineTool<{ order_id: string }>({
+            name: "lookup_order",
+            description: "Looks up an order by its id.",
+            input: { type: "object", properties: { order_id: { type: "string" } }, required: ["order_id"] },
+            run: ({ order_id }) => `Order ${order_id}: 3 blue widgets.`,
+          }),
+        ],
+        permissions: "allow",
+      });
+      try {
+        const t = await sdk.create({ harness: "codex", model: process.env.CODEX_MODEL ?? "gpt-5.6-luna", effort: "low", cwd: tempDir() });
+        const done = () =>
+          new Promise<void>((resolve) => {
+            const off = sdk.subscribe((e) => {
+              if (e.type === "turn.completed") {
+                off();
+                resolve();
+              }
+            });
+          });
+
+        let finished = done();
+        await sdk.send(t.id, "Reply with exactly these words and nothing else: hello from agent-threads");
+        await finished;
+        let s = await sdk.snapshot(t.id);
+        expect(s.thread).toMatchObject({ status: "idle", session_id: expect.any(String) });
+        expect(s.items.filter((i) => i.type === "assistant_message").map((i) => (i as { text: string }).text).join("")).toMatch(/hello from agent-threads/i);
+
+        finished = done();
+        await sdk.send(t.id, "Look up order 42 with the lookup_order tool, then tell me in a few words what's in it.");
+        await finished;
+        s = await sdk.snapshot(t.id);
+        expect(s.thread.status).toBe("idle");
+        const call = s.items.find((i): i is ToolCall => i.type === "tool_call" && i.kind === "app");
+        expect(call).toMatchObject({ name: "lookup_order", status: "completed", result: { content: expect.stringContaining("Order 42: 3 blue widgets.") } });
+        expect(s.thread.usage?.output_tokens).toBeGreaterThan(0);
+      } finally {
+        await sdk.close();
+      }
+    });
+  }
 });

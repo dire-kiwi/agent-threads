@@ -3,6 +3,7 @@
 export type * from "@dire-kiwi/agent-threads-protocol";
 export { AgentThreads, CommandError, type AgentThreadsOptions, type Capabilities, type CreateOptions } from "./agent-threads.js";
 export { claudeCode, type ClaudeCodeOptions } from "./claude/driver.js";
+export { codex, type CodexOptions } from "./codex/driver.js";
 export type { Harness, HarnessSession, McpServer, Message, NewItem, NewRequest, Skill, ThreadConfig, ThreadContext, TurnEnd } from "./harness.js";
 export type { PermissionContext, PermissionDecision, PermissionPolicy, PermissionQuery } from "./permissions.js";
 export { direct, type ExitStatus, type HarnessProcess, type ProcessHandlers, type SpawnOptions, type Spawner } from "./spawner.js";

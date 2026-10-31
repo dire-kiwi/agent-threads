@@ -15,6 +15,7 @@ import {
   type ThreadEvent,
 } from "@dire-kiwi/agent-threads-protocol";
 import { claudeCode } from "./claude/driver.js";
+import { codex } from "./codex/driver.js";
 import type { Harness, McpServer, Skill, ThreadConfig } from "./harness.js";
 import { newId } from "./ids.js";
 import type { PermissionPolicy } from "./permissions.js";
@@ -38,7 +39,7 @@ export interface Capabilities {
 export interface AgentThreadsOptions extends Capabilities {
   /** Where threads are kept: the app's, which it closes after this. A MemoryStore by default. */
   store?: Store;
-  /** The harnesses threads can run on, by name. Claude Code (`claude`) by default. */
+  /** The harnesses threads can run on, by name. Claude Code (`claude`) and Codex (`codex`) by default. */
   harnesses?: { [name: string]: Harness };
   /** How harness processes are started. Direct child processes by default. */
   spawner?: Spawner;
@@ -84,7 +85,7 @@ export class AgentThreads {
   constructor(options: AgentThreadsOptions = {}) {
     this.#options = options;
     this.store = options.store ?? new MemoryStore();
-    this.harnesses = options.harnesses ?? { claude: claudeCode() };
+    this.harnesses = options.harnesses ?? { claude: claudeCode(), codex: codex() };
     this.spawner = options.spawner ?? direct();
   }
 
