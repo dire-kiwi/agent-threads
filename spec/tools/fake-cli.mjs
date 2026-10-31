@@ -16,8 +16,9 @@
 //
 // It replays one run per process. Outputs go out in their recorded order; at each recorded input
 // it waits for the backend's next line and checks it (consecutive recorded inputs may arrive in any
-// order, and one the recording has later may come sooner). At a recorded `close` it waits for stdin to close; at `exit` it exits as the CLI did. If
-// an input doesn't match, it says why on stderr, writes the report, and exits with code 97.
+// order, and one the recording has later may come sooner). At a recorded `close` it waits for stdin
+// to close; at `exit` it exits as the CLI did. If an input doesn't match, it says why on stderr,
+// writes the report, and exits with code 97.
 
 import { openSync, closeSync, writeFileSync, mkdirSync } from "node:fs";
 import { join } from "node:path";

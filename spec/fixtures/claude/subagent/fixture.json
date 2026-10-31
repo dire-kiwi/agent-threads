@@ -12,7 +12,7 @@
   "permissions": "allow",
   "steps": [
     {
-      "send": {
+      "command": {
         "type": "send",
         "text": "Use the Task tool to start a general-purpose subagent with this prompt: 'Read notes.txt with the Read tool and reply with its first line only.' Then reply with just what the subagent said.",
         "client_id": "c1"

@@ -12,7 +12,7 @@
   "permissions": "allow",
   "steps": [
     {
-      "send": {
+      "command": {
         "type": "send",
         "text": "Run `sleep 5 && echo first` with the Bash tool, then reply with its output.",
         "client_id": "c1"
@@ -27,7 +27,7 @@
       }
     },
     {
-      "send": {
+      "command": {
         "type": "send",
         "text": "Also end your reply with the word: steered",
         "client_id": "c2"

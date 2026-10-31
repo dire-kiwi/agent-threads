@@ -13,7 +13,7 @@
   "permissions": "allow",
   "steps": [
     {
-      "send": {
+      "command": {
         "type": "send",
         "text": "Reply with: hi",
         "client_id": "c1"

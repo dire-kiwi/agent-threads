@@ -1,5 +1,6 @@
 // Each fixture's expected.jsonl (spec/fixtures/<harness>/<scenario>) is a valid stream of events:
-// every event is a ThreadEvent, and they fold with applyEvent into a finished thread.
+// every event is a ThreadEvent, and they fold with applyEvent into a finished thread. And the values
+// in the store conformance suite (spec/conformance/store.json) are valid too.
 
 import { readdirSync } from "node:fs";
 import { Ajv2020 } from "ajv/dist/2020.js";
@@ -41,5 +42,16 @@ describe.each(fixtures)("spec/fixtures/%s/expected.jsonl", (fixture) => {
     expect(s.items.filter((i) => i.type === "turn_result")).toHaveLength(turns);
     expect(s.items.filter((i) => i.type === "tool_call" && (i.status === "running" || i.status === "pending"))).toEqual([]);
     expect(s.items.filter((i) => i.type === "user_message" && i.queued)).toEqual([]);
+  });
+});
+
+describe("spec/conformance/store.json", () => {
+  const { values } = readJson("conformance/store.json") as { values: Record<string, unknown> };
+  // T* are threads, E*, F* and D events, S* snapshots; R* are runs, which are each backend's own.
+  const defs: Record<string, string> = { T: "Thread", E: "ThreadEvent", F: "ThreadEvent", D: "ThreadEvent", S: "Snapshot" };
+  it.each(Object.keys(values).filter((k) => defs[k[0]!]))("%s is valid", (name) => {
+    const validate = ajv.getSchema(`protocol#/$defs/${defs[name[0]!]}`)!;
+    validate(values[name]);
+    expect(validate.errors ?? []).toEqual([]);
   });
 });

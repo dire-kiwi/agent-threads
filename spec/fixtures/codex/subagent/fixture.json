@@ -13,7 +13,7 @@
   "permissions": "allow",
   "steps": [
     {
-      "send": {
+      "command": {
         "type": "send",
         "text": "Spawn one subagent with this task: 'Read notes.txt and reply with its first line only.' Wait for it, then reply with just what the subagent said.",
         "client_id": "c1"

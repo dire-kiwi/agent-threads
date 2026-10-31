@@ -13,7 +13,7 @@
   "permissions": "allow",
   "steps": [
     {
-      "send": {
+      "command": {
         "type": "send",
         "text": "Do these one at a time: 1. Show notes.txt with `cat notes.txt`. 2. Run `wc -l notes.txt`. 3. Edit notes.txt with apply_patch to change the line apple to apricot. Then reply with just: done",
         "client_id": "c1"

@@ -13,7 +13,7 @@
   "permissions": "allow",
   "steps": [
     {
-      "send": {
+      "command": {
         "type": "send",
         "text": "Use the request_user_input tool to ask me one question: which color do I prefer, with the options red and blue (header: Color). Then reply with just the color I chose.",
         "client_id": "c1"
@@ -28,7 +28,7 @@
       }
     },
     {
-      "send": {
+      "command": {
         "type": "respond",
         "resolution": {
           "outcome": "answer",

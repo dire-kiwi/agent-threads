@@ -140,3 +140,32 @@ test("accepts a SIGTERM once everything was sent", async () => {
   const report = JSON.parse(readFileSync(join(state, "run-1.json"), "utf8"));
   assert.equal(report.ok, true, report.error);
 });
+
+test("takes an input sooner than the recording has it", async () => {
+  // The test's interrupt can reach the CLI before the backend's automatic answer to a permission.
+  const dir = join(fixtures, "claude/interrupt");
+  const { runs } = loadSession(dir);
+  const state = mkdtempSync(join(tmpdir(), "fake-cli-test-"));
+  const [spawnEntry, ...rest] = runs.get(1);
+  const interrupt = rest.find((e) => e.dir === "in" && e.msg.type === "control_request" && e.msg.request.subtype === "interrupt");
+  const answer = rest.find((e) => e.dir === "in" && e.msg.type === "control_response");
+  assert.ok(rest.indexOf(answer) < rest.indexOf(interrupt));
+  const cli = start(dir, spawnEntry.argv.slice(1), state);
+  let outs = 0;
+  for (const e of rest) {
+    if (e.dir === "out" && e.msg !== undefined) outs++;
+    if (e.dir === "in" && e !== interrupt) {
+      await cli.until(outs);
+      if (e === answer) cli.child.stdin.write(JSON.stringify(interrupt.msg) + "\n");
+      cli.child.stdin.write(JSON.stringify(e.msg) + "\n");
+    }
+    if (e.dir === "close") {
+      await cli.until(outs);
+      cli.child.stdin.end();
+    }
+  }
+  await cli.exited;
+  const report = JSON.parse(readFileSync(join(state, "run-1.json"), "utf8"));
+  assert.equal(report.ok, true, report.error);
+  assert.equal(report.matched, report.expected);
+});

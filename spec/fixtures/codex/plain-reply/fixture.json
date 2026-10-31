@@ -13,7 +13,7 @@
   "permissions": "allow",
   "steps": [
     {
-      "send": {
+      "command": {
         "type": "send",
         "text": "Reply with exactly these words and nothing else: hello from the fixture",
         "client_id": "c1"

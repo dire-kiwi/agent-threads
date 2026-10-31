@@ -18,6 +18,8 @@ source of truth for the shapes, and this document says what they mean. See
 `protocol.schema.json` bundles them into one schema, and the TS, Go and Rust types are generated
 from it: run `make gen` after changing a schema. [examples/](examples/) has a whole thread's events,
 the snapshot they fold into, and one of each command; every language's tests read them.
+[fixtures/](fixtures/README.md) has recorded Claude and Codex sessions with the events a backend
+must make of them, which is where the translation from each harness is pinned down.
 
 ## Conventions
 

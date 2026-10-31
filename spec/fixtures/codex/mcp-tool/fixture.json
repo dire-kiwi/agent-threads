@@ -21,7 +21,7 @@
   },
   "steps": [
     {
-      "send": {
+      "command": {
         "type": "send",
         "text": "Call the echo tool with the text: fixture. Then reply with exactly what it returned.",
         "client_id": "c1"

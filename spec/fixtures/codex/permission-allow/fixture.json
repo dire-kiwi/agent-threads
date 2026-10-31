@@ -13,7 +13,7 @@
   "permissions": "ask",
   "steps": [
     {
-      "send": {
+      "command": {
         "type": "send",
         "text": "Run this shell command: touch allowed.txt — then reply with just: created",
         "client_id": "c1"
@@ -28,7 +28,7 @@
       }
     },
     {
-      "send": {
+      "command": {
         "type": "respond",
         "resolution": {
           "outcome": "allow"

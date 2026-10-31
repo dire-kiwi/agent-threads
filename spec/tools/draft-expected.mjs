@@ -101,18 +101,17 @@ class Draft {
     this.events = [];
     this.steps = [];
     this.n = {};
+    const { harness: _, ...options } = fixture.thread ?? {};
     this.thread = {
       id: "{{thread}}",
       harness: meta.harness,
       status: "idle",
-      ...fixture.thread,
-      permission_mode: fixture.thread?.permission_mode ?? "default",
+      ...options,
+      permission_mode: options.permission_mode ?? "default",
       cwd: "{{cwd}}",
       // Not compared: there so each event is a valid ThreadEvent.
       created_at: "2026-11-01T00:00:00Z",
     };
-    delete this.thread.harness;
-    this.thread = { id: "{{thread}}", harness: meta.harness, ...this.thread };
     this.lastThread = null;
     this.turn = null;
     this.items = new Map();
@@ -149,7 +148,7 @@ class Draft {
   /** Before a command: wait for the last event so far, then send it. */
   command(cmd, bind) {
     if (this.events.length > 1 || this.steps.length) this.waitForLast();
-    const step = { send: cmd, from: this.events.length };
+    const step = { command: cmd, from: this.events.length };
     this.steps.push(step);
     return bind;
   }
@@ -731,8 +730,9 @@ function codexDone(item, it) {
   const patch = { status: it?.status === "denied" ? "denied" : status };
   switch (item.type) {
     case "commandExecution":
-      if (item.aggregatedOutput !== null && item.aggregatedOutput !== undefined) {
-        patch.result = { content: item.aggregatedOutput };
+      // A command with no output has none (null), but still an exit code.
+      if (typeof item.aggregatedOutput === "string" || typeof item.exitCode === "number") {
+        patch.result = { content: item.aggregatedOutput ?? "" };
         if (typeof item.exitCode === "number") patch.result.exit_code = item.exitCode;
       }
       break;

@@ -4,13 +4,17 @@ A library for apps to run threads of agents on Claude Code (`claude -p`, stream-
 (`codex app-server`), with native Go, Rust and TypeScript (Node) backends and React components. It
 has no network layer: backends emit JSON events and accept JSON commands, and the app carries them.
 
-It's early: so far there's the spec, the generated types and the `applyEvent` reducer. See
-[docs/design.md](docs/design.md) for the design and [spec/PROTOCOL.md](spec/PROTOCOL.md) for the
-protocol.
+It's early: so far there's the spec, the generated types, the `applyEvent` reducer, and the
+conformance suite the backends will run (recorded sessions replayed by a fake CLI, and store
+cases). See [docs/design.md](docs/design.md) for the design and [spec/PROTOCOL.md](spec/PROTOCOL.md)
+for the protocol.
 
 | Path | What |
 | --- | --- |
 | `spec/` | JSON Schemas (the source of truth), the protocol doc and examples |
+| `spec/fixtures/` | Recorded Claude and Codex sessions with the events they must produce ([README](spec/fixtures/README.md)) |
+| `spec/tools/` | The fake CLI that replays them in backends' tests, the recorder, and the event comparator ([README](spec/tools/README.md)) |
+| `spec/conformance/` | The cases every store must pass ([store.md](spec/conformance/store.md)) |
 | `ts/` | pnpm workspace: `@dire-kiwi/agent-threads-protocol`, `-node`, `-react` |
 | `go/` | Go module `github.com/dire-kiwi/agent-threads/go` |
 | `rust/` | Cargo workspace with the `agent-threads` crate |
@@ -22,7 +26,7 @@ You need Node 24+ with pnpm 10, Go 1.24+ and stable Rust.
 
 ```sh
 (cd ts && pnpm install)
-make test        # build and test TS, Go and Rust
+make test        # build and test TS, Go and Rust, and the fixtures' tools
 make gen         # regenerate the types after changing spec/schema/
 make check-gen   # fail if the generated code is out of date (CI runs it)
 ```

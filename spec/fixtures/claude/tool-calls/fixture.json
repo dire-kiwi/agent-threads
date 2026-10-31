@@ -12,7 +12,7 @@
   "permissions": "allow",
   "steps": [
     {
-      "send": {
+      "command": {
         "type": "send",
         "text": "Do these one at a time, using the tools named: 1. Read notes.txt with the Read tool. 2. Run `wc -l notes.txt` with the Bash tool. 3. Use the Edit tool to change the line apple to apricot in notes.txt. Then reply with just: done",
         "client_id": "c1"

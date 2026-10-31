@@ -31,7 +31,7 @@
   ],
   "steps": [
     {
-      "send": {
+      "command": {
         "type": "send",
         "text": "Look up order 42 with the lookup_order tool and tell me in one short sentence what's in it.",
         "client_id": "c1"

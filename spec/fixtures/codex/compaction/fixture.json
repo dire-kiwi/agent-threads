@@ -13,7 +13,7 @@
   "permissions": "allow",
   "steps": [
     {
-      "send": {
+      "command": {
         "type": "send",
         "text": "Reply with just: ready",
         "client_id": "c1"
@@ -28,7 +28,7 @@
       }
     },
     {
-      "send": {
+      "command": {
         "type": "send",
         "text": "/compact",
         "client_id": "c2"

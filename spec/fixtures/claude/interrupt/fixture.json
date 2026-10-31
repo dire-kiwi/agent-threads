@@ -12,7 +12,7 @@
   "permissions": "allow",
   "steps": [
     {
-      "send": {
+      "command": {
         "type": "send",
         "text": "Run `python3 -c 'import time; time.sleep(30); print(\"finished\")'` with the Bash tool, then reply with its output.",
         "client_id": "c1"
@@ -27,7 +27,7 @@
       }
     },
     {
-      "send": {
+      "command": {
         "type": "interrupt"
       }
     },

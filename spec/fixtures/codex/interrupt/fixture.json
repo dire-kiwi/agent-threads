@@ -13,7 +13,7 @@
   "permissions": "allow",
   "steps": [
     {
-      "send": {
+      "command": {
         "type": "send",
         "text": "Run `sleep 30 && echo finished`, then reply with its output.",
         "client_id": "c1"
@@ -28,7 +28,7 @@
       }
     },
     {
-      "send": {
+      "command": {
         "type": "interrupt"
       }
     },
