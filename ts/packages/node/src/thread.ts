@@ -343,39 +343,39 @@ export class ThreadRuntime implements ThreadContext {
     });
     this.emit({ type: "turn.completed", turn_id: turn.id });
     this.turn = null;
-    this.setThread({ status: error ? "error" : "idle", error, usage: addUsage(this.#state.thread.usage, end.usage) });
+    const usage = addUsage(this.#state.thread.usage, end.usage);
 
+    // Queued messages are carried over to the next turn, unless:
+    // - shutting down (which closes the process that has them), or the turn was lost (its process
+    //   is gone): they wait, queued, for the next message;
+    // - that's been tried enough: a retry that was interrupted (the user wants it stopped), one that
+    //   failed with no process left holding them, or too many in a row that took none in. Then a
+    //   process that has them is stopped, and they wait too. A retry that failed while its process
+    //   lives and holds them carries over again (to the limit), since that process would otherwise
+    //   take them in unseen. (A process holding several makes a turn of each, so a retry that took
+    //   one in has made progress.)
     const left = this.queued();
-    if (!left.length) {
-      void this.saveSnapshot();
-      return;
-    }
-    if (!carry || this.closing) {
-      // Shutting down closes the process that has them; a lost turn's process is gone. Either
-      // way they wait, queued, for the next message.
-      if (!this.closing) this.#undelivered(left.length);
-      void this.saveSnapshot();
-      return;
-    }
-    // Carry them over, unless that's been tried enough: a retry that was interrupted (the user
-    // wants it stopped), one that failed with no process left holding them, or too many in a row
-    // that took none in. A retry that failed while its process lives and holds them carries over
-    // again (to the limit), since that process would otherwise take them in unseen. (A process
-    // holding several makes a turn of each, so a retry that took one in has made progress.)
     const retry = (turn.carried ?? 0) > 0;
     const carried = turn.progressed ? 0 : (turn.carried ?? 0);
-    const holding = this.session?.live() ?? false;
-    const giveUp = carried >= MAX_CARRIED || (retry && turn.interrupted) || (carried > 0 && !ok && !holding);
+    const giveUp =
+      !left.length ||
+      !carry ||
+      this.closing ||
+      carried >= MAX_CARRIED ||
+      (retry && turn.interrupted) ||
+      (carried > 0 && !ok && !(this.session?.live() ?? false));
     if (giveUp) {
-      this.session?.release();
-      this.#undelivered(left.length);
+      this.setThread({ status: error ? "error" : "idle", error, usage });
+      if (left.length && carry && !this.closing) this.session?.release();
+      if (left.length && !this.closing) this.#undelivered(left.length);
       void this.saveSnapshot();
       return;
     }
+    // The next turn starts straight away, so the thread doesn't go idle in between.
     this.turn = { id: newId("turn"), interrupted: false, carried: carried + 1 };
     for (const m of left) this.updateItem(m.id, { turn_id: this.turn.id });
     this.emit({ type: "turn.started", turn_id: this.turn.id });
-    this.setThread({ status: "running", error: undefined });
+    this.setThread({ status: "running", error: undefined, usage });
     this.session?.carryOver(left.map((m) => toMessage(m.id, m)));
   }
 

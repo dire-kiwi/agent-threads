@@ -346,6 +346,28 @@ describe("the Claude driver", () => {
     expect(results(s.items)).toEqual([expect.objectContaining({ ok: false, interrupted: true })]);
   });
 
+  it("doesn't restart Claude while it works through steered messages for longer than the grace", async () => {
+    const { sdk, events, runs } = setup({ steer: "late", claude: { steerGraceMs: 150 } });
+    const t = await sdk.create();
+    await sdk.send(t.id, "sleep 100 first");
+    await until(async () => (await sdk.snapshot(t.id)).thread.session_id);
+    // Both wait for the first turn's result; Claude makes a turn of each, and the first of those
+    // runs longer than the grace.
+    await sdk.send(t.id, "sleep 500 second", { client_id: "a" });
+    await sdk.send(t.id, "reply third", { client_id: "b" });
+    const from = events.length;
+    const s = await until(async () => {
+      const s = await sdk.snapshot(t.id);
+      return texts(s.items).includes("third") && s.thread.status === "idle" ? s : undefined;
+    });
+    await new Promise((r) => setTimeout(r, 300));
+    expect(texts((await sdk.snapshot(t.id)).items)).toEqual(["first", "second", "third"]);
+    expect(s.items.filter((i) => i.type === "user_message" && i.queued)).toEqual([]);
+    expect(runs()).toHaveLength(1);
+    expectIdleAfter(events, from, "third");
+    expectTracked(events, runs());
+  });
+
   it("restarts Claude with a steered message it never takes in", async () => {
     const { sdk, runs } = setup({ steer: "never", claude: { steerGraceMs: 100, closeGraceMs: 100 } });
     const t = await sdk.create();

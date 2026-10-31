@@ -518,8 +518,12 @@ class ClaudeSession implements HarnessSession {
       // Claude echoes a message as it was sent: match it with the first sent like that.
       const echo = echoKey(content);
       const at = run.sent.findIndex((s) => s.echo === echo);
-      if (at >= 0) for (const id of run.sent.splice(at, 1)[0]!.ids) ctx.tookIn(id);
-      if (this.#steerTimer && !ctx.queued().length) clearTimeout(this.#steerTimer);
+      if (at < 0) return;
+      for (const id of run.sent.splice(at, 1)[0]!.ids) ctx.tookIn(id);
+      // It's taking its messages in, and its turn for this one may run past the grace: the grace
+      // is for a Claude that takes none in. The turn's result carries over what's still queued,
+      // which starts it again.
+      if (run === this.#run) clearTimeout(this.#steerTimer);
       return;
     }
     if (typeof content === "string") {
