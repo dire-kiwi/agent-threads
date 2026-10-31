@@ -3,7 +3,7 @@
 // adds its own by tool name or kind (see ThreadConfig), and a subagent is a row of its own.
 
 import type { FileChange, ThreadRequest, ToolCall as ToolCallItem, ToolKind } from "@dire-kiwi/agent-threads-protocol";
-import { memo, useEffect, useMemo, useState } from "react";
+import { memo, useEffect, useMemo, useState, type ComponentType } from "react";
 import type { ThreadConfig, ToolBodyProps, ToolRenderer } from "../config.js";
 import { useRevealed, useThreadConfig, useThreadState } from "../hooks.js";
 import { ShieldIcon, SpinnerIcon, XIcon } from "../icons.js";
@@ -22,6 +22,15 @@ export function toolRenderer(config: ThreadConfig, call: Pick<ToolCallItem, "nam
   const byKind = config.toolKinds?.[call.kind];
   const builtin = builtinToolRenderers[call.kind] ?? builtinToolRenderers.other;
   return byName || byKind ? { ...builtin, ...byKind, ...byName } : builtin;
+}
+
+/**
+ * What a permission card shows of the call it asks about, under its summary line: the renderer's
+ * body, except the built-in ones that only show a result (read, search, web), whose input it shows
+ * instead (what's to be read, searched or fetched).
+ */
+export function permissionBody(renderer: ToolRenderer): ComponentType<ToolBodyProps> {
+  return renderer.Body === ReadBody || renderer.Body === WebBody ? InputBody : (renderer.Body ?? GenericBody);
 }
 
 /** A tool call: its summary line, which opens to show its input and result. */
@@ -141,6 +150,10 @@ export function ToolResultView({ call }: ToolBodyProps) {
       )}
     </>
   );
+}
+
+function InputBody({ call }: ToolBodyProps) {
+  return <CodeBlock text={JSON.stringify(call.input, null, 2) ?? ""} />;
 }
 
 function GenericBody({ call }: ToolBodyProps) {

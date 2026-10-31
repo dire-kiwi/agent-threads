@@ -28,7 +28,8 @@ snapshot. `onCommand` can return a promise, and the components show a failure.
 - `useThread(source)`: the thread's state, `{snapshot, streaming, resyncing, view}`. Events are
   applied with `applyEvent`; a saved event whose `seq` skips ahead is held while `source.resync`
   fetches the missing ones (or a snapshot), and deltas that come meanwhile are dropped (the
-  message's final text puts it right).
+  message's final text puts it right). Connecting again (e.g. React hid the thread for a while)
+  calls `source.resync` too, for what was sent while it wasn't listening.
 - `<ThreadProvider source onCommand>` gives the components a thread. Inside it,
   `useThreadState(pick)` redraws only when what it picks changes, and `useSend()`,
   `useInterrupt()`, `useRespond()` and `useSetOptions()` send the commands.

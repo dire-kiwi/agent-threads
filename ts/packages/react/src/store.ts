@@ -19,8 +19,9 @@ export interface ThreadSource {
    * Called when events were missed: a saved event came whose seq is more than one past the
    * state's. Resolve with the events after `seq` or a fresh snapshot (backends offer both), or
    * deliver the missing events through `subscribe` and return nothing. Events that come meanwhile
-   * are held, and applied once the gap is filled. Without it, a gap is ignored and the event
-   * applied anyway.
+   * are held, and applied once the gap is filled. It's also called when the store connects again
+   * (e.g. React hid the thread for a while), for the events sent while it wasn't listening.
+   * Without it, a gap is ignored and the event applied anyway.
    */
   resync?(seq: number): Promise<Snapshot | ThreadEvent[] | void> | void;
 }
@@ -30,7 +31,7 @@ export interface ThreadState {
   snapshot: Snapshot;
   /** The assistant messages and reasoning that deltas are streaming into, until their final text comes. */
   streaming: ReadonlySet<string>;
-  /** Waiting for missed events (see ThreadSource.resync). */
+  /** Waiting for missed events: a resync under way, or events held until the ones before them come (see ThreadSource.resync). */
   resyncing: boolean;
   /** The items arranged for drawing (see buildView). */
   view: ThreadView;
@@ -49,7 +50,13 @@ export class ThreadStore {
   private held = new Map<number, ThreadEvent>();
   /** Counts resyncs, so one that's been overtaken (by a newer one, or the store disconnecting) is ignored. */
   private attempt = 0;
+  /**
+   * The resync under way: "answer" while its promise is awaited, "events" while the source sends
+   * the held events' missing ones itself, "none" when there's none (it's done, or it failed).
+   */
+  private asked: "none" | "answer" | "events" = "none";
   private connected = false;
+  private connections = 0;
 
   constructor(readonly source: ThreadSource) {
     const snapshot = source.snapshot;
@@ -66,13 +73,16 @@ export class ThreadStore {
   /** Starts taking the source's events. Returns how to stop. */
   connect(): () => void {
     this.connected = true;
+    const again = this.connections++ > 0;
     const off = this.source.subscribe((event) => this.receive(event));
-    // Connected again (e.g. React running the effect again) while events were missing: the resync
-    // under way when it disconnected was dropped, so ask again from where the state is now.
-    if (this.connected && (this.held.size || this.state.resyncing)) this.gap();
+    // Connected again (e.g. React hid the thread, or ran the effect again): events may have been
+    // sent while it wasn't listening, and a resync under way then was dropped. Ask from where the
+    // state is now (after any the subscription replayed).
+    if (this.connected && this.source.resync && (again || this.held.size)) this.gap();
     return () => {
       this.connected = false;
       this.attempt++;
+      this.asked = "none";
       off();
     };
   }
@@ -85,7 +95,8 @@ export class ThreadStore {
       // One from after a saved event that hasn't come: that's missed too. Deltas aren't saved, so
       // a resync can't give them back, and its snapshot may have them in already: they're dropped
       // until it's done, and the item's final text puts it right.
-      if (this.state.resyncing) return;
+      // One from before the state's seq is stale (the snapshot has it in), and the reducer ignores it.
+      if (this.state.resyncing || event.seq < s.seq) return;
       if (event.seq > s.seq && this.source.resync) return this.gap();
       return this.update(this.apply(this.state, event));
     }
@@ -93,16 +104,19 @@ export class ThreadStore {
     if (event.seq > s.seq + 1) {
       if (!this.source.resync) return this.update(this.apply(this.state, event));
       this.held.set(event.seq, event);
-      if (!this.state.resyncing) this.gap();
+      if (this.asked === "none") this.gap();
       return;
     }
     this.update(this.drain(this.apply(this.state, event)));
+    // It filled only part of the gap, and the last resync failed: try again.
+    if (this.held.size && this.asked === "none" && this.connected) this.gap();
   }
 
   /** Events were missed: ask the source for them. */
   private gap() {
     const n = ++this.attempt;
     const from = this.state.snapshot.seq;
+    this.asked = "events";
     if (!this.state.resyncing) this.update({ ...this.state, resyncing: true });
     let result;
     try {
@@ -110,8 +124,14 @@ export class ThreadStore {
     } catch (e) {
       return this.failed(n, e);
     }
-    // Nothing back: the source sends the missing events itself, and draining them ends it.
-    if (!result) return;
+    if (n !== this.attempt) return;
+    if (!result) {
+      // Nothing back: the source sends the missing events itself, and draining the held ones ends
+      // it. With none held, there's nothing to wait for.
+      if (!this.held.size) this.update(this.drain(this.state));
+      return;
+    }
+    this.asked = "answer";
     result.then(
       (r) => n === this.attempt && this.caughtUp(r ?? undefined),
       (e) => this.failed(n, e),
@@ -119,6 +139,7 @@ export class ThreadStore {
   }
 
   private caughtUp(r: Snapshot | ThreadEvent[] | undefined) {
+    this.asked = "none";
     const before = this.state.snapshot.seq;
     let next = this.state;
     if (Array.isArray(r)) {
@@ -141,7 +162,8 @@ export class ThreadStore {
     if (n !== this.attempt) return;
     console.error("agent-threads: resync failed", e);
     // The next saved event to come tries again.
-    this.update({ ...this.state, resyncing: false });
+    this.asked = "none";
+    this.update(this.drain(this.state));
   }
 
   /** `state` with the held events that follow on from it applied; with `force`, past any gap. */
@@ -154,7 +176,8 @@ export class ThreadStore {
       this.held.delete(next.seq);
       state = this.apply(state, next);
     }
-    const resyncing = this.held.size > 0;
+    if (!this.held.size && this.asked === "events") this.asked = "none";
+    const resyncing = this.asked === "answer" || this.held.size > 0;
     return resyncing === state.resyncing ? state : { ...state, resyncing };
   }
 

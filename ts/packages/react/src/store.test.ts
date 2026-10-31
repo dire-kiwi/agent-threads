@@ -61,6 +61,15 @@ describe("ThreadStore", () => {
     expect(store.getState().streaming.size).toBe(0);
   });
 
+  it("ignores a stale delta, from before the state's seq", () => {
+    const start = applyEvents(initialState(thread), [added(1, msg("a", "Hello")), updated(2, "a", { text: "Hello!" }), { type: "turn.completed", thread_id: "th", seq: 3, turn_id: "t" }]);
+    const { store, emit } = connected(start);
+    const before = store.getState();
+    emit(delta(2, "a", " again"));
+    expect(store.getState()).toBe(before);
+    expect(store.getState().streaming.size).toBe(0);
+  });
+
   it("keeps the view when an event leaves the items and requests as they were", () => {
     const { store, emit } = connected();
     emit(added(1, msg("a", "hi")));
@@ -138,11 +147,28 @@ describe("ThreadStore", () => {
       const { store, emit, ids } = connected(undefined, resync);
       emit(added(1, msg("a")), added(3, msg("c")));
       await flush();
-      expect(store.getState().resyncing).toBe(false);
+      // Still missing seq 2, but not asking for it until the next event.
+      expect(resync).toHaveBeenCalledTimes(1);
+      expect(store.getState().resyncing).toBe(true);
       emit(added(4, msg("d")));
       await flush();
       expect(resync).toHaveBeenCalledTimes(2);
       expect(ids()).toEqual(["a", "b", "c", "d"]);
+    });
+
+    it("tries again after a failed resync when an event fills only part of the gap", async () => {
+      vi.spyOn(console, "error").mockImplementation(() => {});
+      const resync = vi.fn().mockRejectedValueOnce(new Error("offline")).mockResolvedValueOnce([added(2, msg("b")), added(3, msg("c"))]);
+      const { store, emit, ids } = connected(undefined, resync);
+      emit(added(4, msg("d")));
+      await flush();
+      emit(added(1, msg("a")));
+      expect(resync).toHaveBeenCalledTimes(2);
+      expect(resync).toHaveBeenLastCalledWith(1);
+      emit(added(5, msg("e")));
+      await flush();
+      expect(ids()).toEqual(["a", "b", "c", "d", "e"]);
+      expect(store.getState().resyncing).toBe(false);
     });
 
     it("applies the event anyway when the source can't resync", () => {
@@ -178,6 +204,35 @@ describe("ThreadStore", () => {
       answers[0]!([added(2, msg("stale"))]);
       await flush();
       expect(ids()).toEqual(["a", "b", "c", "d"]);
+    });
+
+    it("catches up on what it missed while disconnected, with no gap seen", async () => {
+      const resync = vi.fn(async () => [updated(2, "a", { text: "done" }), { type: "turn.completed", thread_id: "th", seq: 3, turn_id: "t" } as ThreadEvent]);
+      const { store, emit, disconnect } = connected(undefined, resync);
+      emit(added(1, msg("a")), delta(1, "a", "do"));
+      expect(resync).not.toHaveBeenCalled();
+      disconnect();
+      // The turn ends while nothing's listening, and no more events come.
+      store.connect();
+      expect(resync).toHaveBeenCalledWith(1);
+      await flush();
+      expect(store.getState().snapshot.seq).toBe(3);
+      expect(store.getState().snapshot.items[0]).toMatchObject({ text: "done" });
+      expect(store.getState().streaming.size).toBe(0);
+      expect(store.getState().resyncing).toBe(false);
+    });
+
+    it("ends a resync on connecting again that brings nothing, quietly", async () => {
+      const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+      const { store, emit, disconnect } = connected(undefined, async () => []);
+      emit(added(1, msg("a")));
+      disconnect();
+      store.connect();
+      await flush();
+      expect(store.getState().resyncing).toBe(false);
+      emit(delta(1, "a", "x"));
+      expect(store.getState().snapshot.items[0]).toMatchObject({ text: "x" });
+      expect(warn).not.toHaveBeenCalled();
     });
 
     it("ignores a resync that comes after it disconnected", async () => {

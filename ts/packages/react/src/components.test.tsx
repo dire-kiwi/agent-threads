@@ -7,7 +7,7 @@ import { AgentsPill } from "./components/AgentsPill.js";
 import { Thread } from "./components/Thread.js";
 import type { ThreadConfig, ToolRowProps } from "./config.js";
 import { ThreadProvider } from "./hooks.js";
-import { fixtureEvents, fixtureNames, fixtureThread, testSource } from "./test/helpers.js";
+import { fixtureEvents, fixtureNames, fixtureThread, testSource, thread } from "./test/helpers.js";
 
 afterEach(() => {
   cleanup();
@@ -142,6 +142,37 @@ describe("<Thread>", () => {
       { outcome: "allow", always: true },
       { outcome: "deny", message: "Not that file" },
     ]);
+  });
+
+  // Requests with no tool item to look at: the card alone shows what's being allowed.
+  it.each([
+    ["Read", "read", { file_path: "/private/payroll.csv" }, ["/private/payroll.csv"]],
+    ["Grep", "search", { pattern: "password", path: "/private/" }, ["password", "/private/"]],
+    ["WebSearch", "web", { query: "agent threads" }, ["agent threads"]],
+    ["WebFetch", "web", { url: "https://example.com/x" }, ["https://example.com/x"]],
+    ["Edit", "edit", { file_path: "/etc/config", old_string: "old", new_string: "new" }, ["/etc/config", "- old", "+ new"]],
+    ["Write", "edit", { file_path: "/etc/hosts", content: "127.0.0.1 x" }, ["/etc/hosts", "127.0.0.1 x"]],
+    ["Bash", "shell", { command: "rm -rf build" }, ["rm -rf build"]],
+  ] as const)("shows what a standalone %s request is for", (name, kind, input, shown) => {
+    const opened: ThreadEvent = { type: "request.opened", thread_id: "th", seq: 1, request: { id: "p1", type: "permission", name, kind, input } };
+    const { container } = mount(applyEvents(initialState(thread), [opened]));
+    const card = container.querySelector(".at-permission") as HTMLElement;
+    for (const text of shown) expect(card.textContent).toContain(text);
+    expect(card.textContent).not.toContain("Reading…");
+  });
+
+  it("shows a request's title, and the target of a call that's in the thread", () => {
+    const call: Item = { id: "c1", type: "tool_call", name: "Read", kind: "read", input: { file_path: "/srv/app/.env" }, status: "pending" };
+    const { container } = mount(
+      applyEvents(initialState({ ...thread, cwd: "/srv/app" }), [
+        { type: "item.added", thread_id: "th", seq: 1, item: call },
+        { type: "request.opened", thread_id: "th", seq: 2, request: { id: "p1", type: "permission", tool_call_id: "c1", name: "Read", kind: "read", input: call.input, title: "Read the app's secrets" } },
+      ]),
+    );
+    const card = container.querySelector(".at-permission") as HTMLElement;
+    expect(card.querySelector(".at-permission-summary")?.textContent).toBe(".env");
+    expect(card.querySelector(".at-permission-title")?.textContent).toBe("Read the app's secrets");
+    expect(card.textContent).toContain('"file_path": "/srv/app/.env"');
   });
 
   it("shows why a response failed", async () => {

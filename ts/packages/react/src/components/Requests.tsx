@@ -7,7 +7,8 @@ import { useRespond, useReveal, useThreadConfig, useThreadState } from "../hooks
 import type { ThreadState } from "../store.js";
 import { BotIcon, CheckIcon, QuestionIcon, SendIcon, ShieldIcon, XIcon } from "../icons.js";
 import { subagentTitle } from "./Subagent.js";
-import { toolRenderer } from "./ToolCall.js";
+import { toolMeta } from "../toolMeta.js";
+import { permissionBody, toolRenderer } from "./ToolCall.js";
 import { Button, cx } from "./ui.js";
 
 const NO_REQUESTS: readonly ThreadRequest[] = [];
@@ -84,9 +85,12 @@ export const PermissionCard = memo(function PermissionCard({ request, className 
   const respond = useRespond();
   const config = useThreadConfig();
   const harness = useThreadState((s) => s.snapshot.thread.harness);
+  const cwd = useThreadState((s) => s.snapshot.thread.cwd);
   const found = useThreadState((s) => (request.tool_call_id ? findCall(s, request.tool_call_id) : undefined));
   const call: ToolCall = found ?? { id: request.id, type: "tool_call", name: request.name, kind: request.kind, input: request.input, status: "pending", title: request.title };
-  const Body = toolRenderer(config, call).Body;
+  const renderer = toolRenderer(config, call);
+  const meta = { ...toolMeta(call, cwd), ...renderer.meta?.(call, cwd) };
+  const Body = permissionBody(renderer);
   const { busy, error, run } = useSending();
   const [noting, setNoting] = useState(false);
   const [note, setNote] = useState("");
@@ -101,8 +105,16 @@ export const PermissionCard = memo(function PermissionCard({ request, className 
         </span>
         <From parentId={request.parent_id} />
       </div>
+      {/* What it's for, whatever the body shows: the call's target (its label is for a call that's run), and the harness's summary. */}
+      {meta.summary && (
+        <div className="at-permission-target">
+          <span className="at-tool-icon">{meta.icon}</span>
+          <span className="at-permission-summary">{meta.summary}</span>
+        </div>
+      )}
+      {request.title && request.title !== meta.summary && <div className="at-permission-title">{request.title}</div>}
       {request.reason && <div className="at-card-reason">{request.reason}</div>}
-      {Body ? <Body call={call} /> : null}
+      <Body call={call} />
       {noting && (
         <input
           className="at-input"

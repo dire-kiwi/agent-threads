@@ -688,6 +688,26 @@ button.at-line-rule:not(:disabled):hover {
   font-size: 0.93em;
 }
 
+.at-permission-target {
+  display: flex;
+  align-items: baseline;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+/* All of it, wrapped: it's what's being allowed. */
+.at-permission-summary {
+  min-width: 0;
+  overflow-wrap: anywhere;
+  font-family: var(--at-mono);
+  font-size: 0.93em;
+}
+
+.at-permission-title {
+  overflow-wrap: anywhere;
+  font-size: 0.93em;
+}
+
 .at-card-reason {
   color: var(--at-muted);
   font-size: 0.9em;
