@@ -9,9 +9,13 @@
   "files": ["dist"],
   "scripts": {
     "build": "tsc -p tsconfig.build.json",
-    "test": "tsc --noEmit && vitest run"
+    "test": "tsc --noEmit && vitest run",
+    "gen:codex": "node scripts/gen-codex.mjs"
   },
   "dependencies": {
     "@dire-kiwi/agent-threads-protocol": "workspace:*"
+  },
+  "devDependencies": {
+    "json-schema-to-typescript": "^16.0.0"
   }
 }

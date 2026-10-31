@@ -4,13 +4,15 @@
 // app's tools are an in-process MCP server answered over `mcp_message`, and steered messages go in
 // over stdin and join the turn when Claude echoes them back.
 
-import { cpSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { basename, join, resolve } from "node:path";
+import { join } from "node:path";
 import type { Resolution } from "@dire-kiwi/agent-threads-protocol";
+import { messageParts, pathText } from "../attachments.js";
 import type { Harness, HarnessSession, Message, Skill, ThreadContext } from "../harness.js";
 import { newId } from "../ids.js";
 import { permissionKey, type PermissionDecision } from "../permissions.js";
+import { writeSkills } from "../skills.js";
 import type { ExitStatus, HarnessProcess } from "../spawner.js";
 import { runTool } from "../tools.js";
 import { APP_SERVER, claudePermissionMode, claudeTool, claudeUsage, editChange, questions, resultText, slim, title } from "./translate.js";
@@ -212,35 +214,15 @@ class ClaudeSession implements HarnessSession {
     return { type: "user", message: { role: "user", content }, parent_tool_use_id: null, session_id: "" };
   }
 
-  /**
-   * A message's content as Claude takes it. Images with data go as images; files with textual data
-   * as their text; other files with data are written out, and Claude is told where (as for files
-   * with a path).
-   */
+  /** A message's content as Claude takes it: images with data as images, other files as text. */
   #content(m: Message): Json[] {
-    const content: Json[] = [{ type: "text", text: m.text }];
-    for (const [i, a] of (m.attachments ?? []).entries()) {
-      const name = a.name ?? a.path ?? `attachment-${i + 1}`;
-      if (a.data !== undefined) {
-        if (a.kind === "image") {
-          content.push({ type: "image", source: { type: "base64", media_type: a.media_type ?? "image/png", data: a.data } });
-          continue;
-        }
-        const bytes = Buffer.from(a.data, "base64");
-        if (a.media_type && TEXTUAL.test(a.media_type)) {
-          content.push({ type: "text", text: `Attached file ${name}:\n${bytes.toString("utf8")}` });
-          continue;
-        }
-        const dir = join(this.#dir(), "attachments", m.id);
-        mkdirSync(dir, { recursive: true });
-        const path = join(dir, `${i + 1}-${basename(name).replace(/[^\w.-]+/g, "_")}`);
-        writeFileSync(path, bytes);
-        content.push({ type: "text", text: `Attached file ${name}${a.media_type ? ` (${a.media_type})` : ""}: ${path}` });
-      } else if (a.path) {
-        content.push({ type: "text", text: `Attached file: ${a.path}` });
-      }
-    }
-    return content;
+    return messageParts(m, () => this.#dir()).map((p) =>
+      p.type === "text"
+        ? { type: "text", text: p.text }
+        : p.type === "image"
+          ? { type: "image", source: { type: "base64", media_type: p.media_type, data: p.data } }
+          : { type: "text", text: pathText(p) },
+    );
   }
 
   // ---------- the process ----------
@@ -692,9 +674,6 @@ function echoKey(content: unknown): string {
   return JSON.stringify([blocks.filter((b) => b?.type === "text").map((b) => b.text).join("\n"), blocks.filter((b) => b?.type === "image").length]);
 }
 
-/** Media types whose content goes to Claude as text. */
-const TEXTUAL = /^(text\/|application\/(json|xml|yaml|x-yaml|toml|javascript|x-sh|x-ndjson|csv)\b)|\+(json|xml)\b/;
-
 function exitError(status: ExitStatus, stderr: string[]): string {
   if (status.error) return `Claude Code couldn't be started: ${status.error.message}`;
   const how = status.signal ? `was stopped by ${status.signal}` : `exited with code ${status.code}`;
@@ -706,14 +685,6 @@ function exitError(status: ExitStatus, stderr: string[]): string {
 function writePlugin(dir: string, skills: Skill[]): string {
   mkdirSync(join(dir, ".claude-plugin"), { recursive: true });
   writeFileSync(join(dir, ".claude-plugin", "plugin.json"), JSON.stringify({ name: APP_SERVER, version: "1.0.0", description: "The app's skills" }));
-  const root = join(dir, "skills");
-  mkdirSync(root, { recursive: true });
-  for (const s of skills) {
-    if (typeof s === "string") cpSync(resolve(s), join(root, basename(resolve(s))), { recursive: true });
-    else {
-      mkdirSync(join(root, s.name), { recursive: true });
-      writeFileSync(join(root, s.name, "SKILL.md"), s.content);
-    }
-  }
+  writeSkills(join(dir, "skills"), skills);
   return dir;
 }
