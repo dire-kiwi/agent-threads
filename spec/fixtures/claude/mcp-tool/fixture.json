@@ -1,0 +1,38 @@
+{
+  "description": "A tool on an external stdio MCP server (echo), passed with --mcp-config.",
+  "recorded": {
+    "cli": "2.1.312 (Claude Code)",
+    "model": "haiku",
+    "date": "2026-10-31"
+  },
+  "thread": {
+    "harness": "claude",
+    "model": "haiku"
+  },
+  "permissions": "allow",
+  "mcp_servers": {
+    "echo": {
+      "command": "node",
+      "args": [
+        "spec/tools/mcp-echo.mjs"
+      ]
+    }
+  },
+  "steps": [
+    {
+      "command": {
+        "type": "send",
+        "text": "Call the echo tool with the text: fixture. Then reply with exactly what it returned.",
+        "client_id": "c1"
+      }
+    },
+    {
+      "wait": {
+        "type": "thread.updated",
+        "thread": {
+          "status": "idle"
+        }
+      }
+    }
+  ]
+}

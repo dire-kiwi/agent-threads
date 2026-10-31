@@ -1,0 +1,30 @@
+{
+  "description": "Built-in tools: Read, Bash and Edit, all allowed by the app's permission policy without asking.",
+  "recorded": {
+    "cli": "2.1.312 (Claude Code)",
+    "model": "haiku",
+    "date": "2026-10-31"
+  },
+  "thread": {
+    "harness": "claude",
+    "model": "haiku"
+  },
+  "permissions": "allow",
+  "steps": [
+    {
+      "command": {
+        "type": "send",
+        "text": "Do these one at a time, using the tools named: 1. Read notes.txt with the Read tool. 2. Run `wc -l notes.txt` with the Bash tool. 3. Use the Edit tool to change the line apple to apricot in notes.txt. Then reply with just: done",
+        "client_id": "c1"
+      }
+    },
+    {
+      "wait": {
+        "type": "thread.updated",
+        "thread": {
+          "status": "idle"
+        }
+      }
+    }
+  ]
+}

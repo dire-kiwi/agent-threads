@@ -1,0 +1,44 @@
+{
+  "description": "An interrupt (turn/interrupt) while a long command runs.",
+  "recorded": {
+    "cli": "codex-cli 0.165.0",
+    "model": "gpt-5.6-luna",
+    "date": "2026-10-31"
+  },
+  "thread": {
+    "harness": "codex",
+    "model": "gpt-5.6-luna",
+    "effort": "low"
+  },
+  "permissions": "allow",
+  "steps": [
+    {
+      "command": {
+        "type": "send",
+        "text": "Run `sleep 30 && echo finished`, then reply with its output.",
+        "client_id": "c1"
+      }
+    },
+    {
+      "wait": {
+        "type": "item.added",
+        "item": {
+          "id": "exec-65d8e05a-a7e9-4c8d-a128-5af26f131642"
+        }
+      }
+    },
+    {
+      "command": {
+        "type": "interrupt"
+      }
+    },
+    {
+      "wait": {
+        "type": "thread.updated",
+        "thread": {
+          "status": "idle"
+        }
+      }
+    }
+  ]
+}

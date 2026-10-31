@@ -1,0 +1,31 @@
+{
+  "description": "Built-in tools: reading a file and running commands, and editing a file, all allowed by the app's permission policy without asking.",
+  "recorded": {
+    "cli": "codex-cli 0.165.0",
+    "model": "gpt-5.6-luna",
+    "date": "2026-10-31"
+  },
+  "thread": {
+    "harness": "codex",
+    "model": "gpt-5.6-luna",
+    "effort": "low"
+  },
+  "permissions": "allow",
+  "steps": [
+    {
+      "command": {
+        "type": "send",
+        "text": "Do these one at a time: 1. Show notes.txt with `cat notes.txt`. 2. Run `wc -l notes.txt`. 3. Edit notes.txt with apply_patch to change the line apple to apricot. Then reply with just: done",
+        "client_id": "c1"
+      }
+    },
+    {
+      "wait": {
+        "type": "thread.updated",
+        "thread": {
+          "status": "idle"
+        }
+      }
+    }
+  ]
+}

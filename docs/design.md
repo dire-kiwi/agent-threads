@@ -76,7 +76,7 @@ hand. The wire format is specified in [spec/PROTOCOL.md](../spec/PROTOCOL.md) an
 | Path | What |
 | --- | --- |
 | `spec/` | The source of truth: JSON Schemas in `spec/schema/`, the protocol doc `spec/PROTOCOL.md`, and example events in `spec/examples/`. |
-| `spec/fixtures/` | (Later) recorded Claude and Codex sessions, each with the normalized events they must produce: the conformance suite every backend runs. |
+| `spec/fixtures/` | Recorded Claude and Codex sessions, each with the normalized events they must produce: the conformance suite every backend runs ([spec/fixtures/README.md](../spec/fixtures/README.md)). `spec/tools/` has the fake CLI that replays them, and `spec/conformance/` the store conformance cases. |
 | `ts/packages/protocol` | Generated TS types and the pure `applyEvent` reducer, shared by the Node backend and React. |
 | `ts/packages/node` | The Node backend (Memory, JSONL file and SQLite stores). |
 | `ts/packages/react` | React hooks and components. |

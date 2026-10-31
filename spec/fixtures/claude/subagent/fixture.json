@@ -1,0 +1,30 @@
+{
+  "description": "A subagent (the Agent/Task tool): its messages and tool calls carry parent_tool_use_id.",
+  "recorded": {
+    "cli": "2.1.312 (Claude Code)",
+    "model": "haiku",
+    "date": "2026-10-31"
+  },
+  "thread": {
+    "harness": "claude",
+    "model": "haiku"
+  },
+  "permissions": "allow",
+  "steps": [
+    {
+      "command": {
+        "type": "send",
+        "text": "Use the Task tool to start a general-purpose subagent with this prompt: 'Read notes.txt with the Read tool and reply with its first line only.' Then reply with just what the subagent said.",
+        "client_id": "c1"
+      }
+    },
+    {
+      "wait": {
+        "type": "thread.updated",
+        "thread": {
+          "status": "idle"
+        }
+      }
+    }
+  ]
+}

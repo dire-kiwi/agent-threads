@@ -1,0 +1,238 @@
+{
+  "description": "The store conformance cases: every backend's Memory, JSONL and SQLite stores (and an app's own) must pass them. See store.md for the operations, the error kinds and how a test runs a case.",
+  "values": {
+    "T1": { "id": "th_1", "harness": "claude", "status": "idle", "model": "haiku", "permission_mode": "default", "cwd": "/work", "created_at": "2026-11-01T00:00:00Z" },
+    "T1_running": { "id": "th_1", "harness": "claude", "status": "running", "model": "haiku", "permission_mode": "default", "cwd": "/work", "session_id": "sess_1", "created_at": "2026-11-01T00:00:00Z", "updated_at": "2026-11-01T00:00:02Z" },
+    "T2": { "id": "th_2", "harness": "codex", "status": "idle", "metadata": { "user": "u_42", "tags": ["a", "b"] }, "created_at": "2026-11-01T00:00:05Z" },
+    "T3": { "id": "th_0", "harness": "codex", "status": "idle", "created_at": "2026-11-01T00:00:05Z" },
+    "E1": { "type": "thread.updated", "thread_id": "th_1", "seq": 1, "thread": { "id": "th_1", "harness": "claude", "status": "idle", "model": "haiku", "permission_mode": "default", "cwd": "/work", "created_at": "2026-11-01T00:00:00Z" } },
+    "E2": { "type": "item.added", "thread_id": "th_1", "seq": 2, "item": { "id": "u1", "type": "user_message", "text": "Fix the failing test", "client_id": "c1", "turn_id": "t1" } },
+    "E3": { "type": "turn.started", "thread_id": "th_1", "seq": 3, "turn_id": "t1" },
+    "E4": { "type": "item.added", "thread_id": "th_1", "seq": 4, "item": { "id": "tc1", "type": "tool_call", "name": "Bash", "kind": "shell", "input": { "command": "echo 'ünïcödé ✓' && printf '%s\\n' \"a\tb\"", "nested": { "list": [1, 2.5, null, true, { "x": "" }] } }, "status": "running", "command": "echo 'ünïcödé ✓'", "turn_id": "t1" }, "raw": { "type": "assistant", "unknown_field": { "kept": true } } },
+    "E5": { "type": "item.updated", "thread_id": "th_1", "seq": 5, "item_id": "tc1", "patch": { "status": "completed", "result": { "content": "ünïcödé ✓\na\tb\n", "exit_code": 0 } }, "future_field": "kept too" },
+    "D": { "type": "delta", "thread_id": "th_1", "seq": 3, "item_id": "a1", "kind": "text", "text": "Hel" },
+    "F1": { "type": "thread.updated", "thread_id": "th_2", "seq": 1, "thread": { "id": "th_2", "harness": "codex", "status": "idle", "created_at": "2026-11-01T00:00:05Z" } },
+    "F2": { "type": "turn.started", "thread_id": "th_2", "seq": 2, "turn_id": "t9" },
+    "S2": {
+      "thread": { "id": "th_1", "harness": "claude", "status": "idle", "model": "haiku", "permission_mode": "default", "cwd": "/work", "created_at": "2026-11-01T00:00:00Z" },
+      "items": [{ "id": "u1", "type": "user_message", "text": "Fix the failing test", "client_id": "c1", "turn_id": "t1" }],
+      "requests": [],
+      "seq": 2
+    },
+    "S4": {
+      "thread": { "id": "th_1", "harness": "claude", "status": "idle", "model": "haiku", "permission_mode": "default", "cwd": "/work", "created_at": "2026-11-01T00:00:00Z" },
+      "items": [
+        { "id": "u1", "type": "user_message", "text": "Fix the failing test", "client_id": "c1", "turn_id": "t1" },
+        { "id": "tc1", "type": "tool_call", "name": "Bash", "kind": "shell", "input": { "command": "echo 'ünïcödé ✓' && printf '%s\\n' \"a\tb\"", "nested": { "list": [1, 2.5, null, true, { "x": "" }] } }, "status": "running", "command": "echo 'ünïcödé ✓'", "turn_id": "t1" }
+      ],
+      "requests": [],
+      "seq": 4
+    },
+    "R1": { "id": "run_1", "thread_id": "th_1", "spawner": "shim", "offset": 0, "started_at": "2026-11-01T00:00:01Z", "data": { "dir": "/var/lib/app/runs/run_1" } },
+    "R1_read": { "id": "run_1", "thread_id": "th_1", "spawner": "shim", "offset": 18342, "started_at": "2026-11-01T00:00:01Z", "data": { "dir": "/var/lib/app/runs/run_1" } },
+    "R1_ended": { "id": "run_1", "thread_id": "th_1", "spawner": "shim", "offset": 20117, "started_at": "2026-11-01T00:00:01Z", "ended_at": "2026-11-01T00:05:00Z", "data": { "dir": "/var/lib/app/runs/run_1", "exit": { "code": 0 } } },
+    "R2": { "id": "run_2", "thread_id": "th_2", "spawner": "shim", "offset": 512, "started_at": "2026-11-01T00:00:00Z" },
+    "R3": { "id": "run_3", "thread_id": "th_1", "spawner": "direct", "offset": 0, "started_at": "2026-11-01T00:06:00Z" },
+    "R_orphan": { "id": "run_9", "thread_id": "th_nope", "spawner": "shim", "offset": 0, "started_at": "2026-11-01T00:00:00Z" }
+  },
+  "cases": [
+    {
+      "name": "creates and gets threads",
+      "steps": [
+        { "op": "getThread", "args": ["th_1"], "result": null },
+        { "op": "createThread", "args": [{ "$": "T1" }], "result": null },
+        { "op": "getThread", "args": ["th_1"], "result": { "$": "T1" } },
+        { "op": "getThread", "args": ["th_nope"], "result": null },
+        { "op": "createThread", "args": [{ "$": "T1" }], "error": "exists" }
+      ]
+    },
+    {
+      "name": "lists threads oldest first, then by id",
+      "steps": [
+        { "op": "listThreads", "args": [], "result": [] },
+        { "op": "createThread", "args": [{ "$": "T2" }], "result": null },
+        { "op": "createThread", "args": [{ "$": "T1" }], "result": null },
+        { "op": "createThread", "args": [{ "$": "T3" }], "result": null },
+        { "op": "listThreads", "args": [], "result": [{ "$": "T1" }, { "$": "T3" }, { "$": "T2" }] }
+      ]
+    },
+    {
+      "name": "updates a thread in full",
+      "steps": [
+        { "op": "createThread", "args": [{ "$": "T1" }], "result": null },
+        { "op": "updateThread", "args": [{ "$": "T1_running" }], "result": null },
+        { "op": "getThread", "args": ["th_1"], "result": { "$": "T1_running" } },
+        { "op": "updateThread", "args": [{ "$": "T1" }], "result": null },
+        { "op": "getThread", "args": ["th_1"], "result": { "$": "T1" } },
+        { "op": "updateThread", "args": [{ "$": "T2" }], "error": "not_found" }
+      ]
+    },
+    {
+      "name": "keeps a thread's metadata as it was given",
+      "steps": [
+        { "op": "createThread", "args": [{ "$": "T2" }], "result": null },
+        { "op": "getThread", "args": ["th_2"], "result": { "$": "T2" } }
+      ]
+    },
+    {
+      "name": "appends events and reads them back after a seq",
+      "steps": [
+        { "op": "createThread", "args": [{ "$": "T1" }], "result": null },
+        { "op": "lastSeq", "args": ["th_1"], "result": 0 },
+        { "op": "readEvents", "args": ["th_1", { "after": 0 }], "result": [] },
+        { "op": "appendEvents", "args": ["th_1", [{ "$": "E1" }, { "$": "E2" }]], "result": null },
+        { "op": "appendEvents", "args": ["th_1", [{ "$": "E3" }]], "result": null },
+        { "op": "lastSeq", "args": ["th_1"], "result": 3 },
+        { "op": "readEvents", "args": ["th_1", { "after": 0 }], "result": [{ "$": "E1" }, { "$": "E2" }, { "$": "E3" }] },
+        { "op": "readEvents", "args": ["th_1", { "after": 2 }], "result": [{ "$": "E3" }] },
+        { "op": "readEvents", "args": ["th_1", { "after": 3 }], "result": [] },
+        { "op": "readEvents", "args": ["th_1", { "after": 9 }], "result": [] },
+        { "op": "readEvents", "args": ["th_1", { "after": 0, "limit": 2 }], "result": [{ "$": "E1" }, { "$": "E2" }] },
+        { "op": "readEvents", "args": ["th_1", { "after": 1, "limit": 1 }], "result": [{ "$": "E2" }] },
+        { "op": "appendEvents", "args": ["th_1", []], "result": null },
+        { "op": "lastSeq", "args": ["th_1"], "result": 3 }
+      ]
+    },
+    {
+      "name": "keeps events exactly, with fields it doesn't know and raw payloads",
+      "steps": [
+        { "op": "createThread", "args": [{ "$": "T1" }], "result": null },
+        { "op": "appendEvents", "args": ["th_1", [{ "$": "E1" }, { "$": "E2" }, { "$": "E3" }, { "$": "E4" }, { "$": "E5" }]], "result": null },
+        { "op": "readEvents", "args": ["th_1", { "after": 3 }], "result": [{ "$": "E4" }, { "$": "E5" }] }
+      ]
+    },
+    {
+      "name": "refuses events whose seq doesn't follow on, and appends none of a batch it refuses",
+      "steps": [
+        { "op": "createThread", "args": [{ "$": "T1" }], "result": null },
+        { "op": "appendEvents", "args": ["th_1", [{ "$": "E2" }]], "error": "seq" },
+        { "op": "appendEvents", "args": ["th_1", [{ "$": "E1" }, { "$": "E3" }]], "error": "seq" },
+        { "op": "lastSeq", "args": ["th_1"], "result": 0 },
+        { "op": "appendEvents", "args": ["th_1", [{ "$": "E1" }]], "result": null },
+        { "op": "appendEvents", "args": ["th_1", [{ "$": "E1" }]], "error": "seq" },
+        { "op": "appendEvents", "args": ["th_1", [{ "$": "E2" }, { "$": "E2" }]], "error": "seq" },
+        { "op": "lastSeq", "args": ["th_1"], "result": 1 },
+        { "op": "readEvents", "args": ["th_1", { "after": 0 }], "result": [{ "$": "E1" }] }
+      ]
+    },
+    {
+      "name": "refuses deltas and events for another thread",
+      "steps": [
+        { "op": "createThread", "args": [{ "$": "T1" }], "result": null },
+        { "op": "createThread", "args": [{ "$": "T2" }], "result": null },
+        { "op": "appendEvents", "args": ["th_1", [{ "$": "E1" }, { "$": "E2" }]], "result": null },
+        { "op": "appendEvents", "args": ["th_1", [{ "$": "D" }]], "error": "invalid" },
+        { "op": "appendEvents", "args": ["th_2", [{ "$": "F1" }, { "$": "E2" }]], "error": "invalid" },
+        { "op": "lastSeq", "args": ["th_1"], "result": 2 },
+        { "op": "lastSeq", "args": ["th_2"], "result": 0 }
+      ]
+    },
+    {
+      "name": "numbers each thread's events on their own",
+      "steps": [
+        { "op": "createThread", "args": [{ "$": "T1" }], "result": null },
+        { "op": "createThread", "args": [{ "$": "T2" }], "result": null },
+        { "op": "appendEvents", "args": ["th_1", [{ "$": "E1" }]], "result": null },
+        { "op": "appendEvents", "args": ["th_2", [{ "$": "F1" }]], "result": null },
+        { "op": "appendEvents", "args": ["th_1", [{ "$": "E2" }]], "result": null },
+        { "op": "appendEvents", "args": ["th_2", [{ "$": "F2" }]], "result": null },
+        { "op": "readEvents", "args": ["th_1", { "after": 0 }], "result": [{ "$": "E1" }, { "$": "E2" }] },
+        { "op": "readEvents", "args": ["th_2", { "after": 0 }], "result": [{ "$": "F1" }, { "$": "F2" }] }
+      ]
+    },
+    {
+      "name": "says when a thread doesn't exist",
+      "steps": [
+        { "op": "appendEvents", "args": ["th_nope", []], "error": "not_found" },
+        { "op": "readEvents", "args": ["th_nope", { "after": 0 }], "error": "not_found" },
+        { "op": "lastSeq", "args": ["th_nope"], "error": "not_found" },
+        { "op": "saveSnapshot", "args": ["th_nope", { "$": "S2" }], "error": "not_found" },
+        { "op": "loadSnapshot", "args": ["th_nope"], "error": "not_found" },
+        { "op": "putRun", "args": [{ "$": "R_orphan" }], "error": "not_found" },
+        { "op": "deleteThread", "args": ["th_nope"], "result": false }
+      ]
+    },
+    {
+      "name": "saves the latest snapshot",
+      "steps": [
+        { "op": "createThread", "args": [{ "$": "T1" }], "result": null },
+        { "op": "loadSnapshot", "args": ["th_1"], "result": null },
+        { "op": "appendEvents", "args": ["th_1", [{ "$": "E1" }, { "$": "E2" }, { "$": "E3" }, { "$": "E4" }]], "result": null },
+        { "op": "saveSnapshot", "args": ["th_1", { "$": "S2" }], "result": null },
+        { "op": "loadSnapshot", "args": ["th_1"], "result": { "$": "S2" } },
+        { "op": "saveSnapshot", "args": ["th_1", { "$": "S4" }], "result": null },
+        { "op": "loadSnapshot", "args": ["th_1"], "result": { "$": "S4" } },
+        { "op": "readEvents", "args": ["th_1", { "after": 0 }], "result": [{ "$": "E1" }, { "$": "E2" }, { "$": "E3" }, { "$": "E4" }] }
+      ]
+    },
+    {
+      "name": "keeps runs and their offsets, and lists the ones still going",
+      "steps": [
+        { "op": "createThread", "args": [{ "$": "T1" }], "result": null },
+        { "op": "createThread", "args": [{ "$": "T2" }], "result": null },
+        { "op": "getRun", "args": ["run_1"], "result": null },
+        { "op": "activeRuns", "args": [], "result": [] },
+        { "op": "putRun", "args": [{ "$": "R1" }], "result": null },
+        { "op": "putRun", "args": [{ "$": "R2" }], "result": null },
+        { "op": "getRun", "args": ["run_1"], "result": { "$": "R1" } },
+        { "op": "putRun", "args": [{ "$": "R1_read" }], "result": null },
+        { "op": "getRun", "args": ["run_1"], "result": { "$": "R1_read" } },
+        { "op": "activeRuns", "args": [], "result": [{ "$": "R2" }, { "$": "R1_read" }] },
+        { "op": "putRun", "args": [{ "$": "R1_ended" }], "result": null },
+        { "op": "activeRuns", "args": [], "result": [{ "$": "R2" }] },
+        { "op": "getRun", "args": ["run_1"], "result": { "$": "R1_ended" } },
+        { "op": "putRun", "args": [{ "$": "R3" }], "result": null },
+        { "op": "activeRuns", "args": [], "result": [{ "$": "R2" }, { "$": "R3" }] }
+      ]
+    },
+    {
+      "name": "deletes a thread with its events, snapshot and runs",
+      "steps": [
+        { "op": "createThread", "args": [{ "$": "T1" }], "result": null },
+        { "op": "createThread", "args": [{ "$": "T2" }], "result": null },
+        { "op": "appendEvents", "args": ["th_1", [{ "$": "E1" }, { "$": "E2" }]], "result": null },
+        { "op": "appendEvents", "args": ["th_2", [{ "$": "F1" }]], "result": null },
+        { "op": "saveSnapshot", "args": ["th_1", { "$": "S2" }], "result": null },
+        { "op": "putRun", "args": [{ "$": "R1" }], "result": null },
+        { "op": "putRun", "args": [{ "$": "R2" }], "result": null },
+        { "op": "deleteThread", "args": ["th_1"], "result": true },
+        { "op": "getThread", "args": ["th_1"], "result": null },
+        { "op": "readEvents", "args": ["th_1", { "after": 0 }], "error": "not_found" },
+        { "op": "getRun", "args": ["run_1"], "result": null },
+        { "op": "activeRuns", "args": [], "result": [{ "$": "R2" }] },
+        { "op": "listThreads", "args": [], "result": [{ "$": "T2" }] },
+        { "op": "readEvents", "args": ["th_2", { "after": 0 }], "result": [{ "$": "F1" }] },
+        { "op": "deleteThread", "args": ["th_1"], "result": false },
+        { "op": "createThread", "args": [{ "$": "T1" }], "result": null },
+        { "op": "lastSeq", "args": ["th_1"], "result": 0 },
+        { "op": "loadSnapshot", "args": ["th_1"], "result": null },
+        { "op": "appendEvents", "args": ["th_1", [{ "$": "E1" }]], "result": null }
+      ]
+    },
+    {
+      "name": "keeps everything when it's reopened",
+      "persistent": true,
+      "steps": [
+        { "op": "createThread", "args": [{ "$": "T1" }], "result": null },
+        { "op": "createThread", "args": [{ "$": "T2" }], "result": null },
+        { "op": "appendEvents", "args": ["th_1", [{ "$": "E1" }, { "$": "E2" }, { "$": "E3" }, { "$": "E4" }, { "$": "E5" }]], "result": null },
+        { "op": "appendEvents", "args": ["th_2", [{ "$": "F1" }]], "result": null },
+        { "op": "updateThread", "args": [{ "$": "T1_running" }], "result": null },
+        { "op": "saveSnapshot", "args": ["th_1", { "$": "S4" }], "result": null },
+        { "op": "putRun", "args": [{ "$": "R1_read" }], "result": null },
+        { "op": "reopen", "args": [], "result": null },
+        { "op": "listThreads", "args": [], "result": [{ "$": "T1_running" }, { "$": "T2" }] },
+        { "op": "lastSeq", "args": ["th_1"], "result": 5 },
+        { "op": "readEvents", "args": ["th_1", { "after": 0 }], "result": [{ "$": "E1" }, { "$": "E2" }, { "$": "E3" }, { "$": "E4" }, { "$": "E5" }] },
+        { "op": "readEvents", "args": ["th_2", { "after": 0 }], "result": [{ "$": "F1" }] },
+        { "op": "loadSnapshot", "args": ["th_1"], "result": { "$": "S4" } },
+        { "op": "activeRuns", "args": [], "result": [{ "$": "R1_read" }] },
+        { "op": "appendEvents", "args": ["th_1", [{ "$": "E1" }]], "error": "seq" },
+        { "op": "deleteThread", "args": ["th_2"], "result": true },
+        { "op": "reopen", "args": [], "result": null },
+        { "op": "listThreads", "args": [], "result": [{ "$": "T1_running" }] },
+        { "op": "getThread", "args": ["th_2"], "result": null }
+      ]
+    }
+  ]
+}

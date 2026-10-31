@@ -1,0 +1,51 @@
+{
+  "description": "AskUserQuestion, answered by the user through the permission callback.",
+  "recorded": {
+    "cli": "2.1.312 (Claude Code)",
+    "model": "haiku",
+    "date": "2026-10-31"
+  },
+  "thread": {
+    "harness": "claude",
+    "model": "haiku"
+  },
+  "permissions": "allow",
+  "steps": [
+    {
+      "command": {
+        "type": "send",
+        "text": "Use the AskUserQuestion tool to ask me one question: which color do I prefer, with the options red and blue (header: Color). Then reply with just the color I chose.",
+        "client_id": "c1"
+      }
+    },
+    {
+      "wait": {
+        "type": "thread.updated",
+        "thread": {
+          "status": "waiting"
+        }
+      }
+    },
+    {
+      "command": {
+        "type": "respond",
+        "resolution": {
+          "outcome": "answer",
+          "answers": {
+            "Which color do you prefer?": [
+              "Blue"
+            ]
+          }
+        }
+      }
+    },
+    {
+      "wait": {
+        "type": "thread.updated",
+        "thread": {
+          "status": "idle"
+        }
+      }
+    }
+  ]
+}
