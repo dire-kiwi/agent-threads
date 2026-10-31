@@ -35,7 +35,7 @@ export interface Capabilities {
 }
 
 export interface AgentThreadsOptions extends Capabilities {
-  /** Where threads are kept. A MemoryStore by default. */
+  /** Where threads are kept: the app's, which it closes after this. A MemoryStore by default. */
   store?: Store;
   /** The harnesses threads can run on, by name. Claude Code (`claude`) by default. */
   harnesses?: { [name: string]: Harness };
@@ -224,7 +224,10 @@ export class AgentThreads {
     if (JSON.stringify(rt.thread) !== before) rt.session?.optionsChanged();
   }
 
-  /** Stops every harness process and saves everything. The instance can't be used after. */
+  /**
+   * Stops every harness process and saves everything. The instance can't be used after; the
+   * store can (the app closes it).
+   */
   async close(): Promise<void> {
     if (this.#closed) return;
     this.#closed = true;
@@ -233,6 +236,7 @@ export class AgentThreads {
     await Promise.all(
       threads.map(async (rt) => {
         // A turn cut short by shutting down ends as an interrupted one.
+        rt.closing = true;
         if (rt.turn) rt.turn.interrupted = true;
         try {
           await rt.session?.close();
@@ -243,7 +247,6 @@ export class AgentThreads {
         await rt.saveSnapshot();
       }),
     );
-    await this.store.close?.();
   }
 
   // ---------- internals ----------

@@ -36,6 +36,8 @@ export class ThreadRuntime implements ThreadContext {
   policy: PermissionPolicy;
   session: HarnessSession | undefined;
   turn: Turn | null = null;
+  /** The backend is shutting down: a turn that ends doesn't start another. */
+  closing = false;
 
   #host: RuntimeHost;
   /** The live state, with the text streamed so far. */
@@ -246,7 +248,7 @@ export class ThreadRuntime implements ThreadContext {
     this.setThread({ status: error ? "error" : "idle", error, usage: addUsage(this.#state.thread.usage, end.usage) });
 
     // A steered message the harness didn't take in starts the next turn.
-    const left = this.queued();
+    const left = this.closing ? [] : this.queued();
     if (left.length) {
       this.turn = { id: newId("turn"), interrupted: false };
       for (const m of left) this.updateItem(m.id, { turn_id: this.turn.id });
