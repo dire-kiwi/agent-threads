@@ -11,7 +11,7 @@ scripts with no dependencies (Node 20 or later).
 | [draft-expected.mjs](draft-expected.mjs) | Drafts a fixture's `expected.jsonl` and steps from its recording, to be checked by hand. |
 | [mcp-echo.mjs](mcp-echo.mjs) | The stdio MCP server the `mcp-tool` scenarios were recorded with. |
 | [scenarios/](scenarios/) | What each scenario does, per harness, when it's recorded. |
-| [test/](test/) | Their tests: `node --test spec/tools/test/` (CI runs it). |
+| [test/](test/) | Their tests: `node --test 'spec/tools/test/*.test.mjs'` (CI runs it). |
 
 ## Using the fake CLI in a backend's tests
 

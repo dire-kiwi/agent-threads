@@ -27,7 +27,7 @@ check-gen: gen
 test: test-spec test-ts test-go test-rust
 
 test-spec:
-	node --test spec/tools/test/
+	node --test 'spec/tools/test/*.test.mjs'
 
 test-ts:
 	cd ts && pnpm build && pnpm test

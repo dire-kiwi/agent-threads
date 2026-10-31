@@ -2,7 +2,7 @@
 // ids, to check they're mapped), it must get the recorded output back and a passing report. And it
 // must catch a backend that sends the wrong thing.
 //
-//   node --test spec/tools/test/
+//   node --test 'spec/tools/test/*.test.mjs'
 
 import { spawn } from "node:child_process";
 import { mkdtempSync, readFileSync } from "node:fs";

@@ -232,7 +232,7 @@ node spec/tools/record.mjs claude all       # or a comma-separated list of scena
 node spec/tools/record.mjs codex all
 node spec/tools/draft-expected.mjs spec/fixtures/*/*
 git diff spec/fixtures                        # check every change to expected.jsonl by hand
-node --test spec/tools/test/
+node --test 'spec/tools/test/*.test.mjs'
 ```
 
 Recording needs both CLIs logged in; it costs a few cents. The models' replies vary between
