@@ -5,7 +5,7 @@ import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { afterEach, describe, expect, it } from "vitest";
-import type { Item, ThreadEvent, ToolCall, TurnResult, UserMessage } from "@dire-kiwi/agent-threads-protocol";
+import { applyEvents, initialState, type Item, type ThreadEvent, type ToolCall, type TurnResult, type UserMessage } from "@dire-kiwi/agent-threads-protocol";
 import { AgentThreads, CommandError, type AgentThreadsOptions } from "../agent-threads.js";
 import { claudeCode, type ClaudeCodeOptions } from "../claude/driver.js";
 import type { Store } from "../store.js";
@@ -22,16 +22,16 @@ afterEach(async () => {
   await Promise.all(open.splice(0).map((s) => s.close()));
 });
 
-function setup(options: AgentThreadsOptions & { claude?: ClaudeCodeOptions; steer?: "now" | "late" | "never" } = {}) {
+function setup(options: AgentThreadsOptions & { claude?: ClaudeCodeOptions; steer?: "now" | "late" | "never"; failResume?: boolean } = {}) {
   const log = join(tempDir(), "log.jsonl");
-  const { claude, steer = "now", ...rest } = options;
+  const { claude, steer = "now", failResume, ...rest } = options;
   const events: ThreadEvent[] = [];
   const make = (store: Store = rest.store ?? new MemoryStore()) => {
     const sdk = new AgentThreads({
       permissions: "allow",
       ...rest,
       store,
-      harnesses: { claude: claudeCode({ bin: mini, env: { MINI_CLAUDE_LOG: log, MINI_CLAUDE_STEER: steer }, ...claude }) },
+      harnesses: { claude: claudeCode({ bin: mini, env: { MINI_CLAUDE_LOG: log, MINI_CLAUDE_STEER: steer, ...(failResume ? { MINI_CLAUDE_FAIL_RESUME: "1" } : {}) }, ...claude }) },
       onError:
         rest.onError ??
         ((e) => {
@@ -136,6 +136,35 @@ describe("the Claude driver", () => {
     const [first, second] = runs();
     expect(first!.argv).toEqual(expect.arrayContaining(["--model", "old-model"]));
     expect(second!.argv).toEqual(expect.arrayContaining(["--model", "new-model", "--resume", s.thread.session_id!]));
+  });
+
+  it("stops carrying a steered message over to a harness that keeps failing, and sends it with the next", async () => {
+    const { sdk, events, runs } = setup({ failResume: true });
+    const t = await sdk.create();
+    await sdk.send(t.id, "sleepcrash 300");
+    await until(async () => (await sdk.snapshot(t.id)).thread.session_id);
+    await sdk.send(t.id, "reply steered", { client_id: "s" });
+    // The first process crashes; the turn it carries over to fails too, and that's where it stops.
+    const s = await until(async () => {
+      const s = await sdk.snapshot(t.id);
+      return results(s.items).length === 2 && s.thread.status === "error" ? s : undefined;
+    });
+    const count = { runs: runs().length, events: events.length };
+    expect(count.runs).toBe(2);
+    await new Promise((r) => setTimeout(r, 500));
+    expect({ runs: runs().length, events: events.length }).toEqual(count);
+    expect((await sdk.snapshot(t.id)).thread.status).toBe("error");
+    const steered = s.items.find((i): i is UserMessage => i.type === "user_message" && i.client_id === "s")!;
+    expect(steered.queued).toBe(true);
+    expect(s.items.at(-1)).toMatchObject({ type: "notice", level: "warning", code: "undelivered" });
+
+    // The next message takes it along.
+    await sdk.send(t.id, "reply again", { client_id: "n" });
+    await settle(sdk, t.id);
+    const third = runs()[2]!.sent.filter((m) => m.type === "user") as unknown as { message: { content: { text: string }[] } }[];
+    expect(third.map((m) => m.message.content[0]!.text)).toEqual(["reply steered", "reply again"]);
+    expect((await sdk.snapshot(t.id)).items.filter((i) => i.type === "user_message" && i.queued)).toEqual([]);
+    await sdk.close();
   });
 
   it("restarts Claude with a steered message it never takes in", async () => {
@@ -389,6 +418,73 @@ describe("the Claude driver", () => {
     expect(existsSync(firstPlugin)).toBe(false);
   });
 
+  it("refuses a malformed command before it changes anything", async () => {
+    const { sdk, events, runs } = setup({ permissions: "ask" });
+    const t = await sdk.create();
+    await sdk.send(t.id, 'tool Bash {"command":"ls"}');
+    const opened = await until(() => events.find((e) => e.type === "request.opened"));
+    const requestId = opened.type === "request.opened" ? opened.request.id : "";
+    const before = { snapshot: await sdk.snapshot(t.id), events: events.length, runs: runs().length };
+    const bad: unknown[] = [
+      { type: "send", thread_id: t.id, text: "hi", attachments: [{ kind: "video" }] },
+      { type: "send", thread_id: t.id, text: "hi", attachments: [{ kind: "file", data: "not base64!" }] },
+      { type: "send", thread_id: t.id, text: "hi", attachments: "a.txt" },
+      { type: "send", thread_id: t.id, text: "hi", client_id: 5 },
+      { type: "send", thread_id: t.id, text: 7 },
+      { type: "respond", thread_id: t.id, request_id: requestId, resolution: { outcome: "answer", answers: { q: "Blue" } } },
+      { type: "respond", thread_id: t.id, request_id: requestId, resolution: { outcome: "yes" } },
+      { type: "respond", thread_id: t.id, request_id: requestId, resolution: { outcome: "allow", always: "please" } },
+      { type: "respond", thread_id: t.id, request_id: requestId },
+      { type: "set_options", thread_id: t.id, permission_mode: "yolo" },
+      { type: "set_options", thread_id: t.id, model: 4 },
+      { type: "set_options", thread_id: t.id, model: "fine", effort: ["high"] },
+      { type: "interrupt", thread_id: 1 },
+      { type: "dance", thread_id: t.id },
+      "send",
+      null,
+    ];
+    for (const command of bad) await expect(sdk.handle(command as never), JSON.stringify(command)).rejects.toBeInstanceOf(CommandError);
+    // The same from code.
+    await expect(sdk.respond(t.id, requestId, { outcome: "maybe" } as never)).rejects.toBeInstanceOf(CommandError);
+    await expect(sdk.setOptions(t.id, { permission_mode: "yolo" } as never)).rejects.toBeInstanceOf(CommandError);
+
+    expect({ snapshot: await sdk.snapshot(t.id), events: events.length, runs: runs().length }).toEqual(before);
+    // The request is still open, and a valid answer to it works.
+    await sdk.handle({ type: "respond", thread_id: t.id, request_id: requestId, resolution: { outcome: "allow" } });
+    expect((await settle(sdk, t.id)).thread.status).toBe("idle");
+  });
+
+  it("starts no process for a malformed command to a thread that has none", async () => {
+    const { sdk, events, runs } = setup();
+    const t = await sdk.create();
+    await expect(sdk.handle({ type: "send", thread_id: t.id, text: "reply hi", attachments: [{ kind: "file", path: 3 }] } as never)).rejects.toBeInstanceOf(CommandError);
+    await new Promise((r) => setTimeout(r, 100));
+    expect(runs()).toEqual([]);
+    expect(events).toHaveLength(1);
+  });
+
+  it("refuses commands after close()", async () => {
+    const { sdk } = setup();
+    const t = await sdk.create();
+    await sdk.close();
+    for (const op of [
+      () => sdk.snapshot(t.id),
+      () => sdk.send(t.id, "hi"),
+      () => sdk.interrupt(t.id),
+      () => sdk.respond(t.id, "r", { outcome: "allow" }),
+      () => sdk.setOptions(t.id, { model: "x" }),
+      () => sdk.handle({ type: "interrupt", thread_id: t.id }),
+      () => sdk.configure(t.id, {}),
+      () => sdk.delete(t.id),
+      () => sdk.create(),
+    ]) {
+      await expect(op()).rejects.toBeInstanceOf(CommandError);
+    }
+    // Reading the store still works.
+    expect((await sdk.get(t.id))?.id).toBe(t.id);
+    expect(await sdk.eventsSince(t.id, 0)).toHaveLength(1);
+  });
+
   it("reports commands it can't carry out", async () => {
     const { sdk } = setup();
     await expect(sdk.handle({ type: "send", thread_id: "nope", text: "hi" })).rejects.toBeInstanceOf(CommandError);
@@ -412,7 +508,8 @@ describe.each([
     expect(await sdk.eventsSince(t.id, saved.length - 2)).toEqual(saved.slice(-2));
     await sdk.close();
     open = open.filter((s) => s !== sdk);
-    const before = await sdk.snapshot(t.id);
+    // Everything it sent, folded, which a new instance must load from the store.
+    const before = applyEvents(initialState(t), events);
 
     const again = make(store);
     expect(await again.snapshot(t.id)).toEqual(before);

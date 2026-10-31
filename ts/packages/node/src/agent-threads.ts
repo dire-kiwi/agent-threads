@@ -5,6 +5,7 @@
 import {
   applyEvents,
   initialState,
+  validate,
   type Attachment,
   type Command,
   type PermissionMode,
@@ -119,6 +120,7 @@ export class AgentThreads {
    * e.g. for a thread created before the app restarted. They apply from its next turn.
    */
   async configure(threadId: string, capabilities: Capabilities): Promise<void> {
+    this.#open();
     this.#configs.set(threadId, { ...this.#configs.get(threadId), ...capabilities });
     const rt = this.#threads.get(threadId);
     if (rt) {
@@ -140,6 +142,7 @@ export class AgentThreads {
 
   /** Deletes a thread, stopping its harness first. Whether there was one. */
   async delete(threadId: string): Promise<boolean> {
+    this.#open();
     const rt = this.#threads.get(threadId);
     if (rt) {
       await rt.session?.close();
@@ -152,6 +155,7 @@ export class AgentThreads {
 
   /** The thread's state now, including text streamed so far. */
   async snapshot(threadId: string): Promise<Snapshot> {
+    this.#open();
     return structuredClone((await this.#load(threadId)).snapshot);
   }
 
@@ -173,49 +177,45 @@ export class AgentThreads {
 
   /** Carries out a command from a client. Throws a CommandError for one it can't. */
   async handle(command: Command): Promise<void> {
-    if (!command || typeof command !== "object") throw new CommandError("a command is an object");
-    if (typeof command.thread_id !== "string") throw new CommandError("a command needs a thread_id");
+    // Checked against the protocol's schema before anything is touched.
+    const problems = validate(command, "Command");
+    if (problems.length) throw new CommandError(`that isn't a valid command: ${problems.slice(0, 5).join("; ")}`);
     switch (command.type) {
       case "send":
-        if (typeof command.text !== "string") throw new CommandError("send needs text");
         return this.send(command.thread_id, command.text, {
           ...(command.attachments ? { attachments: command.attachments } : {}),
-          ...(command.client_id ? { client_id: command.client_id } : {}),
+          ...(command.client_id !== undefined ? { client_id: command.client_id } : {}),
         });
       case "interrupt":
         return this.interrupt(command.thread_id);
       case "respond":
-        if (typeof command.request_id !== "string" || !command.resolution) throw new CommandError("respond needs a request_id and a resolution");
         return this.respond(command.thread_id, command.request_id, command.resolution);
       case "set_options": {
         const { type: _t, thread_id, ...options } = command;
         return this.setOptions(thread_id, options);
       }
-      default:
-        throw new CommandError(`there's no command ${JSON.stringify((command as { type?: unknown }).type)}`);
     }
   }
 
   /** Sends the agent a message: starts a turn, or steers the running one. */
   async send(threadId: string, text: string, options: { attachments?: Attachment[]; client_id?: string } = {}): Promise<void> {
-    this.#open();
-    const rt = await this.#load(threadId);
+    const rt = await this.#ready({ type: "send", thread_id: threadId, text, ...options });
     rt.send({ text, ...options });
   }
 
   /** Stops the running turn, if there is one. */
   async interrupt(threadId: string): Promise<void> {
-    (await this.#load(threadId)).interrupt();
+    (await this.#ready({ type: "interrupt", thread_id: threadId })).interrupt();
   }
 
   /** Answers an open request; does nothing if it isn't open. */
   async respond(threadId: string, requestId: string, resolution: Resolution): Promise<void> {
-    (await this.#load(threadId)).respond(requestId, resolution);
+    (await this.#ready({ type: "respond", thread_id: threadId, request_id: requestId, resolution })).respond(requestId, resolution);
   }
 
   /** Changes the thread's model, effort or permission mode, from its next turn. */
   async setOptions(threadId: string, options: { model?: string; effort?: string; permission_mode?: PermissionMode }): Promise<void> {
-    const rt = await this.#load(threadId);
+    const rt = await this.#ready({ type: "set_options", thread_id: threadId, ...options });
     const patch: Partial<Thread> = {};
     if (options.model !== undefined) patch.model = options.model || undefined;
     if (options.effort !== undefined) patch.effort = options.effort || undefined;
@@ -227,8 +227,9 @@ export class AgentThreads {
 
   /**
    * Stops every harness process and saves everything. It rejects if some thread's events can't be
-   * saved (the store is failing): they're kept, and calling close() again tries again. The
-   * instance can't be used after; the store can (the app closes it).
+   * saved (the store is failing): they're kept, and calling close() again tries again. After it,
+   * commands, snapshots and changes to threads are refused with a CommandError; get, list and
+   * eventsSince still read the store, which is the app's to close.
    */
   close(): Promise<void> {
     this.#stopping ??= this.#stopAll();
@@ -277,6 +278,19 @@ export class AgentThreads {
 
   #open(): void {
     if (this.#closed) throw new CommandError("this AgentThreads is closed");
+  }
+
+  /**
+   * The live thread a command is for, once the command is known to be valid and the instance
+   * open: a command that isn't changes nothing.
+   */
+  async #ready(command: Command): Promise<ThreadRuntime> {
+    this.#open();
+    const problems = validate(command, "Command");
+    if (problems.length) throw new CommandError(`that isn't a valid command: ${problems.slice(0, 5).join("; ")}`);
+    const rt = await this.#load(command.thread_id);
+    this.#open();
+    return rt;
   }
 
   #config(threadId: string): ThreadConfig {

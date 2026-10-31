@@ -37,8 +37,9 @@ await sdk.close(); // on shutdown: stops the harness processes and saves everyth
   `title`, `metadata`) and sends its first `thread.updated`. It can have its own `tools`,
   `mcpServers`, `skills`, `permissions` and `systemPrompt`, on top of the instance's.
 - `handle(command)` carries out a command from a client ([spec/PROTOCOL.md](../../../spec/PROTOCOL.md#commands)),
-  and throws a `CommandError` for one it can't (an unknown thread, a malformed command). `send`,
-  `interrupt`, `respond` and `setOptions` do the same from code.
+  and throws a `CommandError` for one it can't (an unknown thread, or a command that isn't valid by
+  the protocol's schema, which is checked before anything changes). `send`, `interrupt`, `respond`
+  and `setOptions` do the same from code. After `close()`, they're all refused.
 - `get`, `list` and `delete` look threads up and remove them.
 - A thread's own tools, policy and so on live in memory. After a restart, give them again with
   `configure(threadId, { tools, ... })`; its stored state (items, session) comes back by itself, and
@@ -66,7 +67,9 @@ again to finish saving. The file store undoes a write that fails partway, so a r
   model, effort or permission mode) the next message starts a new one with `--resume`.
 - **Steering**: a message sent during a turn goes in on stdin and is `queued` until Claude echoes
   it back. One it hasn't taken in when the turn ends starts the next turn; if Claude doesn't take it
-  in within `steerGraceMs` (30s), it goes to a new process instead.
+  in within `steerGraceMs` (30s), it goes to a new process instead. If a turn started that way
+  fails (or three in a row run), the messages left stay queued, a `notice` says so, and they go
+  with the next message sent.
 - **Interrupt** sends a `control_request` interrupt; if the turn hasn't ended after `stopGraceMs`
   (10s), the process's input is closed and it's sent SIGTERM.
 - **Permissions**: `--permission-prompt-tool stdio`, so Claude asks over `can_use_tool` and the

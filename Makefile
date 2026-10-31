@@ -2,7 +2,7 @@
 # make check-gen: fail if that changes anything, i.e. the generated code isn't up to date (CI runs it).
 # make test: build and test all three languages, and the fixtures' tools (make test-spec).
 
-GENERATED := spec/protocol.schema.json ts/packages/protocol/src/generated.ts go/protocol/protocol_gen.go rust/agent-threads/src/protocol.rs
+GENERATED := spec/protocol.schema.json ts/packages/protocol/src/generated.ts ts/packages/protocol/src/schema.ts go/protocol/protocol_gen.go rust/agent-threads/src/protocol.rs
 
 .PHONY: gen gen-bundle gen-ts gen-go gen-rust check-gen test test-spec test-ts test-go test-rust
 

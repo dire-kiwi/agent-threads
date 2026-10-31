@@ -10,10 +10,12 @@
 //   slow                  waits for an interrupt, then ends the turn as interrupted
 //   stubborn              ignores interrupts (and a closed stdin), until it's signalled
 //   crash                 writes to stderr and exits with code 3
+//   sleepcrash <ms>       waits, then crashes
 //
 // MINI_CLAUDE_LOG names a file each run appends its argv and every line it's sent to. With
 // MINI_CLAUDE_STEER=late, messages sent during a turn are taken in after its result (as the next
-// turn); with MINI_CLAUDE_STEER=never, they never are (and the process has to be restarted).
+// turn); with MINI_CLAUDE_STEER=never, they never are (and the process has to be restarted). With
+// MINI_CLAUDE_FAIL_RESUME=1, a process started with --resume fails at its first message.
 
 import { appendFileSync } from "node:fs";
 import { createInterface } from "node:readline";
@@ -67,6 +69,11 @@ createInterface({ input: process.stdin })
       if (!initialized) {
         process.stderr.write("a message came before initialize\n");
         process.exit(4);
+      }
+      if (resume && process.env.MINI_CLAUDE_FAIL_RESUME) {
+        process.stderr.write("can't resume\n");
+        setTimeout(() => process.exit(2), 50);
+        return;
       }
       inbox.push(m);
       wake?.();
@@ -133,6 +140,10 @@ async function turn(m) {
     result({ subtype: "error_during_execution", is_error: true });
     busy = false;
     return;
+  } else if (cmd === "sleepcrash") {
+    await new Promise((r) => setTimeout(r, Number(rest[0])));
+    process.stderr.write("something broke\n");
+    process.exit(3);
   } else if (cmd === "crash") {
     process.stderr.write("something broke\n");
     process.exit(3);

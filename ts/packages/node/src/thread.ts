@@ -15,7 +15,12 @@ type Unnumbered = ThreadEvent extends infer E ? (E extends ThreadEvent ? Omit<E,
 export interface Turn {
   id: string;
   interrupted: boolean;
+  /** How many turns in a row (this one included) were started by messages left over. */
+  carried?: number;
 }
+
+/** How many turns in a row leftover steered messages may start. */
+const MAX_CARRIED = 3;
 
 interface OpenRequest {
   request: ThreadRequest;
@@ -69,6 +74,8 @@ export class ThreadRuntime implements ThreadContext {
     this.#state = state;
     this.#saved = state;
     this.threadId = state.thread.id;
+    // Messages left queued (by a harness that kept failing, or before a restart) go with the next.
+    this.#queue = state.items.filter((i) => i.type === "user_message" && i.queued).map((i) => i.id);
     this.config = config;
     this.policy = policy;
   }
@@ -252,10 +259,14 @@ export class ThreadRuntime implements ThreadContext {
     const id = newId("um");
     if (!this.turn) {
       this.turn = { id: newId("turn"), interrupted: false };
+      // Messages still queued from before weren't delivered: they go first, in this turn.
+      const left = this.queued();
+      this.#queue = [];
+      for (const m of left) this.updateItem(m.id, { turn_id: this.turn.id, queued: null });
       this.addItem({ id, type: "user_message", ...userFields(message) });
       this.emit({ type: "turn.started", turn_id: this.turn.id });
       this.setThread({ status: "running", error: undefined });
-      this.session!.start([toMessage(id, message)]);
+      this.session!.start([...left.map((m) => toMessage(m.id, m)), toMessage(id, message)]);
       return;
     }
     this.addItem({ id, type: "user_message", ...userFields(message), steered: true, queued: true });
@@ -309,10 +320,23 @@ export class ThreadRuntime implements ThreadContext {
     this.turn = null;
     this.setThread({ status: error ? "error" : "idle", error, usage: addUsage(this.#state.thread.usage, end.usage) });
 
-    // A steered message the harness didn't take in starts the next turn.
+    // A steered message the harness didn't take in starts the next turn; but not again and again
+    // if those turns fail (the harness can't start, say): then the messages stay queued, and go
+    // with the next one sent.
+    const carried = turn.carried ?? 0;
+    const giveUp = carried > 0 && (!ok || carried >= MAX_CARRIED);
     const left = this.closing ? [] : this.queued();
-    if (left.length) {
-      this.turn = { id: newId("turn"), interrupted: false };
+    if (left.length && giveUp) {
+      this.addItem({
+        id: newId("n"),
+        type: "notice",
+        level: "warning",
+        code: "undelivered",
+        text: `${left.length === 1 ? "A message wasn't" : `${left.length} messages weren't`} delivered; ${left.length === 1 ? "it goes" : "they go"} with the next one you send.`,
+      });
+    }
+    if (left.length && !giveUp) {
+      this.turn = { id: newId("turn"), interrupted: false, carried: carried + 1 };
       for (const m of left) this.updateItem(m.id, { turn_id: this.turn.id });
       this.emit({ type: "turn.started", turn_id: this.turn.id });
       this.setThread({ status: "running", error: undefined });
