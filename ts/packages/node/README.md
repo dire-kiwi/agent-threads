@@ -69,13 +69,19 @@ yours: `close()` doesn't close it.
   (10s), the process's input is closed and it's sent SIGTERM.
 - **Permissions**: `--permission-prompt-tool stdio`, so Claude asks over `can_use_tool` and the
   policy answers. `ask` opens a `permission` request for the user; answering it with `always` keeps
-  that answer for the tool for the rest of the thread. AskUserQuestion is always a `question`.
+  that answer for that tool (the same name on the same MCP server, of the same kind) for the rest
+  of the thread. AskUserQuestion is always a `question`.
 - **App tools** are an in-process MCP server, `app`, answered over the control channel. Tool
   handlers get `ctx` with the thread's id and metadata, and the tool call's id.
 - **Isolated config**: threads run with `--setting-sources ""` and `--strict-mcp-config`, so they
-  see only the app's MCP servers and skills. Skills are copied into a generated `.claude/skills`
-  directory passed with `--add-dir`. `claudeCode({ userSettings: true })` lets threads see the
-  user's own settings instead; `configDir` points Claude at another config (and login).
+  see only the app's MCP servers and skills. The skills go in a plugin (`app`) generated for each
+  process and passed with `--plugin-dir`, which Claude loads even with no setting sources (a
+  `.claude/skills` directory it wouldn't), so they're `app:<name>`. `claudeCode({ userSettings:
+  true })` lets threads see the user's own settings instead; `configDir` points Claude at another
+  config (and login).
+- **Attachments**: images with data go to Claude as images, and files with textual data (`text/*`,
+  JSON, YAML...) as their text. Other files with data are written to a temporary directory, removed
+  with the thread's harness, and Claude is told the path, as it is for attachments with a `path`.
 - Tool results are cut to 30,000 characters (with `truncated`), and images become `[image]`.
 
 Processes are started by a `Spawner`: `direct()` (the default) runs them as child processes, each

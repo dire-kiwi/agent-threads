@@ -142,7 +142,7 @@ export class AgentThreads {
     const rt = this.#threads.get(threadId);
     if (rt) {
       await rt.session?.close();
-      await rt.saved();
+      rt.dispose();
       this.#threads.delete(threadId);
     }
     this.#configs.delete(threadId);
@@ -245,6 +245,7 @@ export class AgentThreads {
         }
         if (rt.turn) rt.endTurn({ ok: false });
         await rt.saveSnapshot();
+        rt.dispose();
       }),
     );
   }

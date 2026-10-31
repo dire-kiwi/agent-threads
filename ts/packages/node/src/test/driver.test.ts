@@ -32,9 +32,11 @@ function setup(options: AgentThreadsOptions & { claude?: ClaudeCodeOptions; stee
       ...rest,
       store,
       harnesses: { claude: claudeCode({ bin: mini, env: { MINI_CLAUDE_LOG: log, MINI_CLAUDE_STEER: steer }, ...claude }) },
-      onError: (e) => {
-        throw e;
-      },
+      onError:
+        rest.onError ??
+        ((e) => {
+          throw e;
+        }),
     });
     sdk.subscribe((e) => events.push(e));
     open.push(sdk);
@@ -246,7 +248,10 @@ describe("the Claude driver", () => {
     await settle(sdk, t.id);
     const argv = runs()[0]!.argv;
     const flag = (name: string) => argv[argv.indexOf(name) + 1]!;
-    const skills = join(flag("--add-dir"), ".claude", "skills");
+    // A plugin, which Claude finds even with --setting-sources "".
+    const plugin = flag("--plugin-dir");
+    expect(JSON.parse(readFileSync(join(plugin, ".claude-plugin", "plugin.json"), "utf8"))).toMatchObject({ name: "app" });
+    const skills = join(plugin, "skills");
     expect(readFileSync(join(skills, "support", "SKILL.md"), "utf8")).toMatch(/Be kind/);
     expect(readFileSync(join(skills, "greet", "SKILL.md"), "utf8")).toBe("Say hi.");
     expect(JSON.parse(flag("--mcp-config"))).toEqual({
@@ -255,7 +260,7 @@ describe("the Claude driver", () => {
     expect(flag("--append-system-prompt")).toBe("You help.");
     expect(flag("--setting-sources")).toBe("");
     expect(argv).toContain("--strict-mcp-config");
-    // The generated skills directory goes when the thread's harness stops.
+    // The generated plugin goes when the process that used it stops.
     await sdk.close();
     expect(existsSync(skills)).toBe(false);
   });
@@ -267,6 +272,102 @@ describe("the Claude driver", () => {
     await settle(sdk, t.id);
     expect(runs()[0]!.argv).not.toContain("--setting-sources");
     expect(runs()[0]!.argv).not.toContain("--strict-mcp-config");
+  });
+
+  it("takes in steered messages with attachments, and ones with the same text", async () => {
+    const { sdk, runs } = setup();
+    const t = await sdk.create();
+    await sdk.send(t.id, "sleep 300 done");
+    await until(async () => (await sdk.snapshot(t.id)).thread.session_id);
+    const pdf = Buffer.from("%PDF-1.4 not really").toString("base64");
+    await sdk.send(t.id, "read these", {
+      client_id: "a",
+      attachments: [
+        { kind: "file", name: "notes.txt", media_type: "text/plain", data: Buffer.from("line one\nline two").toString("base64") },
+        { kind: "file", name: "report.pdf", media_type: "application/pdf", data: pdf },
+        { kind: "file", path: "/srv/data.csv" },
+        { kind: "image", media_type: "image/png", data: "iVBORw0KGgo=" },
+      ],
+    });
+    await sdk.send(t.id, "again", { client_id: "b" });
+    await sdk.send(t.id, "again", { client_id: "c" });
+    const s = await settle(sdk, t.id);
+    expect(s.items.filter((i) => i.type === "user_message" && i.queued)).toEqual([]);
+    expect(results(s.items)).toHaveLength(1);
+    expect(runs()).toHaveLength(1);
+
+    const sent = runs()[0]!.sent.filter((m) => m.type === "user") as unknown as { message: { content: { type: string; text?: string }[] } }[];
+    const blocks = sent[1]!.message.content;
+    expect(blocks.map((b) => b.type)).toEqual(["text", "text", "text", "text", "image"]);
+    expect(blocks[1]!.text).toBe("Attached file notes.txt:\nline one\nline two");
+    // A binary file is written out, and Claude is told where.
+    const path = /: (\/.*)$/.exec(blocks[2]!.text!)![1]!;
+    expect(readFileSync(path).toString("base64")).toBe(pdf);
+    expect(blocks[3]!.text).toBe("Attached file: /srv/data.csv");
+  });
+
+  it("keeps a standing answer to the tool it was given for", async () => {
+    const asked: string[] = [];
+    const { sdk, events } = setup({
+      permissions: (q) => {
+        asked.push(`${q.server}/${q.name}`);
+        return "ask";
+      },
+    });
+    const t = await sdk.create();
+    const respondTo = async (n: number, resolution: { outcome: "allow" | "deny"; always?: boolean }) => {
+      const req = await until(() => events.filter((e) => e.type === "request.opened")[n]);
+      await sdk.respond(t.id, req.type === "request.opened" ? req.request.id : "", resolution);
+    };
+    await sdk.send(t.id, "tool mcp__safe__execute {}");
+    await respondTo(0, { outcome: "allow", always: true });
+    await settle(sdk, t.id);
+    await sdk.send(t.id, "tool mcp__safe__execute {}");
+    await settle(sdk, t.id);
+    // Another server's tool of the same name, and a built-in one, are asked about.
+    await sdk.send(t.id, "tool mcp__danger__execute {}");
+    await respondTo(1, { outcome: "deny" });
+    await settle(sdk, t.id);
+    await sdk.send(t.id, "tool execute {}");
+    await respondTo(2, { outcome: "deny" });
+    const s = await settle(sdk, t.id);
+    expect(asked).toEqual(["safe/execute", "danger/execute", "undefined/execute"]);
+    expect(texts(s.items).filter((x) => x.startsWith("denied"))).toHaveLength(2);
+  });
+
+  it("drops a policy's answer that comes after Claude stopped asking", async () => {
+    let answer!: (d: "ask" | "allow") => void;
+    const { sdk, runs } = setup({ permissions: () => new Promise((r) => (answer = r)) });
+    const t = await sdk.create();
+    await sdk.send(t.id, "cancelled Bash");
+    await settle(sdk, t.id);
+    answer("ask");
+    await new Promise((r) => setTimeout(r, 50));
+    const s = await sdk.snapshot(t.id);
+    expect(s.thread.status).toBe("idle");
+    expect(s.requests).toEqual([]);
+    expect(s.items.find((i): i is ToolCall => i.type === "tool_call")!.status).toBe("failed");
+    expect(runs()[0]!.sent.filter((m) => m.type === "control_response")).toEqual([]);
+  });
+
+  it("makes the skills plugin again when the thread's skills change", async () => {
+    const { sdk, runs } = setup();
+    const t = await sdk.create({ skills: [{ name: "style", content: "old" }] });
+    await sdk.send(t.id, "reply one");
+    await settle(sdk, t.id);
+    const first = runs()[0]!.argv;
+    const firstPlugin = first[first.indexOf("--plugin-dir") + 1]!;
+    expect(readFileSync(join(firstPlugin, "skills", "style", "SKILL.md"), "utf8")).toBe("old");
+
+    await sdk.configure(t.id, { skills: [{ name: "style", content: "new" }, { name: "tone", content: "calm" }] });
+    await sdk.send(t.id, "reply two");
+    await settle(sdk, t.id);
+    const second = runs()[1]!.argv;
+    const plugin = second[second.indexOf("--plugin-dir") + 1]!;
+    expect(readFileSync(join(plugin, "skills", "style", "SKILL.md"), "utf8")).toBe("new");
+    expect(readFileSync(join(plugin, "skills", "tone", "SKILL.md"), "utf8")).toBe("calm");
+    // The first run's plugin went with it.
+    expect(existsSync(firstPlugin)).toBe(false);
   });
 
   it("reports commands it can't carry out", async () => {
@@ -320,6 +421,69 @@ describe("AgentThreads", () => {
     expect(s.thread).toMatchObject({ status: "error", error: expect.stringMatching(/stopped/) });
     expect(s.thread.run).toBeUndefined();
     expect(results(s.items)).toEqual([expect.objectContaining({ ok: false })]);
+  });
+
+  it("keeps events a store failed to append, and saves them in order once it can", async () => {
+    const inner = new MemoryStore();
+    let failures = 0;
+    let wrote = 0;
+    // The first append fails; the second is written but reported as failed.
+    const store = new Proxy(inner, {
+      get(target, prop, receiver) {
+        if (prop === "appendEvents") {
+          return async (id: string, events: ThreadEvent[]) => {
+            wrote++;
+            if (wrote === 2) throw new Error("the disk is full");
+            if (wrote === 3) {
+              await target.appendEvents(id, events);
+              throw new Error("timed out (but it happened)");
+            }
+            return target.appendEvents(id, events);
+          };
+        }
+        const v = Reflect.get(target, prop, receiver);
+        return typeof v === "function" ? v.bind(target) : v;
+      },
+    }) as MemoryStore;
+    const errors: unknown[] = [];
+    const { sdk, events } = setup({ store, onError: (e) => errors.push(e) });
+    const t = await sdk.create();
+    await sdk.send(t.id, "reply one");
+    await settle(sdk, t.id);
+    await until(async () => (await inner.lastSeq(t.id)) === events.filter((e) => e.type !== "delta").length, 10_000);
+    const saved = await inner.readEvents(t.id);
+    expect(saved).toEqual(events.filter((e) => e.type !== "delta"));
+    expect(errors.length).toBeGreaterThanOrEqual(2);
+    failures = errors.length;
+    await sdk.close();
+    // The snapshot is never ahead of the events.
+    const snap = await inner.loadSnapshot(t.id);
+    expect(snap!.seq).toBe(await inner.lastSeq(t.id));
+    expect(failures).toBe(errors.length);
+  });
+
+  it("fails eventsSince while the store can't take the thread's events", async () => {
+    const inner = new MemoryStore();
+    let broken = false;
+    const store = new Proxy(inner, {
+      get(target, prop, receiver) {
+        if (prop === "appendEvents") {
+          return async (id: string, events: ThreadEvent[]) => {
+            if (broken) throw new Error("the disk is full");
+            return target.appendEvents(id, events);
+          };
+        }
+        const v = Reflect.get(target, prop, receiver);
+        return typeof v === "function" ? v.bind(target) : v;
+      },
+    }) as MemoryStore;
+    const { sdk } = setup({ store, onError: () => {} });
+    const t = await sdk.create();
+    broken = true;
+    await sdk.setOptions(t.id, { model: "other" });
+    await expect(sdk.eventsSince(t.id, 0)).rejects.toThrow(/disk is full/);
+    broken = false;
+    expect((await sdk.eventsSince(t.id, 0)).map((e) => e.seq)).toEqual([1, 2]);
   });
 
   it("deletes a thread", async () => {

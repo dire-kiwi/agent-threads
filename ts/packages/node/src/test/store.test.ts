@@ -136,6 +136,23 @@ describe("FileStore", () => {
     expect((await new FileStore(dir).readEvents("th_1")).map((e) => e.seq)).toEqual([1, 2]);
   });
 
+  it("keeps a run moved to another thread there after it's reopened", async () => {
+    const dir = tempDir();
+    const a = new FileStore(dir);
+    for (const id of ["z", "a"]) await a.createThread({ ...thread, id });
+    const run = { id: "r", thread_id: "z", spawner: "shim", started_at: "2026-11-01T00:00:01Z" };
+    await a.putRun(run);
+    await a.putRun({ ...run, thread_id: "a", started_at: "2026-11-01T00:00:02Z" });
+    await a.putRun({ ...run, thread_id: "z", started_at: "2026-11-01T00:00:03Z" });
+    await a.putRun({ ...run, thread_id: "a", started_at: "2026-11-01T00:00:04Z" });
+    await a.close();
+    const b = new FileStore(dir);
+    expect(await b.getRun("r")).toEqual({ ...run, thread_id: "a", started_at: "2026-11-01T00:00:04Z" });
+    await b.deleteThread("z");
+    await b.close();
+    expect(await new FileStore(dir).activeRuns()).toEqual([{ ...run, thread_id: "a", started_at: "2026-11-01T00:00:04Z" }]);
+  });
+
   it("keeps one file per thread, named for it", async () => {
     const dir = tempDir();
     const s = new FileStore(dir);

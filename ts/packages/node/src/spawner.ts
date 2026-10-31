@@ -71,8 +71,13 @@ export function direct(): Spawner {
       const err = createInterface({ input: child.stderr });
       out.on("line", (l) => handlers.line(l));
       err.on("line", (l) => handlers.stderr(l));
-      // 'close' comes after the process exits and its stdio ends, so after the last line.
-      child.on("close", (code, signal) => handlers.exit({ code, signal, ...(error ? { error } : {}) }));
+      // 'close' comes after the process exits and its stdio ends, so after the last line. Until then
+      // something it started may still hold its stdio, so its group can still be signalled.
+      let closed = false;
+      child.on("close", (code, signal) => {
+        closed = true;
+        handlers.exit({ code, signal, ...(error ? { error } : {}) });
+      });
       return {
         get pid() {
           return child.pid;
@@ -86,13 +91,17 @@ export function direct(): Spawner {
           child.stdin.end();
         },
         kill(signal = "SIGTERM") {
-          if (child.exitCode !== null || child.signalCode !== null || child.pid === undefined) return;
-          try {
-            if (unix) process.kill(-child.pid, signal);
-            else child.kill(signal);
-          } catch {
-            child.kill(signal);
+          if (closed || child.pid === undefined) return;
+          if (unix) {
+            try {
+              // The group outlives its leader while anything in it runs.
+              process.kill(-child.pid, signal);
+              return;
+            } catch {
+              // No group (it's gone): signal the child itself, below.
+            }
           }
+          if (child.exitCode === null && child.signalCode === null) child.kill(signal);
         },
       };
     },

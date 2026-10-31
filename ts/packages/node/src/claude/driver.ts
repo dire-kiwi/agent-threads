@@ -10,7 +10,7 @@ import { basename, join, resolve } from "node:path";
 import type { Resolution } from "@dire-kiwi/agent-threads-protocol";
 import type { Harness, HarnessSession, Message, Skill, ThreadContext } from "../harness.js";
 import { newId } from "../ids.js";
-import type { PermissionDecision } from "../permissions.js";
+import { permissionKey, type PermissionDecision } from "../permissions.js";
 import type { ExitStatus, HarnessProcess } from "../spawner.js";
 import { runTool } from "../tools.js";
 import { APP_SERVER, claudePermissionMode, claudeTool, claudeUsage, editChange, questions, resultText, slim, title } from "./translate.js";
@@ -75,6 +75,12 @@ class Run {
   streamed = new Set<string>(); // items that got deltas
   summaryNext: string | null = null; // a compaction waiting for its summary
   asked = new Map<string, string>(); // Claude's request id -> our request's
+  /** Claude's requests not yet answered, with the turn each came in. */
+  open = new Map<string, string | undefined>();
+  /** The messages sent, oldest first, by what Claude echoes when it takes one in. */
+  sent: { id: string; echo: string }[] = [];
+  /** The generated plugin with the thread's skills, for this run only. */
+  pluginDir: string | undefined;
 
   constructor() {
     this.done = new Promise((r) => (this.finish = r));
@@ -84,8 +90,9 @@ class Run {
     if (!this.exited) this.proc?.write(JSON.stringify(msg));
   }
 
-  /** Writes a user message, once Claude is ready for one. */
-  send(msg: Json): void {
+  /** Writes a user message (that's the item `id`), once Claude is ready for one. */
+  send(id: string, msg: Json): void {
+    this.sent.push({ id, echo: echoKey(msg.message.content) });
     if (this.ready) this.write(msg);
     else this.waiting.push(JSON.stringify(msg));
   }
@@ -98,6 +105,7 @@ class Run {
   }
 
   respond(request_id: string, response: Json): void {
+    this.open.delete(request_id);
     this.write({ type: "control_response", response: { subtype: "success", request_id, response } });
   }
 
@@ -116,7 +124,8 @@ class ClaudeSession implements HarnessSession {
   #stale = false;
   #steerTimer: NodeJS.Timeout | undefined;
   #stopTimer: NodeJS.Timeout | undefined;
-  #skillsDir: string | undefined;
+  /** A directory for the thread's generated files (skills, attached files), made when needed. */
+  #tmp: string | undefined;
   #closed = false;
 
   constructor(ctx: ThreadContext, options: ClaudeCodeOptions) {
@@ -128,11 +137,11 @@ class ClaudeSession implements HarnessSession {
 
   start(messages: Message[]): void {
     const run = this.#ensure(true);
-    for (const m of messages) run.send(userMessage(m));
+    for (const m of messages) run.send(m.id, this.#userMessage(m));
   }
 
   steer(message: Message): void {
-    this.#ensure(false).send(userMessage(message));
+    this.#ensure(false).send(message.id, this.#userMessage(message));
   }
 
   carryOver(messages: Message[]): void {
@@ -171,8 +180,44 @@ class ClaudeSession implements HarnessSession {
     const run = this.#run;
     if (run) await this.#stop(run, false);
     if (this.#stopping) await this.#stopping;
-    if (this.#skillsDir) rmSync(this.#skillsDir, { recursive: true, force: true });
-    this.#skillsDir = undefined;
+    if (this.#tmp) rmSync(this.#tmp, { recursive: true, force: true });
+    this.#tmp = undefined;
+  }
+
+  /** The thread's directory for generated files. */
+  #dir(): string {
+    this.#tmp ??= mkdtempSync(join(tmpdir(), "agent-threads-"));
+    return this.#tmp;
+  }
+
+  /**
+   * A message as Claude takes it. Images with data go as images; files with textual data as their
+   * text; other files with data are written out, and Claude is told where (as for files with a path).
+   */
+  #userMessage(m: Message): Json {
+    const content: Json[] = [{ type: "text", text: m.text }];
+    for (const [i, a] of (m.attachments ?? []).entries()) {
+      const name = a.name ?? a.path ?? `attachment-${i + 1}`;
+      if (a.data !== undefined) {
+        if (a.kind === "image") {
+          content.push({ type: "image", source: { type: "base64", media_type: a.media_type ?? "image/png", data: a.data } });
+          continue;
+        }
+        const bytes = Buffer.from(a.data, "base64");
+        if (a.media_type && TEXTUAL.test(a.media_type)) {
+          content.push({ type: "text", text: `Attached file ${name}:\n${bytes.toString("utf8")}` });
+          continue;
+        }
+        const dir = join(this.#dir(), "attachments", m.id);
+        mkdirSync(dir, { recursive: true });
+        const path = join(dir, `${i + 1}-${basename(name).replace(/[^\w.-]+/g, "_")}`);
+        writeFileSync(path, bytes);
+        content.push({ type: "text", text: `Attached file ${name}${a.media_type ? ` (${a.media_type})` : ""}: ${path}` });
+      } else if (a.path) {
+        content.push({ type: "text", text: `Attached file: ${a.path}` });
+      }
+    }
+    return { type: "user", message: { role: "user", content }, parent_tool_use_id: null, session_id: "" };
   }
 
   // ---------- the process ----------
@@ -223,7 +268,7 @@ class ClaudeSession implements HarnessSession {
     if (this.#run !== run || run.exited || !this.#ctx.queued().length) return;
     void this.#stop(run, true);
     const next = this.#ensure(false);
-    for (const m of this.#ctx.queued()) next.send(userMessage(m));
+    for (const m of this.#ctx.queued()) next.send(m.id, this.#userMessage({ id: m.id, text: m.text, ...(m.attachments ? { attachments: m.attachments } : {}) }));
   }
 
   #spawn(run: Run): void {
@@ -241,7 +286,7 @@ class ClaudeSession implements HarnessSession {
       proc = ctx.spawner.spawn(
         {
           command: o.bin ?? "claude",
-          args: [...(o.binArgs ?? []), ...this.#args()],
+          args: [...(o.binArgs ?? []), ...this.#args(run)],
           ...(thread.cwd ? { cwd: thread.cwd } : {}),
           env: { ...process.env, ...o.env, ...(o.configDir ? { CLAUDE_CONFIG_DIR: o.configDir } : {}) },
           threadId: ctx.threadId,
@@ -275,7 +320,7 @@ class ClaudeSession implements HarnessSession {
     });
   }
 
-  #args(): string[] {
+  #args(run: Run): string[] {
     const ctx = this.#ctx;
     const t = ctx.thread;
     const { tools, mcpServers, skills, systemPrompt } = ctx.config;
@@ -299,8 +344,10 @@ class ClaudeSession implements HarnessSession {
     }
     if (Object.keys(servers).length) args.push("--mcp-config", JSON.stringify({ mcpServers: servers }));
     if (skills.length) {
-      this.#skillsDir ??= writeSkills(skills);
-      args.push("--add-dir", this.#skillsDir);
+      // A plugin of the run's own, made from the skills as they are now: Claude finds a plugin's
+      // skills (as app:<name>) even with --setting-sources "", which hides .claude/skills directories.
+      run.pluginDir = writePlugin(join(this.#dir(), `plugin-${run.id}`), skills);
+      args.push("--plugin-dir", run.pluginDir);
     }
     if (systemPrompt) args.push("--append-system-prompt", systemPrompt);
     args.push(...(o.args ?? []));
@@ -311,6 +358,7 @@ class ClaudeSession implements HarnessSession {
     if (run.exited) return;
     run.exited = true;
     run.abort.abort();
+    if (run.pluginDir) rmSync(run.pluginDir, { recursive: true, force: true });
     for (const resolve of run.pending.values()) resolve(null);
     run.pending.clear();
     const ctx = this.#ctx;
@@ -411,11 +459,15 @@ class ClaudeSession implements HarnessSession {
         this.#controlRequest(run, m.request_id, m.request ?? {});
         break;
       case "control_cancel_request": {
+        // It no longer wants an answer, including one a policy is still working out.
+        run.open.delete(m.request_id);
         const id = run.asked.get(m.request_id);
         if (id) ctx.cancelRequest(id);
         break;
       }
       case "result": {
+        // The turn's requests are moot now; its open questions are cancelled with it.
+        run.open.clear();
         if (!ctx.turnId) break;
         clearTimeout(this.#stopTimer);
         const failed = !!m.is_error;
@@ -435,7 +487,10 @@ class ClaudeSession implements HarnessSession {
     const content = m.message?.content;
     if (m.isReplay) {
       // Claude took in a message: if it was a steered one, it's no longer queued.
-      ctx.tookIn(typeof content === "string" ? content : textOf(content));
+      // Claude echoes a message as it was sent: match it with the first sent like that.
+      const echo = echoKey(content);
+      const at = run.sent.findIndex((s) => s.echo === echo);
+      if (at >= 0) ctx.tookIn(run.sent.splice(at, 1)[0]!.id);
       if (this.#steerTimer && !ctx.queued().length) clearTimeout(this.#steerTimer);
       return;
     }
@@ -478,13 +533,17 @@ class ClaudeSession implements HarnessSession {
     const ctx = this.#ctx;
     const toolUseId: string | undefined = req.tool_use_id;
     const input = req.input ?? {};
-    const allow = (updatedInput: unknown) => run.respond(requestId, { behavior: "allow", updatedInput });
-    const deny = (message: string) => run.respond(requestId, { behavior: "deny", message });
+    const turn = ctx.turnId;
+    run.open.set(requestId, turn);
+    // Whether Claude still wants this answered: not cancelled, its turn not over, its run not gone.
+    const wanted = () => run.open.has(requestId) && !run.exited && !run.retired && this.#run === run && ctx.turnId === turn;
+    const allow = (updatedInput: unknown) => wanted() && run.respond(requestId, { behavior: "allow", updatedInput });
+    const deny = (message: string) => wanted() && run.respond(requestId, { behavior: "deny", message });
     const denied = () => toolUseId && ctx.updateItem(toolUseId, { status: "denied" });
 
     if (req.tool_name === "AskUserQuestion") {
       const qs = questions(input);
-      if (!qs.length) return allow(input);
+      if (!qs.length) return void allow(input);
       const id = ctx.ask({ type: "question", questions: qs as [(typeof qs)[0], ...typeof qs] }, toolUseId, (res: Resolution) => {
         if (res.outcome === "answer") {
           const answers: { [q: string]: string } = {};
@@ -502,9 +561,20 @@ class ClaudeSession implements HarnessSession {
 
     const t = claudeTool(req.tool_name, input);
     const call = toolUseId ? ctx.item(toolUseId) : undefined;
+    const query = {
+      name: t.name,
+      kind: t.kind,
+      input,
+      title: title(t),
+      ...(t.server ? { server: t.server } : {}),
+      ...(typeof req.decision_reason === "string" && req.decision_reason ? { reason: req.decision_reason } : {}),
+      ...(toolUseId ? { toolCallId: toolUseId } : {}),
+      ...(call?.parent_id ? { parentId: call.parent_id } : {}),
+    };
     const apply = (d: PermissionDecision) => {
-      if (run.exited) return;
-      if (d === "allow") return allow(input);
+      // A policy that took a while may answer after Claude stopped asking.
+      if (!wanted()) return;
+      if (d === "allow") return void allow(input);
       if (d === "ask") {
         const id = ctx.ask(
           {
@@ -525,6 +595,7 @@ class ClaudeSession implements HarnessSession {
               denied();
             }
           },
+          permissionKey(query),
         );
         run.asked.set(requestId, id);
         return;
@@ -532,16 +603,7 @@ class ClaudeSession implements HarnessSession {
       deny(typeof d === "object" ? d.deny : "The app's permission policy doesn't allow this.");
       denied();
     };
-    const d = ctx.decide({
-      name: t.name,
-      kind: t.kind,
-      input,
-      title: title(t),
-      ...(t.server ? { server: t.server } : {}),
-      ...(typeof req.decision_reason === "string" && req.decision_reason ? { reason: req.decision_reason } : {}),
-      ...(toolUseId ? { toolCallId: toolUseId } : {}),
-      ...(call?.parent_id ? { parentId: call.parent_id } : {}),
-    });
+    const d = ctx.decide(query);
     if (d instanceof Promise) void d.then(apply);
     else apply(d);
   }
@@ -588,19 +650,18 @@ class ClaudeSession implements HarnessSession {
   }
 }
 
-/** A message on Claude's stdin. */
-function userMessage(m: Message): Json {
-  const content: Json[] = [{ type: "text", text: m.text }];
-  for (const a of m.attachments ?? []) {
-    if (a.kind === "image" && a.data) content.push({ type: "image", source: { type: "base64", media_type: a.media_type ?? "image/png", data: a.data } });
-    else if (a.path || a.name) content.push({ type: "text", text: `Attached file: ${a.path ?? a.name}` });
-  }
-  return { type: "user", message: { role: "user", content }, parent_tool_use_id: null, session_id: "" };
+/**
+ * What identifies a user message in Claude's echo of it: its text blocks and how many images it
+ * has (Claude echoes the content as it was sent).
+ */
+function echoKey(content: unknown): string {
+  if (typeof content === "string") return JSON.stringify([content, 0]);
+  const blocks = Array.isArray(content) ? (content as Json[]) : [];
+  return JSON.stringify([blocks.filter((b) => b?.type === "text").map((b) => b.text).join("\n"), blocks.filter((b) => b?.type === "image").length]);
 }
 
-function textOf(content: unknown): string {
-  return Array.isArray(content) ? content.filter((b) => b?.type === "text").map((b) => b.text).join("\n") : "";
-}
+/** Media types whose content goes to Claude as text. */
+const TEXTUAL = /^(text\/|application\/(json|xml|yaml|x-yaml|toml|javascript|x-sh|x-ndjson|csv)\b)|\+(json|xml)\b/;
 
 function exitError(status: ExitStatus, stderr: string[]): string {
   if (status.error) return `Claude Code couldn't be started: ${status.error.message}`;
@@ -609,10 +670,11 @@ function exitError(status: ExitStatus, stderr: string[]): string {
   return `Claude Code ${how} during the turn.${tail ? `\n${tail.slice(-2000)}` : ""}`;
 }
 
-/** Copies the skills into a new directory's .claude/skills, for --add-dir. */
-function writeSkills(skills: Skill[]): string {
-  const dir = mkdtempSync(join(tmpdir(), "agent-threads-skills-"));
-  const root = join(dir, ".claude", "skills");
+/** Writes a plugin (named `app`) holding the skills, for --plugin-dir. */
+function writePlugin(dir: string, skills: Skill[]): string {
+  mkdirSync(join(dir, ".claude-plugin"), { recursive: true });
+  writeFileSync(join(dir, ".claude-plugin", "plugin.json"), JSON.stringify({ name: APP_SERVER, version: "1.0.0", description: "The app's skills" }));
+  const root = join(dir, "skills");
   mkdirSync(root, { recursive: true });
   for (const s of skills) {
     if (typeof s === "string") cpSync(resolve(s), join(root, basename(resolve(s))), { recursive: true });

@@ -2,12 +2,12 @@
 // steering queue and open requests. Every change is an event, numbered, applied, sent to the
 // subscribers, and saved to the store in order (deltas aren't saved).
 
-import { applyEvent, type Item, type Resolution, type Snapshot, type Thread, type ThreadEvent, type ThreadRequest, type Usage, type UserMessage } from "@dire-kiwi/agent-threads-protocol";
+import { applyEvent, type Attachment, type Item, type Resolution, type Snapshot, type Thread, type ThreadEvent, type ThreadRequest, type Usage, type UserMessage } from "@dire-kiwi/agent-threads-protocol";
 import type { HarnessSession, Message, NewItem, NewRequest, ThreadConfig, ThreadContext, TurnEnd } from "./harness.js";
 import { newId } from "./ids.js";
-import { decide, type PermissionDecision, type PermissionPolicy, type PermissionQuery } from "./permissions.js";
+import { decide, permissionKey, type PermissionDecision, type PermissionPolicy, type PermissionQuery } from "./permissions.js";
 import type { Spawner } from "./spawner.js";
-import type { Store } from "./store.js";
+import { StoreError, type Store } from "./store.js";
 
 /** An event before it's numbered: what emit() takes. */
 type Unnumbered = ThreadEvent extends infer E ? (E extends ThreadEvent ? Omit<E, "seq" | "thread_id"> : never) : never;
@@ -20,6 +20,15 @@ export interface Turn {
 interface OpenRequest {
   request: ThreadRequest;
   answered: (resolution: Resolution) => void;
+  /** The tool it's about (permissionKey), for an answer given `always`. */
+  standing?: string;
+}
+
+/** A message as sent: its text and attachments, and the client's id for it. */
+export interface Outgoing {
+  text: string;
+  attachments?: Attachment[];
+  client_id?: string;
 }
 
 /** What a ThreadRuntime needs from the AgentThreads that holds it. */
@@ -46,11 +55,14 @@ export class ThreadRuntime implements ThreadContext {
   #saved: Snapshot;
   #queue: string[] = []; // ids of queued user messages, oldest first
   #requests = new Map<string, OpenRequest>();
-  #always = new Map<string, "allow" | "deny">(); // tool name -> the user's standing answer
-  #unsaved: ThreadEvent[] = [];
+  #always = new Map<string, "allow" | "deny">(); // permissionKey -> the user's standing answer
+  #unsaved: ThreadEvent[] = []; // saved events not yet in the store, in order
   #threadChanged = false;
   #writes: Promise<void> = Promise.resolve();
   #flushQueued = false;
+  #failure: { error: unknown } | undefined; // why the last write failed, while writes are failing
+  #retry: NodeJS.Timeout | undefined;
+  #backoff = 0;
 
   constructor(host: RuntimeHost, state: Snapshot, config: ThreadConfig, policy: PermissionPolicy) {
     this.#host = host;
@@ -101,37 +113,91 @@ export class ThreadRuntime implements ThreadContext {
     });
   }
 
+  /**
+   * Appends the unsaved events, then the thread. Events stay unsaved until the store has them, so
+   * a write that fails is tried again (with the events after it), in order, and nothing is lost or
+   * numbered around a gap.
+   */
   async #flush(): Promise<void> {
-    const events = this.#unsaved.splice(0);
+    const store = this.#host.store;
+    const events = this.#unsaved.slice();
     const threadChanged = this.#threadChanged;
-    this.#threadChanged = false;
+    if (!events.length && !threadChanged) return;
     try {
-      if (events.length) await this.#host.store.appendEvents(this.threadId, events);
-      if (threadChanged) await this.#host.store.updateThread(this.#state.thread);
+      if (events.length) {
+        try {
+          await store.appendEvents(this.threadId, events);
+        } catch (e) {
+          // An append reported as failed may have happened anyway: keep only what the store lacks.
+          if (!(e instanceof StoreError && e.kind === "seq")) throw e;
+          const last = await store.lastSeq(this.threadId);
+          const rest = events.filter((x) => x.seq > last);
+          if (rest.length === events.length) throw e;
+          if (rest.length) await store.appendEvents(this.threadId, rest);
+        }
+        this.#unsaved.splice(0, events.length);
+      }
+      if (threadChanged) {
+        this.#threadChanged = false;
+        try {
+          await store.updateThread(this.#state.thread);
+        } catch (e) {
+          this.#threadChanged = true;
+          throw e;
+        }
+      }
+      this.#failure = undefined;
+      this.#backoff = 0;
     } catch (e) {
+      this.#failure = { error: e };
       this.#host.error(e);
+      this.#retryLater();
     }
   }
 
-  /** Resolves once every event so far is saved. */
+  #retryLater(): void {
+    if (this.#retry || this.closed) return;
+    this.#backoff = Math.min(Math.max(this.#backoff * 2, 250), 30_000);
+    this.#retry = setTimeout(() => {
+      this.#retry = undefined;
+      this.#writes = this.#writes.then(() => this.#flush());
+    }, this.#backoff);
+    this.#retry.unref?.();
+  }
+
+  /** Resolves once every event so far is saved; rejects with the store's error if it can't be. */
   async saved(): Promise<void> {
     // Let a flush queued in this tick start, then wait for the writes to finish.
     await Promise.resolve();
-    if (this.#flushQueued || this.#unsaved.length) {
+    if (this.#flushQueued || this.#unsaved.length || this.#threadChanged) {
       this.#flushQueued = false;
       this.#writes = this.#writes.then(() => this.#flush());
     }
     await this.#writes;
+    if (this.#failure && (this.#unsaved.length || this.#threadChanged)) throw this.#failure.error;
   }
 
-  /** Saves a snapshot, so loading the thread needn't fold all its events. */
+  /** Saves a snapshot, so loading the thread needn't fold all its events; never one ahead of them. */
   async saveSnapshot(): Promise<void> {
-    await this.saved();
+    try {
+      await this.saved();
+    } catch {
+      return; // Already reported; the events come first.
+    }
+    if (this.#unsaved.length) return;
     try {
       await this.#host.store.saveSnapshot(this.threadId, this.#saved);
     } catch (e) {
       this.#host.error(e);
     }
+  }
+
+  /** Stops retrying writes: the backend is closing. */
+  closed = false;
+  dispose(): void {
+    this.closed = true;
+    clearTimeout(this.#retry);
+    this.#retry = undefined;
   }
 
   // ---------- items and the thread ----------
@@ -182,34 +248,30 @@ export class ThreadRuntime implements ThreadContext {
   // ---------- turns ----------
 
   /** Sends a message: starts a turn, or steers the running one. */
-  send(message: Message & { client_id?: string }): void {
+  send(message: Outgoing): void {
+    const id = newId("um");
     if (!this.turn) {
-      this.#startTurn([message]);
+      this.turn = { id: newId("turn"), interrupted: false };
+      this.addItem({ id, type: "user_message", ...userFields(message) });
+      this.emit({ type: "turn.started", turn_id: this.turn.id });
+      this.setThread({ status: "running", error: undefined });
+      this.session!.start([toMessage(id, message)]);
       return;
     }
-    const id = newId("um");
     this.addItem({ id, type: "user_message", ...userFields(message), steered: true, queued: true });
     this.#queue.push(id);
-    this.session!.steer({ text: message.text, ...(message.attachments ? { attachments: message.attachments } : {}) });
-  }
-
-  #startTurn(messages: (Message & { client_id?: string })[]): void {
-    this.turn = { id: newId("turn"), interrupted: false };
-    for (const m of messages) this.addItem({ id: newId("um"), type: "user_message", ...userFields(m) });
-    this.emit({ type: "turn.started", turn_id: this.turn.id });
-    this.setThread({ status: "running", error: undefined });
-    this.session!.start(messages.map((m) => ({ text: m.text, ...(m.attachments ? { attachments: m.attachments } : {}) })));
+    this.session!.steer(toMessage(id, message));
   }
 
   queued(): UserMessage[] {
     return this.#queue.map((id) => this.item(id)).filter((i): i is UserMessage => i?.type === "user_message");
   }
 
-  tookIn(text: string): boolean {
-    const at = this.#queue.findIndex((id) => (this.item(id) as UserMessage | undefined)?.text === text);
+  tookIn(id: string): boolean {
+    const at = this.#queue.indexOf(id);
     if (at < 0) return false;
-    const [id] = this.#queue.splice(at, 1);
-    this.updateItem(id!, { queued: null });
+    this.#queue.splice(at, 1);
+    this.updateItem(id, { queued: null });
     return true;
   }
 
@@ -254,7 +316,7 @@ export class ThreadRuntime implements ThreadContext {
       for (const m of left) this.updateItem(m.id, { turn_id: this.turn.id });
       this.emit({ type: "turn.started", turn_id: this.turn.id });
       this.setThread({ status: "running", error: undefined });
-      this.session?.carryOver(left.map((m) => ({ text: m.text, ...(m.attachments ? { attachments: m.attachments } : {}) })));
+      this.session?.carryOver(left.map((m) => toMessage(m.id, m)));
     } else {
       void this.saveSnapshot();
     }
@@ -263,12 +325,12 @@ export class ThreadRuntime implements ThreadContext {
   // ---------- requests ----------
 
   decide(query: PermissionQuery): PermissionDecision | Promise<PermissionDecision> {
-    const standing = this.#always.get(query.name);
+    const standing = this.#always.get(permissionKey(query));
     if (standing) return standing;
     return decide(this.policy, query, { threadId: this.threadId, thread: this.thread, metadata: this.thread.metadata ?? {} });
   }
 
-  ask(request: NewRequest, toolCallId: string | undefined, answered: (resolution: Resolution) => void): string {
+  ask(request: NewRequest, toolCallId: string | undefined, answered: (resolution: Resolution) => void, standing?: string): string {
     const r = { ...request, id: newId(request.type === "question" ? "q" : "perm") } as ThreadRequest;
     if (this.turn) r.turn_id = this.turn.id;
     const call = toolCallId ? this.item(toolCallId) : undefined;
@@ -277,7 +339,7 @@ export class ThreadRuntime implements ThreadContext {
       if (call.parent_id) r.parent_id = call.parent_id;
       this.updateItem(call.id, { status: "pending" });
     }
-    this.#requests.set(r.id, { request: r, answered });
+    this.#requests.set(r.id, { request: r, answered, ...(standing ? { standing } : {}) });
     this.emit({ type: "request.opened", request: r });
     this.setThread({ status: "waiting" });
     return r.id;
@@ -289,8 +351,8 @@ export class ThreadRuntime implements ThreadContext {
     this.#requests.delete(requestId);
     this.emit({ type: "request.resolved", request_id: requestId, resolution });
     if (!this.#requests.size && this.turn) this.setThread({ status: "running" });
-    if (resolution.always && open.request.type === "permission" && (resolution.outcome === "allow" || resolution.outcome === "deny")) {
-      this.#always.set(open.request.name, resolution.outcome);
+    if (resolution.always && open.standing && (resolution.outcome === "allow" || resolution.outcome === "deny")) {
+      this.#always.set(open.standing, resolution.outcome);
     }
     open.answered(resolution);
   }
@@ -311,7 +373,11 @@ export class ThreadRuntime implements ThreadContext {
   }
 }
 
-function userFields(m: Message & { client_id?: string }): Omit<UserMessage, "id" | "type"> {
+function toMessage(id: string, m: { text: string; attachments?: Attachment[] }): Message {
+  return { id, text: m.text, ...(m.attachments?.length ? { attachments: m.attachments } : {}) };
+}
+
+function userFields(m: Outgoing): Omit<UserMessage, "id" | "type"> {
   return {
     text: m.text,
     ...(m.attachments?.length ? { attachments: m.attachments } : {}),

@@ -5,6 +5,8 @@
 //   reply <text>          replies with <text> and ends the turn
 //   tool <name> <json>    calls a tool (asking can_use_tool), says how it went, and ends the turn
 //   app <name> <json>     calls an app tool over mcp_message, says what it returned, and ends the turn
+//   sleep <ms> <text>     waits, then replies with <text> and ends the turn
+//   cancelled <tool>      asks can_use_tool, then cancels the request and ends the turn
 //   slow                  waits for an interrupt, then ends the turn as interrupted
 //   stubborn              ignores interrupts (and a closed stdin), until it's signalled
 //   crash                 writes to stderr and exits with code 3
@@ -92,6 +94,17 @@ async function turn(m) {
   const [cmd, ...rest] = text.split(" ");
   if (cmd === "reply") {
     say(rest.join(" "));
+  } else if (cmd === "sleep") {
+    const [ms, ...words] = rest;
+    await new Promise((r) => setTimeout(r, Number(ms)));
+    say(words.join(" "));
+  } else if (cmd === "cancelled") {
+    const id = `toolu_${++ids}`;
+    out({ type: "assistant", message: { id: `msg_${process.pid}_${++msgs}`, model: "mini", content: [{ type: "tool_use", id, name: rest[0], input: {} }] }, parent_tool_use_id: null, session_id: session });
+    const request_id = `cli_${++ids}`;
+    out({ type: "control_request", request_id, request: { subtype: "can_use_tool", tool_name: rest[0], input: {}, tool_use_id: id } });
+    out({ type: "control_cancel_request", request_id });
+    out({ type: "user", message: { role: "user", content: [{ type: "tool_result", tool_use_id: id, content: "cancelled", is_error: true }] }, parent_tool_use_id: null, session_id: session });
   } else if (cmd === "tool") {
     const [name, json = "{}"] = rest;
     const id = `toolu_${++ids}`;

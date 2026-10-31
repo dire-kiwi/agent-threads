@@ -5,12 +5,22 @@ import { describe, expect, it } from "vitest";
 import type { ToolCall } from "@dire-kiwi/agent-threads-protocol";
 import { AgentThreads } from "../agent-threads.js";
 import { claudeCode } from "../claude/driver.js";
+import { direct, type Spawner } from "../spawner.js";
 import { defineTool } from "../tools.js";
 import { tempDir } from "./spec.js";
 
 describe.skipIf(!process.env.AGENT_THREADS_LIVE)("live Claude Code", () => {
-  it("replies, and calls an app tool", { timeout: 120_000 }, async () => {
+  it("replies, calls an app tool, and has the app's skills", { timeout: 120_000 }, async () => {
+    // Claude's output, to see what its initialize response lists.
+    const out: string[] = [];
+    const inner = direct();
+    const spawner: Spawner = {
+      name: "direct",
+      spawn: (options, handlers) => inner.spawn(options, { ...handlers, line: (l) => (out.push(l), handlers.line(l)) }),
+    };
     const sdk = new AgentThreads({
+      spawner,
+      skills: [{ name: "review-sentinel", content: "---\nname: review-sentinel\ndescription: Says sentinel.\n---\nSay sentinel.\n" }],
       harnesses: { claude: claudeCode({ bin: process.env.CLAUDE_BIN ?? "claude" }) },
       tools: [
         defineTool<{ order_id: string }>({
@@ -38,6 +48,10 @@ describe.skipIf(!process.env.AGENT_THREADS_LIVE)("live Claude Code", () => {
       await sdk.send(t.id, "Reply with exactly these words and nothing else: hello from agent-threads");
       await finished;
       let s = await sdk.snapshot(t.id);
+      // The app's skill is there, though the user's and the project's config aren't loaded.
+      const init = out.map((l) => JSON.parse(l)).find((m) => m.type === "control_response" && m.response?.response?.commands);
+      const commands: string[] = init.response.response.commands.map((c: { name: string }) => c.name);
+      expect(commands).toContain("app:review-sentinel");
       expect(s.thread).toMatchObject({ status: "idle", session_id: expect.any(String) });
       expect(s.items.filter((i) => i.type === "assistant_message").map((i) => (i as { text: string }).text).join("")).toMatch(/hello from agent-threads/i);
 

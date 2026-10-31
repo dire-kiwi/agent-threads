@@ -10,7 +10,7 @@ import type { Snapshot, Thread, ThreadEvent } from "@dire-kiwi/agent-threads-pro
 import { checkEvents, notFound, StoreError, type ReadOptions, type RunRecord, type Store } from "../store.js";
 import { MemoryState, MemoryStore } from "./memory.js";
 
-type Line = { thread: Thread } | { events: ThreadEvent[] } | { snapshot: Snapshot } | { run: RunRecord };
+type Line = { thread: Thread } | { events: ThreadEvent[] } | { snapshot: Snapshot } | { run: RunRecord } | { run_moved: string };
 
 const SUFFIX = ".jsonl";
 
@@ -43,6 +43,7 @@ export class FileStore implements Store {
         text = text.slice(0, end);
       }
       let id: string | undefined;
+      const runs = new Map<string, RunRecord>(); // this file's runs, as its lines leave them
       for (const raw of text.split("\n")) {
         if (!raw) continue;
         const line = JSON.parse(raw) as Line;
@@ -57,9 +58,13 @@ export class FileStore implements Store {
         } else if ("snapshot" in line) {
           state.snapshots.set(id, line.snapshot);
         } else if ("run" in line) {
-          state.runs.set(line.run.id, line.run);
+          runs.set(line.run.id, line.run);
+        } else if ("run_moved" in line) {
+          runs.delete(line.run_moved);
         }
       }
+      // A run is in one file at a time: one moved to another thread was marked gone from this one.
+      for (const [rid, r] of runs) state.runs.set(rid, r);
     }
     return state;
   }
@@ -151,6 +156,10 @@ export class FileStore implements Store {
   putRun(run: RunRecord): Promise<void> {
     return this.#serial(async () => {
       this.#known(run.thread_id);
+      const before = this.#mem.state.runs.get(run.id);
+      if (before && before.thread_id !== run.thread_id && this.#mem.state.threads.has(before.thread_id)) {
+        await this.#append(before.thread_id, { run_moved: run.id });
+      }
       await this.#append(run.thread_id, { run });
       await this.#mem.putRun(run);
     });

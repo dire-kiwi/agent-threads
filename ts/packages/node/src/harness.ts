@@ -32,8 +32,9 @@ export interface ThreadConfig {
   systemPrompt?: string;
 }
 
-/** A message to give the harness. */
+/** A message to give the harness: its user_message item's id, text and attachments. */
 export interface Message {
+  id: string;
   text: string;
   attachments?: Attachment[];
 }
@@ -73,16 +74,17 @@ export interface ThreadContext {
   delta(itemId: string, kind: "text" | "reasoning", text: string): void;
   /** Changes the thread's fields (undefined removes one); sends nothing if nothing changes. */
   setThread(patch: Partial<Thread>): void;
-  /** The harness took in the queued message with this text. Whether there was one. */
-  tookIn(text: string): boolean;
+  /** The harness took in the queued message with this id. Whether it was queued. */
+  tookIn(id: string): boolean;
 
   /** The permission policy's answer, synchronously when it has one. */
   decide(query: PermissionQuery): PermissionDecision | Promise<PermissionDecision>;
   /**
    * Opens a request (for the tool call `toolCallId`, which is set `pending`) and calls `answered`
    * when the user responds. It isn't called when the request is cancelled because its turn ended.
+   * `standing` (permissionKey of the tool) lets an answer given `always` stand for the thread.
    */
-  ask(request: NewRequest, toolCallId: string | undefined, answered: (resolution: Resolution) => void): string;
+  ask(request: NewRequest, toolCallId: string | undefined, answered: (resolution: Resolution) => void, standing?: string): string;
   /** Closes a request the harness no longer wants answered. */
   cancelRequest(id: string): void;
   /** The running turn ended. */

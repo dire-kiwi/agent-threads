@@ -33,6 +33,14 @@ export type PermissionPolicy =
   | PermissionDecision
   | ((query: PermissionQuery, ctx: PermissionContext) => PermissionDecision | Promise<PermissionDecision>);
 
+/**
+ * Which tool a query is about, for a standing answer: its kind, its MCP server and its name, since
+ * two servers (or an app tool and a built-in) can have tools of the same name.
+ */
+export function permissionKey(query: Pick<PermissionQuery, "kind" | "server" | "name">): string {
+  return JSON.stringify([query.kind, query.server ?? null, query.name]);
+}
+
 /** Runs a policy; synchronously when it answers synchronously, so its effects keep their order. */
 export function decide(policy: PermissionPolicy, query: PermissionQuery, ctx: PermissionContext): PermissionDecision | Promise<PermissionDecision> {
   if (typeof policy !== "function") return policy;
