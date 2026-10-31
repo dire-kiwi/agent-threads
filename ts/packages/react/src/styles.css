@@ -122,16 +122,12 @@
   line-height: 1.5;
 }
 
-.at-root *,
-.at-root *::before,
-.at-root *::after {
+:where(.at-root *, .at-root *::before, .at-root *::after) {
   box-sizing: border-box;
 }
 
-.at-root button,
-.at-root input,
-.at-root textarea,
-:where(button, input, textarea)[class*="at-"] {
+/* With no specificity, so the components' own colours win. */
+:where(.at-root button, .at-root input, .at-root textarea, button[class*="at-"], input[class*="at-"], textarea[class*="at-"]) {
   font-family: inherit;
   color: inherit;
 }

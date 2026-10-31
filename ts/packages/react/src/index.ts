@@ -3,7 +3,18 @@
 // draws the thread. Import "@dire-kiwi/agent-threads-react/styles.css" for the components' styles.
 
 export { applyEvent, applyEvents, initialState, isGap } from "@dire-kiwi/agent-threads-protocol";
+// The protocol's types. Those that share a component's name are here as ...Item (and Thread as
+// ThreadInfo); the components' names win.
 export type * from "@dire-kiwi/agent-threads-protocol";
+export type {
+  AssistantMessage as AssistantMessageItem,
+  Notice as NoticeItem,
+  Reasoning as ReasoningItem,
+  Thread as ThreadInfo,
+  ToolCall as ToolCallItem,
+  TurnResult as TurnResultItem,
+  UserMessage as UserMessageItem,
+} from "@dire-kiwi/agent-threads-protocol";
 
 // Headless
 export { ThreadStore, type ThreadSource, type ThreadState } from "./store.js";

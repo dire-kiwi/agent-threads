@@ -23,7 +23,13 @@ import { lineage } from "./view.js";
  * a reconnect, with a fresh snapshot) makes a new store.
  */
 export function useThreadStore(source: ThreadSource): ThreadStore {
-  const store = useMemo(() => new ThreadStore(source), [source]);
+  // In state rather than a memo, which React may drop (and the events applied since with it).
+  const [kept, keep] = useState(() => new ThreadStore(source));
+  let store = kept;
+  if (store.source !== source) {
+    store = new ThreadStore(source);
+    keep(store);
+  }
   useEffect(() => store.connect(), [store]);
   return store;
 }
