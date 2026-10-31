@@ -66,10 +66,14 @@ again to finish saving. The file store undoes a write that fails partway, so a r
   `--input-format stream-json` and `--replay-user-messages`. After a restart (or a change of
   model, effort or permission mode) the next message starts a new one with `--resume`.
 - **Steering**: a message sent during a turn goes in on stdin and is `queued` until Claude echoes
-  it back. One it hasn't taken in when the turn ends starts the next turn; if Claude doesn't take it
-  in within `steerGraceMs` (30s), it goes to a new process instead. If a turn started that way
-  fails (or three in a row run), the messages left stay queued, a `notice` says so, and they go
-  with the next message sent.
+  it back, which is all that unqueues it. One it hasn't taken in when the turn ends starts the next
+  turn (in the same process, or a new one if the options changed or Claude doesn't take it in
+  within `steerGraceMs`, 30s). That stops when a retry is interrupted, fails with no process left
+  holding the message, or three have run: then a process that has it is stopped (so it can't act on
+  it unseen), a `notice` says it wasn't delivered, and it's sent again, first, with the next
+  message. A turn lost when the backend stopped is ended without retrying, and starts nothing.
+- **Unfinished text**: when a turn ends before Claude finishes a message (its process exits, or the
+  backend shuts down), the text streamed so far is saved.
 - **Interrupt** sends a `control_request` interrupt; if the turn hasn't ended after `stopGraceMs`
   (10s), the process's input is closed and it's sent SIGTERM.
 - **Permissions**: `--permission-prompt-tool stdio`, so Claude asks over `can_use_tool` and the

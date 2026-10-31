@@ -250,7 +250,7 @@ export class AgentThreads {
         } catch (e) {
           this.#error(e);
         }
-        if (rt.turn) rt.endTurn({ ok: false });
+        if (rt.turn) rt.endTurn({ ok: false }, { carry: false });
       }),
     );
   }
@@ -379,7 +379,8 @@ function recoverLost(rt: ThreadRuntime): void {
     for (const r of rt.snapshot.requests) {
       rt.emit({ type: "request.resolved", request_id: r.id, resolution: { outcome: "cancel" } });
     }
-    rt.endTurn({ ok: false, error: "The backend stopped while this turn was running." });
+    // Not carried over: loading a thread starts no process. Its queued messages go with the next.
+    rt.endTurn({ ok: false, error: "The backend stopped while this turn was running." }, { carry: false });
   }
   rt.setThread({ run: undefined });
 }

@@ -176,6 +176,17 @@ class ClaudeSession implements HarnessSession {
     this.#stale = true;
   }
 
+  live(): boolean {
+    return !!this.#live();
+  }
+
+  release(): void {
+    clearTimeout(this.#steerTimer);
+    const run = this.#live();
+    // It has the messages on its stdin: stopped at once, it can't take them in unseen.
+    if (run) void this.#stop(run, true, true);
+  }
+
   async close(): Promise<void> {
     this.#closed = true;
     clearTimeout(this.#steerTimer);

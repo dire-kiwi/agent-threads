@@ -1,7 +1,7 @@
 // What the recorded fixtures don't cover, against a scriptable fake `claude` (mini-claude.mjs):
 // steering that outlives a turn, policies, failures, restarts, option changes and stopping.
 
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { afterEach, describe, expect, it } from "vitest";
@@ -22,16 +22,25 @@ afterEach(async () => {
   await Promise.all(open.splice(0).map((s) => s.close()));
 });
 
-function setup(options: AgentThreadsOptions & { claude?: ClaudeCodeOptions; steer?: "now" | "late" | "never"; failResume?: boolean } = {}) {
+interface Setup extends AgentThreadsOptions {
+  claude?: ClaudeCodeOptions;
+  steer?: "now" | "late" | "never" | "hold";
+  /** Resumed processes fail: always, or while this file exists. */
+  failResume?: boolean | string;
+  /** More of mini-claude's environment. */
+  env?: { [k: string]: string };
+}
+
+function setup(options: Setup = {}) {
   const log = join(tempDir(), "log.jsonl");
-  const { claude, steer = "now", failResume, ...rest } = options;
+  const { claude, steer = "now", failResume, env, ...rest } = options;
   const events: ThreadEvent[] = [];
   const make = (store: Store = rest.store ?? new MemoryStore()) => {
     const sdk = new AgentThreads({
       permissions: "allow",
       ...rest,
       store,
-      harnesses: { claude: claudeCode({ bin: mini, env: { MINI_CLAUDE_LOG: log, MINI_CLAUDE_STEER: steer, ...(failResume ? { MINI_CLAUDE_FAIL_RESUME: "1" } : {}) }, ...claude }) },
+      harnesses: { claude: claudeCode({ bin: mini, env: { MINI_CLAUDE_LOG: log, MINI_CLAUDE_STEER: steer, ...(failResume ? { MINI_CLAUDE_FAIL_RESUME: failResume === true ? "1" : failResume } : {}), ...env }, ...claude }) },
       onError:
         rest.onError ??
         ((e) => {
@@ -138,14 +147,16 @@ describe("the Claude driver", () => {
     expect(second!.argv).toEqual(expect.arrayContaining(["--model", "new-model", "--resume", s.thread.session_id!]));
   });
 
-  it("stops carrying a steered message over to a harness that keeps failing, and sends it with the next", async () => {
-    const { sdk, events, runs } = setup({ failResume: true });
+  it("stops carrying a steered message over to a harness that keeps failing, and keeps it for a retry that works", async () => {
+    const broken = join(tempDir(), "broken");
+    writeFileSync(broken, "");
+    const { sdk, events, runs } = setup({ failResume: broken });
     const t = await sdk.create();
     await sdk.send(t.id, "sleepcrash 300");
     await until(async () => (await sdk.snapshot(t.id)).thread.session_id);
     await sdk.send(t.id, "reply steered", { client_id: "s" });
     // The first process crashes; the turn it carries over to fails too, and that's where it stops.
-    const s = await until(async () => {
+    let s = await until(async () => {
       const s = await sdk.snapshot(t.id);
       return results(s.items).length === 2 && s.thread.status === "error" ? s : undefined;
     });
@@ -154,17 +165,124 @@ describe("the Claude driver", () => {
     await new Promise((r) => setTimeout(r, 500));
     expect({ runs: runs().length, events: events.length }).toEqual(count);
     expect((await sdk.snapshot(t.id)).thread.status).toBe("error");
-    const steered = s.items.find((i): i is UserMessage => i.type === "user_message" && i.client_id === "s")!;
-    expect(steered.queued).toBe(true);
+    const steered = () => s.items.find((i): i is UserMessage => i.type === "user_message" && i.client_id === "s")!;
+    expect(steered().queued).toBe(true);
     expect(s.items.at(-1)).toMatchObject({ type: "notice", level: "warning", code: "undelivered" });
 
-    // The next message takes it along.
-    await sdk.send(t.id, "reply again", { client_id: "n" });
-    await settle(sdk, t.id);
-    const third = runs()[2]!.sent.filter((m) => m.type === "user") as unknown as { message: { content: { text: string }[] } }[];
-    expect(third.map((m) => m.message.content[0]!.text)).toEqual(["reply steered", "reply again"]);
-    expect((await sdk.snapshot(t.id)).items.filter((i) => i.type === "user_message" && i.queued)).toEqual([]);
+    // An explicit retry that fails too leaves it queued, and stops there.
+    await sdk.send(t.id, "reply again", { client_id: "a" });
+    s = await until(async () => {
+      const s = await sdk.snapshot(t.id);
+      return results(s.items).length === 3 && s.thread.status === "error" ? s : undefined;
+    });
+    await new Promise((r) => setTimeout(r, 300));
+    expect(runs()).toHaveLength(3);
+    expect(results((await sdk.snapshot(t.id)).items)).toHaveLength(3);
+    expect(steered().queued).toBe(true);
+
+    // Once the harness works, the next message takes it along, and it's taken in.
+    rmSync(broken);
+    await sdk.send(t.id, "reply ok", { client_id: "o" });
+    s = await settle(sdk, t.id);
+    const fourth = runs()[3]!.sent.filter((m) => m.type === "user") as unknown as { message: { content: { text: string }[] } }[];
+    expect(fourth.map((m) => m.message.content[0]!.text)).toEqual(["reply steered", "reply ok"]);
+    expect(steered().queued).toBeUndefined();
+    expect(texts(s.items)).toContain("steered");
+    expect(s.thread.status).toBe("idle");
     await sdk.close();
+  });
+
+  it("stops a live process holding a message it gives up on, after two interrupts", async () => {
+    const { sdk, events, runs } = setup({ steer: "hold", claude: { closeGraceMs: 100 } });
+    const t = await sdk.create();
+    await sdk.send(t.id, "slow");
+    await until(async () => (await sdk.snapshot(t.id)).thread.session_id);
+    await sdk.send(t.id, "reply steered", { client_id: "s" });
+    await sdk.interrupt(t.id);
+    // The steered message is carried over to a turn that the live process holds it for...
+    await until(() => events.filter((e) => e.type === "turn.started").length === 2);
+    // ...which is interrupted too: that's enough, and the process is stopped so it can't run it.
+    await sdk.interrupt(t.id);
+    const s = await until(async () => {
+      const s = await sdk.snapshot(t.id);
+      return results(s.items).length === 2 && s.thread.status === "idle" && !s.thread.run ? s : undefined;
+    });
+    expect(results(s.items).map((r) => r.interrupted)).toEqual([true, true]);
+    expect(s.items.find((i): i is UserMessage => i.type === "user_message" && i.client_id === "s")!.queued).toBe(true);
+    expect(s.items.at(-1)).toMatchObject({ type: "notice", code: "undelivered" });
+    const count = events.length;
+    await new Promise((r) => setTimeout(r, 300));
+    expect(events).toHaveLength(count);
+    expect(runs()).toHaveLength(1);
+
+    // The next message takes it to a new process.
+    await sdk.send(t.id, "reply next");
+    const after = await until(async () => {
+      const s = await sdk.snapshot(t.id);
+      return texts(s.items).includes("steered") ? s : undefined;
+    });
+    expect(after.items.filter((i) => i.type === "user_message" && i.queued)).toEqual([]);
+  });
+
+  it("carries a message over again after a failed result while the process holds it", async () => {
+    const { sdk, runs } = setup({ steer: "late", env: { MINI_CLAUDE_IDLE_ERRORS: "1" } });
+    const t = await sdk.create();
+    await sdk.send(t.id, "sleep 200 first");
+    await until(async () => (await sdk.snapshot(t.id)).thread.session_id);
+    await sdk.send(t.id, "reply steered", { client_id: "s" });
+    const s = await until(async () => {
+      const s = await sdk.snapshot(t.id);
+      return results(s.items).length === 3 && s.thread.status === "idle" ? s : undefined;
+    });
+    expect(results(s.items).map((r) => r.ok)).toEqual([true, false, true]);
+    expect(texts(s.items)).toEqual(["first", "steered"]);
+    expect(s.items.filter((i) => i.type === "user_message" && i.queued)).toEqual([]);
+    expect(runs()).toHaveLength(1);
+  });
+
+  it("gives up after too many failed results, stopping the process that holds the message", async () => {
+    const { sdk, events, runs } = setup({ steer: "late", env: { MINI_CLAUDE_IDLE_ERRORS: "10" }, claude: { closeGraceMs: 100 } });
+    const t = await sdk.create();
+    await sdk.send(t.id, "sleep 200 first");
+    await until(async () => (await sdk.snapshot(t.id)).thread.session_id);
+    await sdk.send(t.id, "reply steered", { client_id: "s" });
+    const s = await until(async () => {
+      const s = await sdk.snapshot(t.id);
+      return results(s.items).length === 4 && s.thread.status === "error" && !s.thread.run ? s : undefined;
+    });
+    const count = events.length;
+    await new Promise((r) => setTimeout(r, 300));
+    expect(events).toHaveLength(count);
+    expect(runs()).toHaveLength(1);
+    expect(texts(s.items)).toEqual(["first"]);
+    expect(s.items.find((i): i is UserMessage => i.type === "user_message" && i.client_id === "s")!.queued).toBe(true);
+    expect(s.items.at(-1)).toMatchObject({ type: "notice", code: "undelivered" });
+  });
+
+  it("keeps the text streamed so far when the process exits before finishing it", async () => {
+    const store = new MemoryStore();
+    const { sdk, make } = setup({ store });
+    const t = await sdk.create();
+    await sdk.send(t.id, "streamcrash half a thought");
+    const s = await settle(sdk, t.id);
+    expect(s.thread.status).toBe("error");
+    expect(texts(s.items)).toEqual(["half a thought "]);
+    await sdk.close();
+    open = open.filter((x) => x !== sdk);
+    expect(texts((await make(store).snapshot(t.id)).items)).toEqual(["half a thought "]);
+  });
+
+  it("keeps the text streamed so far when the backend shuts down mid-message", async () => {
+    const store = new MemoryStore();
+    const { sdk, make } = setup({ store });
+    const t = await sdk.create();
+    await sdk.send(t.id, "streamhang cut short");
+    await until(async () => texts((await sdk.snapshot(t.id)).items)[0] === "cut short ");
+    await sdk.close();
+    open = open.filter((x) => x !== sdk);
+    const s = await make(store).snapshot(t.id);
+    expect(texts(s.items)).toEqual(["cut short "]);
+    expect(results(s.items)).toEqual([expect.objectContaining({ ok: false, interrupted: true })]);
   });
 
   it("restarts Claude with a steered message it never takes in", async () => {
@@ -537,6 +655,44 @@ describe("AgentThreads", () => {
     expect(s.thread).toMatchObject({ status: "error", error: expect.stringMatching(/stopped/) });
     expect(s.thread.run).toBeUndefined();
     expect(results(s.items)).toEqual([expect.objectContaining({ ok: false })]);
+  });
+
+  it("recovers a lost turn's queued message without starting a process, and sends it with the next, configured again", async () => {
+    const store = new MemoryStore();
+    const { sdk, make, runs } = setup({ store });
+    const t = await sdk.create();
+    await sdk.send(t.id, "slow");
+    await until(async () => (await sdk.snapshot(t.id)).thread.session_id);
+    await sdk.send(t.id, "app lookup {}", { client_id: "s" });
+    await sdk.eventsSince(t.id, 0); // saved
+    // As if the backend died now, with the steered message queued.
+    const crashed = structuredClone(store.state);
+    await sdk.close();
+    open = open.filter((x) => x !== sdk);
+    const before = runs().length;
+
+    const again = make(new MemoryStore(crashed));
+    const s = await again.snapshot(t.id);
+    await new Promise((r) => setTimeout(r, 300));
+    expect(runs()).toHaveLength(before);
+    expect(s.thread).toMatchObject({ status: "error" });
+    expect(s.thread.run).toBeUndefined();
+    expect(results(s.items)).toHaveLength(1);
+    expect(s.items.find((i): i is UserMessage => i.type === "user_message" && i.client_id === "s")!.queued).toBe(true);
+    expect(s.items.at(-1)).toMatchObject({ type: "notice", code: "undelivered" });
+
+    // The app gives the thread its tools again; the next message takes the queued one along.
+    const lookup = defineTool({ name: "lookup", description: "Looks up.", input: { type: "object" }, run: () => "found it" });
+    await again.configure(t.id, { tools: [lookup] });
+    await again.send(t.id, "reply next");
+    const done = await until(async () => {
+      const s = await again.snapshot(t.id);
+      return texts(s.items).includes("app said found it") && s.thread.status === "idle" ? s : undefined;
+    });
+    expect(done.items.filter((i) => i.type === "user_message" && i.queued)).toEqual([]);
+    const last = runs().at(-1)!;
+    expect(last.argv).toEqual(expect.arrayContaining(["--resume", s.thread.session_id!]));
+    expect(last.sent.find((m) => m.type === "control_request")).toMatchObject({ request: { sdkMcpServers: ["app"] } });
   });
 
   it("keeps events a store failed to append, and saves them in order once it can", async () => {

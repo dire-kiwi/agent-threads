@@ -11,13 +11,18 @@
 //   stubborn              ignores interrupts (and a closed stdin), until it's signalled
 //   crash                 writes to stderr and exits with code 3
 //   sleepcrash <ms>       waits, then crashes
+//   streamcrash <text>    streams <text> (deltas, no final message), then crashes
+//   streamhang <text>     streams <text>, then waits for its input to close
 //
 // MINI_CLAUDE_LOG names a file each run appends its argv and every line it's sent to. With
 // MINI_CLAUDE_STEER=late, messages sent during a turn are taken in after its result (as the next
-// turn); with MINI_CLAUDE_STEER=never, they never are (and the process has to be restarted). With
-// MINI_CLAUDE_FAIL_RESUME=1, a process started with --resume fails at its first message.
+// turn); with MINI_CLAUDE_STEER=never, they never are (and the process has to be restarted); with
+// MINI_CLAUDE_STEER=hold, they're never taken in either, and an interrupt while no turn runs gets
+// an interrupted result. MINI_CLAUDE_IDLE_ERRORS=<n> sends n failed results (an API error, say)
+// before taking in late messages. With MINI_CLAUDE_FAIL_RESUME=1 (or the name of a file that
+// exists), a process started with --resume fails at its first message.
 
-import { appendFileSync } from "node:fs";
+import { appendFileSync, existsSync } from "node:fs";
 import { createInterface } from "node:readline";
 
 const log = process.env.MINI_CLAUDE_LOG;
@@ -38,6 +43,7 @@ let busy = false;
 let interrupted = null;
 let stubborn = false;
 let initialized = false;
+let idleErrors = Number(process.env.MINI_CLAUDE_IDLE_ERRORS ?? 0);
 
 const ask = (request) =>
   new Promise((resolve) => {
@@ -56,6 +62,7 @@ createInterface({ input: process.stdin })
       if (m.request.subtype === "initialize") initialized = true;
       out({ type: "control_response", response: { subtype: "success", request_id: m.request_id, response: {} } });
       if (m.request.subtype === "interrupt" && !stubborn) interrupted?.();
+      if (m.request.subtype === "interrupt" && !busy && steer === "hold") result({ subtype: "error_during_execution", is_error: true });
       return;
     }
     if (m.type === "control_response") {
@@ -70,7 +77,8 @@ createInterface({ input: process.stdin })
         process.stderr.write("a message came before initialize\n");
         process.exit(4);
       }
-      if (resume && process.env.MINI_CLAUDE_FAIL_RESUME) {
+      const failResume = process.env.MINI_CLAUDE_FAIL_RESUME;
+      if (resume && failResume && (failResume === "1" || existsSync(failResume))) {
         process.stderr.write("can't resume\n");
         setTimeout(() => process.exit(2), 50);
         return;
@@ -140,6 +148,14 @@ async function turn(m) {
     result({ subtype: "error_during_execution", is_error: true });
     busy = false;
     return;
+  } else if (cmd === "streamcrash" || cmd === "streamhang") {
+    const id = `msg_${process.pid}_${++msgs}`;
+    out({ type: "stream_event", event: { type: "message_start", message: { id } }, parent_tool_use_id: null, session_id: session });
+    for (const word of rest) out({ type: "stream_event", event: { type: "content_block_delta", index: 0, delta: { type: "text_delta", text: word + " " } }, parent_tool_use_id: null, session_id: session });
+    if (cmd === "streamhang") await new Promise(() => {});
+    await new Promise((r) => setTimeout(r, 50));
+    process.stderr.write("something broke\n");
+    process.exit(3);
   } else if (cmd === "sleepcrash") {
     await new Promise((r) => setTimeout(r, Number(rest[0])));
     process.stderr.write("something broke\n");
@@ -162,6 +178,17 @@ for (;;) {
   }
   if (steer === "never" && turns > 0) {
     inbox.length = 0;
+    continue;
+  }
+  if (steer === "hold" && turns > 0) {
+    await new Promise((r) => (wake = r));
+    wake = null;
+    continue;
+  }
+  if (idleErrors > 0 && turns > 0) {
+    idleErrors--;
+    await new Promise((r) => setTimeout(r, 20));
+    result({ subtype: "success", is_error: true, result: "API Error: overloaded" });
     continue;
   }
   await turn(inbox.shift());

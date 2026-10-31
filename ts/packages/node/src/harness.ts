@@ -106,6 +106,13 @@ export interface HarnessSession {
   carryOver(messages: Message[]): void;
   /** Stop the running turn. */
   interrupt(): void;
+  /** Whether a harness process is running that has the queued messages (it was sent them). */
+  live(): boolean;
+  /**
+   * The core gave up carrying the queued messages over: make sure nothing acts on them (stop a
+   * process that has them). They're sent again with the next turn's start().
+   */
+  release(): void;
   /** The thread's options (model, effort, permission mode) or config changed. */
   optionsChanged(): void;
   /** Stop the harness process, if it's running. */

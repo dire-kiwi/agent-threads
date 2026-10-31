@@ -15,12 +15,23 @@ type Unnumbered = ThreadEvent extends infer E ? (E extends ThreadEvent ? Omit<E,
 export interface Turn {
   id: string;
   interrupted: boolean;
-  /** How many turns in a row (this one included) were started by messages left over. */
+  /**
+   * How many turns in a row (this one included) are retries for messages left queued: carried
+   * over from the turn before, or sent again with an explicit message.
+   */
   carried?: number;
 }
 
-/** How many turns in a row leftover steered messages may start. */
+/** How many turns in a row may be retries for queued messages. */
 const MAX_CARRIED = 3;
+
+// Steered messages, and who has them. A steered message is queued (its item has `queued`, and
+// its id is in #queue) until the harness echoes it back as taken in (tookIn); nothing else
+// unqueues it. Until then it's either with the session's live process (written to its stdin)
+// or with nobody. When a turn ends with messages queued, endTurn either carries them over (a
+// new turn, which the live process takes them into, or a new process if there's none) or gives
+// up on them: then the session releases them, stopping any process that has them so it can't
+// act on them unseen, and they're sent again, first, with the next message the user sends.
 
 interface OpenRequest {
   request: ThreadRequest;
@@ -258,11 +269,11 @@ export class ThreadRuntime implements ThreadContext {
   send(message: Outgoing): void {
     const id = newId("um");
     if (!this.turn) {
-      this.turn = { id: newId("turn"), interrupted: false };
-      // Messages still queued from before weren't delivered: they go first, in this turn.
+      // Messages still queued from before weren't delivered: they go first, in this turn, and stay
+      // queued until the harness takes them in. Such a turn is a retry for them.
       const left = this.queued();
-      this.#queue = [];
-      for (const m of left) this.updateItem(m.id, { turn_id: this.turn.id, queued: null });
+      this.turn = { id: newId("turn"), interrupted: false, ...(left.length ? { carried: 1 } : {}) };
+      for (const m of left) this.updateItem(m.id, { turn_id: this.turn.id });
       this.addItem({ id, type: "user_message", ...userFields(message) });
       this.emit({ type: "turn.started", turn_id: this.turn.id });
       this.setThread({ status: "running", error: undefined });
@@ -292,9 +303,19 @@ export class ThreadRuntime implements ThreadContext {
     this.session?.interrupt();
   }
 
-  endTurn(end: TurnEnd): void {
+  /**
+   * The running turn ended. Its queued messages are carried over to a new turn unless `carry` is
+   * false (shutting down, or recovering a turn the backend lost), or they've been tried enough.
+   */
+  endTurn(end: TurnEnd, { carry = true }: { carry?: boolean } = {}): void {
     const turn = this.turn;
     if (!turn) return;
+    // Text streamed but never finished (its process went first) is kept as it was shown.
+    for (const it of this.#state.items) {
+      if (it.type !== "assistant_message" && it.type !== "reasoning") continue;
+      const saved = this.item(it.id);
+      if (saved && "text" in saved && saved.text !== it.text) this.updateItem(it.id, { text: it.text });
+    }
     for (const it of this.#state.items) {
       if (it.type === "tool_call" && it.turn_id === turn.id && (it.status === "running" || it.status === "pending")) {
         this.updateItem(it.id, { status: "cancelled" });
@@ -320,30 +341,46 @@ export class ThreadRuntime implements ThreadContext {
     this.turn = null;
     this.setThread({ status: error ? "error" : "idle", error, usage: addUsage(this.#state.thread.usage, end.usage) });
 
-    // A steered message the harness didn't take in starts the next turn; but not again and again
-    // if those turns fail (the harness can't start, say): then the messages stay queued, and go
-    // with the next one sent.
-    const carried = turn.carried ?? 0;
-    const giveUp = carried > 0 && (!ok || carried >= MAX_CARRIED);
-    const left = this.closing ? [] : this.queued();
-    if (left.length && giveUp) {
-      this.addItem({
-        id: newId("n"),
-        type: "notice",
-        level: "warning",
-        code: "undelivered",
-        text: `${left.length === 1 ? "A message wasn't" : `${left.length} messages weren't`} delivered; ${left.length === 1 ? "it goes" : "they go"} with the next one you send.`,
-      });
-    }
-    if (left.length && !giveUp) {
-      this.turn = { id: newId("turn"), interrupted: false, carried: carried + 1 };
-      for (const m of left) this.updateItem(m.id, { turn_id: this.turn.id });
-      this.emit({ type: "turn.started", turn_id: this.turn.id });
-      this.setThread({ status: "running", error: undefined });
-      this.session?.carryOver(left.map((m) => toMessage(m.id, m)));
-    } else {
+    const left = this.queued();
+    if (!left.length) {
       void this.saveSnapshot();
+      return;
     }
+    if (!carry || this.closing) {
+      // Shutting down closes the process that has them; a lost turn's process is gone. Either
+      // way they wait, queued, for the next message.
+      if (!this.closing) this.#undelivered(left.length);
+      void this.saveSnapshot();
+      return;
+    }
+    // Carry them over, unless that's been tried enough: a retry that was interrupted (the user
+    // wants it stopped), one that failed with no process left holding them, or too many in a row.
+    // A retry that failed while its process lives and holds them carries over again (to the
+    // limit), since that process would otherwise take them in unseen.
+    const carried = turn.carried ?? 0;
+    const holding = this.session?.live() ?? false;
+    const giveUp = carried >= MAX_CARRIED || (carried > 0 && turn.interrupted) || (carried > 0 && !ok && !holding);
+    if (giveUp) {
+      this.session?.release();
+      this.#undelivered(left.length);
+      void this.saveSnapshot();
+      return;
+    }
+    this.turn = { id: newId("turn"), interrupted: false, carried: carried + 1 };
+    for (const m of left) this.updateItem(m.id, { turn_id: this.turn.id });
+    this.emit({ type: "turn.started", turn_id: this.turn.id });
+    this.setThread({ status: "running", error: undefined });
+    this.session?.carryOver(left.map((m) => toMessage(m.id, m)));
+  }
+
+  #undelivered(n: number): void {
+    this.addItem({
+      id: newId("n"),
+      type: "notice",
+      level: "warning",
+      code: "undelivered",
+      text: `${n === 1 ? "A message wasn't" : `${n} messages weren't`} delivered; ${n === 1 ? "it goes" : "they go"} with the next one you send.`,
+    });
   }
 
   // ---------- requests ----------
