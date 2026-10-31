@@ -8,9 +8,13 @@ const msg = (id: string, text = ""): Item => ({ id, type: "assistant_message", t
 const delta = (seq: number, item_id: string, text: string): ThreadEvent => ({ type: "delta", thread_id: "th", seq, item_id, kind: "text", text });
 const updated = (seq: number, item_id: string, patch: Record<string, unknown>): ThreadEvent => ({ type: "item.updated", thread_id: "th", seq, item_id, patch });
 
-/** A store on a test source, connected. */
+/**
+ * A store on a test source, connected. The resync it asks for on connecting gets nothing (as from a
+ * source with nothing new to send), and isn't passed on to `resync`.
+ */
 function connected(snapshot?: Snapshot, resync?: Parameters<typeof testSource>[1]) {
-  const t = testSource(snapshot, resync);
+  let first = true;
+  const t = testSource(snapshot, resync && ((seq) => (first ? void (first = false) : resync(seq))));
   const store = new ThreadStore(t.source);
   const disconnect = store.connect();
   return { ...t, store, disconnect, ids: () => store.getState().snapshot.items.map((i) => i.id) };
@@ -77,6 +81,42 @@ describe("ThreadStore", () => {
     emit({ type: "turn.started", thread_id: "th", seq: 2, turn_id: "t" }, { type: "thread.updated", thread_id: "th", seq: 3, thread: { ...thread, status: "running" } });
     expect(store.getState().view).toBe(view);
     expect(store.getState().snapshot.thread.status).toBe("running");
+  });
+
+  describe("on connecting", () => {
+    it("catches up on what was sent between the snapshot and subscribing", async () => {
+      // The snapshot was taken mid-turn; the turn ended before the store subscribed, and no more events come.
+      const start = applyEvents(initialState({ ...thread, status: "running" }), [added(1, msg("a", "Hel"))]);
+      const resync = vi.fn(async () => [updated(2, "a", { text: "Hello" }), { type: "thread.updated", thread_id: "th", seq: 3, thread } as ThreadEvent]);
+      const t = testSource(start, resync);
+      const store = new ThreadStore(t.source);
+      store.connect();
+      expect(resync).toHaveBeenCalledWith(1);
+      expect(store.getState().resyncing).toBe(true);
+      await flush();
+      expect(store.getState().snapshot.seq).toBe(3);
+      expect(store.getState().snapshot.thread.status).toBe("idle");
+      expect(store.getState().snapshot.items[0]).toMatchObject({ text: "Hello" });
+      expect(store.getState().resyncing).toBe(false);
+    });
+
+    it("asks after taking what the subscription replays", () => {
+      const resync = vi.fn(() => undefined);
+      const t = testSource(undefined, resync);
+      t.source.subscribe = (fn) => {
+        fn(added(1, msg("a")));
+        return () => {};
+      };
+      const store = new ThreadStore(t.source);
+      store.connect();
+      expect(resync).toHaveBeenCalledWith(1);
+      expect(store.getState().resyncing).toBe(false);
+    });
+
+    it("doesn't ask a source that can't resync", () => {
+      const { store } = connected();
+      expect(store.getState().resyncing).toBe(false);
+    });
   });
 
   describe("after a gap", () => {

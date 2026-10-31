@@ -28,8 +28,9 @@ snapshot. `onCommand` can return a promise, and the components show a failure.
 - `useThread(source)`: the thread's state, `{snapshot, streaming, resyncing, view}`. Events are
   applied with `applyEvent`; a saved event whose `seq` skips ahead is held while `source.resync`
   fetches the missing ones (or a snapshot), and deltas that come meanwhile are dropped (the
-  message's final text puts it right). Connecting again (e.g. React hid the thread for a while)
-  calls `source.resync` too, for what was sent while it wasn't listening.
+  message's final text puts it right). Each time it connects, `source.resync` is called too, for
+  what was sent while it wasn't listening (since the snapshot was taken, or while it was
+  disconnected). That's on every mount, so twice in StrictMode, and again on each remount.
 - `<ThreadProvider source onCommand>` gives the components a thread. Inside it,
   `useThreadState(pick)` redraws only when what it picks changes, and `useSend()`,
   `useInterrupt()`, `useRespond()` and `useSetOptions()` send the commands.
@@ -54,7 +55,8 @@ Give `ThreadProvider` (or `Thread`):
 - `toolKinds`: renderers by kind, in place of the built-in ones.
 - `renderMarkdown(text)`: the built-in one only does paragraphs and code; pass e.g.
   `react-markdown`.
-- `renderItem(item)`: any item's row; return `undefined` for the built-in one.
+- `renderItem(item)`: any item's row; return `undefined` for the built-in one. Tool calls drawn
+  in a group don't go through it: use `tools` or `toolKinds` for those.
 
 Make these once (or memoize them): new ones redraw every row.
 

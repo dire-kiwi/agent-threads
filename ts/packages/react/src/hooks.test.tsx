@@ -34,9 +34,13 @@ describe("useThread", () => {
   });
 
   it("asks the source for a resync on a gap", async () => {
-    const resync = vi.fn(async () => [added(2, msg("b"))]);
+    // On mounting it asks for what came before it subscribed: nothing, here.
+    const resync = vi.fn().mockResolvedValueOnce([]).mockResolvedValueOnce([added(2, msg("b"))]);
     const t = testSource(undefined, resync);
     const { result } = renderHook(() => useThread(t.source));
+    expect(resync).toHaveBeenCalledWith(0);
+    await act(async () => {});
+    expect(result.current.resyncing).toBe(false);
     act(() => t.emit(added(1, msg("a")), added(3, msg("c"))));
     expect(result.current.resyncing).toBe(true);
     await act(async () => {});

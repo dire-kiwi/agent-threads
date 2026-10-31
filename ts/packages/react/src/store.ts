@@ -19,8 +19,9 @@ export interface ThreadSource {
    * Called when events were missed: a saved event came whose seq is more than one past the
    * state's. Resolve with the events after `seq` or a fresh snapshot (backends offer both), or
    * deliver the missing events through `subscribe` and return nothing. Events that come meanwhile
-   * are held, and applied once the gap is filled. It's also called when the store connects again
-   * (e.g. React hid the thread for a while), for the events sent while it wasn't listening.
+   * are held, and applied once the gap is filled. It's also called each time the store connects
+   * (each mount, twice in StrictMode), for the events sent while it wasn't listening: since the
+   * snapshot was taken, or since it last disconnected.
    * Without it, a gap is ignored and the event applied anyway.
    */
   resync?(seq: number): Promise<Snapshot | ThreadEvent[] | void> | void;
@@ -56,7 +57,6 @@ export class ThreadStore {
    */
   private asked: "none" | "answer" | "events" = "none";
   private connected = false;
-  private connections = 0;
 
   constructor(readonly source: ThreadSource) {
     const snapshot = source.snapshot;
@@ -73,12 +73,12 @@ export class ThreadStore {
   /** Starts taking the source's events. Returns how to stop. */
   connect(): () => void {
     this.connected = true;
-    const again = this.connections++ > 0;
     const off = this.source.subscribe((event) => this.receive(event));
-    // Connected again (e.g. React hid the thread, or ran the effect again): events may have been
-    // sent while it wasn't listening, and a resync under way then was dropped. Ask from where the
-    // state is now (after any the subscription replayed).
-    if (this.connected && this.source.resync && (again || this.held.size)) this.gap();
+    // Events may have been sent while it wasn't listening: after the snapshot was taken and before
+    // this subscription, or while it was disconnected (React hid the thread, or ran the effect
+    // again), when a resync under way was dropped too. Ask from where the state is now (after any
+    // the subscription replayed).
+    if (this.connected && this.source.resync) this.gap();
     return () => {
       this.connected = false;
       this.attempt++;

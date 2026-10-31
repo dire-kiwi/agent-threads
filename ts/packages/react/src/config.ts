@@ -48,8 +48,9 @@ export interface ThreadConfig {
    */
   renderMarkdown?: (text: string) => ReactNode;
   /**
-   * Draws an item in place of the built-in row for it: return undefined to keep that one. For a
-   * tool call, the tool renderers above are usually simpler.
+   * Draws an item in place of the built-in row for it: return undefined to keep that one. It isn't
+   * called for tool calls drawn in a group (consecutive calls shown as one row): change how tool
+   * calls look with `tools` or `toolKinds`, which apply in groups too.
    */
   renderItem?: (item: Item) => ReactNode | undefined;
 }
