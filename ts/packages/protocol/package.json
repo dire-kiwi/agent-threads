@@ -1,0 +1,25 @@
+{
+  "name": "@dire-kiwi/agent-threads-protocol",
+  "version": "0.0.0",
+  "description": "agent-threads' protocol: types generated from spec/, and the applyEvent reducer.",
+  "type": "module",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    }
+  },
+  "files": [
+    "dist"
+  ],
+  "scripts": {
+    "build": "tsc -p tsconfig.build.json",
+    "test": "tsc --noEmit && vitest run",
+    "gen": "node scripts/gen.mjs"
+  },
+  "devDependencies": {
+    "ajv": "^8.20.0",
+    "ajv-formats": "^3.0.1",
+    "json-schema-to-typescript": "^16.0.0"
+  }
+}

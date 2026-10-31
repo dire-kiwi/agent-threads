@@ -1,0 +1,194 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/dire-kiwi/agent-threads/spec/schema/item.schema.json",
+  "title": "Item",
+  "description": "The saved contents of a thread. Every item has id, type and the optional parent_id, turn_id, created_at and raw.",
+  "$defs": {
+    "Item": {
+      "description": "One entry in a thread, told apart by type.",
+      "oneOf": [
+        { "$ref": "#/$defs/UserMessage" },
+        { "$ref": "#/$defs/AssistantMessage" },
+        { "$ref": "#/$defs/Reasoning" },
+        { "$ref": "#/$defs/ToolCall" },
+        { "$ref": "#/$defs/Compaction" },
+        { "$ref": "#/$defs/Notice" },
+        { "$ref": "#/$defs/TurnResult" }
+      ]
+    },
+    "UserMessage": {
+      "type": "object",
+      "description": "A message to the agent from the user (or the app on their behalf).",
+      "required": ["id", "type", "text"],
+      "properties": {
+        "id": { "type": "string" },
+        "type": { "const": "user_message" },
+        "text": { "type": "string" },
+        "attachments": { "type": "array", "items": { "$ref": "#/$defs/Attachment" } },
+        "steered": { "type": "boolean", "default": false, "description": "Sent while a turn was running, so it joined that turn instead of starting one." },
+        "queued": { "type": "boolean", "default": false, "description": "Sent, but the harness hasn't taken it in yet. An item.updated clears it once it has." },
+        "client_id": { "type": "string", "description": "The client_id of the send command that made it, so a client can match it to what it showed while waiting." },
+        "parent_id": { "type": "string", "description": "The id of the subagent tool_call this item belongs to. Absent for the main conversation." },
+        "turn_id": { "type": "string", "description": "The turn the item was made in." },
+        "created_at": { "type": "string", "format": "date-time" },
+        "raw": { "description": "The harness's own payload this came from, for debugging. Backends can leave it out; clients mustn't depend on it." }
+      }
+    },
+    "AssistantMessage": {
+      "type": "object",
+      "description": "Text from the agent. While it streams, delta events append to text; an item.updated sets the final text.",
+      "required": ["id", "type", "text"],
+      "properties": {
+        "id": { "type": "string" },
+        "type": { "const": "assistant_message" },
+        "text": { "type": "string", "description": "Markdown." },
+        "parent_id": { "type": "string", "description": "The id of the subagent tool_call this item belongs to. Absent for the main conversation." },
+        "turn_id": { "type": "string", "description": "The turn the item was made in." },
+        "created_at": { "type": "string", "format": "date-time" },
+        "raw": { "description": "The harness's own payload this came from, for debugging. Backends can leave it out; clients mustn't depend on it." }
+      }
+    },
+    "Reasoning": {
+      "type": "object",
+      "description": "The agent's thinking, or a summary of it, as the harness gives it. Streams like assistant_message.",
+      "required": ["id", "type", "text"],
+      "properties": {
+        "id": { "type": "string" },
+        "type": { "const": "reasoning" },
+        "text": { "type": "string" },
+        "parent_id": { "type": "string", "description": "The id of the subagent tool_call this item belongs to. Absent for the main conversation." },
+        "turn_id": { "type": "string", "description": "The turn the item was made in." },
+        "created_at": { "type": "string", "format": "date-time" },
+        "raw": { "description": "The harness's own payload this came from, for debugging. Backends can leave it out; clients mustn't depend on it." }
+      }
+    },
+    "ToolCall": {
+      "type": "object",
+      "description": "A tool the agent called, with its result once it has one. A subagent is a tool_call of kind subagent: the items it makes have its id as their parent_id. The optional fields after input are the same facts for every harness, set when the kind has them, so a UI can show a call without knowing the harness's tool names.",
+      "required": ["id", "type", "name", "kind", "input", "status"],
+      "properties": {
+        "id": { "type": "string", "description": "The harness's id for the call (Claude's tool_use id, Codex's item id)." },
+        "type": { "const": "tool_call" },
+        "name": { "type": "string", "description": "The tool's name as the harness gave it (Bash, Read, apply_patch...). For an MCP tool, the tool's own name; server has the server's." },
+        "kind": { "$ref": "#/$defs/ToolKind" },
+        "input": { "description": "The tool's arguments as the harness gave them, usually an object." },
+        "status": { "$ref": "#/$defs/ToolStatus" },
+        "result": { "$ref": "#/$defs/ToolResult" },
+        "title": { "type": "string", "description": "A short summary of the call, e.g. a subagent's description." },
+        "command": { "type": "string", "description": "shell: the command line." },
+        "path": { "type": "string", "description": "read, search: the file or directory." },
+        "changes": { "type": "array", "items": { "$ref": "#/$defs/FileChange" }, "description": "edit: the files it changes." },
+        "query": { "type": "string", "description": "search: the pattern. web: the search query." },
+        "url": { "type": "string", "description": "web: the URL fetched." },
+        "server": { "type": "string", "description": "mcp: the MCP server's name." },
+        "todos": { "type": "array", "items": { "$ref": "#/$defs/Todo" }, "description": "todo: the whole list after the call." },
+        "parent_id": { "type": "string", "description": "The id of the subagent tool_call this item belongs to. Absent for the main conversation." },
+        "turn_id": { "type": "string", "description": "The turn the item was made in." },
+        "created_at": { "type": "string", "format": "date-time" },
+        "raw": { "description": "The harness's own payload this came from, for debugging. Backends can leave it out; clients mustn't depend on it." }
+      }
+    },
+    "ToolKind": {
+      "type": "string",
+      "description": "What a tool does, for permission policies and for picking a renderer. shell: runs a command. read: reads files. edit: writes or patches files. search: finds files or text (glob, grep). web: fetches or searches the web. mcp: a tool on an external MCP server. app: a tool the app defined. subagent: starts a subagent. todo: updates the agent's plan or todo list. other: anything else.",
+      "enum": ["shell", "read", "edit", "search", "web", "mcp", "app", "subagent", "todo", "other"]
+    },
+    "ToolStatus": {
+      "type": "string",
+      "description": "pending: called, not started (e.g. waiting for permission). running: started, no result yet. completed: it returned. failed: it returned an error. denied: permission was refused. cancelled: the turn ended (e.g. was interrupted) before it returned.",
+      "enum": ["pending", "running", "completed", "failed", "denied", "cancelled"]
+    },
+    "ToolResult": {
+      "type": "object",
+      "description": "What a tool returned. For a failed call, content is the error.",
+      "required": ["content"],
+      "properties": {
+        "content": { "type": "string", "description": "The result as text. Images become [image]." },
+        "structured": { "description": "Structured output, when the tool gave some (an app tool's return value, MCP structuredContent)." },
+        "truncated": { "type": "boolean", "default": false, "description": "content was cut short before it was saved." },
+        "exit_code": { "type": "integer", "description": "shell: the command's exit code." }
+      }
+    },
+    "FileChange": {
+      "type": "object",
+      "required": ["path", "op"],
+      "properties": {
+        "path": { "type": "string" },
+        "op": { "type": "string", "enum": ["add", "update", "delete"] },
+        "diff": { "type": "string", "description": "A unified diff of the change, or the content of an added file." },
+        "move_to": { "type": "string", "description": "The file's new path, when the change renames it." }
+      }
+    },
+    "Todo": {
+      "type": "object",
+      "required": ["text", "status"],
+      "properties": {
+        "text": { "type": "string" },
+        "status": { "type": "string", "enum": ["pending", "in_progress", "completed"] }
+      }
+    },
+    "Compaction": {
+      "type": "object",
+      "description": "The harness compacted the conversation's context.",
+      "required": ["id", "type"],
+      "properties": {
+        "id": { "type": "string" },
+        "type": { "const": "compaction" },
+        "trigger": { "type": "string", "enum": ["auto", "manual"] },
+        "summary": { "type": "string" },
+        "tokens_before": { "type": "integer", "minimum": 0 },
+        "parent_id": { "type": "string", "description": "The id of the subagent tool_call this item belongs to. Absent for the main conversation." },
+        "turn_id": { "type": "string", "description": "The turn the item was made in." },
+        "created_at": { "type": "string", "format": "date-time" },
+        "raw": { "description": "The harness's own payload this came from, for debugging. Backends can leave it out; clients mustn't depend on it." }
+      }
+    },
+    "Notice": {
+      "type": "object",
+      "description": "Something to tell the user that isn't the agent talking: an error, a retry, hook output, a run re-attached after a restart.",
+      "required": ["id", "type", "level", "text"],
+      "properties": {
+        "id": { "type": "string" },
+        "type": { "const": "notice" },
+        "level": { "type": "string", "enum": ["info", "warning", "error"] },
+        "text": { "type": "string" },
+        "code": { "type": "string", "description": "What kind of notice it is, for apps that treat some specially. Known codes: run.reattached (a restarted backend picked up a run that was still going), run.lost (a run ended while the backend was down), retry, hook, stderr.", "examples": ["run.reattached", "run.lost", "retry", "hook", "stderr"] },
+        "detail": { "type": "string", "description": "More text, e.g. a stack trace or a hook's full output." },
+        "parent_id": { "type": "string", "description": "The id of the subagent tool_call this item belongs to. Absent for the main conversation." },
+        "turn_id": { "type": "string", "description": "The turn the item was made in." },
+        "created_at": { "type": "string", "format": "date-time" },
+        "raw": { "description": "The harness's own payload this came from, for debugging. Backends can leave it out; clients mustn't depend on it." }
+      }
+    },
+    "TurnResult": {
+      "type": "object",
+      "description": "How a turn ended. The last item of each turn.",
+      "required": ["id", "type", "ok"],
+      "properties": {
+        "id": { "type": "string" },
+        "type": { "const": "turn_result" },
+        "ok": { "type": "boolean", "description": "The turn finished without an error. An interrupted turn isn't ok." },
+        "interrupted": { "type": "boolean", "default": false, "description": "The turn was stopped by an interrupt command." },
+        "error": { "type": "string" },
+        "usage": { "$ref": "thread.schema.json#/$defs/Usage", "description": "Tokens the turn used." },
+        "duration_ms": { "type": "integer", "minimum": 0 },
+        "parent_id": { "type": "string", "description": "The id of the subagent tool_call this item belongs to. Absent for the main conversation." },
+        "turn_id": { "type": "string", "description": "The turn the item was made in." },
+        "created_at": { "type": "string", "format": "date-time" },
+        "raw": { "description": "The harness's own payload this came from, for debugging. Backends can leave it out; clients mustn't depend on it." }
+      }
+    },
+    "Attachment": {
+      "type": "object",
+      "description": "A file sent with a message: inline as base64 data, or by path on the backend's machine.",
+      "required": ["kind"],
+      "properties": {
+        "kind": { "type": "string", "enum": ["image", "file"] },
+        "name": { "type": "string" },
+        "media_type": { "type": "string", "examples": ["image/png"] },
+        "data": { "type": "string", "contentEncoding": "base64" },
+        "path": { "type": "string" }
+      }
+    }
+  }
+}

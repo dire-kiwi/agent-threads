@@ -1,0 +1,63 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/dire-kiwi/agent-threads/spec/schema/thread.schema.json",
+  "title": "Thread",
+  "description": "A thread: one conversation with one harness, and the state that isn't its items.",
+  "$defs": {
+    "Thread": {
+      "type": "object",
+      "description": "A thread's own state. Sent whole in thread.updated and in snapshots.",
+      "required": ["id", "harness", "status", "created_at"],
+      "properties": {
+        "id": { "type": "string", "description": "The thread's id, chosen by the backend." },
+        "harness": { "type": "string", "description": "The harness driver that runs it: \"claude\" or \"codex\" in v1.", "examples": ["claude", "codex"] },
+        "status": { "$ref": "#/$defs/ThreadStatus" },
+        "title": { "type": "string" },
+        "model": { "type": "string", "description": "The model the next turn uses, as the harness names it." },
+        "effort": { "type": "string", "description": "Reasoning effort, as the harness names it (e.g. low, medium, high)." },
+        "permission_mode": { "$ref": "#/$defs/PermissionMode" },
+        "cwd": { "type": "string", "description": "The working directory the harness runs in." },
+        "session_id": { "type": "string", "description": "The harness's own session or thread id, used to resume it." },
+        "usage": { "$ref": "#/$defs/Usage", "description": "Tokens used by the thread so far, over all its turns." },
+        "error": { "type": "string", "description": "What went wrong, when status is error." },
+        "run": { "$ref": "#/$defs/Run", "description": "The harness process running the thread, if one is. Absent when it's idle with no process." },
+        "metadata": { "type": "object", "additionalProperties": true, "description": "The app's own data, given when the thread was created. Backends store it and pass it to tools; they don't read it." },
+        "created_at": { "type": "string", "format": "date-time" },
+        "updated_at": { "type": "string", "format": "date-time" }
+      }
+    },
+    "ThreadStatus": {
+      "type": "string",
+      "description": "idle: no turn is running. running: a turn is running. waiting: a turn is waiting on a request (permission or question). error: the last turn failed, or the harness couldn't start; the next send tries again.",
+      "enum": ["idle", "running", "waiting", "error"]
+    },
+    "PermissionMode": {
+      "type": "string",
+      "description": "default: ask (via the permission policy) for anything the harness would ask about. accept_edits: file edits in cwd are allowed without asking. plan: the agent plans and doesn't change anything. bypass: nothing is asked.",
+      "enum": ["default", "accept_edits", "plan", "bypass"]
+    },
+    "Run": {
+      "type": "object",
+      "description": "A harness process. A run started under the shim can outlive the backend: after a restart the backend re-attaches to it and sets reattached_at.",
+      "required": ["id", "spawner"],
+      "properties": {
+        "id": { "type": "string", "description": "The run's id (with the shim, its run directory's name)." },
+        "spawner": { "type": "string", "enum": ["direct", "shim"], "description": "direct: a child process of the backend, which ends with it. shim: supervised by agent-threads-shim, so it survives a backend restart." },
+        "started_at": { "type": "string", "format": "date-time" },
+        "reattached_at": { "type": "string", "format": "date-time", "description": "When a restarted backend last re-attached to the run. Absent if it never has." }
+      }
+    },
+    "Usage": {
+      "type": "object",
+      "description": "Token counts.",
+      "required": ["input_tokens", "output_tokens"],
+      "properties": {
+        "input_tokens": { "type": "integer", "minimum": 0 },
+        "output_tokens": { "type": "integer", "minimum": 0 },
+        "cache_read_tokens": { "type": "integer", "minimum": 0 },
+        "cache_write_tokens": { "type": "integer", "minimum": 0 },
+        "cost_usd": { "type": "number", "minimum": 0, "description": "What the tokens cost, when the harness says." }
+      }
+    }
+  }
+}

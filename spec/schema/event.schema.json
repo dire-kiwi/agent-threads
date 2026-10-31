@@ -1,0 +1,121 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/dire-kiwi/agent-threads/spec/schema/event.schema.json",
+  "title": "Event",
+  "description": "What a backend sends. Every event has type, thread_id and seq, and an optional raw.",
+  "$defs": {
+    "ThreadEvent": {
+      "description": "An event, told apart by type. All but delta are saved, and each saved event's seq is one more than the one before it in the thread.",
+      "oneOf": [
+        { "$ref": "#/$defs/ThreadUpdatedEvent" },
+        { "$ref": "#/$defs/TurnStartedEvent" },
+        { "$ref": "#/$defs/TurnCompletedEvent" },
+        { "$ref": "#/$defs/ItemAddedEvent" },
+        { "$ref": "#/$defs/ItemUpdatedEvent" },
+        { "$ref": "#/$defs/DeltaEvent" },
+        { "$ref": "#/$defs/RequestOpenedEvent" },
+        { "$ref": "#/$defs/RequestResolvedEvent" }
+      ]
+    },
+    "ThreadUpdatedEvent": {
+      "type": "object",
+      "description": "The thread's own state changed (status, model, usage, run...). Carries all of it.",
+      "required": ["type", "thread_id", "seq", "thread"],
+      "properties": {
+        "type": { "const": "thread.updated" },
+        "thread_id": { "type": "string" },
+        "seq": { "type": "integer", "minimum": 1 },
+        "thread": { "$ref": "thread.schema.json#/$defs/Thread" },
+        "raw": { "description": "The harness's own payload, for debugging." }
+      }
+    },
+    "TurnStartedEvent": {
+      "type": "object",
+      "description": "A turn started: the agent is working on a message.",
+      "required": ["type", "thread_id", "seq", "turn_id"],
+      "properties": {
+        "type": { "const": "turn.started" },
+        "thread_id": { "type": "string" },
+        "seq": { "type": "integer", "minimum": 1 },
+        "turn_id": { "type": "string" },
+        "raw": { "description": "The harness's own payload, for debugging." }
+      }
+    },
+    "TurnCompletedEvent": {
+      "type": "object",
+      "description": "A turn ended, however it ended. Its turn_result item comes just before.",
+      "required": ["type", "thread_id", "seq", "turn_id"],
+      "properties": {
+        "type": { "const": "turn.completed" },
+        "thread_id": { "type": "string" },
+        "seq": { "type": "integer", "minimum": 1 },
+        "turn_id": { "type": "string" },
+        "raw": { "description": "The harness's own payload, for debugging." }
+      }
+    },
+    "ItemAddedEvent": {
+      "type": "object",
+      "description": "An item was added to the end of the thread. If the thread already has an item with its id, it replaces that one in place.",
+      "required": ["type", "thread_id", "seq", "item"],
+      "properties": {
+        "type": { "const": "item.added" },
+        "thread_id": { "type": "string" },
+        "seq": { "type": "integer", "minimum": 1 },
+        "item": { "$ref": "item.schema.json#/$defs/Item" },
+        "raw": { "description": "The harness's own payload, for debugging." }
+      }
+    },
+    "ItemUpdatedEvent": {
+      "type": "object",
+      "description": "An item changed: patch's fields replace the item's, and a field set to null is removed. id and type never change.",
+      "required": ["type", "thread_id", "seq", "item_id", "patch"],
+      "properties": {
+        "type": { "const": "item.updated" },
+        "thread_id": { "type": "string" },
+        "seq": { "type": "integer", "minimum": 1 },
+        "item_id": { "type": "string" },
+        "patch": { "type": "object", "additionalProperties": true, "description": "Top-level fields of the item to set, e.g. {\"status\": \"completed\", \"result\": {...}}." },
+        "raw": { "description": "The harness's own payload, for debugging." }
+      }
+    },
+    "DeltaEvent": {
+      "type": "object",
+      "description": "Streamed text to append to an assistant_message (kind text) or reasoning (kind reasoning) item's text. Not saved, and doesn't advance seq: its seq is that of the last saved event. An item.updated with the final text follows.",
+      "required": ["type", "thread_id", "seq", "item_id", "kind", "text"],
+      "properties": {
+        "type": { "const": "delta" },
+        "thread_id": { "type": "string" },
+        "seq": { "type": "integer", "minimum": 0 },
+        "item_id": { "type": "string" },
+        "kind": { "type": "string", "enum": ["text", "reasoning"] },
+        "text": { "type": "string" },
+        "raw": { "description": "The harness's own payload, for debugging." }
+      }
+    },
+    "RequestOpenedEvent": {
+      "type": "object",
+      "description": "The agent is waiting on the user for a permission or an answer.",
+      "required": ["type", "thread_id", "seq", "request"],
+      "properties": {
+        "type": { "const": "request.opened" },
+        "thread_id": { "type": "string" },
+        "seq": { "type": "integer", "minimum": 1 },
+        "request": { "$ref": "request.schema.json#/$defs/ThreadRequest" },
+        "raw": { "description": "The harness's own payload, for debugging." }
+      }
+    },
+    "RequestResolvedEvent": {
+      "type": "object",
+      "description": "A request was answered or cancelled, and is no longer open.",
+      "required": ["type", "thread_id", "seq", "request_id", "resolution"],
+      "properties": {
+        "type": { "const": "request.resolved" },
+        "thread_id": { "type": "string" },
+        "seq": { "type": "integer", "minimum": 1 },
+        "request_id": { "type": "string" },
+        "resolution": { "$ref": "request.schema.json#/$defs/Resolution" },
+        "raw": { "description": "The harness's own payload, for debugging." }
+      }
+    }
+  }
+}

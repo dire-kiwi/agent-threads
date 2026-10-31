@@ -1,0 +1,7 @@
+{"type":"send","thread_id":"th_1","text":"Fix the failing test","client_id":"c1"}
+{"type":"send","thread_id":"th_1","text":"What's in this screenshot?","attachments":[{"kind":"image","name":"shot.png","media_type":"image/png","data":"iVBORw0KGgo="}]}
+{"type":"interrupt","thread_id":"th_1"}
+{"type":"respond","thread_id":"th_1","request_id":"p1","resolution":{"outcome":"allow","always":true}}
+{"type":"respond","thread_id":"th_1","request_id":"p2","resolution":{"outcome":"deny","message":"Don't touch the lockfile."}}
+{"type":"respond","thread_id":"th_1","request_id":"q1","resolution":{"outcome":"answer","answers":{"runner":["vitest"]}}}
+{"type":"set_options","thread_id":"th_1","model":"sonnet","effort":"high","permission_mode":"accept_edits"}

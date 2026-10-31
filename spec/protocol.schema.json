@@ -1,0 +1,1318 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/dire-kiwi/agent-threads/spec/protocol.schema.json",
+  "title": "agent-threads protocol",
+  "description": "Generated from spec/schema/*.schema.json by scripts/bundle-schema.mjs. Don't edit.",
+  "$defs": {
+    "Command": {
+      "description": "A command, told apart by type.",
+      "oneOf": [
+        {
+          "$ref": "#/$defs/SendCommand"
+        },
+        {
+          "$ref": "#/$defs/InterruptCommand"
+        },
+        {
+          "$ref": "#/$defs/RespondCommand"
+        },
+        {
+          "$ref": "#/$defs/SetOptionsCommand"
+        }
+      ]
+    },
+    "SendCommand": {
+      "type": "object",
+      "description": "Send the agent a message. It starts a turn if none is running, and steers the running one if one is.",
+      "required": [
+        "type",
+        "thread_id",
+        "text"
+      ],
+      "properties": {
+        "type": {
+          "const": "send"
+        },
+        "thread_id": {
+          "type": "string"
+        },
+        "text": {
+          "type": "string"
+        },
+        "attachments": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/Attachment"
+          }
+        },
+        "client_id": {
+          "type": "string",
+          "description": "The client's own id for the message, copied to the user_message item."
+        }
+      }
+    },
+    "InterruptCommand": {
+      "type": "object",
+      "description": "Stop the running turn. Does nothing if none is running.",
+      "required": [
+        "type",
+        "thread_id"
+      ],
+      "properties": {
+        "type": {
+          "const": "interrupt"
+        },
+        "thread_id": {
+          "type": "string"
+        }
+      }
+    },
+    "RespondCommand": {
+      "type": "object",
+      "description": "Answer an open request.",
+      "required": [
+        "type",
+        "thread_id",
+        "request_id",
+        "resolution"
+      ],
+      "properties": {
+        "type": {
+          "const": "respond"
+        },
+        "thread_id": {
+          "type": "string"
+        },
+        "request_id": {
+          "type": "string"
+        },
+        "resolution": {
+          "$ref": "#/$defs/Resolution"
+        }
+      }
+    },
+    "SetOptionsCommand": {
+      "type": "object",
+      "description": "Change the thread's options. Fields left out stay as they are. They apply from the next turn, or straight away where the harness allows.",
+      "required": [
+        "type",
+        "thread_id"
+      ],
+      "properties": {
+        "type": {
+          "const": "set_options"
+        },
+        "thread_id": {
+          "type": "string"
+        },
+        "model": {
+          "type": "string"
+        },
+        "effort": {
+          "type": "string"
+        },
+        "permission_mode": {
+          "$ref": "#/$defs/PermissionMode"
+        }
+      }
+    },
+    "ThreadEvent": {
+      "description": "An event, told apart by type. All but delta are saved, and each saved event's seq is one more than the one before it in the thread.",
+      "oneOf": [
+        {
+          "$ref": "#/$defs/ThreadUpdatedEvent"
+        },
+        {
+          "$ref": "#/$defs/TurnStartedEvent"
+        },
+        {
+          "$ref": "#/$defs/TurnCompletedEvent"
+        },
+        {
+          "$ref": "#/$defs/ItemAddedEvent"
+        },
+        {
+          "$ref": "#/$defs/ItemUpdatedEvent"
+        },
+        {
+          "$ref": "#/$defs/DeltaEvent"
+        },
+        {
+          "$ref": "#/$defs/RequestOpenedEvent"
+        },
+        {
+          "$ref": "#/$defs/RequestResolvedEvent"
+        }
+      ]
+    },
+    "ThreadUpdatedEvent": {
+      "type": "object",
+      "description": "The thread's own state changed (status, model, usage, run...). Carries all of it.",
+      "required": [
+        "type",
+        "thread_id",
+        "seq",
+        "thread"
+      ],
+      "properties": {
+        "type": {
+          "const": "thread.updated"
+        },
+        "thread_id": {
+          "type": "string"
+        },
+        "seq": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "thread": {
+          "$ref": "#/$defs/Thread"
+        },
+        "raw": {
+          "description": "The harness's own payload, for debugging."
+        }
+      }
+    },
+    "TurnStartedEvent": {
+      "type": "object",
+      "description": "A turn started: the agent is working on a message.",
+      "required": [
+        "type",
+        "thread_id",
+        "seq",
+        "turn_id"
+      ],
+      "properties": {
+        "type": {
+          "const": "turn.started"
+        },
+        "thread_id": {
+          "type": "string"
+        },
+        "seq": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "turn_id": {
+          "type": "string"
+        },
+        "raw": {
+          "description": "The harness's own payload, for debugging."
+        }
+      }
+    },
+    "TurnCompletedEvent": {
+      "type": "object",
+      "description": "A turn ended, however it ended. Its turn_result item comes just before.",
+      "required": [
+        "type",
+        "thread_id",
+        "seq",
+        "turn_id"
+      ],
+      "properties": {
+        "type": {
+          "const": "turn.completed"
+        },
+        "thread_id": {
+          "type": "string"
+        },
+        "seq": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "turn_id": {
+          "type": "string"
+        },
+        "raw": {
+          "description": "The harness's own payload, for debugging."
+        }
+      }
+    },
+    "ItemAddedEvent": {
+      "type": "object",
+      "description": "An item was added to the end of the thread. If the thread already has an item with its id, it replaces that one in place.",
+      "required": [
+        "type",
+        "thread_id",
+        "seq",
+        "item"
+      ],
+      "properties": {
+        "type": {
+          "const": "item.added"
+        },
+        "thread_id": {
+          "type": "string"
+        },
+        "seq": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "item": {
+          "$ref": "#/$defs/Item"
+        },
+        "raw": {
+          "description": "The harness's own payload, for debugging."
+        }
+      }
+    },
+    "ItemUpdatedEvent": {
+      "type": "object",
+      "description": "An item changed: patch's fields replace the item's, and a field set to null is removed. id and type never change.",
+      "required": [
+        "type",
+        "thread_id",
+        "seq",
+        "item_id",
+        "patch"
+      ],
+      "properties": {
+        "type": {
+          "const": "item.updated"
+        },
+        "thread_id": {
+          "type": "string"
+        },
+        "seq": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "item_id": {
+          "type": "string"
+        },
+        "patch": {
+          "type": "object",
+          "additionalProperties": true,
+          "description": "Top-level fields of the item to set, e.g. {\"status\": \"completed\", \"result\": {...}}."
+        },
+        "raw": {
+          "description": "The harness's own payload, for debugging."
+        }
+      }
+    },
+    "DeltaEvent": {
+      "type": "object",
+      "description": "Streamed text to append to an assistant_message (kind text) or reasoning (kind reasoning) item's text. Not saved, and doesn't advance seq: its seq is that of the last saved event. An item.updated with the final text follows.",
+      "required": [
+        "type",
+        "thread_id",
+        "seq",
+        "item_id",
+        "kind",
+        "text"
+      ],
+      "properties": {
+        "type": {
+          "const": "delta"
+        },
+        "thread_id": {
+          "type": "string"
+        },
+        "seq": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "item_id": {
+          "type": "string"
+        },
+        "kind": {
+          "type": "string",
+          "enum": [
+            "text",
+            "reasoning"
+          ]
+        },
+        "text": {
+          "type": "string"
+        },
+        "raw": {
+          "description": "The harness's own payload, for debugging."
+        }
+      }
+    },
+    "RequestOpenedEvent": {
+      "type": "object",
+      "description": "The agent is waiting on the user for a permission or an answer.",
+      "required": [
+        "type",
+        "thread_id",
+        "seq",
+        "request"
+      ],
+      "properties": {
+        "type": {
+          "const": "request.opened"
+        },
+        "thread_id": {
+          "type": "string"
+        },
+        "seq": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "request": {
+          "$ref": "#/$defs/ThreadRequest"
+        },
+        "raw": {
+          "description": "The harness's own payload, for debugging."
+        }
+      }
+    },
+    "RequestResolvedEvent": {
+      "type": "object",
+      "description": "A request was answered or cancelled, and is no longer open.",
+      "required": [
+        "type",
+        "thread_id",
+        "seq",
+        "request_id",
+        "resolution"
+      ],
+      "properties": {
+        "type": {
+          "const": "request.resolved"
+        },
+        "thread_id": {
+          "type": "string"
+        },
+        "seq": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "request_id": {
+          "type": "string"
+        },
+        "resolution": {
+          "$ref": "#/$defs/Resolution"
+        },
+        "raw": {
+          "description": "The harness's own payload, for debugging."
+        }
+      }
+    },
+    "Item": {
+      "description": "One entry in a thread, told apart by type.",
+      "oneOf": [
+        {
+          "$ref": "#/$defs/UserMessage"
+        },
+        {
+          "$ref": "#/$defs/AssistantMessage"
+        },
+        {
+          "$ref": "#/$defs/Reasoning"
+        },
+        {
+          "$ref": "#/$defs/ToolCall"
+        },
+        {
+          "$ref": "#/$defs/Compaction"
+        },
+        {
+          "$ref": "#/$defs/Notice"
+        },
+        {
+          "$ref": "#/$defs/TurnResult"
+        }
+      ]
+    },
+    "UserMessage": {
+      "type": "object",
+      "description": "A message to the agent from the user (or the app on their behalf).",
+      "required": [
+        "id",
+        "type",
+        "text"
+      ],
+      "properties": {
+        "id": {
+          "type": "string"
+        },
+        "type": {
+          "const": "user_message"
+        },
+        "text": {
+          "type": "string"
+        },
+        "attachments": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/Attachment"
+          }
+        },
+        "steered": {
+          "type": "boolean",
+          "default": false,
+          "description": "Sent while a turn was running, so it joined that turn instead of starting one."
+        },
+        "queued": {
+          "type": "boolean",
+          "default": false,
+          "description": "Sent, but the harness hasn't taken it in yet. An item.updated clears it once it has."
+        },
+        "client_id": {
+          "type": "string",
+          "description": "The client_id of the send command that made it, so a client can match it to what it showed while waiting."
+        },
+        "parent_id": {
+          "type": "string",
+          "description": "The id of the subagent tool_call this item belongs to. Absent for the main conversation."
+        },
+        "turn_id": {
+          "type": "string",
+          "description": "The turn the item was made in."
+        },
+        "created_at": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "raw": {
+          "description": "The harness's own payload this came from, for debugging. Backends can leave it out; clients mustn't depend on it."
+        }
+      }
+    },
+    "AssistantMessage": {
+      "type": "object",
+      "description": "Text from the agent. While it streams, delta events append to text; an item.updated sets the final text.",
+      "required": [
+        "id",
+        "type",
+        "text"
+      ],
+      "properties": {
+        "id": {
+          "type": "string"
+        },
+        "type": {
+          "const": "assistant_message"
+        },
+        "text": {
+          "type": "string",
+          "description": "Markdown."
+        },
+        "parent_id": {
+          "type": "string",
+          "description": "The id of the subagent tool_call this item belongs to. Absent for the main conversation."
+        },
+        "turn_id": {
+          "type": "string",
+          "description": "The turn the item was made in."
+        },
+        "created_at": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "raw": {
+          "description": "The harness's own payload this came from, for debugging. Backends can leave it out; clients mustn't depend on it."
+        }
+      }
+    },
+    "Reasoning": {
+      "type": "object",
+      "description": "The agent's thinking, or a summary of it, as the harness gives it. Streams like assistant_message.",
+      "required": [
+        "id",
+        "type",
+        "text"
+      ],
+      "properties": {
+        "id": {
+          "type": "string"
+        },
+        "type": {
+          "const": "reasoning"
+        },
+        "text": {
+          "type": "string"
+        },
+        "parent_id": {
+          "type": "string",
+          "description": "The id of the subagent tool_call this item belongs to. Absent for the main conversation."
+        },
+        "turn_id": {
+          "type": "string",
+          "description": "The turn the item was made in."
+        },
+        "created_at": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "raw": {
+          "description": "The harness's own payload this came from, for debugging. Backends can leave it out; clients mustn't depend on it."
+        }
+      }
+    },
+    "ToolCall": {
+      "type": "object",
+      "description": "A tool the agent called, with its result once it has one. A subagent is a tool_call of kind subagent: the items it makes have its id as their parent_id. The optional fields after input are the same facts for every harness, set when the kind has them, so a UI can show a call without knowing the harness's tool names.",
+      "required": [
+        "id",
+        "type",
+        "name",
+        "kind",
+        "input",
+        "status"
+      ],
+      "properties": {
+        "id": {
+          "type": "string",
+          "description": "The harness's id for the call (Claude's tool_use id, Codex's item id)."
+        },
+        "type": {
+          "const": "tool_call"
+        },
+        "name": {
+          "type": "string",
+          "description": "The tool's name as the harness gave it (Bash, Read, apply_patch...). For an MCP tool, the tool's own name; server has the server's."
+        },
+        "kind": {
+          "$ref": "#/$defs/ToolKind"
+        },
+        "input": {
+          "description": "The tool's arguments as the harness gave them, usually an object."
+        },
+        "status": {
+          "$ref": "#/$defs/ToolStatus"
+        },
+        "result": {
+          "$ref": "#/$defs/ToolResult"
+        },
+        "title": {
+          "type": "string",
+          "description": "A short summary of the call, e.g. a subagent's description."
+        },
+        "command": {
+          "type": "string",
+          "description": "shell: the command line."
+        },
+        "path": {
+          "type": "string",
+          "description": "read, search: the file or directory."
+        },
+        "changes": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/FileChange"
+          },
+          "description": "edit: the files it changes."
+        },
+        "query": {
+          "type": "string",
+          "description": "search: the pattern. web: the search query."
+        },
+        "url": {
+          "type": "string",
+          "description": "web: the URL fetched."
+        },
+        "server": {
+          "type": "string",
+          "description": "mcp: the MCP server's name."
+        },
+        "todos": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/Todo"
+          },
+          "description": "todo: the whole list after the call."
+        },
+        "parent_id": {
+          "type": "string",
+          "description": "The id of the subagent tool_call this item belongs to. Absent for the main conversation."
+        },
+        "turn_id": {
+          "type": "string",
+          "description": "The turn the item was made in."
+        },
+        "created_at": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "raw": {
+          "description": "The harness's own payload this came from, for debugging. Backends can leave it out; clients mustn't depend on it."
+        }
+      }
+    },
+    "ToolKind": {
+      "type": "string",
+      "description": "What a tool does, for permission policies and for picking a renderer. shell: runs a command. read: reads files. edit: writes or patches files. search: finds files or text (glob, grep). web: fetches or searches the web. mcp: a tool on an external MCP server. app: a tool the app defined. subagent: starts a subagent. todo: updates the agent's plan or todo list. other: anything else.",
+      "enum": [
+        "shell",
+        "read",
+        "edit",
+        "search",
+        "web",
+        "mcp",
+        "app",
+        "subagent",
+        "todo",
+        "other"
+      ]
+    },
+    "ToolStatus": {
+      "type": "string",
+      "description": "pending: called, not started (e.g. waiting for permission). running: started, no result yet. completed: it returned. failed: it returned an error. denied: permission was refused. cancelled: the turn ended (e.g. was interrupted) before it returned.",
+      "enum": [
+        "pending",
+        "running",
+        "completed",
+        "failed",
+        "denied",
+        "cancelled"
+      ]
+    },
+    "ToolResult": {
+      "type": "object",
+      "description": "What a tool returned. For a failed call, content is the error.",
+      "required": [
+        "content"
+      ],
+      "properties": {
+        "content": {
+          "type": "string",
+          "description": "The result as text. Images become [image]."
+        },
+        "structured": {
+          "description": "Structured output, when the tool gave some (an app tool's return value, MCP structuredContent)."
+        },
+        "truncated": {
+          "type": "boolean",
+          "default": false,
+          "description": "content was cut short before it was saved."
+        },
+        "exit_code": {
+          "type": "integer",
+          "description": "shell: the command's exit code."
+        }
+      }
+    },
+    "FileChange": {
+      "type": "object",
+      "required": [
+        "path",
+        "op"
+      ],
+      "properties": {
+        "path": {
+          "type": "string"
+        },
+        "op": {
+          "type": "string",
+          "enum": [
+            "add",
+            "update",
+            "delete"
+          ]
+        },
+        "diff": {
+          "type": "string",
+          "description": "A unified diff of the change, or the content of an added file."
+        },
+        "move_to": {
+          "type": "string",
+          "description": "The file's new path, when the change renames it."
+        }
+      }
+    },
+    "Todo": {
+      "type": "object",
+      "required": [
+        "text",
+        "status"
+      ],
+      "properties": {
+        "text": {
+          "type": "string"
+        },
+        "status": {
+          "type": "string",
+          "enum": [
+            "pending",
+            "in_progress",
+            "completed"
+          ]
+        }
+      }
+    },
+    "Compaction": {
+      "type": "object",
+      "description": "The harness compacted the conversation's context.",
+      "required": [
+        "id",
+        "type"
+      ],
+      "properties": {
+        "id": {
+          "type": "string"
+        },
+        "type": {
+          "const": "compaction"
+        },
+        "trigger": {
+          "type": "string",
+          "enum": [
+            "auto",
+            "manual"
+          ]
+        },
+        "summary": {
+          "type": "string"
+        },
+        "tokens_before": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "parent_id": {
+          "type": "string",
+          "description": "The id of the subagent tool_call this item belongs to. Absent for the main conversation."
+        },
+        "turn_id": {
+          "type": "string",
+          "description": "The turn the item was made in."
+        },
+        "created_at": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "raw": {
+          "description": "The harness's own payload this came from, for debugging. Backends can leave it out; clients mustn't depend on it."
+        }
+      }
+    },
+    "Notice": {
+      "type": "object",
+      "description": "Something to tell the user that isn't the agent talking: an error, a retry, hook output, a run re-attached after a restart.",
+      "required": [
+        "id",
+        "type",
+        "level",
+        "text"
+      ],
+      "properties": {
+        "id": {
+          "type": "string"
+        },
+        "type": {
+          "const": "notice"
+        },
+        "level": {
+          "type": "string",
+          "enum": [
+            "info",
+            "warning",
+            "error"
+          ]
+        },
+        "text": {
+          "type": "string"
+        },
+        "code": {
+          "type": "string",
+          "description": "What kind of notice it is, for apps that treat some specially. Known codes: run.reattached (a restarted backend picked up a run that was still going), run.lost (a run ended while the backend was down), retry, hook, stderr.",
+          "examples": [
+            "run.reattached",
+            "run.lost",
+            "retry",
+            "hook",
+            "stderr"
+          ]
+        },
+        "detail": {
+          "type": "string",
+          "description": "More text, e.g. a stack trace or a hook's full output."
+        },
+        "parent_id": {
+          "type": "string",
+          "description": "The id of the subagent tool_call this item belongs to. Absent for the main conversation."
+        },
+        "turn_id": {
+          "type": "string",
+          "description": "The turn the item was made in."
+        },
+        "created_at": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "raw": {
+          "description": "The harness's own payload this came from, for debugging. Backends can leave it out; clients mustn't depend on it."
+        }
+      }
+    },
+    "TurnResult": {
+      "type": "object",
+      "description": "How a turn ended. The last item of each turn.",
+      "required": [
+        "id",
+        "type",
+        "ok"
+      ],
+      "properties": {
+        "id": {
+          "type": "string"
+        },
+        "type": {
+          "const": "turn_result"
+        },
+        "ok": {
+          "type": "boolean",
+          "description": "The turn finished without an error. An interrupted turn isn't ok."
+        },
+        "interrupted": {
+          "type": "boolean",
+          "default": false,
+          "description": "The turn was stopped by an interrupt command."
+        },
+        "error": {
+          "type": "string"
+        },
+        "usage": {
+          "$ref": "#/$defs/Usage",
+          "description": "Tokens the turn used."
+        },
+        "duration_ms": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "parent_id": {
+          "type": "string",
+          "description": "The id of the subagent tool_call this item belongs to. Absent for the main conversation."
+        },
+        "turn_id": {
+          "type": "string",
+          "description": "The turn the item was made in."
+        },
+        "created_at": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "raw": {
+          "description": "The harness's own payload this came from, for debugging. Backends can leave it out; clients mustn't depend on it."
+        }
+      }
+    },
+    "Attachment": {
+      "type": "object",
+      "description": "A file sent with a message: inline as base64 data, or by path on the backend's machine.",
+      "required": [
+        "kind"
+      ],
+      "properties": {
+        "kind": {
+          "type": "string",
+          "enum": [
+            "image",
+            "file"
+          ]
+        },
+        "name": {
+          "type": "string"
+        },
+        "media_type": {
+          "type": "string",
+          "examples": [
+            "image/png"
+          ]
+        },
+        "data": {
+          "type": "string",
+          "contentEncoding": "base64"
+        },
+        "path": {
+          "type": "string"
+        }
+      }
+    },
+    "ThreadRequest": {
+      "description": "An open request, told apart by type.",
+      "oneOf": [
+        {
+          "$ref": "#/$defs/PermissionRequest"
+        },
+        {
+          "$ref": "#/$defs/QuestionRequest"
+        }
+      ]
+    },
+    "PermissionRequest": {
+      "type": "object",
+      "description": "The agent wants to call a tool, and the permission policy said ask. Answered with outcome allow or deny.",
+      "required": [
+        "id",
+        "type",
+        "name",
+        "kind",
+        "input"
+      ],
+      "properties": {
+        "id": {
+          "type": "string"
+        },
+        "type": {
+          "const": "permission"
+        },
+        "tool_call_id": {
+          "type": "string",
+          "description": "The tool_call item it's for, when there is one."
+        },
+        "name": {
+          "type": "string",
+          "description": "The tool's name, as in ToolCall.name."
+        },
+        "kind": {
+          "$ref": "#/$defs/ToolKind"
+        },
+        "input": {
+          "description": "The tool's arguments, as in ToolCall.input."
+        },
+        "title": {
+          "type": "string",
+          "description": "A short summary of what's asked, e.g. the command line."
+        },
+        "reason": {
+          "type": "string",
+          "description": "Why the harness asks, when it says."
+        },
+        "parent_id": {
+          "type": "string",
+          "description": "The subagent tool_call that's asking, if one is."
+        },
+        "turn_id": {
+          "type": "string"
+        },
+        "created_at": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "raw": {
+          "description": "The harness's own payload, for debugging."
+        }
+      }
+    },
+    "QuestionRequest": {
+      "type": "object",
+      "description": "The agent asks the user one or more questions (Claude's AskUserQuestion, Codex's requestUserInput). Answered with outcome answer.",
+      "required": [
+        "id",
+        "type",
+        "questions"
+      ],
+      "properties": {
+        "id": {
+          "type": "string"
+        },
+        "type": {
+          "const": "question"
+        },
+        "questions": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "$ref": "#/$defs/Question"
+          }
+        },
+        "tool_call_id": {
+          "type": "string",
+          "description": "The tool_call item it's for, when there is one."
+        },
+        "parent_id": {
+          "type": "string",
+          "description": "The subagent tool_call that's asking, if one is."
+        },
+        "turn_id": {
+          "type": "string"
+        },
+        "created_at": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "raw": {
+          "description": "The harness's own payload, for debugging."
+        }
+      }
+    },
+    "Question": {
+      "type": "object",
+      "required": [
+        "id",
+        "question"
+      ],
+      "properties": {
+        "id": {
+          "type": "string",
+          "description": "Unique within the request; the key for its answer."
+        },
+        "question": {
+          "type": "string"
+        },
+        "header": {
+          "type": "string",
+          "description": "A very short label for it."
+        },
+        "options": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/QuestionOption"
+          },
+          "description": "Choices. With none, the answer is free text."
+        },
+        "multi_select": {
+          "type": "boolean",
+          "default": false,
+          "description": "More than one option can be chosen."
+        },
+        "allow_other": {
+          "type": "boolean",
+          "default": false,
+          "description": "Free text is accepted as well as the options."
+        },
+        "secret": {
+          "type": "boolean",
+          "default": false,
+          "description": "The answer is a secret: don't show or log it."
+        }
+      }
+    },
+    "QuestionOption": {
+      "type": "object",
+      "required": [
+        "label"
+      ],
+      "properties": {
+        "label": {
+          "type": "string",
+          "description": "The option's text, which is also its answer."
+        },
+        "description": {
+          "type": "string"
+        }
+      }
+    },
+    "Resolution": {
+      "type": "object",
+      "description": "How a request was answered: sent in respond, and repeated in request.resolved.",
+      "required": [
+        "outcome"
+      ],
+      "properties": {
+        "outcome": {
+          "type": "string",
+          "enum": [
+            "allow",
+            "deny",
+            "answer",
+            "cancel"
+          ],
+          "description": "allow, deny: for a permission. answer: for a question. cancel: for either, when the user dismisses it or the turn ends first."
+        },
+        "always": {
+          "type": "boolean",
+          "default": false,
+          "description": "allow, deny: apply the same answer to matching calls for the rest of the thread, without asking."
+        },
+        "message": {
+          "type": "string",
+          "description": "deny: why, which the agent is told. answer: a note with the answers."
+        },
+        "answers": {
+          "type": "object",
+          "description": "answer: for each question id, the chosen option labels or the free text.",
+          "additionalProperties": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          }
+        }
+      }
+    },
+    "Snapshot": {
+      "type": "object",
+      "description": "A thread's whole state as of seq: what applying its events, in order, from the start gives.",
+      "required": [
+        "thread",
+        "items",
+        "requests",
+        "seq"
+      ],
+      "properties": {
+        "thread": {
+          "$ref": "#/$defs/Thread"
+        },
+        "items": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/Item"
+          }
+        },
+        "requests": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/ThreadRequest"
+          },
+          "description": "The open requests, oldest first."
+        },
+        "seq": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "The seq of the last saved event it includes; 0 for none."
+        }
+      }
+    },
+    "Thread": {
+      "type": "object",
+      "description": "A thread's own state. Sent whole in thread.updated and in snapshots.",
+      "required": [
+        "id",
+        "harness",
+        "status",
+        "created_at"
+      ],
+      "properties": {
+        "id": {
+          "type": "string",
+          "description": "The thread's id, chosen by the backend."
+        },
+        "harness": {
+          "type": "string",
+          "description": "The harness driver that runs it: \"claude\" or \"codex\" in v1.",
+          "examples": [
+            "claude",
+            "codex"
+          ]
+        },
+        "status": {
+          "$ref": "#/$defs/ThreadStatus"
+        },
+        "title": {
+          "type": "string"
+        },
+        "model": {
+          "type": "string",
+          "description": "The model the next turn uses, as the harness names it."
+        },
+        "effort": {
+          "type": "string",
+          "description": "Reasoning effort, as the harness names it (e.g. low, medium, high)."
+        },
+        "permission_mode": {
+          "$ref": "#/$defs/PermissionMode"
+        },
+        "cwd": {
+          "type": "string",
+          "description": "The working directory the harness runs in."
+        },
+        "session_id": {
+          "type": "string",
+          "description": "The harness's own session or thread id, used to resume it."
+        },
+        "usage": {
+          "$ref": "#/$defs/Usage",
+          "description": "Tokens used by the thread so far, over all its turns."
+        },
+        "error": {
+          "type": "string",
+          "description": "What went wrong, when status is error."
+        },
+        "run": {
+          "$ref": "#/$defs/Run",
+          "description": "The harness process running the thread, if one is. Absent when it's idle with no process."
+        },
+        "metadata": {
+          "type": "object",
+          "additionalProperties": true,
+          "description": "The app's own data, given when the thread was created. Backends store it and pass it to tools; they don't read it."
+        },
+        "created_at": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "updated_at": {
+          "type": "string",
+          "format": "date-time"
+        }
+      }
+    },
+    "ThreadStatus": {
+      "type": "string",
+      "description": "idle: no turn is running. running: a turn is running. waiting: a turn is waiting on a request (permission or question). error: the last turn failed, or the harness couldn't start; the next send tries again.",
+      "enum": [
+        "idle",
+        "running",
+        "waiting",
+        "error"
+      ]
+    },
+    "PermissionMode": {
+      "type": "string",
+      "description": "default: ask (via the permission policy) for anything the harness would ask about. accept_edits: file edits in cwd are allowed without asking. plan: the agent plans and doesn't change anything. bypass: nothing is asked.",
+      "enum": [
+        "default",
+        "accept_edits",
+        "plan",
+        "bypass"
+      ]
+    },
+    "Run": {
+      "type": "object",
+      "description": "A harness process. A run started under the shim can outlive the backend: after a restart the backend re-attaches to it and sets reattached_at.",
+      "required": [
+        "id",
+        "spawner"
+      ],
+      "properties": {
+        "id": {
+          "type": "string",
+          "description": "The run's id (with the shim, its run directory's name)."
+        },
+        "spawner": {
+          "type": "string",
+          "enum": [
+            "direct",
+            "shim"
+          ],
+          "description": "direct: a child process of the backend, which ends with it. shim: supervised by agent-threads-shim, so it survives a backend restart."
+        },
+        "started_at": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "reattached_at": {
+          "type": "string",
+          "format": "date-time",
+          "description": "When a restarted backend last re-attached to the run. Absent if it never has."
+        }
+      }
+    },
+    "Usage": {
+      "type": "object",
+      "description": "Token counts.",
+      "required": [
+        "input_tokens",
+        "output_tokens"
+      ],
+      "properties": {
+        "input_tokens": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "output_tokens": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "cache_read_tokens": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "cache_write_tokens": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "cost_usd": {
+          "type": "number",
+          "minimum": 0,
+          "description": "What the tokens cost, when the harness says."
+        }
+      }
+    }
+  }
+}
