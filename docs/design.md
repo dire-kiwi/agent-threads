@@ -37,7 +37,7 @@ hand. The wire format is specified in [spec/PROTOCOL.md](../spec/PROTOCOL.md) an
   subagents and partial messages).
 - **Claude Code and Codex** for v1.
 - **Isolated config by default**: a thread sees only the app's tools, MCP servers and skills. Claude
-  runs with `--setting-sources` limited, `--strict-mcp-config` and its own skills directory; Codex
+  runs with `--setting-sources` limited, `--strict-mcp-config` and its own skills plugin; Codex
   gets an app-specific `CODEX_HOME` with the login linked in. The login is still the user's, and apps
   can opt in to user settings.
 - **Stores**: in-memory, JSONL file and SQLite, built into every backend. They all pass one store
@@ -183,7 +183,7 @@ Tool handlers get a `ctx` with the thread id and metadata, so an app can scope t
 | External MCP servers | `--mcp-config` + `--strict-mcp-config` | `mcp_servers` in `thread/start` config overrides |
 | Permissions | `--permission-prompt-tool stdio` → `can_use_tool` control requests | Approval server requests (`commandExecution`, `fileChange`, MCP elicitation) |
 | Questions to the user | `AskUserQuestion`, answered through the permission callback | `item/tool/requestUserInput` |
-| Skills | The app's skills copied into a generated `.claude/skills` directory passed with `--add-dir`; others turned off with `--disallowedTools Skill(name)` | `skills/extraRoots/set` |
+| Skills | The app's skills copied into a generated plugin passed with `--plugin-dir` (Claude doesn't look in `.claude/skills` directories with `--setting-sources ""`) | `skills/extraRoots/set` |
 | Subagents | `parent_tool_use_id`, plus `--agents` for app-defined agents | Child threads |
 
 ## The shim: runs that outlive the backend

@@ -8,8 +8,8 @@
   },
   "files": ["dist"],
   "scripts": {
-    "build": "tsc",
-    "test": "tsc --noEmit"
+    "build": "tsc -p tsconfig.build.json",
+    "test": "tsc --noEmit && vitest run"
   },
   "dependencies": {
     "@dire-kiwi/agent-threads-protocol": "workspace:*"

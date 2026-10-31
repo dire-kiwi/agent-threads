@@ -3,3 +3,5 @@
 
 export type * from "./generated.js";
 export { applyEvent, applyEvents, initialState, isGap } from "./reducer.js";
+export { validate, type SchemaName } from "./validate.js";
+export { schema } from "./schema.js";
