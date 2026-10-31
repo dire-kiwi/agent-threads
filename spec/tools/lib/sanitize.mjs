@@ -113,7 +113,9 @@ function deltaRef(e) {
     const key = `${e.run}|${m.parent_tool_use_id}|${m.api_message_id ?? m.event.message_id}|${m.event.index}|${field}`;
     return { key, get: () => d[field], set: (v) => (d[field] = v) };
   }
-  if (typeof m.method === "string" && /Delta$/.test(m.method) && typeof m.params?.delta === "string") {
+  // Codex's streams: item/agentMessage/delta, and the camel-cased ones (item/reasoning/textDelta,
+  // item/commandExecution/outputDelta...).
+  if (typeof m.method === "string" && /(\/d|D)elta$/.test(m.method) && typeof m.params?.delta === "string") {
     const p = m.params;
     const key = `${e.run}|${m.method}|${p.threadId}|${p.itemId}|${p.summaryIndex ?? p.contentIndex ?? ""}`;
     return { key, get: () => p.delta, set: (v) => (p.delta = v) };
