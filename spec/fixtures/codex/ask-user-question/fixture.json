@@ -1,0 +1,52 @@
+{
+  "description": "item/tool/requestUserInput, answered by the user.",
+  "recorded": {
+    "cli": "codex-cli 0.165.0",
+    "model": "gpt-5.6-luna",
+    "date": "2026-10-31"
+  },
+  "thread": {
+    "harness": "codex",
+    "model": "gpt-5.6-luna",
+    "effort": "low"
+  },
+  "permissions": "allow",
+  "steps": [
+    {
+      "send": {
+        "type": "send",
+        "text": "Use the request_user_input tool to ask me one question: which color do I prefer, with the options red and blue (header: Color). Then reply with just the color I chose.",
+        "client_id": "c1"
+      }
+    },
+    {
+      "wait": {
+        "type": "thread.updated",
+        "thread": {
+          "status": "waiting"
+        }
+      }
+    },
+    {
+      "send": {
+        "type": "respond",
+        "resolution": {
+          "outcome": "answer",
+          "answers": {
+            "color": [
+              "Blue"
+            ]
+          }
+        }
+      }
+    },
+    {
+      "wait": {
+        "type": "thread.updated",
+        "thread": {
+          "status": "idle"
+        }
+      }
+    }
+  ]
+}

@@ -1,0 +1,45 @@
+{
+  "description": "A message sent while a turn is running, which joins that turn.",
+  "recorded": {
+    "cli": "2.1.312 (Claude Code)",
+    "model": "haiku",
+    "date": "2026-10-31"
+  },
+  "thread": {
+    "harness": "claude",
+    "model": "haiku"
+  },
+  "permissions": "allow",
+  "steps": [
+    {
+      "send": {
+        "type": "send",
+        "text": "Run `sleep 5 && echo first` with the Bash tool, then reply with its output.",
+        "client_id": "c1"
+      }
+    },
+    {
+      "wait": {
+        "type": "item.added",
+        "item": {
+          "id": "toolu_01AdiFBCZbmGs7psADyRJ4rk"
+        }
+      }
+    },
+    {
+      "send": {
+        "type": "send",
+        "text": "Also end your reply with the word: steered",
+        "client_id": "c2"
+      }
+    },
+    {
+      "wait": {
+        "type": "thread.updated",
+        "thread": {
+          "status": "idle"
+        }
+      }
+    }
+  ]
+}

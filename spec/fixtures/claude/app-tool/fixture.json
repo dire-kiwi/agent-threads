@@ -1,0 +1,48 @@
+{
+  "description": "An app-defined tool (lookup_order), served by the backend as an in-process sdk MCP server over the control channel.",
+  "recorded": {
+    "cli": "2.1.312 (Claude Code)",
+    "model": "haiku",
+    "date": "2026-10-31"
+  },
+  "thread": {
+    "harness": "claude",
+    "model": "haiku"
+  },
+  "permissions": "allow",
+  "tools": [
+    {
+      "name": "lookup_order",
+      "description": "Looks up an order by its id and says what's in it and whether it has shipped.",
+      "input": {
+        "type": "object",
+        "properties": {
+          "order_id": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "order_id"
+        ]
+      },
+      "result": "Order 42: 3 blue widgets, shipped on 2026-10-30."
+    }
+  ],
+  "steps": [
+    {
+      "send": {
+        "type": "send",
+        "text": "Look up order 42 with the lookup_order tool and tell me in one short sentence what's in it.",
+        "client_id": "c1"
+      }
+    },
+    {
+      "wait": {
+        "type": "thread.updated",
+        "thread": {
+          "status": "idle"
+        }
+      }
+    }
+  ]
+}

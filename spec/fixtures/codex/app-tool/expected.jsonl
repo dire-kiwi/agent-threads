@@ -1,0 +1,41 @@
+{"type":"thread.updated","thread_id":"{{thread}}","seq":1,"thread":{"id":"{{thread}}","harness":"codex","status":"idle","model":"gpt-5.6-luna","effort":"low","permission_mode":"default","cwd":"{{cwd}}","created_at":"2026-11-01T00:00:00Z"}}
+{"type":"item.added","thread_id":"{{thread}}","seq":2,"item":{"id":"{{u1}}","type":"user_message","text":"Look up order 42 with the lookup_order tool and tell me in one short sentence what's in it.","client_id":"c1","turn_id":"{{t1}}"}}
+{"type":"turn.started","thread_id":"{{thread}}","seq":3,"turn_id":"{{t1}}"}
+{"type":"thread.updated","thread_id":"{{thread}}","seq":4,"thread":{"id":"{{thread}}","harness":"codex","status":"running","model":"gpt-5.6-luna","effort":"low","permission_mode":"default","cwd":"{{cwd}}","created_at":"2026-11-01T00:00:00Z"}}
+{"type":"thread.updated","thread_id":"{{thread}}","seq":5,"thread":{"id":"{{thread}}","harness":"codex","status":"running","model":"gpt-5.6-luna","effort":"low","permission_mode":"default","cwd":"{{cwd}}","created_at":"2026-11-01T00:00:00Z","session_id":"01a19253-e058-7f41-8968-a3223801cff3"}}
+{"type":"item.added","thread_id":"{{thread}}","seq":6,"item":{"id":"msg_01ac33431ed4f893016ae5f8ceddd48191ba77e922532f70c7","type":"assistant_message","text":"","turn_id":"{{t1}}"}}
+{"type":"delta","thread_id":"{{thread}}","seq":6,"item_id":"msg_01ac33431ed4f893016ae5f8ceddd48191ba77e922532f70c7","kind":"text","text":"I"}
+{"type":"delta","thread_id":"{{thread}}","seq":6,"item_id":"msg_01ac33431ed4f893016ae5f8ceddd48191ba77e922532f70c7","kind":"text","text":"’m"}
+{"type":"delta","thread_id":"{{thread}}","seq":6,"item_id":"msg_01ac33431ed4f893016ae5f8ceddd48191ba77e922532f70c7","kind":"text","text":" checking"}
+{"type":"delta","thread_id":"{{thread}}","seq":6,"item_id":"msg_01ac33431ed4f893016ae5f8ceddd48191ba77e922532f70c7","kind":"text","text":" order"}
+{"type":"delta","thread_id":"{{thread}}","seq":6,"item_id":"msg_01ac33431ed4f893016ae5f8ceddd48191ba77e922532f70c7","kind":"text","text":" "}
+{"type":"delta","thread_id":"{{thread}}","seq":6,"item_id":"msg_01ac33431ed4f893016ae5f8ceddd48191ba77e922532f70c7","kind":"text","text":"42"}
+{"type":"delta","thread_id":"{{thread}}","seq":6,"item_id":"msg_01ac33431ed4f893016ae5f8ceddd48191ba77e922532f70c7","kind":"text","text":" now"}
+{"type":"delta","thread_id":"{{thread}}","seq":6,"item_id":"msg_01ac33431ed4f893016ae5f8ceddd48191ba77e922532f70c7","kind":"text","text":"."}
+{"type":"item.updated","thread_id":"{{thread}}","seq":7,"item_id":"msg_01ac33431ed4f893016ae5f8ceddd48191ba77e922532f70c7","patch":{"text":"I’m checking order 42 now."}}
+{"type":"item.added","thread_id":"{{thread}}","seq":8,"item":{"id":"exec-1f95cfdf-b6a4-4f99-9238-2d6f341a3b52","type":"tool_call","name":"lookup_order","kind":"app","input":{"order_id":"42"},"status":"running","turn_id":"{{t1}}"}}
+{"type":"item.updated","thread_id":"{{thread}}","seq":9,"item_id":"exec-1f95cfdf-b6a4-4f99-9238-2d6f341a3b52","patch":{"status":"completed","result":{"content":"Order 42: 3 blue widgets, shipped on 2026-10-30."}}}
+{"type":"item.added","thread_id":"{{thread}}","seq":10,"item":{"id":"msg_01ac33431ed4f893016ae5f8d04e6c81918cd218950b4d82db","type":"assistant_message","text":"","turn_id":"{{t1}}"}}
+{"type":"delta","thread_id":"{{thread}}","seq":10,"item_id":"msg_01ac33431ed4f893016ae5f8d04e6c81918cd218950b4d82db","kind":"text","text":"Order"}
+{"type":"delta","thread_id":"{{thread}}","seq":10,"item_id":"msg_01ac33431ed4f893016ae5f8d04e6c81918cd218950b4d82db","kind":"text","text":" "}
+{"type":"delta","thread_id":"{{thread}}","seq":10,"item_id":"msg_01ac33431ed4f893016ae5f8d04e6c81918cd218950b4d82db","kind":"text","text":"42"}
+{"type":"delta","thread_id":"{{thread}}","seq":10,"item_id":"msg_01ac33431ed4f893016ae5f8d04e6c81918cd218950b4d82db","kind":"text","text":" contains"}
+{"type":"delta","thread_id":"{{thread}}","seq":10,"item_id":"msg_01ac33431ed4f893016ae5f8d04e6c81918cd218950b4d82db","kind":"text","text":" "}
+{"type":"delta","thread_id":"{{thread}}","seq":10,"item_id":"msg_01ac33431ed4f893016ae5f8d04e6c81918cd218950b4d82db","kind":"text","text":"3"}
+{"type":"delta","thread_id":"{{thread}}","seq":10,"item_id":"msg_01ac33431ed4f893016ae5f8d04e6c81918cd218950b4d82db","kind":"text","text":" blue"}
+{"type":"delta","thread_id":"{{thread}}","seq":10,"item_id":"msg_01ac33431ed4f893016ae5f8d04e6c81918cd218950b4d82db","kind":"text","text":" widgets"}
+{"type":"delta","thread_id":"{{thread}}","seq":10,"item_id":"msg_01ac33431ed4f893016ae5f8d04e6c81918cd218950b4d82db","kind":"text","text":" and"}
+{"type":"delta","thread_id":"{{thread}}","seq":10,"item_id":"msg_01ac33431ed4f893016ae5f8d04e6c81918cd218950b4d82db","kind":"text","text":" shipped"}
+{"type":"delta","thread_id":"{{thread}}","seq":10,"item_id":"msg_01ac33431ed4f893016ae5f8d04e6c81918cd218950b4d82db","kind":"text","text":" on"}
+{"type":"delta","thread_id":"{{thread}}","seq":10,"item_id":"msg_01ac33431ed4f893016ae5f8d04e6c81918cd218950b4d82db","kind":"text","text":" October"}
+{"type":"delta","thread_id":"{{thread}}","seq":10,"item_id":"msg_01ac33431ed4f893016ae5f8d04e6c81918cd218950b4d82db","kind":"text","text":" "}
+{"type":"delta","thread_id":"{{thread}}","seq":10,"item_id":"msg_01ac33431ed4f893016ae5f8d04e6c81918cd218950b4d82db","kind":"text","text":"30"}
+{"type":"delta","thread_id":"{{thread}}","seq":10,"item_id":"msg_01ac33431ed4f893016ae5f8d04e6c81918cd218950b4d82db","kind":"text","text":","}
+{"type":"delta","thread_id":"{{thread}}","seq":10,"item_id":"msg_01ac33431ed4f893016ae5f8d04e6c81918cd218950b4d82db","kind":"text","text":" "}
+{"type":"delta","thread_id":"{{thread}}","seq":10,"item_id":"msg_01ac33431ed4f893016ae5f8d04e6c81918cd218950b4d82db","kind":"text","text":"202"}
+{"type":"delta","thread_id":"{{thread}}","seq":10,"item_id":"msg_01ac33431ed4f893016ae5f8d04e6c81918cd218950b4d82db","kind":"text","text":"6"}
+{"type":"delta","thread_id":"{{thread}}","seq":10,"item_id":"msg_01ac33431ed4f893016ae5f8d04e6c81918cd218950b4d82db","kind":"text","text":"."}
+{"type":"item.updated","thread_id":"{{thread}}","seq":11,"item_id":"msg_01ac33431ed4f893016ae5f8d04e6c81918cd218950b4d82db","patch":{"text":"Order 42 contains 3 blue widgets and shipped on October 30, 2026."}}
+{"type":"item.added","thread_id":"{{thread}}","seq":12,"item":{"id":"{{tr1}}","type":"turn_result","ok":true,"usage":{"input_tokens":12352,"output_tokens":65,"cache_read_tokens":11904,"cache_write_tokens":0},"duration_ms":3321,"turn_id":"{{t1}}"}}
+{"type":"turn.completed","thread_id":"{{thread}}","seq":13,"turn_id":"{{t1}}"}
+{"type":"thread.updated","thread_id":"{{thread}}","seq":14,"thread":{"id":"{{thread}}","harness":"codex","status":"idle","model":"gpt-5.6-luna","effort":"low","permission_mode":"default","cwd":"{{cwd}}","created_at":"2026-11-01T00:00:00Z","session_id":"01a19253-e058-7f41-8968-a3223801cff3","usage":{"input_tokens":12352,"output_tokens":65,"cache_read_tokens":11904,"cache_write_tokens":0}}}

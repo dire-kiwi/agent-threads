@@ -1,0 +1,48 @@
+{
+  "description": "Two runs: a turn, the process ends, then a new process resumes the session with --resume.",
+  "recorded": {
+    "cli": "2.1.312 (Claude Code)",
+    "model": "haiku",
+    "date": "2026-10-31"
+  },
+  "thread": {
+    "harness": "claude",
+    "model": "haiku"
+  },
+  "permissions": "allow",
+  "steps": [
+    {
+      "send": {
+        "type": "send",
+        "text": "Remember the word pineapple. Reply with just: ok",
+        "client_id": "c1"
+      }
+    },
+    {
+      "wait": {
+        "type": "thread.updated",
+        "thread": {
+          "status": "idle"
+        }
+      }
+    },
+    {
+      "restart": true
+    },
+    {
+      "send": {
+        "type": "send",
+        "text": "What word did I ask you to remember? Reply with just the word.",
+        "client_id": "c2"
+      }
+    },
+    {
+      "wait": {
+        "type": "thread.updated",
+        "thread": {
+          "status": "idle"
+        }
+      }
+    }
+  ]
+}

@@ -1,0 +1,47 @@
+{
+  "description": "A Bash call that the user denies when asked, with a message the agent is told.",
+  "recorded": {
+    "cli": "2.1.312 (Claude Code)",
+    "model": "haiku",
+    "date": "2026-10-31"
+  },
+  "thread": {
+    "harness": "claude",
+    "model": "haiku"
+  },
+  "permissions": "ask",
+  "steps": [
+    {
+      "send": {
+        "type": "send",
+        "text": "Run this shell command with the Bash tool: touch denied.txt — if you can't, reply with just: not allowed",
+        "client_id": "c1"
+      }
+    },
+    {
+      "wait": {
+        "type": "thread.updated",
+        "thread": {
+          "status": "waiting"
+        }
+      }
+    },
+    {
+      "send": {
+        "type": "respond",
+        "resolution": {
+          "outcome": "deny",
+          "message": "The user doesn't want files created."
+        }
+      }
+    },
+    {
+      "wait": {
+        "type": "thread.updated",
+        "thread": {
+          "status": "idle"
+        }
+      }
+    }
+  ]
+}

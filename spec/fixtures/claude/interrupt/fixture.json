@@ -1,0 +1,43 @@
+{
+  "description": "An interrupt while a long Bash command runs.",
+  "recorded": {
+    "cli": "2.1.312 (Claude Code)",
+    "model": "haiku",
+    "date": "2026-10-31"
+  },
+  "thread": {
+    "harness": "claude",
+    "model": "haiku"
+  },
+  "permissions": "allow",
+  "steps": [
+    {
+      "send": {
+        "type": "send",
+        "text": "Run `python3 -c 'import time; time.sleep(30); print(\"finished\")'` with the Bash tool, then reply with its output.",
+        "client_id": "c1"
+      }
+    },
+    {
+      "wait": {
+        "type": "item.added",
+        "item": {
+          "id": "toolu_013swdkX1XNatdHoBeWjMQUU"
+        }
+      }
+    },
+    {
+      "send": {
+        "type": "interrupt"
+      }
+    },
+    {
+      "wait": {
+        "type": "thread.updated",
+        "thread": {
+          "status": "idle"
+        }
+      }
+    }
+  ]
+}

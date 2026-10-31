@@ -1,0 +1,31 @@
+{
+  "description": "A subagent: Codex spawns a child thread, whose items arrive with the child's threadId.",
+  "recorded": {
+    "cli": "codex-cli 0.165.0",
+    "model": "gpt-5.6-luna",
+    "date": "2026-10-31"
+  },
+  "thread": {
+    "harness": "codex",
+    "model": "gpt-5.6-luna",
+    "effort": "low"
+  },
+  "permissions": "allow",
+  "steps": [
+    {
+      "send": {
+        "type": "send",
+        "text": "Spawn one subagent with this task: 'Read notes.txt and reply with its first line only.' Wait for it, then reply with just what the subagent said.",
+        "client_id": "c1"
+      }
+    },
+    {
+      "wait": {
+        "type": "thread.updated",
+        "thread": {
+          "status": "idle"
+        }
+      }
+    }
+  ]
+}

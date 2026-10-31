@@ -1,0 +1,46 @@
+{
+  "description": "A message sent while a turn is running (turn/steer), which joins that turn.",
+  "recorded": {
+    "cli": "codex-cli 0.165.0",
+    "model": "gpt-5.6-luna",
+    "date": "2026-10-31"
+  },
+  "thread": {
+    "harness": "codex",
+    "model": "gpt-5.6-luna",
+    "effort": "low"
+  },
+  "permissions": "allow",
+  "steps": [
+    {
+      "send": {
+        "type": "send",
+        "text": "Run `sleep 5 && echo first`, then reply with its output.",
+        "client_id": "c1"
+      }
+    },
+    {
+      "wait": {
+        "type": "item.added",
+        "item": {
+          "id": "exec-28e495c3-c328-4311-ace4-b2128f83f36f"
+        }
+      }
+    },
+    {
+      "send": {
+        "type": "send",
+        "text": "Also end your reply with the word: steered",
+        "client_id": "c2"
+      }
+    },
+    {
+      "wait": {
+        "type": "thread.updated",
+        "thread": {
+          "status": "idle"
+        }
+      }
+    }
+  ]
+}

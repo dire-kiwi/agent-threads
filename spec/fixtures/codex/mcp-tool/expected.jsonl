@@ -1,0 +1,15 @@
+{"type":"thread.updated","thread_id":"{{thread}}","seq":1,"thread":{"id":"{{thread}}","harness":"codex","status":"idle","model":"gpt-5.6-luna","effort":"low","permission_mode":"default","cwd":"{{cwd}}","created_at":"2026-11-01T00:00:00Z"}}
+{"type":"item.added","thread_id":"{{thread}}","seq":2,"item":{"id":"{{u1}}","type":"user_message","text":"Call the echo tool with the text: fixture. Then reply with exactly what it returned.","client_id":"c1","turn_id":"{{t1}}"}}
+{"type":"turn.started","thread_id":"{{thread}}","seq":3,"turn_id":"{{t1}}"}
+{"type":"thread.updated","thread_id":"{{thread}}","seq":4,"thread":{"id":"{{thread}}","harness":"codex","status":"running","model":"gpt-5.6-luna","effort":"low","permission_mode":"default","cwd":"{{cwd}}","created_at":"2026-11-01T00:00:00Z"}}
+{"type":"thread.updated","thread_id":"{{thread}}","seq":5,"thread":{"id":"{{thread}}","harness":"codex","status":"running","model":"gpt-5.6-luna","effort":"low","permission_mode":"default","cwd":"{{cwd}}","created_at":"2026-11-01T00:00:00Z","session_id":"01a19253-ef3a-74e3-a892-f12cc987dc04"}}
+{"type":"item.added","thread_id":"{{thread}}","seq":6,"item":{"id":"exec-3cc477c3-412f-492c-b28d-079a8806ab2b","type":"tool_call","name":"echo","kind":"mcp","input":{"text":"fixture"},"server":"echo","status":"running","turn_id":"{{t1}}"}}
+{"type":"item.updated","thread_id":"{{thread}}","seq":7,"item_id":"exec-3cc477c3-412f-492c-b28d-079a8806ab2b","patch":{"status":"completed","result":{"content":"echo: fixture"}}}
+{"type":"item.added","thread_id":"{{thread}}","seq":8,"item":{"id":"msg_062d09bf8848b474016ae5f8d841488191a349b68a3fb7a819","type":"assistant_message","text":"","turn_id":"{{t1}}"}}
+{"type":"delta","thread_id":"{{thread}}","seq":8,"item_id":"msg_062d09bf8848b474016ae5f8d841488191a349b68a3fb7a819","kind":"text","text":"echo"}
+{"type":"delta","thread_id":"{{thread}}","seq":8,"item_id":"msg_062d09bf8848b474016ae5f8d841488191a349b68a3fb7a819","kind":"text","text":":"}
+{"type":"delta","thread_id":"{{thread}}","seq":8,"item_id":"msg_062d09bf8848b474016ae5f8d841488191a349b68a3fb7a819","kind":"text","text":" fixture"}
+{"type":"item.updated","thread_id":"{{thread}}","seq":9,"item_id":"msg_062d09bf8848b474016ae5f8d841488191a349b68a3fb7a819","patch":{"text":"echo: fixture"}}
+{"type":"item.added","thread_id":"{{thread}}","seq":10,"item":{"id":"{{tr1}}","type":"turn_result","ok":true,"usage":{"input_tokens":12558,"output_tokens":119,"cache_read_tokens":23936,"cache_write_tokens":0},"duration_ms":7412,"turn_id":"{{t1}}"}}
+{"type":"turn.completed","thread_id":"{{thread}}","seq":11,"turn_id":"{{t1}}"}
+{"type":"thread.updated","thread_id":"{{thread}}","seq":12,"thread":{"id":"{{thread}}","harness":"codex","status":"idle","model":"gpt-5.6-luna","effort":"low","permission_mode":"default","cwd":"{{cwd}}","created_at":"2026-11-01T00:00:00Z","session_id":"01a19253-ef3a-74e3-a892-f12cc987dc04","usage":{"input_tokens":12558,"output_tokens":119,"cache_read_tokens":23936,"cache_write_tokens":0}}}

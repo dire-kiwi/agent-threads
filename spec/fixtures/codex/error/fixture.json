@@ -1,0 +1,31 @@
+{
+  "description": "A turn that fails: the model doesn't exist.",
+  "recorded": {
+    "cli": "codex-cli 0.165.0",
+    "model": "gpt-5.6-luna",
+    "date": "2026-10-31"
+  },
+  "thread": {
+    "harness": "codex",
+    "model": "gpt-no-such-model",
+    "effort": "low"
+  },
+  "permissions": "allow",
+  "steps": [
+    {
+      "send": {
+        "type": "send",
+        "text": "Reply with: hi",
+        "client_id": "c1"
+      }
+    },
+    {
+      "wait": {
+        "type": "thread.updated",
+        "thread": {
+          "status": "error"
+        }
+      }
+    }
+  ]
+}

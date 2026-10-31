@@ -1,0 +1,39 @@
+{
+  "description": "A tool on an external stdio MCP server (echo), given in thread/start's config.",
+  "recorded": {
+    "cli": "codex-cli 0.165.0",
+    "model": "gpt-5.6-luna",
+    "date": "2026-10-31"
+  },
+  "thread": {
+    "harness": "codex",
+    "model": "gpt-5.6-luna",
+    "effort": "low"
+  },
+  "permissions": "allow",
+  "mcp_servers": {
+    "echo": {
+      "command": "node",
+      "args": [
+        "spec/tools/mcp-echo.mjs"
+      ]
+    }
+  },
+  "steps": [
+    {
+      "send": {
+        "type": "send",
+        "text": "Call the echo tool with the text: fixture. Then reply with exactly what it returned.",
+        "client_id": "c1"
+      }
+    },
+    {
+      "wait": {
+        "type": "thread.updated",
+        "thread": {
+          "status": "idle"
+        }
+      }
+    }
+  ]
+}
