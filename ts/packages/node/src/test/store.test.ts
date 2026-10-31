@@ -2,6 +2,7 @@
 // it; and the JSONL store copes with a crash mid-write.
 
 import { appendFileSync, readdirSync, readFileSync } from "node:fs";
+import { open, type FileHandle } from "node:fs/promises";
 import { join } from "node:path";
 import { describe, expect, it } from "vitest";
 import type { Thread } from "@dire-kiwi/agent-threads-protocol";
@@ -151,6 +152,95 @@ describe("FileStore", () => {
     await b.deleteThread("z");
     await b.close();
     expect(await new FileStore(dir).activeRuns()).toEqual([{ ...run, thread_id: "a", started_at: "2026-11-01T00:00:04Z" }]);
+  });
+
+  /** Runs `fn` with FileHandle's `method` replaced (on every handle) by `fake`. */
+  async function patched<K extends "write" | "datasync">(method: K, fake: (original: FileHandle[K]) => FileHandle[K], fn: () => Promise<void>) {
+    const probe = await open(join(tempDir(), "probe"), "w");
+    const proto = Object.getPrototypeOf(probe) as FileHandle;
+    await probe.close();
+    const original = proto[method];
+    proto[method] = fake(original);
+    try {
+      await fn();
+    } finally {
+      proto[method] = original;
+    }
+  }
+
+  it("leaves nothing of an append whose sync fails, so trying it again doesn't repeat it", async () => {
+    const dir = tempDir();
+    const s = new FileStore(dir);
+    await s.createThread(thread);
+    let fail = true;
+    await patched(
+      "datasync",
+      (original) =>
+        async function (this: FileHandle) {
+          if (fail) {
+            fail = false;
+            throw new Error("EIO");
+          }
+          return original.call(this);
+        },
+      async () => {
+        await expect(s.appendEvents("th_1", [event(1)])).rejects.toThrow("EIO");
+        expect(await s.lastSeq("th_1")).toBe(0);
+        await s.appendEvents("th_1", [event(1)]);
+      },
+    );
+    await s.appendEvents("th_1", [event(2)]);
+    await s.close();
+    const lines = readFileSync(join(dir, readdirSync(dir)[0]!), "utf8").split("\n").filter(Boolean);
+    expect(lines.map((l) => JSON.parse(l).events?.[0]?.seq ?? "thread")).toEqual(["thread", 1, 2]);
+    const again = new FileStore(dir);
+    expect((await again.readEvents("th_1")).map((e) => e.seq)).toEqual([1, 2]);
+    expect(await again.readEvents("th_1", { after: 1 })).toEqual([event(2)]);
+  });
+
+  it("writes every byte of a line the file takes a few at a time", async () => {
+    const dir = tempDir();
+    const s = new FileStore(dir);
+    const big = { ...event(1), turn_id: "t".repeat(10_000) };
+    await patched(
+      "write",
+      (original) =>
+        function (this: FileHandle, buffer: Buffer, offset: number, length: number) {
+          return (original as (b: Buffer, o: number, l: number) => Promise<{ bytesWritten: number }>).call(this, buffer, offset, Math.min(length, 4096));
+        } as FileHandle["write"],
+      async () => {
+        await s.createThread(thread);
+        await s.appendEvents("th_1", [big]);
+      },
+    );
+    await s.close();
+    expect(await new FileStore(dir).readEvents("th_1")).toEqual([big]);
+  });
+
+  it("cuts off a line whose write fails partway, so the next one starts clean", async () => {
+    const dir = tempDir();
+    const s = new FileStore(dir);
+    await s.createThread(thread);
+    let fail = true;
+    await patched(
+      "write",
+      (original) =>
+        async function (this: FileHandle, buffer: Buffer, offset: number, length: number) {
+          const write = original as (b: Buffer, o: number, l: number) => Promise<{ bytesWritten: number }>;
+          if (!fail) return write.call(this, buffer, offset, length);
+          fail = false;
+          await write.call(this, buffer, offset, Math.floor(length / 2));
+          throw new Error("EFBIG");
+        } as FileHandle["write"],
+      async () => {
+        await expect(s.appendEvents("th_1", [event(1)])).rejects.toThrow("EFBIG");
+        await s.appendEvents("th_1", [event(1)]);
+      },
+    );
+    await s.close();
+    const text = readFileSync(join(dir, readdirSync(dir)[0]!), "utf8");
+    expect(text.split("\n").filter(Boolean).map((l) => Object.keys(JSON.parse(l))[0])).toEqual(["thread", "events"]);
+    expect((await new FileStore(dir).readEvents("th_1")).map((e) => e.seq)).toEqual([1]);
   });
 
   it("keeps one file per thread, named for it", async () => {

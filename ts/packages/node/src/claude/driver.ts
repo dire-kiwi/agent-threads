@@ -146,7 +146,10 @@ class ClaudeSession implements HarnessSession {
 
   carryOver(messages: Message[]): void {
     const run = this.#live();
-    if (!run) {
+    if (!run || this.#stale) {
+      // The next turn runs with the options as they are now, so in a new process if they changed.
+      // The old one has the messages on its stdin, and mustn't act on them: it's stopped at once.
+      if (run) void this.#stop(run, true, true);
       this.start(messages);
       return;
     }
@@ -241,12 +244,16 @@ class ClaudeSession implements HarnessSession {
     return run;
   }
 
-  /** Stops a run: closes its input, then signals it if it doesn't exit. */
-  #stop(run: Run, retire: boolean): Promise<void> {
+  /**
+   * Stops a run: closes its input, then signals it if it doesn't exit; or signals it straight away
+   * (`now`), when it has messages on its stdin that are going to another process instead.
+   */
+  #stop(run: Run, retire: boolean, now = false): Promise<void> {
     if (retire) run.retired = true;
     if (run.exited) return run.done;
     run.proc?.closeInput();
     const grace = this.#o.closeGraceMs ?? 5_000;
+    if (now) run.proc?.kill("SIGTERM");
     const term = setTimeout(() => run.proc?.kill("SIGTERM"), grace);
     const kill = setTimeout(() => run.proc?.kill("SIGKILL"), grace * 2);
     const stopped = run.done.then(() => {
@@ -266,7 +273,7 @@ class ClaudeSession implements HarnessSession {
   /** Claude didn't take in steered messages after its turn: they go to a new process. */
   #requeue(run: Run): void {
     if (this.#run !== run || run.exited || !this.#ctx.queued().length) return;
-    void this.#stop(run, true);
+    void this.#stop(run, true, true);
     const next = this.#ensure(false);
     for (const m of this.#ctx.queued()) next.send(m.id, this.#userMessage({ id: m.id, text: m.text, ...(m.attachments ? { attachments: m.attachments } : {}) }));
   }

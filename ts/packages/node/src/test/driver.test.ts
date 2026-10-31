@@ -119,6 +119,25 @@ describe("the Claude driver", () => {
     expect(events.filter((e) => e.type === "turn.started")).toHaveLength(2);
   });
 
+  it("runs a carried-over turn with options changed during the turn before", async () => {
+    const { sdk, runs } = setup({ steer: "late" });
+    const t = await sdk.create({ model: "old-model" });
+    await sdk.send(t.id, "slow");
+    await until(async () => (await sdk.snapshot(t.id)).thread.session_id);
+    await sdk.send(t.id, "reply steered");
+    await sdk.setOptions(t.id, { model: "new-model" });
+    await sdk.interrupt(t.id);
+    const s = await until(async () => {
+      const s = await sdk.snapshot(t.id);
+      return results(s.items).length === 2 && s.thread.status === "idle" ? s : undefined;
+    });
+    expect(texts(s.items)).toEqual(["steered"]);
+    expect(s.items.filter((i) => i.type === "user_message" && i.queued)).toEqual([]);
+    const [first, second] = runs();
+    expect(first!.argv).toEqual(expect.arrayContaining(["--model", "old-model"]));
+    expect(second!.argv).toEqual(expect.arrayContaining(["--model", "new-model", "--resume", s.thread.session_id!]));
+  });
+
   it("restarts Claude with a steered message it never takes in", async () => {
     const { sdk, runs } = setup({ steer: "never", claude: { steerGraceMs: 100, closeGraceMs: 100 } });
     const t = await sdk.create();
@@ -460,6 +479,35 @@ describe("AgentThreads", () => {
     const snap = await inner.loadSnapshot(t.id);
     expect(snap!.seq).toBe(await inner.lastSeq(t.id));
     expect(failures).toBe(errors.length);
+  });
+
+  it("fails close() while events can't be saved, and saves them when it's called again", async () => {
+    const inner = new MemoryStore();
+    let broken = false;
+    const store = new Proxy(inner, {
+      get(target, prop, receiver) {
+        if (prop === "appendEvents") {
+          return async (id: string, events: ThreadEvent[]) => {
+            if (broken) throw new Error("the disk is full");
+            return target.appendEvents(id, events);
+          };
+        }
+        const v = Reflect.get(target, prop, receiver);
+        return typeof v === "function" ? v.bind(target) : v;
+      },
+    }) as MemoryStore;
+    const { sdk, make } = setup({ store, onError: () => {} });
+    const t = await sdk.create();
+    broken = true;
+    await sdk.setOptions(t.id, { model: "unsaved-model" });
+    await expect(sdk.close()).rejects.toBeInstanceOf(AggregateError);
+    expect(await inner.lastSeq(t.id)).toBe(1);
+    await expect(sdk.send(t.id, "reply hi")).rejects.toBeInstanceOf(CommandError);
+
+    broken = false;
+    await sdk.close();
+    open = open.filter((s) => s !== sdk);
+    expect((await make(inner).snapshot(t.id)).thread.model).toBe("unsaved-model");
   });
 
   it("fails eventsSince while the store can't take the thread's events", async () => {

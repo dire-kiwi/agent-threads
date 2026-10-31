@@ -28,7 +28,7 @@ const off = sdk.subscribe((event) => ws.broadcast(event)); // every thread's eve
 ws.on("message", (cmd) => sdk.handle(JSON.parse(cmd))); // send / interrupt / respond / set_options
 await sdk.snapshot(thread.id); // for a client that just connected
 await sdk.eventsSince(thread.id, seq); // for one catching up
-await sdk.close(); // on shutdown: stops the harness processes
+await sdk.close(); // on shutdown: stops the harness processes and saves everything
 ```
 
 ## Threads
@@ -55,7 +55,9 @@ streamed so far.
 `SqliteStore(path)` (Node's built-in `node:sqlite`, so no native dependency) all pass
 [spec/conformance/store.json](../../../spec/conformance/store.md). To keep threads in your own
 database, implement `Store` and run the same cases (see `src/test/store.test.ts`). The store is
-yours: `close()` doesn't close it.
+yours: `close()` doesn't close it. If the store fails, events are kept and written again in
+order once it works; meanwhile `eventsSince()` rejects, and so does `close()`, which can be called
+again to finish saving. The file store undoes a write that fails partway, so a retry can't repeat it.
 
 ## Claude Code
 

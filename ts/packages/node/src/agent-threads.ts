@@ -78,6 +78,7 @@ export class AgentThreads {
   #configs = new Map<string, Capabilities>();
   #subscribers = new Set<(event: ThreadEvent) => void>();
   #closed = false;
+  #stopping: Promise<void> | undefined;
 
   constructor(options: AgentThreadsOptions = {}) {
     this.#options = options;
@@ -225,16 +226,21 @@ export class AgentThreads {
   }
 
   /**
-   * Stops every harness process and saves everything. The instance can't be used after; the
-   * store can (the app closes it).
+   * Stops every harness process and saves everything. It rejects if some thread's events can't be
+   * saved (the store is failing): they're kept, and calling close() again tries again. The
+   * instance can't be used after; the store can (the app closes it).
    */
-  async close(): Promise<void> {
-    if (this.#closed) return;
+  close(): Promise<void> {
+    this.#stopping ??= this.#stopAll();
+    return this.#stopping.then(() => this.#saveAll());
+  }
+
+  /** Stops every thread's harness, once. */
+  async #stopAll(): Promise<void> {
     this.#closed = true;
     await Promise.allSettled([...this.#loading.values()]);
-    const threads = [...this.#threads.values()];
     await Promise.all(
-      threads.map(async (rt) => {
+      [...this.#threads.values()].map(async (rt) => {
         // A turn cut short by shutting down ends as an interrupted one.
         rt.closing = true;
         if (rt.turn) rt.turn.interrupted = true;
@@ -244,10 +250,27 @@ export class AgentThreads {
           this.#error(e);
         }
         if (rt.turn) rt.endTurn({ ok: false });
+      }),
+    );
+  }
+
+  /** Saves every thread's events and a snapshot; rejects with the failures if any can't be saved. */
+  async #saveAll(): Promise<void> {
+    const failed: unknown[] = [];
+    await Promise.all(
+      [...this.#threads.values()].map(async (rt) => {
+        if (rt.closed) return;
+        try {
+          await rt.saved();
+        } catch (e) {
+          failed.push(e);
+          return;
+        }
         await rt.saveSnapshot();
         rt.dispose();
       }),
     );
+    if (failed.length) throw new AggregateError(failed, `${failed.length} thread(s) have events the store hasn't saved; close() again to retry`);
   }
 
   // ---------- internals ----------
