@@ -69,9 +69,13 @@ fn draft7(node: &mut Value) {
 fn untag(defs: &mut Map<String, Value>) -> BTreeMap<String, Vec<(String, String)>> {
     let mut unions = BTreeMap::new();
     for (name, def) in defs.iter() {
-        let Some(Value::Array(variants)) = def.get("oneOf") else { continue };
+        let Some(Value::Array(variants)) = def.get("oneOf") else {
+            continue;
+        };
         let variants = variants.iter().map(|v| {
-            let r = v["$ref"].as_str().unwrap_or_else(|| panic!("$defs/{name}: a oneOf variant isn't a $ref"));
+            let r = v["$ref"]
+                .as_str()
+                .unwrap_or_else(|| panic!("$defs/{name}: a oneOf variant isn't a $ref"));
             r.trim_start_matches("#/definitions/").to_string()
         });
         unions.insert(name.clone(), variants.map(|v| (v, String::new())).collect::<Vec<_>>());
@@ -81,7 +85,9 @@ fn untag(defs: &mut Map<String, Value>) -> BTreeMap<String, Vec<(String, String)
             let def = defs[variant.as_str()].as_object_mut().unwrap();
             let props = def["properties"].as_object_mut().unwrap();
             let constant = props.remove("type").and_then(|t| t.get("const").cloned());
-            *tag = constant.and_then(|c| c.as_str().map(String::from)).unwrap_or_else(|| panic!("$defs/{variant} (in {name}): no type constant"));
+            *tag = constant
+                .and_then(|c| c.as_str().map(String::from))
+                .unwrap_or_else(|| panic!("$defs/{variant} (in {name}): no type constant"));
             if let Some(Value::Array(required)) = def.get_mut("required") {
                 required.retain(|r| r != "type");
             }
@@ -94,14 +100,25 @@ fn untag(defs: &mut Map<String, Value>) -> BTreeMap<String, Vec<(String, String)
 fn tag(file: &mut syn::File, unions: &BTreeMap<String, Vec<(String, String)>>) {
     for item in &mut file.items {
         let syn::Item::Enum(e) = item else { continue };
-        let Some(variants) = unions.get(&e.ident.to_string()) else { continue };
-        let untagged = e.attrs.iter().position(|a| a.path().is_ident("serde") && quote!(#a).to_string().contains("untagged"));
-        e.attrs[untagged.unwrap_or_else(|| panic!("{} isn't untagged", e.ident))] = syn::parse_quote!(#[serde(tag = "type")]);
+        let Some(variants) = unions.get(&e.ident.to_string()) else {
+            continue;
+        };
+        let untagged = e
+            .attrs
+            .iter()
+            .position(|a| a.path().is_ident("serde") && quote!(#a).to_string().contains("untagged"));
+        e.attrs[untagged.unwrap_or_else(|| panic!("{} isn't untagged", e.ident))] =
+            syn::parse_quote!(#[serde(tag = "type")]);
         for v in &mut e.variants {
-            let syn::Fields::Unnamed(fields) = &v.fields else { panic!("{}::{} isn't a newtype variant", e.ident, v.ident) };
+            let syn::Fields::Unnamed(fields) = &v.fields else {
+                panic!("{}::{} isn't a newtype variant", e.ident, v.ident)
+            };
             let ty = &fields.unnamed[0].ty;
             let ty = quote!(#ty).to_string();
-            let (_, tag) = variants.iter().find(|(name, _)| *name == ty).unwrap_or_else(|| panic!("{}::{}: unknown type {ty}", e.ident, v.ident));
+            let (_, tag) = variants
+                .iter()
+                .find(|(name, _)| *name == ty)
+                .unwrap_or_else(|| panic!("{}::{}: unknown type {ty}", e.ident, v.ident));
             v.attrs.push(syn::parse_quote!(#[serde(rename = #tag)]));
         }
     }
