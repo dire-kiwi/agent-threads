@@ -70,8 +70,9 @@ again to finish saving. The file store undoes a write that fails partway, so a r
   turn (in the same process, or a new one if the options changed or Claude doesn't take it in
   within `steerGraceMs`, 30s). That stops when a retry is interrupted, fails with no process left
   holding the message, or three have run: then a process that has it is stopped (so it can't act on
-  it unseen), a `notice` says it wasn't delivered, and it's sent again, first, with the next
-  message. A turn lost when the backend stopped is ended without retrying, and starts nothing.
+  it unseen), a `notice` says it wasn't delivered, and it's sent again with the next message, in
+  one stream-json message with it (Claude makes a turn of each message waiting for it, so they
+  can't go separately). A turn lost when the backend stopped is ended without retrying, and starts nothing.
 - **Unfinished text**: when a turn ends before Claude finishes a message (its process exits, or the
   backend shuts down), the text streamed so far is saved.
 - **Interrupt** sends a `control_request` interrupt; if the turn hasn't ended after `stopGraceMs`

@@ -87,6 +87,35 @@ async function settle(sdk: AgentThreads, id: string, ms = 5000) {
   }
 }
 
+/**
+ * Nothing happened outside a turn the SDK tracks: every assistant message, tool call and turn
+ * result was added while its turn was open, and every result Claude sent ended one (a turn ended
+ * by a result has its usage; one ended otherwise, e.g. by its process exiting, has none).
+ */
+function expectTracked(events: ThreadEvent[], runs: { sent: { [k: string]: unknown }[] }[]) {
+  const open = new Set<string>();
+  for (const e of events) {
+    if (e.type === "turn.started") open.add(e.turn_id);
+    else if (e.type === "turn.completed") open.delete(e.turn_id);
+    else if (e.type === "item.added" && ["assistant_message", "reasoning", "tool_call", "turn_result"].includes(e.item.type)) {
+      expect(!!e.item.turn_id && open.has(e.item.turn_id), `outside a turn: ${JSON.stringify(e.item)}`).toBe(true);
+    }
+  }
+  const sent = runs.flatMap((r) => r.sent).filter((m) => "result" in m).length;
+  const ended = events.filter((e) => e.type === "item.added" && e.item.type === "turn_result" && e.item.usage).length;
+  expect(ended, "results Claude sent that ended a turn").toBe(sent);
+}
+
+/** After events[from], the thread went idle only once the reply `text` was in. */
+function expectIdleAfter(events: ThreadEvent[], from: number, text: string) {
+  const later = events.slice(from);
+  const idle = later.findIndex((e) => e.type === "thread.updated" && (e.thread.status === "idle" || e.thread.status === "error"));
+  const reply = later.findIndex((e) => (e.type === "item.added" || e.type === "item.updated") && JSON.stringify(e).includes(JSON.stringify(text)));
+  expect(reply, `the reply ${text}`).toBeGreaterThanOrEqual(0);
+  expect(idle, "going idle").toBeGreaterThan(reply);
+  expect(later[idle]).toMatchObject({ thread: { status: "idle" } });
+}
+
 const results = (items: Item[]) => items.filter((i): i is TurnResult => i.type === "turn_result");
 const texts = (items: Item[]) => items.filter((i) => i.type === "assistant_message").map((i) => (i as { text: string }).text);
 
@@ -181,14 +210,18 @@ describe("the Claude driver", () => {
     expect(steered().queued).toBe(true);
 
     // Once the harness works, the next message takes it along, and it's taken in.
+    // They go as one message, so Claude makes one turn of them.
     rmSync(broken);
+    const from = events.length;
     await sdk.send(t.id, "reply ok", { client_id: "o" });
     s = await settle(sdk, t.id);
     const fourth = runs()[3]!.sent.filter((m) => m.type === "user") as unknown as { message: { content: { text: string }[] } }[];
-    expect(fourth.map((m) => m.message.content[0]!.text)).toEqual(["reply steered", "reply ok"]);
+    expect(fourth.map((m) => m.message.content.map((b) => b.text))).toEqual([["reply steered", "reply ok"]]);
     expect(steered().queued).toBeUndefined();
-    expect(texts(s.items)).toContain("steered");
+    expect(texts(s.items).slice(-2)).toEqual(["steered", "ok"]);
     expect(s.thread.status).toBe("idle");
+    expectIdleAfter(events, from, "ok");
+    expectTracked(events, runs());
     await sdk.close();
   });
 
@@ -215,13 +248,41 @@ describe("the Claude driver", () => {
     expect(events).toHaveLength(count);
     expect(runs()).toHaveLength(1);
 
-    // The next message takes it to a new process.
+    // The next message takes it to a new process, in one turn with it.
+    const from = events.length;
     await sdk.send(t.id, "reply next");
-    const after = await until(async () => {
-      const s = await sdk.snapshot(t.id);
-      return texts(s.items).includes("steered") ? s : undefined;
-    });
+    const after = await settle(sdk, t.id);
+    expect(texts(after.items)).toEqual(["steered", "next"]);
     expect(after.items.filter((i) => i.type === "user_message" && i.queued)).toEqual([]);
+    expectIdleAfter(events, from, "next");
+    expectTracked(events, runs());
+  });
+
+  it("keeps everything in a turn when a carried-over turn Claude has started is interrupted too", async () => {
+    const { sdk, events, runs } = setup({ steer: "late", claude: { closeGraceMs: 100 } });
+    const t = await sdk.create();
+    await sdk.send(t.id, "slow");
+    await until(async () => (await sdk.snapshot(t.id)).thread.session_id);
+    await sdk.send(t.id, "sleep 2000 steered", { client_id: "s" });
+    await sdk.interrupt(t.id);
+    // Claude takes the steered message in after the first turn's result, as a turn of its own...
+    await until(async () => (await sdk.snapshot(t.id)).items.some((i) => i.type === "user_message" && i.client_id === "s" && !i.queued));
+    // ...which is interrupted.
+    await sdk.interrupt(t.id);
+    const s = await until(async () => {
+      const s = await sdk.snapshot(t.id);
+      return results(s.items).length === 2 && s.thread.status === "idle" ? s : undefined;
+    });
+    await new Promise((r) => setTimeout(r, 300));
+    expect(results((await sdk.snapshot(t.id)).items)).toHaveLength(2);
+    expect(results(s.items).map((r) => r.interrupted)).toEqual([true, true]);
+    expect(s.items.filter((i) => i.type === "user_message" && i.queued)).toEqual([]);
+    const from = events.length;
+    await sdk.send(t.id, "reply after");
+    await settle(sdk, t.id);
+    expectIdleAfter(events, from, "after");
+    expectTracked(events, runs());
+    expect(runs()).toHaveLength(1);
   });
 
   it("carries a message over again after a failed result while the process holds it", async () => {
@@ -659,7 +720,7 @@ describe("AgentThreads", () => {
 
   it("recovers a lost turn's queued message without starting a process, and sends it with the next, configured again", async () => {
     const store = new MemoryStore();
-    const { sdk, make, runs } = setup({ store });
+    const { sdk, make, runs, events } = setup({ store });
     const t = await sdk.create();
     await sdk.send(t.id, "slow");
     await until(async () => (await sdk.snapshot(t.id)).thread.session_id);
@@ -684,12 +745,14 @@ describe("AgentThreads", () => {
     // The app gives the thread its tools again; the next message takes the queued one along.
     const lookup = defineTool({ name: "lookup", description: "Looks up.", input: { type: "object" }, run: () => "found it" });
     await again.configure(t.id, { tools: [lookup] });
+    const from = events.length;
     await again.send(t.id, "reply next");
-    const done = await until(async () => {
-      const s = await again.snapshot(t.id);
-      return texts(s.items).includes("app said found it") && s.thread.status === "idle" ? s : undefined;
-    });
+    const done = await settle(again, t.id);
+    expect(texts(done.items)).toEqual(["app said found it", "next"]);
     expect(done.items.filter((i) => i.type === "user_message" && i.queued)).toEqual([]);
+    expectIdleAfter(events, from, "next");
+    // The thread's own history (the old instance's events after the crash aren't in it).
+    expectTracked(await again.eventsSince(t.id, 0), runs());
     const last = runs().at(-1)!;
     expect(last.argv).toEqual(expect.arrayContaining(["--resume", s.thread.session_id!]));
     expect(last.sent.find((m) => m.type === "control_request")).toMatchObject({ request: { sdkMcpServers: ["app"] } });

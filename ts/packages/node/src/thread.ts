@@ -16,13 +16,15 @@ export interface Turn {
   id: string;
   interrupted: boolean;
   /**
-   * How many turns in a row (this one included) are retries for messages left queued: carried
-   * over from the turn before, or sent again with an explicit message.
+   * How many turns in a row (this one included) are retries for messages left queued that took
+   * none in: carried over from the turn before, or sent again with an explicit message.
    */
   carried?: number;
+  /** The harness took in a queued message during it. */
+  progressed?: boolean;
 }
 
-/** How many turns in a row may be retries for queued messages. */
+/** How many retries in a row for queued messages may take none in. */
 const MAX_CARRIED = 3;
 
 // Steered messages, and who has them. A steered message is queued (its item has `queued`, and
@@ -31,7 +33,8 @@ const MAX_CARRIED = 3;
 // or with nobody. When a turn ends with messages queued, endTurn either carries them over (a
 // new turn, which the live process takes them into, or a new process if there's none) or gives
 // up on them: then the session releases them, stopping any process that has them so it can't
-// act on them unseen, and they're sent again, first, with the next message the user sends.
+// act on them unseen, and they're sent again, first, with the next message the user sends. (The
+// driver sends messages that go together as one: a harness may make a turn of each.)
 
 interface OpenRequest {
   request: ThreadRequest;
@@ -294,6 +297,7 @@ export class ThreadRuntime implements ThreadContext {
     if (at < 0) return false;
     this.#queue.splice(at, 1);
     this.updateItem(id, { queued: null });
+    if (this.turn) this.turn.progressed = true;
     return true;
   }
 
@@ -354,12 +358,14 @@ export class ThreadRuntime implements ThreadContext {
       return;
     }
     // Carry them over, unless that's been tried enough: a retry that was interrupted (the user
-    // wants it stopped), one that failed with no process left holding them, or too many in a row.
-    // A retry that failed while its process lives and holds them carries over again (to the
-    // limit), since that process would otherwise take them in unseen.
-    const carried = turn.carried ?? 0;
+    // wants it stopped), one that failed with no process left holding them, or too many in a row
+    // that took none in. A retry that failed while its process lives and holds them carries over
+    // again (to the limit), since that process would otherwise take them in unseen. (A process
+    // holding several makes a turn of each, so a retry that took one in has made progress.)
+    const retry = (turn.carried ?? 0) > 0;
+    const carried = turn.progressed ? 0 : (turn.carried ?? 0);
     const holding = this.session?.live() ?? false;
-    const giveUp = carried >= MAX_CARRIED || (carried > 0 && turn.interrupted) || (carried > 0 && !ok && !holding);
+    const giveUp = carried >= MAX_CARRIED || (retry && turn.interrupted) || (carried > 0 && !ok && !holding);
     if (giveUp) {
       this.session?.release();
       this.#undelivered(left.length);

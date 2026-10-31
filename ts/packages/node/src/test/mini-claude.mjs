@@ -1,11 +1,13 @@
 #!/usr/bin/env node
 // A tiny scriptable `claude -p` for the driver's tests of what the recorded fixtures don't cover.
-// What it does with a message depends on the message's text:
+// Like Claude, it makes a turn of each message waiting for it while it's idle, and takes a message
+// that comes during a turn into that turn (when it's ready to). What it does with a message
+// depends on its text; a message of several text blocks does each in turn, in one turn:
 //
 //   reply <text>          replies with <text> and ends the turn
 //   tool <name> <json>    calls a tool (asking can_use_tool), says how it went, and ends the turn
 //   app <name> <json>     calls an app tool over mcp_message, says what it returned, and ends the turn
-//   sleep <ms> <text>     waits, then replies with <text> and ends the turn
+//   sleep <ms> <text>     waits (or until it's interrupted), then replies with <text> and ends the turn
 //   cancelled <tool>      asks can_use_tool, then cancels the request and ends the turn
 //   slow                  waits for an interrupt, then ends the turn as interrupted
 //   stubborn              ignores interrupts (and a closed stdin), until it's signalled
@@ -14,7 +16,8 @@
 //   streamcrash <text>    streams <text> (deltas, no final message), then crashes
 //   streamhang <text>     streams <text>, then waits for its input to close
 //
-// MINI_CLAUDE_LOG names a file each run appends its argv and every line it's sent to. With
+// MINI_CLAUDE_LOG names a file each run appends its argv, every line it's sent and each result
+// it sends ({"result": ...}) to. With
 // MINI_CLAUDE_STEER=late, messages sent during a turn are taken in after its result (as the next
 // turn); with MINI_CLAUDE_STEER=never, they never are (and the process has to be restarted); with
 // MINI_CLAUDE_STEER=hold, they're never taken in either, and an interrupt while no turn runs gets
@@ -44,6 +47,7 @@ let interrupted = null;
 let stubborn = false;
 let initialized = false;
 let idleErrors = Number(process.env.MINI_CLAUDE_IDLE_ERRORS ?? 0);
+let wasInterrupted = false;
 
 const ask = (request) =>
   new Promise((resolve) => {
@@ -52,7 +56,6 @@ const ask = (request) =>
     out({ type: "control_request", request_id, request });
   });
 
-const textOf = (m) => m.message.content.filter((b) => b.type === "text").map((b) => b.text).join("\n");
 
 createInterface({ input: process.stdin })
   .on("line", (line) => {
@@ -61,7 +64,10 @@ createInterface({ input: process.stdin })
     if (m.type === "control_request") {
       if (m.request.subtype === "initialize") initialized = true;
       out({ type: "control_response", response: { subtype: "success", request_id: m.request_id, response: {} } });
-      if (m.request.subtype === "interrupt" && !stubborn) interrupted?.();
+      if (m.request.subtype === "interrupt" && busy && !stubborn) {
+        wasInterrupted = true;
+        interrupted?.();
+      }
       if (m.request.subtype === "interrupt" && !busy && steer === "hold") result({ subtype: "error_during_execution", is_error: true });
       return;
     }
@@ -83,6 +89,7 @@ createInterface({ input: process.stdin })
         setTimeout(() => process.exit(2), 50);
         return;
       }
+      m.during = busy; // it came during a turn, so it's taken into that turn
       inbox.push(m);
       wake?.();
     }
@@ -97,22 +104,44 @@ const say = (text) => {
   const id = `msg_${process.pid}_${++msgs}`;
   out({ type: "assistant", message: { id, model: "mini", content: [{ type: "text", text }] }, parent_tool_use_id: null, session_id: session });
 };
-const result = (extra = {}) =>
-  out({ type: "result", subtype: "success", is_error: false, duration_ms: 5, result: "", session_id: session, model_usage_since_last_result: { mini: { inputTokens: 1, outputTokens: 2, costUSD: 0.001 } }, ...extra });
+const result = (extra = {}) => {
+  const r = { type: "result", subtype: "success", is_error: false, duration_ms: 5, result: "", session_id: session, model_usage_since_last_result: { mini: { inputTokens: 1, outputTokens: 2, costUSD: 0.001 } }, ...extra };
+  note({ result: r.subtype });
+  out(r);
+};
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 async function turn(m) {
   busy = true;
+  wasInterrupted = false;
   turns++;
   out({ type: "user", message: m.message, isReplay: true, session_id: session, parent_tool_use_id: null });
   out({ type: "system", subtype: "init", session_id: session });
-  const text = textOf(m);
+  for (const block of m.message.content.filter((b) => b.type === "text")) {
+    await step(block.text);
+    if (wasInterrupted) {
+      result({ subtype: "error_during_execution", is_error: true });
+      busy = false;
+      return;
+    }
+  }
+  // Messages that came during the turn are taken in before it ends, unless they're taken in late.
+  if (steer === "now") {
+    for (const w of inbox.filter((x) => x.during)) out({ type: "user", message: w.message, isReplay: true, session_id: session, parent_tool_use_id: null });
+    inbox.splice(0, inbox.length, ...inbox.filter((x) => !x.during));
+  }
+  result();
+  busy = false;
+}
+
+async function step(text) {
   const [cmd, ...rest] = text.split(" ");
   if (cmd === "reply") {
     say(rest.join(" "));
   } else if (cmd === "sleep") {
     const [ms, ...words] = rest;
-    await new Promise((r) => setTimeout(r, Number(ms)));
-    say(words.join(" "));
+    await Promise.race([sleep(Number(ms)), new Promise((r) => (interrupted = r))]);
+    if (!wasInterrupted) say(words.join(" "));
   } else if (cmd === "cancelled") {
     const id = `toolu_${++ids}`;
     out({ type: "assistant", message: { id: `msg_${process.pid}_${++msgs}`, model: "mini", content: [{ type: "tool_use", id, name: rest[0], input: {} }] }, parent_tool_use_id: null, session_id: session });
@@ -145,9 +174,6 @@ async function turn(m) {
   } else if (cmd === "slow" || cmd === "stubborn") {
     stubborn = cmd === "stubborn";
     await new Promise((r) => (interrupted = r));
-    result({ subtype: "error_during_execution", is_error: true });
-    busy = false;
-    return;
   } else if (cmd === "streamcrash" || cmd === "streamhang") {
     const id = `msg_${process.pid}_${++msgs}`;
     out({ type: "stream_event", event: { type: "message_start", message: { id } }, parent_tool_use_id: null, session_id: session });
@@ -164,10 +190,6 @@ async function turn(m) {
     process.stderr.write("something broke\n");
     process.exit(3);
   }
-  // Messages that came during the turn are taken in before it ends, unless they're taken in late.
-  if (steer === "now") while (inbox.length) out({ type: "user", message: inbox.shift().message, isReplay: true, session_id: session, parent_tool_use_id: null });
-  result();
-  busy = false;
 }
 
 for (;;) {

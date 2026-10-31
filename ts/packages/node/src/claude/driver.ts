@@ -78,7 +78,7 @@ class Run {
   /** Claude's requests not yet answered, with the turn each came in. */
   open = new Map<string, string | undefined>();
   /** The messages sent, oldest first, by what Claude echoes when it takes one in. */
-  sent: { id: string; echo: string }[] = [];
+  sent: { ids: string[]; echo: string }[] = [];
   /** The generated plugin with the thread's skills, for this run only. */
   pluginDir: string | undefined;
 
@@ -91,8 +91,8 @@ class Run {
   }
 
   /** Writes a user message (that's the item `id`), once Claude is ready for one. */
-  send(id: string, msg: Json): void {
-    this.sent.push({ id, echo: echoKey(msg.message.content) });
+  send(ids: string[], msg: Json): void {
+    this.sent.push({ ids, echo: echoKey(msg.message.content) });
     if (this.ready) this.write(msg);
     else this.waiting.push(JSON.stringify(msg));
   }
@@ -137,11 +137,13 @@ class ClaudeSession implements HarnessSession {
 
   start(messages: Message[]): void {
     const run = this.#ensure(true);
-    for (const m of messages) run.send(m.id, this.#userMessage(m));
+    // One message, however many there are: Claude makes a turn of each message waiting for it, so
+    // several would run as turns of their own after this one's result.
+    if (messages.length) run.send(messages.map((m) => m.id), this.#userMessage(messages));
   }
 
   steer(message: Message): void {
-    this.#ensure(false).send(message.id, this.#userMessage(message));
+    this.#ensure(false).send([message.id], this.#userMessage([message]));
   }
 
   carryOver(messages: Message[]): void {
@@ -204,11 +206,18 @@ class ClaudeSession implements HarnessSession {
     return this.#tmp;
   }
 
+  /** Messages as one message on Claude's stdin: their content, one after the other. */
+  #userMessage(messages: Message[]): Json {
+    const content = messages.flatMap((m) => this.#content(m));
+    return { type: "user", message: { role: "user", content }, parent_tool_use_id: null, session_id: "" };
+  }
+
   /**
-   * A message as Claude takes it. Images with data go as images; files with textual data as their
-   * text; other files with data are written out, and Claude is told where (as for files with a path).
+   * A message's content as Claude takes it. Images with data go as images; files with textual data
+   * as their text; other files with data are written out, and Claude is told where (as for files
+   * with a path).
    */
-  #userMessage(m: Message): Json {
+  #content(m: Message): Json[] {
     const content: Json[] = [{ type: "text", text: m.text }];
     for (const [i, a] of (m.attachments ?? []).entries()) {
       const name = a.name ?? a.path ?? `attachment-${i + 1}`;
@@ -231,7 +240,7 @@ class ClaudeSession implements HarnessSession {
         content.push({ type: "text", text: `Attached file: ${a.path}` });
       }
     }
-    return { type: "user", message: { role: "user", content }, parent_tool_use_id: null, session_id: "" };
+    return content;
   }
 
   // ---------- the process ----------
@@ -286,7 +295,8 @@ class ClaudeSession implements HarnessSession {
     if (this.#run !== run || run.exited || !this.#ctx.queued().length) return;
     void this.#stop(run, true, true);
     const next = this.#ensure(false);
-    for (const m of this.#ctx.queued()) next.send(m.id, this.#userMessage({ id: m.id, text: m.text, ...(m.attachments ? { attachments: m.attachments } : {}) }));
+    const queued = this.#ctx.queued().map((m) => ({ id: m.id, text: m.text, ...(m.attachments ? { attachments: m.attachments } : {}) }));
+    if (queued.length) next.send(queued.map((m) => m.id), this.#userMessage(queued));
   }
 
   #spawn(run: Run): void {
@@ -508,7 +518,7 @@ class ClaudeSession implements HarnessSession {
       // Claude echoes a message as it was sent: match it with the first sent like that.
       const echo = echoKey(content);
       const at = run.sent.findIndex((s) => s.echo === echo);
-      if (at >= 0) ctx.tookIn(run.sent.splice(at, 1)[0]!.id);
+      if (at >= 0) for (const id of run.sent.splice(at, 1)[0]!.ids) ctx.tookIn(id);
       if (this.#steerTimer && !ctx.queued().length) clearTimeout(this.#steerTimer);
       return;
     }
