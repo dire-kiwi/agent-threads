@@ -2,8 +2,11 @@
 // differ (its own ids and timestamps, raw payloads, deltas cut differently, a thread.updated that
 // only changes the run), and don't when something that matters differs.
 
-import { readFileSync } from "node:fs";
-import { join } from "node:path";
+import { spawnSync } from "node:child_process";
+import { mkdtempSync, readFileSync, symlinkSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { compare } from "../check-events.mjs";
@@ -76,4 +79,69 @@ test("seq numbers must have no gaps, and a delta has the last saved one", () => 
   const delta = (seq) => ({ type: "delta", thread_id: "t", seq, item_id: "a", kind: "text", text: "hi" });
   assert.match(compare([add(1)], [add(2)]).error, /has seq 2, not 1/);
   assert.match(compare([add(1), delta(1)], [add(1), delta(2)]).error, /a delta/);
+});
+
+/** A fixture's expected events, and a copy as a backend would send them to change. */
+function pair(fixture) {
+  const expected = readJsonl(join(fixtureDirs().find((d) => d.endsWith(fixture)), "expected.jsonl"));
+  return { expected, actual: asBackendWould(expected) };
+}
+
+test("a required field that's false must be there", () => {
+  const { expected, actual } = pair("claude/error");
+  const i = actual.findIndex((e) => e.type === "item.added" && e.item.type === "turn_result");
+  assert.equal(actual[i].item.ok, false);
+  delete actual[i].item.ok;
+  assert.match(compare(expected, actual).error, /isn't a valid ThreadEvent: .*missing ok/);
+});
+
+test("a required field that's empty must be there", () => {
+  const { expected, actual } = pair("claude/plain-reply");
+  const i = actual.findIndex((e) => e.type === "item.added" && e.item.type === "assistant_message");
+  assert.equal(actual[i].item.text, "");
+  delete actual[i].item.text;
+  assert.match(compare(expected, actual).error, /missing text/);
+
+  const tc = pair("codex/permission-allow");
+  const j = tc.actual.findIndex((e) => e.type === "item.updated" && e.patch.result?.content === "");
+  delete tc.actual[j].patch.result.content;
+  assert.match(compare(tc.expected, tc.actual).error, /result\.content: expected ""/);
+});
+
+test("an optional field that's false or empty may be left out, or sent", () => {
+  const { expected, actual } = pair("claude/permission-allow");
+  const i = actual.findIndex((e) => e.type === "item.added" && e.item.type === "user_message");
+  actual[i].item = { ...actual[i].item, steered: false, queued: false };
+  assert.equal(compare(expected, actual).ok, true, compare(expected, actual).error);
+});
+
+test("a patch's fields are kept as they're sent", () => {
+  const { expected, actual } = pair("claude/steer");
+  const i = actual.findIndex((e) => e.type === "item.updated" && e.patch.queued === null);
+  actual[i].patch = { queued: false };
+  assert.equal(compare(expected, actual).ok, false);
+});
+
+test("an event that isn't valid doesn't match", () => {
+  const { expected, actual } = pair("claude/plain-reply");
+  const i = actual.findIndex((e) => e.type === "item.added");
+  actual[i] = { ...actual[i], item: { ...actual[i].item, type: "nonsense" } };
+  assert.match(compare(expected, actual).error, /isn't a valid ThreadEvent/);
+});
+
+test("the command line says so when events don't match, however the script's path is spelled", () => {
+  const tools = join(dirname(fileURLToPath(import.meta.url)), "..");
+  const fixture = fixtureDirs().find((d) => d.endsWith("claude/plain-reply"));
+  // A path with a space, reached through a symlink.
+  const tmp = mkdtempSync(join(tmpdir(), "check events "));
+  symlinkSync(tools, join(tmp, "tools"));
+  const bogus = join(tmp, "bogus.jsonl");
+  writeFileSync(bogus, JSON.stringify({ type: "turn.started", thread_id: "t", seq: 1, turn_id: "x" }) + "\n");
+  for (const script of [join(tools, "check-events.mjs"), join(tmp, "tools", "check-events.mjs")]) {
+    const bad = spawnSync(process.execPath, [script, fixture, bogus], { encoding: "utf8" });
+    assert.equal(bad.status, 1, `${script}: ${bad.stdout}${bad.stderr}`);
+    const good = spawnSync(process.execPath, [script, fixture, join(fixture, "expected.jsonl")], { encoding: "utf8" });
+    assert.equal(good.status, 0, `${script}: ${good.stderr}`);
+    assert.equal(good.stdout.trim(), "ok");
+  }
 });

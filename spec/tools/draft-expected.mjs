@@ -12,6 +12,7 @@
 
 import { readFileSync, writeFileSync, existsSync } from "node:fs";
 import { join } from "node:path";
+import { isMain } from "./lib/main.mjs";
 import { loadSession } from "./lib/session.mjs";
 
 // ---------- tools ----------
@@ -464,17 +465,10 @@ function draftClaude(d, runs) {
           break;
         }
         case "result": {
-          const u = m.usage ?? {};
           d.endTurn({
             ok: !m.is_error,
             error: m.is_error ? (m.result || (m.errors ?? []).join("\n") || m.subtype) : undefined,
-            usage: {
-              input_tokens: u.input_tokens ?? 0,
-              output_tokens: u.output_tokens ?? 0,
-              cache_read_tokens: u.cache_read_input_tokens ?? 0,
-              cache_write_tokens: u.cache_creation_input_tokens ?? 0,
-              cost_usd: m.total_cost_usd ?? 0,
-            },
+            usage: claudeUsage(m),
             duration_ms: m.duration_ms,
           });
           interrupted = false;
@@ -483,6 +477,23 @@ function draftClaude(d, runs) {
       }
     }
   }
+}
+
+/**
+ * What a turn used. A result's usage is its last model call's (it leaves out compaction and
+ * subagents) and its total_cost_usd the session's so far (across resumes too), so it's
+ * model_usage_since_last_result, summed over the models.
+ */
+export function claudeUsage(result) {
+  const u = { input_tokens: 0, output_tokens: 0, cache_read_tokens: 0, cache_write_tokens: 0, cost_usd: 0 };
+  for (const m of Object.values(result.model_usage_since_last_result ?? {})) {
+    u.input_tokens += m.inputTokens ?? 0;
+    u.output_tokens += m.outputTokens ?? 0;
+    u.cache_read_tokens += m.cacheReadInputTokens ?? 0;
+    u.cache_write_tokens += m.cacheCreationInputTokens ?? 0;
+    u.cost_usd = Math.round((u.cost_usd + (m.costUSD ?? 0)) * 1e12) / 1e12;
+  }
+  return u;
 }
 
 const userText = (m) => {
@@ -772,7 +783,7 @@ export function draft(dir) {
 }
 
 const args = process.argv.slice(2);
-if (args.length && import.meta.url === `file://${process.argv[1]}`) {
+if (args.length && isMain(import.meta.url)) {
   const check = args[0] === "--check";
   let bad = 0;
   for (const dir of check ? args.slice(1) : args) {

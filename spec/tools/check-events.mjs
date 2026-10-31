@@ -5,10 +5,13 @@
 //
 //   node spec/tools/check-events.mjs spec/fixtures/claude/plain-reply actual.jsonl
 //
-// It exits 0 if they match, and 1 with the first difference if they don't.
+// It exits 0 if they match, and 1 with the first difference if they don't (an event that isn't a
+// valid ThreadEvent is one).
 
 import { readFileSync, statSync } from "node:fs";
 import { join } from "node:path";
+import { isMain } from "./lib/main.mjs";
+import { branch, def, validate } from "./lib/schema.mjs";
 
 const readJsonl = (path) =>
   readFileSync(path, "utf8")
@@ -18,17 +21,38 @@ const readJsonl = (path) =>
 
 /** Fields that are the backend's own business, and harness payloads, which aren't compared. */
 const DROP = new Set(["raw", "created_at", "updated_at", "seq"]);
-/** Harness data, compared as it is (no false or "" removed). */
-const VERBATIM = new Set(["input", "structured"]);
 
-function clean(v, key) {
-  if (Array.isArray(v)) return v.map((x) => clean(x));
-  if (!v || typeof v !== "object") return v;
-  if (VERBATIM.has(key)) return v;
+/**
+ * A value as compared, by its schema: the fields in DROP left out, and optional fields that are
+ * false or "" (which the protocol lets a backend leave out) too. Required fields stay, whatever
+ * their value. Values with no properties in the schema (a tool's input, structured output, an
+ * app's metadata) are the harness's or the app's own, and stay as they are.
+ */
+function clean(v, schema) {
+  const s = branch(schema, v);
+  if (Array.isArray(v)) return s?.items ? v.map((x) => clean(x, s.items)) : v;
+  if (!v || typeof v !== "object" || !s?.properties) return v;
+  const required = new Set(s.required ?? []);
   const out = {};
   for (const [k, x] of Object.entries(v)) {
-    if (DROP.has(k) || x === false || x === "" || x === undefined) continue;
-    out[k] = VERBATIM.has(k) ? x : clean(x, k);
+    if (DROP.has(k) || x === undefined) continue;
+    if ((x === false || x === "") && !required.has(k)) continue;
+    out[k] = s.properties[k] ? clean(x, s.properties[k]) : x;
+  }
+  return out;
+}
+
+/**
+ * An item.updated's patch as compared. Its fields are operations (setting a field to false isn't
+ * the same as leaving it unchanged), so they all stay but DROP's; their values are cleaned by the
+ * patched item's schema.
+ */
+function cleanPatch(patch, itemSchema) {
+  const out = {};
+  for (const [k, x] of Object.entries(patch ?? {})) {
+    if (DROP.has(k)) continue;
+    const p = itemSchema?.properties?.[k];
+    out[k] = p && x !== null ? clean(x, p) : x;
   }
   return out;
 }
@@ -39,9 +63,12 @@ function clean(v, key) {
  */
 export function normalize(events) {
   const out = [];
+  const itemSchemas = new Map(); // item id -> its schema, for patches
   let lastThread = null;
   for (const e of events) {
-    const c = clean(e);
+    const c = clean(e, def("ThreadEvent"));
+    if (c.type === "item.added") itemSchemas.set(e.item?.id, branch(def("Item"), e.item));
+    if (c.type === "item.updated") c.patch = cleanPatch(e.patch, itemSchemas.get(e.item_id));
     if (c.type === "thread.updated") {
       delete c.thread.run;
       const t = JSON.stringify(sortKeys(c.thread));
@@ -56,6 +83,15 @@ export function normalize(events) {
     out.push(c);
   }
   return out;
+}
+
+/** The first event a backend sent that isn't a valid ThreadEvent, and why. */
+export function checkValid(events) {
+  for (const [i, e] of events.entries()) {
+    const errors = validate(e, def("ThreadEvent"), "event");
+    if (errors.length) return `event ${i + 1} (${e?.type}) isn't a valid ThreadEvent: ${errors.slice(0, 3).join("; ")}`;
+  }
+  return null;
 }
 
 function sortKeys(v) {
@@ -82,6 +118,8 @@ const PLACEHOLDER = /^\{\{([a-z0-9_]+)\}\}$/;
  * @returns {{ ok: true, bindings: Record<string, unknown> } | { ok: false, error: string }}
  */
 export function compare(expectedEvents, actualEvents) {
+  const invalid = checkValid(actualEvents);
+  if (invalid) return { ok: false, error: invalid };
   const seqProblem = checkSeq(actualEvents);
   if (seqProblem) return { ok: false, error: seqProblem };
   const want = normalize(expectedEvents);
@@ -135,7 +173,7 @@ export function compare(expectedEvents, actualEvents) {
 
 const same = (a, b) => JSON.stringify(sortKeys(a)) === JSON.stringify(sortKeys(b));
 
-if (import.meta.url === `file://${process.argv[1]}`) {
+if (isMain(import.meta.url)) {
   const [fixture, actualPath] = process.argv.slice(2);
   if (!fixture || !actualPath) {
     console.error("usage: node spec/tools/check-events.mjs <fixture dir or expected.jsonl> <actual events .jsonl>");

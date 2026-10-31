@@ -176,10 +176,13 @@ backend drives each CLI:
   and `compact_boundary`, `rate_limit_event`, stream events other than text and thinking deltas,
   and the echoes of the backend's own control responses. A replayed (`isReplay`) user message
   takes in the queued message with the same text, if there is one.
-- **The result**: `ok` is `!is_error`; `error` is the result's text; `usage` is `input_tokens`,
-  `output_tokens`, `cache_read_input_tokens` as `cache_read_tokens`,
-  `cache_creation_input_tokens` as `cache_write_tokens`, and `total_cost_usd` as `cost_usd`;
-  `duration_ms` is the result's.
+- **The result**: `ok` is `!is_error`; `error` is the result's text; `duration_ms` is the
+  result's. `usage` is the result's `model_usage_since_last_result`, summed over its models:
+  `inputTokens`, `outputTokens`, `cacheReadInputTokens` as `cache_read_tokens`,
+  `cacheCreationInputTokens` as `cache_write_tokens` and `costUSD` as `cost_usd`. Not the result's
+  `usage`, which is only its last model call's (it leaves out subagents, and a compaction's tokens),
+  nor its `total_cost_usd`, which is the session's so far, across a resume too. So the thread's
+  usage adds up to the session's `total_cost_usd`.
 
 ### Codex
 
@@ -210,15 +213,19 @@ backend drives each CLI:
 A backend's events match `expected.jsonl` when, after both are normalized, they're equal in order,
 with placeholders bound. `spec/tools/check-events.mjs` implements this.
 
-1. **Seq.** The backend's saved events have `seq` 1, 2, 3... with no gaps, and each `delta` has the
-   `seq` of the saved event before it.
-2. **Normalize** both streams: leave out `raw`, `created_at`, `updated_at`, `seq` and the thread's
-   `run`, and fields that are `false` or `""` (as the protocol allows), except inside `input` and
-   `result.structured`, which are the harness's own; then drop a `thread.updated` whose thread is
-   the same as the one before; then join consecutive deltas to the same item and kind into one.
-   (So a backend may cut deltas differently, and send a `thread.updated` when only its run
-   changes.)
-3. **Compare** event by event. Every field must be equal, and the backend's events may not have
+1. **Valid.** Each of the backend's events is a valid `ThreadEvent` by the schema (required fields
+   there, even when they're `false` or `""`).
+2. **Seq.** Its saved events have `seq` 1, 2, 3... with no gaps, and each `delta` has the `seq` of
+   the saved event before it.
+3. **Normalize** both streams: leave out `raw`, `created_at`, `updated_at`, `seq` and the thread's
+   `run`, and *optional* fields that are `false` or `""` (as the protocol lets a backend leave them
+   out). Values the schema doesn't describe field by field (a tool's `input`, `result.structured`,
+   `metadata`) stay as they are. An `item.updated`'s patch keeps all its fields, since each is an
+   operation (`false` isn't "unchanged"), with their values normalized by the item's schema. Then
+   drop a `thread.updated` whose thread is the same as the one before, and join consecutive deltas
+   to the same item and kind into one. (So a backend may cut deltas differently, and send a
+   `thread.updated` when only its run changes.)
+4. **Compare** event by event. Every field must be equal, and the backend's events may not have
    fields the expected ones don't. Numbers may differ by one part in a billion (for summed costs).
    A string `"{{name}}"` in the expected events matches any value the first time and binds it;
    later, the same name must be the same value, and different names must be different values.

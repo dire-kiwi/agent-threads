@@ -169,3 +169,68 @@ test("takes an input sooner than the recording has it", async () => {
   assert.equal(report.ok, true, report.error);
   assert.equal(report.matched, report.expected);
 });
+
+/** Play a fixture's first run with the recorded inputs, changing the permission answer. */
+async function answerDifferently(scenario, change) {
+  const dir = join(fixtures, scenario);
+  const { runs } = loadSession(dir);
+  const state = mkdtempSync(join(tmpdir(), "fake-cli-test-"));
+  const [spawnEntry, ...rest] = runs.get(1);
+  const cli = start(dir, spawnEntry.argv.slice(1), state);
+  let outs = 0;
+  for (const e of rest) {
+    if (e.dir === "out" && e.msg !== undefined) outs++;
+    if (e.dir === "in" || e.dir === "close") {
+      try {
+        await cli.until(outs);
+      } catch {
+        break; // it has given up
+      }
+      if (e.dir === "close") cli.child.stdin.end();
+      else {
+        const msg = e.msg.type === "control_response" ? change(structuredClone(e.msg)) : e.msg;
+        cli.child.stdin.write(JSON.stringify(msg) + "\n");
+      }
+    }
+  }
+  const { code } = await cli.exited;
+  return { code, stderr: cli.stderr(), report: JSON.parse(readFileSync(join(state, "run-1.json"), "utf8")) };
+}
+
+test("catches an allowed tool whose input the backend changed", async () => {
+  const r = await answerDifferently("claude/permission-allow", (m) => {
+    m.response.response.updatedInput = { command: "echo DIFFERENT_COMMAND" };
+    return m;
+  });
+  assert.equal(r.code, 97);
+  assert.equal(r.report.ok, false);
+  assert.match(r.stderr, /DIFFERENT_COMMAND/);
+});
+
+test("takes an allow without updatedInput as the input it was asked about", async () => {
+  const r = await answerDifferently("claude/permission-allow", (m) => {
+    delete m.response.response.updatedInput;
+    return m;
+  });
+  assert.equal(r.report.ok, true, r.report.error);
+});
+
+test("catches a denial with a different message", async () => {
+  const r = await answerDifferently("claude/permission-deny", (m) => {
+    m.response.response.message = "Something else.";
+    return m;
+  });
+  assert.equal(r.code, 97);
+  assert.equal(r.report.ok, false);
+  assert.match(r.stderr, /Something else/);
+});
+
+test("catches a different answer to a question", async () => {
+  const r = await answerDifferently("claude/ask-user-question", (m) => {
+    const answers = m.response.response.updatedInput.answers;
+    for (const q of Object.keys(answers)) answers[q] = "Red";
+    return m;
+  });
+  assert.equal(r.code, 97);
+  assert.equal(r.report.ok, false);
+});

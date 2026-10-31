@@ -117,7 +117,10 @@ export class Context {
         const body = r.response ?? {};
         if (asked.subtype === "can_use_tool") {
           k.behavior = body.behavior;
-          if (body.behavior === "allow" && body.updatedInput?.answers) k.answers = body.updatedInput.answers;
+          // What the tool will run with: the input it asked about, unless the backend changed it
+          // (AskUserQuestion's answers go in it too). A denial's message is what the agent is told.
+          if (body.behavior === "allow") k.input = body.updatedInput ?? asked.input;
+          if (body.behavior === "deny") k.message = body.message;
         } else if (asked.subtype === "mcp_message") {
           k.mcp = mcpReply(asked.message, body.mcp_response);
         }
