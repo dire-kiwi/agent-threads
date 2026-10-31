@@ -1,0 +1,18 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/dire-kiwi/agent-threads/spec/schema/snapshot.schema.json",
+  "title": "Snapshot",
+  "$defs": {
+    "Snapshot": {
+      "type": "object",
+      "description": "A thread's whole state as of seq: what applying its events, in order, from the start gives.",
+      "required": ["thread", "items", "requests", "seq"],
+      "properties": {
+        "thread": { "$ref": "thread.schema.json#/$defs/Thread" },
+        "items": { "type": "array", "items": { "$ref": "item.schema.json#/$defs/Item" } },
+        "requests": { "type": "array", "items": { "$ref": "request.schema.json#/$defs/ThreadRequest" }, "description": "The open requests, oldest first." },
+        "seq": { "type": "integer", "minimum": 0, "description": "The seq of the last saved event it includes; 0 for none." }
+      }
+    }
+  }
+}

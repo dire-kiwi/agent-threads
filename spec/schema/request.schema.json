@@ -1,0 +1,85 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/dire-kiwi/agent-threads/spec/schema/request.schema.json",
+  "title": "Request",
+  "description": "Things the agent is waiting on the user for. A request is open from request.opened until request.resolved, and is answered with a respond command.",
+  "$defs": {
+    "ThreadRequest": {
+      "description": "An open request, told apart by type.",
+      "oneOf": [
+        { "$ref": "#/$defs/PermissionRequest" },
+        { "$ref": "#/$defs/QuestionRequest" }
+      ]
+    },
+    "PermissionRequest": {
+      "type": "object",
+      "description": "The agent wants to call a tool, and the permission policy said ask. Answered with outcome allow or deny.",
+      "required": ["id", "type", "name", "kind", "input"],
+      "properties": {
+        "id": { "type": "string" },
+        "type": { "const": "permission" },
+        "tool_call_id": { "type": "string", "description": "The tool_call item it's for, when there is one." },
+        "name": { "type": "string", "description": "The tool's name, as in ToolCall.name." },
+        "kind": { "$ref": "item.schema.json#/$defs/ToolKind" },
+        "input": { "description": "The tool's arguments, as in ToolCall.input." },
+        "title": { "type": "string", "description": "A short summary of what's asked, e.g. the command line." },
+        "reason": { "type": "string", "description": "Why the harness asks, when it says." },
+        "parent_id": { "type": "string", "description": "The subagent tool_call that's asking, if one is." },
+        "turn_id": { "type": "string" },
+        "created_at": { "type": "string", "format": "date-time" },
+        "raw": { "description": "The harness's own payload, for debugging." }
+      }
+    },
+    "QuestionRequest": {
+      "type": "object",
+      "description": "The agent asks the user one or more questions (Claude's AskUserQuestion, Codex's requestUserInput). Answered with outcome answer.",
+      "required": ["id", "type", "questions"],
+      "properties": {
+        "id": { "type": "string" },
+        "type": { "const": "question" },
+        "questions": { "type": "array", "minItems": 1, "items": { "$ref": "#/$defs/Question" } },
+        "tool_call_id": { "type": "string", "description": "The tool_call item it's for, when there is one." },
+        "parent_id": { "type": "string", "description": "The subagent tool_call that's asking, if one is." },
+        "turn_id": { "type": "string" },
+        "created_at": { "type": "string", "format": "date-time" },
+        "raw": { "description": "The harness's own payload, for debugging." }
+      }
+    },
+    "Question": {
+      "type": "object",
+      "required": ["id", "question"],
+      "properties": {
+        "id": { "type": "string", "description": "Unique within the request; the key for its answer." },
+        "question": { "type": "string" },
+        "header": { "type": "string", "description": "A very short label for it." },
+        "options": { "type": "array", "items": { "$ref": "#/$defs/QuestionOption" }, "description": "Choices. With none, the answer is free text." },
+        "multi_select": { "type": "boolean", "default": false, "description": "More than one option can be chosen." },
+        "allow_other": { "type": "boolean", "default": false, "description": "Free text is accepted as well as the options." },
+        "secret": { "type": "boolean", "default": false, "description": "The answer is a secret: don't show or log it." }
+      }
+    },
+    "QuestionOption": {
+      "type": "object",
+      "required": ["label"],
+      "properties": {
+        "label": { "type": "string", "description": "The option's text, which is also its answer." },
+        "description": { "type": "string" }
+      }
+    },
+    "Resolution": {
+      "type": "object",
+      "description": "How a request was answered: sent in respond, and repeated in request.resolved.",
+      "required": ["outcome"],
+      "properties": {
+        "outcome": { "type": "string", "enum": ["allow", "deny", "answer", "cancel"], "description": "allow, deny: for a permission. answer: for a question. cancel: for either, when the user dismisses it or the turn ends first." },
+        "always": { "type": "boolean", "default": false, "description": "allow, deny: apply the same answer to matching calls for the rest of the thread, without asking." },
+        "message": { "type": "string", "description": "deny: why, which the agent is told. answer: a note with the answers." },
+        "answers": {
+          "type": "object",
+          "description": "answer: for each question id, the chosen option labels or the free text.",
+          "additionalProperties": { "type": "array", "items": { "type": "string" } }
+        }
+      }
+    }
+  }
+}

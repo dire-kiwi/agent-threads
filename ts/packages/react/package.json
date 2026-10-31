@@ -1,0 +1,20 @@
+{
+  "name": "@dire-kiwi/agent-threads-react",
+  "version": "0.0.0",
+  "description": "React hooks and components for agent-threads.",
+  "type": "module",
+  "exports": {
+    ".": { "types": "./dist/index.d.ts", "default": "./dist/index.js" }
+  },
+  "files": ["dist"],
+  "scripts": {
+    "build": "tsc",
+    "test": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@dire-kiwi/agent-threads-protocol": "workspace:*"
+  },
+  "peerDependencies": {
+    "react": ">=18"
+  }
+}

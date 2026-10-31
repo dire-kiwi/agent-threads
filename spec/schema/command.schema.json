@@ -1,0 +1,61 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/dire-kiwi/agent-threads/spec/schema/command.schema.json",
+  "title": "Command",
+  "description": "What a backend accepts, from the user's side. Every command has type and thread_id.",
+  "$defs": {
+    "Command": {
+      "description": "A command, told apart by type.",
+      "oneOf": [
+        { "$ref": "#/$defs/SendCommand" },
+        { "$ref": "#/$defs/InterruptCommand" },
+        { "$ref": "#/$defs/RespondCommand" },
+        { "$ref": "#/$defs/SetOptionsCommand" }
+      ]
+    },
+    "SendCommand": {
+      "type": "object",
+      "description": "Send the agent a message. It starts a turn if none is running, and steers the running one if one is.",
+      "required": ["type", "thread_id", "text"],
+      "properties": {
+        "type": { "const": "send" },
+        "thread_id": { "type": "string" },
+        "text": { "type": "string" },
+        "attachments": { "type": "array", "items": { "$ref": "item.schema.json#/$defs/Attachment" } },
+        "client_id": { "type": "string", "description": "The client's own id for the message, copied to the user_message item." }
+      }
+    },
+    "InterruptCommand": {
+      "type": "object",
+      "description": "Stop the running turn. Does nothing if none is running.",
+      "required": ["type", "thread_id"],
+      "properties": {
+        "type": { "const": "interrupt" },
+        "thread_id": { "type": "string" }
+      }
+    },
+    "RespondCommand": {
+      "type": "object",
+      "description": "Answer an open request.",
+      "required": ["type", "thread_id", "request_id", "resolution"],
+      "properties": {
+        "type": { "const": "respond" },
+        "thread_id": { "type": "string" },
+        "request_id": { "type": "string" },
+        "resolution": { "$ref": "request.schema.json#/$defs/Resolution" }
+      }
+    },
+    "SetOptionsCommand": {
+      "type": "object",
+      "description": "Change the thread's options. Fields left out stay as they are. They apply from the next turn, or straight away where the harness allows.",
+      "required": ["type", "thread_id"],
+      "properties": {
+        "type": { "const": "set_options" },
+        "thread_id": { "type": "string" },
+        "model": { "type": "string" },
+        "effort": { "type": "string" },
+        "permission_mode": { "$ref": "thread.schema.json#/$defs/PermissionMode" }
+      }
+    }
+  }
+}

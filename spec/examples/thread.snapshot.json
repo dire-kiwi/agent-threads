@@ -1,0 +1,189 @@
+{
+  "thread": {
+    "id": "th_1",
+    "harness": "claude",
+    "status": "idle",
+    "model": "opus",
+    "permission_mode": "default",
+    "cwd": "/work/app",
+    "session_id": "sess_1",
+    "usage": {
+      "input_tokens": 5200,
+      "output_tokens": 800,
+      "cache_read_tokens": 41000,
+      "cost_usd": 0.12
+    },
+    "created_at": "2026-11-01T00:00:00Z",
+    "updated_at": "2026-11-01T00:10:11Z"
+  },
+  "items": [
+    {
+      "id": "u1",
+      "type": "user_message",
+      "text": "Fix the failing test",
+      "client_id": "c1",
+      "turn_id": "t1",
+      "created_at": "2026-11-01T00:00:01Z"
+    },
+    {
+      "id": "r1",
+      "type": "reasoning",
+      "text": "Let me run the tests first.",
+      "turn_id": "t1"
+    },
+    {
+      "id": "tc1",
+      "type": "tool_call",
+      "name": "Bash",
+      "kind": "shell",
+      "input": {
+        "command": "npm test"
+      },
+      "status": "completed",
+      "command": "npm test",
+      "turn_id": "t1",
+      "result": {
+        "content": "1 failing: sum adds the last number twice",
+        "exit_code": 1
+      }
+    },
+    {
+      "id": "tc2",
+      "type": "tool_call",
+      "name": "Agent",
+      "kind": "subagent",
+      "input": {
+        "description": "Find the bug",
+        "prompt": "Find why sum() is wrong.",
+        "subagent_type": "general-purpose"
+      },
+      "status": "completed",
+      "title": "Find the bug",
+      "turn_id": "t1",
+      "result": {
+        "content": "sum() starts from the last number instead of 0."
+      }
+    },
+    {
+      "id": "tc3",
+      "type": "tool_call",
+      "name": "Read",
+      "kind": "read",
+      "input": {
+        "file_path": "/work/app/src/sum.ts"
+      },
+      "status": "completed",
+      "path": "/work/app/src/sum.ts",
+      "result": {
+        "content": "export const sum = (xs) => xs.reduce((a, x) => a + x, xs.at(-1));",
+        "truncated": true
+      },
+      "parent_id": "tc2",
+      "turn_id": "t1"
+    },
+    {
+      "id": "a0",
+      "type": "assistant_message",
+      "text": "sum() starts from the last number instead of 0.",
+      "parent_id": "tc2",
+      "turn_id": "t1"
+    },
+    {
+      "id": "u2",
+      "type": "user_message",
+      "text": "Add a test for the empty list too",
+      "steered": true,
+      "client_id": "c2",
+      "turn_id": "t1"
+    },
+    {
+      "id": "tc4",
+      "type": "tool_call",
+      "name": "Edit",
+      "kind": "edit",
+      "input": {
+        "file_path": "/work/app/src/sum.ts",
+        "old_string": "xs.at(-1)",
+        "new_string": "0"
+      },
+      "status": "completed",
+      "changes": [
+        {
+          "path": "/work/app/src/sum.ts",
+          "op": "update",
+          "diff": "@@ -1 +1 @@\n-export const sum = (xs) => xs.reduce((a, x) => a + x, xs.at(-1));\n+export const sum = (xs) => xs.reduce((a, x) => a + x, 0);\n"
+        }
+      ],
+      "result": {
+        "content": "The file was updated."
+      },
+      "turn_id": "t1"
+    },
+    {
+      "id": "tc5",
+      "type": "tool_call",
+      "name": "AskUserQuestion",
+      "kind": "other",
+      "input": {
+        "questions": [
+          {
+            "question": "Which test runner?",
+            "header": "Runner",
+            "options": [
+              {
+                "label": "vitest"
+              },
+              {
+                "label": "jest"
+              }
+            ],
+            "multiSelect": false
+          }
+        ]
+      },
+      "status": "completed",
+      "turn_id": "t1",
+      "result": {
+        "content": "runner: vitest"
+      }
+    },
+    {
+      "id": "n1",
+      "type": "notice",
+      "level": "info",
+      "code": "run.reattached",
+      "text": "The backend restarted and picked the run up again.",
+      "turn_id": "t1",
+      "created_at": "2026-11-01T00:05:00Z"
+    },
+    {
+      "id": "cp1",
+      "type": "compaction",
+      "trigger": "auto",
+      "tokens_before": 160000,
+      "summary": "Fixed sum(); adding tests.",
+      "turn_id": "t1"
+    },
+    {
+      "id": "a1",
+      "type": "assistant_message",
+      "text": "Fixed `sum()` to start from 0, and added a vitest test for the empty list.",
+      "turn_id": "t1"
+    },
+    {
+      "id": "tr1",
+      "type": "turn_result",
+      "ok": true,
+      "usage": {
+        "input_tokens": 5200,
+        "output_tokens": 800,
+        "cache_read_tokens": 41000,
+        "cost_usd": 0.12
+      },
+      "duration_ms": 310000,
+      "turn_id": "t1"
+    }
+  ],
+  "requests": [],
+  "seq": 34
+}
