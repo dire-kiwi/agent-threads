@@ -152,6 +152,34 @@ describe("ThreadStore", () => {
       expect(store.getState().snapshot.seq).toBe(3);
     });
 
+    it("applies a delta from past a gap when the source can't resync", () => {
+      const { store, emit } = connected();
+      emit(added(1, msg("a")), delta(2, "a", "x"));
+      expect(store.getState().resyncing).toBe(false);
+      expect(store.getState().snapshot.items[0]).toMatchObject({ text: "x" });
+    });
+
+    it("asks again when it's connected again mid-resync, and catches up", async () => {
+      const answers: ((r: ThreadEvent[]) => void)[] = [];
+      const resync = vi.fn(() => new Promise<ThreadEvent[]>((r) => answers.push(r)));
+      const { store, emit, disconnect, ids } = connected(undefined, resync);
+      emit(added(1, msg("a")), added(3, msg("c")));
+      disconnect();
+      // As React does running the effect again (StrictMode, Fast Refresh, <Activity>).
+      store.connect();
+      expect(resync).toHaveBeenCalledTimes(2);
+      expect(resync).toHaveBeenLastCalledWith(1);
+      emit(added(4, msg("d")));
+      answers[1]!([added(2, msg("b"))]);
+      await flush();
+      expect(ids()).toEqual(["a", "b", "c", "d"]);
+      expect(store.getState().resyncing).toBe(false);
+      // The first resync's late answer changes nothing.
+      answers[0]!([added(2, msg("stale"))]);
+      await flush();
+      expect(ids()).toEqual(["a", "b", "c", "d"]);
+    });
+
     it("ignores a resync that comes after it disconnected", async () => {
       let answer!: (r: ThreadEvent[]) => void;
       const { store, emit, disconnect, ids } = connected(undefined, () => new Promise((r) => (answer = r)));

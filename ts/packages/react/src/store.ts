@@ -67,6 +67,9 @@ export class ThreadStore {
   connect(): () => void {
     this.connected = true;
     const off = this.source.subscribe((event) => this.receive(event));
+    // Connected again (e.g. React running the effect again) while events were missing: the resync
+    // under way when it disconnected was dropped, so ask again from where the state is now.
+    if (this.connected && (this.held.size || this.state.resyncing)) this.gap();
     return () => {
       this.connected = false;
       this.attempt++;
@@ -83,7 +86,7 @@ export class ThreadStore {
       // a resync can't give them back, and its snapshot may have them in already: they're dropped
       // until it's done, and the item's final text puts it right.
       if (this.state.resyncing) return;
-      if (event.seq > s.seq) return this.gap();
+      if (event.seq > s.seq && this.source.resync) return this.gap();
       return this.update(this.apply(this.state, event));
     }
     if (event.seq <= s.seq) return;
