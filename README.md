@@ -4,9 +4,10 @@ A library for apps to run threads of agents on Claude Code (`claude -p`, stream-
 (`codex app-server`), with native Go, Rust and TypeScript (Node) backends and React components. It
 has no network layer: backends emit JSON events and accept JSON commands, and the app carries them.
 
-It's early: so far there's the spec, the generated types, the `applyEvent` reducer, and the
-conformance suite the backends will run (recorded sessions replayed by a fake CLI, and store
-cases). See [docs/design.md](docs/design.md) for the design and [spec/PROTOCOL.md](spec/PROTOCOL.md)
+It's early: so far there's the spec, the generated types, the `applyEvent` reducer, the
+conformance suite the backends run (recorded sessions replayed by a fake CLI, and store cases),
+and the Node backend with its stores and Claude Code driver
+([ts/packages/node](ts/packages/node/README.md)). See [docs/design.md](docs/design.md) for the design and [spec/PROTOCOL.md](spec/PROTOCOL.md)
 for the protocol.
 
 | Path | What |

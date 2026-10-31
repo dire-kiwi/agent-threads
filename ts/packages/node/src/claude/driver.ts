@@ -263,7 +263,13 @@ class ClaudeSession implements HarnessSession {
     run.proc = proc;
     ctx.setThread({ run: { id: run.id, spawner: ctx.spawner.name, started_at: new Date().toISOString() } });
     void run.control({ subtype: "initialize", ...(tools.length ? { sdkMcpServers: [APP_SERVER] } : {}) }).then((r) => {
-      if (!r || run.exited) return;
+      if (run.exited) return;
+      if (!r) {
+        // It refused: messages can't go in, so stop it, which ends the turn.
+        run.stderr.push("Claude Code refused the initialize request.");
+        void this.#stop(run, false);
+        return;
+      }
       run.ready = true;
       for (const line of run.waiting.splice(0)) proc.write(line);
     });
