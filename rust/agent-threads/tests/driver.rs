@@ -1044,3 +1044,87 @@ async fn deletes_a_thread() {
     assert!(env.sdk.get(&t.id).await.unwrap().is_none());
     assert!(matches!(env.sdk.snapshot(&t.id).await, Err(Error::Command(_))));
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn denies_when_an_async_policy_panics_making_its_future_and_the_thread_carries_on() {
+    #[allow(unreachable_code)]
+    let policy = PermissionPolicy::from_async(|_, _| {
+        panic!("policy factory failure");
+        async { PermissionDecision::Allow }
+    });
+    let env = setup(Setup {
+        capabilities: Capabilities {
+            permissions: Some(policy),
+            ..Default::default()
+        },
+        ..Default::default()
+    });
+    let t = env.sdk.create(create()).await.unwrap();
+    env.sdk
+        .send(&t.id, "tool Bash {}", SendOptions::default())
+        .await
+        .unwrap();
+    let s = settle(&env.sdk, &t.id).await;
+    assert_eq!(s["thread"]["status"], "idle");
+    let said = texts(&s).join("\n");
+    assert!(
+        said.contains("The permission policy failed: policy factory failure"),
+        "{said}"
+    );
+    assert_eq!(items(&s, "tool_call")[0]["status"], "denied");
+    // The thread is still there, and saves.
+    env.sdk
+        .send(&t.id, "reply still here", SendOptions::default())
+        .await
+        .unwrap();
+    assert_eq!(texts(&settle(&env.sdk, &t.id).await).last().unwrap(), "still here");
+    env.sdk.close(true).await.unwrap();
+}
+
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread")]
+async fn writes_attached_files_where_only_the_user_can_read_them() {
+    use base64::Engine;
+    use std::os::unix::fs::PermissionsExt;
+    let env = setup(Setup::default());
+    let t = env.sdk.create(create()).await.unwrap();
+    let data = base64::engine::general_purpose::STANDARD.encode(b"\x00\x01secret");
+    let attachment = serde_json::from_value(
+        json!({"kind": "file", "name": "private.bin", "media_type": "application/octet-stream", "data": data}),
+    )
+    .unwrap();
+    env.sdk
+        .send(
+            &t.id,
+            "reply got it",
+            SendOptions {
+                attachments: vec![attachment],
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    settle(&env.sdk, &t.id).await;
+    // What Claude was told: where the file is.
+    let runs = env.runs();
+    let told = runs[0]
+        .sent
+        .iter()
+        .filter(|m| m["type"] == "user")
+        .flat_map(|m| m["message"]["content"].as_array().cloned().unwrap_or_default())
+        .filter_map(|b| b["text"].as_str().map(String::from))
+        .find(|t| t.starts_with("Attached file private.bin"))
+        .unwrap();
+    let path = std::path::PathBuf::from(told.rsplit(": ").next().unwrap());
+    assert_eq!(std::fs::read(&path).unwrap(), b"\x00\x01secret");
+    let mode = |p: &std::path::Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+    assert_eq!(mode(&path) & 0o077, 0, "{}", path.display());
+    let private = path
+        .ancestors()
+        .find(|p| {
+            p.file_name()
+                .is_some_and(|n| n.to_string_lossy().starts_with("agent-threads_"))
+        })
+        .unwrap();
+    assert_eq!(mode(private), 0o700, "{}", private.display());
+}

@@ -133,6 +133,25 @@ jobs:
 
       - run: make test-chat-rust
 
+  # The crate builds on Windows, where the shim doesn't run and direct() is the spawner.
+  rust-windows:
+    name: Rust (Windows build)
+    runs-on: windows-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Rust toolchain
+        run: rustup toolchain install stable --profile minimal && rustup default stable
+
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          workspaces: rust
+
+      - name: cargo check
+        working-directory: rust
+        run: cargo check --locked -p agent-threads --all-targets
+
   shim:
     name: Shim
     runs-on: ubuntu-latest

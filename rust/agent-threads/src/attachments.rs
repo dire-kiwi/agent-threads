@@ -56,8 +56,14 @@ fn textual(media_type: &str) -> bool {
 }
 
 /// A message as parts: its text, then each attachment. Files with data that isn't textual are
-/// written to `dir()/attachments/<message id>/`.
-pub(crate) fn message_parts(m: &Message, dir: &mut dyn FnMut() -> std::path::PathBuf) -> Vec<Part> {
+/// written to `dir()/attachments/<message id>/` (dir() is the thread's private directory), readable
+/// by the user only. One that can't be written is a note to the agent instead, and what went wrong
+/// is added to `errors`, for the app.
+pub(crate) fn message_parts(
+    m: &Message,
+    dir: &mut dyn FnMut() -> std::io::Result<std::path::PathBuf>,
+    errors: &mut Vec<String>,
+) -> Vec<Part> {
     let mut parts = vec![Part::Text(m.text.clone())];
     for (i, a) in m.attachments.iter().enumerate() {
         let name = a
@@ -84,8 +90,6 @@ pub(crate) fn message_parts(m: &Message, dir: &mut dyn FnMut() -> std::path::Pat
                 )));
                 continue;
             }
-            let to = dir().join("attachments").join(&m.id);
-            let _ = std::fs::create_dir_all(&to);
             let base = Path::new(&name)
                 .file_name()
                 .map(|n| n.to_string_lossy().to_string())
@@ -102,8 +106,19 @@ pub(crate) fn message_parts(m: &Message, dir: &mut dyn FnMut() -> std::path::Pat
                     run = true;
                 }
             }
-            let path = to.join(format!("{}-{clean}", i + 1));
-            let _ = std::fs::write(&path, &bytes);
+            let file = format!("{}-{clean}", i + 1);
+            let path = match dir().and_then(|d| write_private(&d.join("attachments").join(&m.id), &file, &bytes)) {
+                Ok(p) => p,
+                Err(e) => {
+                    errors.push(format!(
+                        "the attached file {name} couldn't be written for the agent: {e}"
+                    ));
+                    parts.push(Part::Text(format!(
+                        "Attached file {name}: it couldn't be passed on ({e})."
+                    )));
+                    continue;
+                }
+            };
             parts.push(Part::Path {
                 image: false,
                 path: path.to_string_lossy().into(),
@@ -122,6 +137,18 @@ pub(crate) fn message_parts(m: &Message, dir: &mut dyn FnMut() -> std::path::Pat
         }
     }
     parts
+}
+
+/// Writes `bytes` to `dir/name` (making `dir`), readable by the user only.
+fn write_private(dir: &Path, name: &str, bytes: &[u8]) -> std::io::Result<std::path::PathBuf> {
+    std::fs::create_dir_all(dir)?;
+    let path = dir.join(name);
+    let mut o = std::fs::OpenOptions::new();
+    o.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    std::os::unix::fs::OpenOptionsExt::mode(&mut o, 0o600);
+    std::io::Write::write_all(&mut o.open(&path)?, bytes)?;
+    Ok(path)
 }
 
 /// What the agent is told about an attachment that's a file on disk.

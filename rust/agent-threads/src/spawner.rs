@@ -64,6 +64,7 @@ pub enum Signal {
 }
 
 impl Signal {
+    #[cfg(unix)]
     pub(crate) fn number(self) -> i32 {
         match self {
             Signal::Term => libc::SIGTERM,
@@ -74,6 +75,7 @@ impl Signal {
 }
 
 /// A process's name for a signal number.
+#[cfg(unix)]
 pub(crate) fn signal_name(n: i32) -> String {
     match n {
         libc::SIGHUP => "SIGHUP".into(),
@@ -218,8 +220,17 @@ impl Spawner for Direct {
         let out = tokio::spawn(read_lines(child.stdout.take().unwrap(), events.clone(), false));
         let err = tokio::spawn(read_lines(child.stderr.take().unwrap(), events.clone(), true));
         let done = closed.clone();
+        // Where there are no process groups to signal (Windows), the child itself is killed.
+        let (killer, mut kills) = mpsc::unbounded_channel::<()>();
         tokio::spawn(async move {
-            let status = child.wait().await;
+            let status = loop {
+                tokio::select! {
+                    s = child.wait() => break s,
+                    Some(()) = kills.recv() => {
+                        let _ = child.start_kill();
+                    }
+                }
+            };
             // After the process exits and its stdio ends, so after the last line. Until then
             // something it started may still hold its stdio, so its group can still be signalled.
             let _ = out.await;
@@ -238,6 +249,7 @@ impl Spawner for Direct {
             pid,
             input: Mutex::new(Some(input)),
             closed,
+            killer,
         };
         Ok((Arc::new(proc), rx))
     }
@@ -293,6 +305,8 @@ struct DirectProcess {
     pid: Option<u32>,
     input: Mutex<Option<mpsc::UnboundedSender<String>>>,
     closed: Arc<AtomicBool>,
+    #[cfg_attr(unix, allow(dead_code))]
+    killer: mpsc::UnboundedSender<()>,
 }
 
 impl HarnessProcess for DirectProcess {
@@ -319,13 +333,20 @@ impl HarnessProcess for DirectProcess {
         if self.closed.load(Ordering::SeqCst) {
             return;
         }
-        let Some(pid) = self.pid else { return };
         #[cfg(unix)]
-        unsafe {
-            // The group outlives its leader while anything in it runs.
-            if libc::kill(-(pid as i32), signal.number()) != 0 {
-                libc::kill(pid as i32, signal.number());
+        {
+            let Some(pid) = self.pid else { return };
+            unsafe {
+                // The group outlives its leader while anything in it runs.
+                if libc::kill(-(pid as i32), signal.number()) != 0 {
+                    libc::kill(pid as i32, signal.number());
+                }
             }
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = signal;
+            let _ = self.killer.send(());
         }
     }
 }

@@ -19,7 +19,7 @@ use tokio::sync::{mpsc, watch};
 use crate::agent_threads::Error;
 use crate::attachments::{Part, message_parts, path_text};
 use crate::harness::{BoxFuture, Harness, HarnessSession, Message, RunCheckpoint, TurnEnd};
-use crate::ids::{new_id, now_iso, now_ms};
+use crate::ids::{new_id, now_iso, now_ms, private_temp_dir};
 use crate::permissions::{Decided, PermissionDecision, PermissionQuery, permission_key};
 use crate::protocol::{DeltaEventKind, Item, Resolution, ResolutionOutcome, ToolKind, ToolStatus};
 use crate::skills::write_skills;
@@ -382,21 +382,20 @@ impl ClaudeSession {
     }
 
     /// The thread's directory for generated files.
-    fn dir(&mut self) -> PathBuf {
+    fn dir(&mut self) -> std::io::Result<PathBuf> {
         if self.tmp.is_none() {
-            let dir = std::env::temp_dir().join(new_id("agent-threads"));
-            let _ = std::fs::create_dir_all(&dir);
-            self.tmp = Some(dir);
+            self.tmp = Some(private_temp_dir()?);
         }
-        self.tmp.clone().unwrap()
+        Ok(self.tmp.clone().unwrap())
     }
 
     /// Messages as one message on Claude's stdin: their content, one after the other.
-    fn user_message(&mut self, messages: &[Message]) -> Value {
+    fn user_message(&mut self, ctx: &ThreadContext, messages: &[Message]) -> Value {
         let mut content = Vec::new();
+        let mut errors = Vec::new();
         for m in messages {
             let mut dir = || self.dir();
-            for p in message_parts(m, &mut dir) {
+            for p in message_parts(m, &mut dir, &mut errors) {
                 content.push(match p {
                     Part::Text(text) => json!({"type": "text", "text": text}),
                     Part::Image { media_type, data } => {
@@ -413,6 +412,9 @@ impl ClaudeSession {
                     }
                 });
             }
+        }
+        for e in errors {
+            ctx.error(Error::Other(e));
         }
         json!({"type": "user", "message": {"role": "user", "content": content}, "parent_tool_use_id": null, "session_id": ""})
     }
@@ -548,7 +550,7 @@ impl ClaudeSession {
             })
             .collect();
         if !queued.is_empty() {
-            let msg = self.user_message(&queued);
+            let msg = self.user_message(ctx, &queued);
             let ids = queued.into_iter().map(|m| m.id).collect();
             if let Some(r) = self.run(&next) {
                 r.send(ids, msg);
@@ -691,9 +693,12 @@ impl ClaudeSession {
             // A plugin of the run's own, made from the skills as they are now: Claude finds a
             // plugin's skills (as app:<name>) even with --setting-sources "", which hides
             // .claude/skills directories.
-            let dir = self.dir().join(format!("plugin-{id}"));
-            match write_plugin(&dir, &config.skills) {
-                Ok(()) => {
+            let written = self.dir().and_then(|d| {
+                let dir = d.join(format!("plugin-{id}"));
+                write_plugin(&dir, &config.skills).map(|_| dir)
+            });
+            match written {
+                Ok(dir) => {
                     args.extend(["--plugin-dir".into(), dir.to_string_lossy().into()]);
                     if let Some(r) = self.run(id) {
                         r.plugin_dir = Some(dir);
@@ -1442,7 +1447,7 @@ impl HarnessSession for ClaudeSession {
         // One message, however many there are: Claude makes a turn of each message waiting for it,
         // so several would run as turns of their own after this one's result.
         if !messages.is_empty() {
-            let msg = self.user_message(&messages);
+            let msg = self.user_message(ctx, &messages);
             self.run(&id)
                 .unwrap()
                 .send(messages.into_iter().map(|m| m.id).collect(), msg);
@@ -1451,7 +1456,7 @@ impl HarnessSession for ClaudeSession {
 
     fn steer(&mut self, ctx: &mut ThreadContext, message: Message) {
         let id = self.ensure(ctx, false);
-        let msg = self.user_message(std::slice::from_ref(&message));
+        let msg = self.user_message(ctx, std::slice::from_ref(&message));
         self.run(&id).unwrap().send(vec![message.id], msg);
     }
 

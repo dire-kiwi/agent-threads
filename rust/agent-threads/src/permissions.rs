@@ -135,9 +135,11 @@ pub(crate) fn decide(policy: &PermissionPolicy, query: PermissionQuery, ctx: Per
             )),
         },
         PermissionPolicy::Async(f) => {
-            let fut = f(query, ctx);
+            // Called in the task too, so a policy that panics making its future denies as one that
+            // panics running it does, and the thread carries on.
+            let f = f.clone();
             Decided::Later(Box::pin(async move {
-                match tokio::spawn(fut).await {
+                match tokio::spawn(async move { f(query, ctx).await }).await {
                     Ok(d) => d,
                     Err(e) => failed(crate::tools::panic_message(e)),
                 }

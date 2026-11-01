@@ -366,16 +366,15 @@ impl ShimProcess {
             if let Ok(all) = fs::read(dir.join("input.jsonl")) {
                 st.input = all.len() as u64;
                 if let Some(input) = input {
+                    // Offsets are counted on the bytes as written, line by line.
                     let mut at = input.min(all.len() as u64);
-                    for text in String::from_utf8_lossy(&all[at as usize..]).split_inclusive('\n') {
-                        if text.ends_with('\n') {
-                            st.delivered.push(Delivered {
-                                text: text.to_string(),
-                                at,
-                                answers: answering(text),
-                            });
+                    for line in all[at as usize..].split_inclusive(|&b| b == b'\n') {
+                        if line.ends_with(b"\n") {
+                            let text = String::from_utf8_lossy(line).into_owned();
+                            let answers = answering(&text);
+                            st.delivered.push(Delivered { text, at, answers });
                         }
-                        at += text.len() as u64;
+                        at += line.len() as u64;
                     }
                 }
             }
@@ -1054,11 +1053,19 @@ fn read_stopping(dir: &Path) -> Option<(Option<u64>, u64)> {
     Some((s["term_at"].as_f64().map(|t| t as u64), kill))
 }
 
+/// Held while a run's `stopping` is read, changed and acted on, so this backend's stops of a run (an
+/// escalation, a terminate(), a begin_stop()) never both take a SIGTERM as still to send.
+fn stopping_lock() -> std::sync::MutexGuard<'static, ()> {
+    static LOCK: Mutex<()> = Mutex::new(());
+    LOCK.lock().unwrap_or_else(|e| e.into_inner())
+}
+
 /// Signals the run's process group, if it's still the run's; after SIGTERM (or another signal),
 /// SIGKILL to whatever is left of it after `grace`, even if the program itself has exited. That's
 /// written down (`stopping`), so a backend that restarts before then carries on with it.
 fn terminate(dir: &Path, grace: Duration, signal: Signal) {
     let Some(pid) = live_group(dir) else { return };
+    let lock = stopping_lock();
     match read_stopping(dir) {
         // A stop under way whose SIGTERM is still to come doesn't send it again: written down
         // first.
@@ -1073,6 +1080,7 @@ fn terminate(dir: &Path, grace: Duration, signal: Signal) {
         _ => {}
     }
     signal_group(pid, signal);
+    drop(lock);
     if signal != Signal::Kill {
         escalate(dir);
     }
@@ -1082,6 +1090,7 @@ fn terminate(dir: &Path, grace: Duration, signal: Signal) {
 /// SIGKILL in `kill`. It's written down first (`stopping`, with both deadlines), so a backend that
 /// restarts meanwhile carries on with it. A stop already under way only ever comes sooner.
 fn begin_stop(dir: &Path, term: Duration, kill: Duration) {
+    let lock = stopping_lock();
     let now = now_ms();
     let was = read_stopping(dir);
     // Once SIGTERM's gone (no term_at), it isn't sent again.
@@ -1096,6 +1105,7 @@ fn begin_stop(dir: &Path, term: Duration, kill: Duration) {
         None => json!({"kill_at": kill_at}),
     };
     write_atomic(dir, "stopping", &stopping.to_string());
+    drop(lock);
     if fs::write(dir.join("input.closed"), "").is_err() {
         return; // Its directory's gone.
     }
@@ -1167,10 +1177,14 @@ fn escalate(dir: &Path) {
             if let Some(t) = term_at
                 && now >= t
             {
-                // Written down first: it's sent once.
-                write_atomic(&d, "stopping", &json!({"kill_at": kill_at}).to_string());
-                if let Some(group) = live_group(&d) {
-                    signal_group(group, Signal::Term);
+                // Read again under the lock: a terminate() may have sent it meanwhile. Written down
+                // first: it's sent once.
+                let _lock = stopping_lock();
+                if let Some((Some(_), kill_at)) = read_stopping(&d) {
+                    write_atomic(&d, "stopping", &json!({"kill_at": kill_at}).to_string());
+                    if let Some(group) = live_group(&d) {
+                        signal_group(group, Signal::Term);
+                    }
                 }
             }
             let next = match term_at {

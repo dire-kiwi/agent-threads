@@ -59,10 +59,10 @@ pub(crate) fn serve_tools(
     server: Arc<dyn ToolServer>,
     again: Option<(u16, String)>,
 ) -> io::Result<LoopbackMcp> {
-    let token = again
-        .as_ref()
-        .map(|(_, t)| t.clone())
-        .unwrap_or_else(|| crate::ids::token(24));
+    let token = match &again {
+        Some((_, t)) => t.clone(),
+        None => crate::ids::token(24)?,
+    };
     let listener = std::net::TcpListener::bind(("127.0.0.1", again.as_ref().map_or(0, |(p, _)| *p)))?;
     listener.set_nonblocking(true)?;
     let port = listener.local_addr()?.port();

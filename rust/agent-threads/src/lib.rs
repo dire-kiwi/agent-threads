@@ -21,6 +21,10 @@ mod harness;
 mod ids;
 mod mcp_http;
 mod permissions;
+#[cfg(unix)]
+mod shim;
+#[cfg(not(unix))]
+#[path = "shim_other.rs"]
 mod shim;
 mod skills;
 mod spawner;

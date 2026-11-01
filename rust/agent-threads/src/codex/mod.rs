@@ -25,7 +25,7 @@ use crate::agent_threads::Error;
 use crate::attachments::{Part, message_parts, path_text};
 use crate::claude::{forward_events, last_chars, title};
 use crate::harness::{BoxFuture, Harness, HarnessSession, Message, RunCheckpoint, TurnEnd};
-use crate::ids::{new_id, now_iso, now_ms};
+use crate::ids::{new_id, now_iso, now_ms, private_temp_dir};
 use crate::mcp_http::{LoopbackMcp, ToolServer, serve_tools};
 use crate::permissions::{Decided, PermissionDecision, PermissionQuery, permission_key};
 use crate::protocol::{DeltaEventKind, Item, Resolution, ResolutionOutcome, ToolKind, ToolStatus};
@@ -593,13 +593,11 @@ impl CodexSession {
         (!run.exited && !run.retired).then(|| id.clone())
     }
 
-    fn dir(&mut self) -> PathBuf {
+    fn dir(&mut self) -> std::io::Result<PathBuf> {
         if self.tmp.is_none() {
-            let dir = std::env::temp_dir().join(new_id("agent-threads"));
-            let _ = std::fs::create_dir_all(&dir);
-            self.tmp = Some(dir);
+            self.tmp = Some(private_temp_dir()?);
         }
-        self.tmp.clone().unwrap()
+        Ok(self.tmp.clone().unwrap())
     }
 
     fn notice(&self, ctx: &mut ThreadContext, text: &str) {
@@ -731,11 +729,12 @@ impl CodexSession {
     }
 
     /// Messages as a turn's input: their text and attachments, one after the other.
-    fn input(&mut self, messages: &[Message]) -> Vec<Value> {
+    fn input(&mut self, ctx: &ThreadContext, messages: &[Message]) -> Vec<Value> {
         let mut input = Vec::new();
+        let mut errors = Vec::new();
         for m in messages {
             let mut dir = || self.dir();
-            for p in message_parts(m, &mut dir) {
+            for p in message_parts(m, &mut dir, &mut errors) {
                 input.push(match p {
                     Part::Text(text) => json!({"type": "text", "text": text, "text_elements": []}),
                     Part::Image { media_type, data } => json!({"type": "image", "url": format!("data:{media_type};base64,{data}")}),
@@ -746,12 +745,15 @@ impl CodexSession {
                 });
             }
         }
+        for e in errors {
+            ctx.error(Error::Other(e));
+        }
         input
     }
 
     /// Starts a Codex turn with the messages.
     fn turn_start(&mut self, ctx: &mut ThreadContext, run: &str, messages: &[Message]) {
-        let input = self.input(messages);
+        let input = self.input(ctx, messages);
         let sent = self.sent(run, messages.iter().map(|m| m.id.clone()).collect(), &input);
         if let Some(r) = self.run(run) {
             r.starting = true;
@@ -1014,8 +1016,10 @@ impl CodexSession {
         if skills.is_empty() {
             return self.after_skills(ctx, run, home);
         }
-        let dir = self.dir().join(format!("skills-{run}"));
-        match write_skills(&dir, &skills) {
+        let written = self
+            .dir()
+            .and_then(|d| write_skills(&d.join(format!("skills-{run}")), &skills));
+        match written {
             Ok(dir) => {
                 self.run(run).unwrap().skills_dir = Some(dir.clone());
                 self.request(
@@ -2571,7 +2575,7 @@ impl HarnessSession for CodexSession {
         // With no process, there's no turn to steer: the message stays queued, and the turn's end
         // carries it over.
         let Some(run) = self.live_id() else { return };
-        let input = self.input(std::slice::from_ref(&message));
+        let input = self.input(ctx, std::slice::from_ref(&message));
         let sent = self.sent(&run, vec![message.id], &input);
         self.with_turn(
             ctx,
