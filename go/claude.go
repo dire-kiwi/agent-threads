@@ -1512,4 +1512,3 @@ func writePlugin(dir string, skills []Skill) (string, error) {
 	}
 	return dir, nil
 }
-

@@ -126,4 +126,3 @@ func writeSessionState(home, session string, s codexSessionState) error {
 	}
 	return os.Rename(path+".tmp", path)
 }
-

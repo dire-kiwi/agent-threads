@@ -384,12 +384,12 @@ func (r *codexRun) turnEnded() {
 }
 
 type codexSession struct {
-	ctx      ThreadContext
-	o        CodexOptions
-	run      *codexRun
-	last     *codexRun
-	stopping stopper
-	stale    bool
+	ctx       ThreadContext
+	o         CodexOptions
+	run       *codexRun
+	last      *codexRun
+	stopping  stopper
+	stale     bool
 	stopTimer *loopTimer
 	tmp       string
 	closed    bool
@@ -1937,7 +1937,9 @@ func (s *codexSession) mcpAppTool(run *codexRun, name string, args json.RawMessa
 		it, _ = s.callFields(matching[0].ID)
 	}
 	turn := ctx.TurnID()
-	wanted := func() bool { return !run.exited && !run.retired && !run.detached && s.run == run && ctx.TurnID() == turn }
+	wanted := func() bool {
+		return !run.exited && !run.retired && !run.detached && s.run == run && ctx.TurnID() == turn
+	}
 	t := &protocol.ToolCall{Name: name, Kind: protocol.ToolKindApp, Input: args, Title: name}
 	itemID, parent := "", ""
 	if it != nil {
