@@ -100,7 +100,7 @@ function scene(fixture: string, extra: { [k: string]: string } = {}) {
   const fixtureJson = JSON.parse(readFileSync(join(specDir, "fixtures", fixture, "fixture.json"), "utf8"));
   // The fixture's permission policy, unless the test says.
   const all = { POLICY: fixtureJson.permissions ?? "allow", ...env };
-  return { dirs, env: all, fixture: fixtureJson, start: () => new Backend(all) };
+  return { dirs, env: all, fixture: fixtureJson, start: (more: { [k: string]: string } = {}) => new Backend({ ...all, ...more }) };
 }
 
 /** The store's events for the thread, read once the backends are done. */
@@ -437,6 +437,96 @@ describe.skipIf(process.platform === "win32")("a backend restart", () => {
     await until(() => !existsSync(join(runDir, "stopping")));
     await b.call("close", { stop: true });
     await b.exited;
+  });
+
+  it.each([
+    ["claude", '"subtype":"interrupt"'],
+    ["codex", '"method":"turn/interrupt"'],
+  ])("with %s, stops a run that ignores an interrupt when the backend dies right after it", { timeout: 60_000 }, async (harness, interrupt) => {
+    const s = mini({ STOP_GRACE_MS: "1000", CLOSE_GRACE_MS: "500" });
+    // Saving takes a while, so the backend is killed after the interrupt is sent, and before any
+    // save that comes after it would be done.
+    const a = s.start({ SAVE_DELAY_MS: "500" });
+    const thread = await a.call<{ id: string }>("create", { harness, cwd: s.dirs.cwd });
+    await a.call("handle", { type: "send", thread_id: thread.id, text: "stubborn" } satisfies Command);
+    await a.waitFor({ type: "turn.started" });
+    const [runId] = readdirSync(s.dirs.runs);
+    const runDir = join(s.dirs.runs, runId!);
+    await until(() => existsSync(join(runDir, "pid")));
+    // It has taken in the message, and ignores interrupts from now on.
+    await sleep(500);
+    await a.call("saved", thread.id);
+    void a.call("handle", { type: "interrupt", thread_id: thread.id } satisfies Command);
+    await until(() => readFileSync(join(runDir, "input.jsonl"), "utf8").includes(interrupt), 10_000);
+    await a.crash();
+    const pid = Number(readFileSync(join(runDir, "pid"), "utf8"));
+    const alive = () => {
+      try {
+        process.kill(pid, 0);
+        return true;
+      } catch {
+        return false;
+      }
+    };
+    expect(alive()).toBe(true);
+
+    const b = s.start();
+    expect(await b.call("recover")).toEqual({ reattached: [thread.id], lost: [] });
+    // Stopped once the interrupt's grace is over, and the turn ends as interrupted.
+    await until(() => !alive(), 10_000);
+    await b.waitFor({ type: "turn.completed" });
+    expect(b.events.find((e) => e.type === "item.added" && e.item.type === "turn_result")).toMatchObject({ item: { interrupted: true } });
+    await until(() => !existsSync(join(runDir, "stopping")));
+    await b.call("close", { stop: true });
+    await b.exited;
+  });
+
+  it.each([
+    ["claude", "saved", "tool Bash {}", '"behavior":"allow"'],
+    ["codex", "saved", "sleep 1000\nexec ls\nsleep 3000", '"decision":"accept"'],
+    ["claude", "not saved", "tool Bash {}", '"behavior":"allow"'],
+    ["codex", "not saved", "sleep 1000\nexec ls\nsleep 3000", '"decision":"accept"'],
+  ])("with %s, doesn't ask again what the user answered just before the backend died (the request %s)", { timeout: 60_000 }, async (harness, opening, text, answer) => {
+    // Claude asks a while after the tool call, and the turn runs on for a while after it's allowed
+    // (Codex's turn waits before and after the command).
+    const s = mini({ POLICY: "ask", MINI_CLAUDE_ASK_DELAY: "1000", MINI_CLAUDE_TOOL_RUN_MS: "3000" });
+    // Saving takes a while, so the backend is killed after the answer is sent, and before the
+    // save that has it is done: and, unless the request's opening is saved first, before that is.
+    const a = s.start({ SAVE_DELAY_MS: "500" });
+    const thread = await a.call<{ id: string }>("create", { harness, cwd: s.dirs.cwd });
+    await a.call("handle", { type: "send", thread_id: thread.id, text } satisfies Command);
+    await a.waitFor({ type: "turn.started" });
+    // The run and its turn are saved before the request comes.
+    await a.call("saved", thread.id);
+    const opened = await a.waitFor({ type: "request.opened" });
+    const requestId = opened.type === "request.opened" ? opened.request.id : "";
+    if (opening === "saved") await a.call("saved", thread.id);
+    const [runId] = readdirSync(s.dirs.runs);
+    const input = () => readFileSync(join(s.dirs.runs, runId!, "input.jsonl"), "utf8");
+    void a.call("handle", { type: "respond", thread_id: thread.id, request_id: requestId, resolution: { outcome: "allow" } } satisfies Command);
+    await until(() => input().includes(answer), 10_000);
+    await a.crash();
+
+    const b = s.start();
+    expect(await b.call("recover")).toEqual({ reattached: [thread.id], lost: [] });
+    // The tool's still running: nothing's asked of the user, and the turn runs on.
+    await sleep(500);
+    const snap = await b.call<Snapshot>("snapshot", thread.id);
+    expect(snap.requests).toEqual([]);
+    expect(snap.thread.status).toBe("running");
+    expect(b.events.some((e) => e.type === "request.opened")).toBe(false);
+    if (opening === "saved") {
+      // Closed as the run's picked up again.
+      const resolved = b.events.findIndex((e) => e.type === "request.resolved" && e.request_id === requestId);
+      const notice = b.events.findIndex((e) => e.type === "item.added" && e.item.type === "notice" && e.item.code === "run.reattached");
+      expect(resolved).toBeGreaterThanOrEqual(0);
+      expect(resolved).toBeLessThan(notice);
+    }
+    await b.waitFor({ type: "turn.completed" });
+    await b.call("close", { stop: true });
+    await b.exited;
+    // Answered once.
+    expect(input().split(answer).length - 1).toBe(1);
   });
 
   it("with Codex, serves the app's tools where Codex was told they are after two restarts in a row", { timeout: 60_000 }, async () => {

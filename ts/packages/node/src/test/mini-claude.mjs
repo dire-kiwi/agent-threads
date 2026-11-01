@@ -26,7 +26,9 @@
 // before taking in late messages. MINI_CLAUDE_START_DELAY=<ms> waits that long before saying
 // anything about the first message. MINI_CLAUDE_TOOL_DELAY=<ms> waits that long between an app tool's
 // call and asking for it to be run, and MINI_CLAUDE_RESULT_DELAY=<ms> between its answer and its
-// tool_result. With MINI_CLAUDE_FAIL_RESUME=1 (or the name of a file that
+// tool_result. MINI_CLAUDE_ASK_DELAY=<ms> waits that long between a tool's call and asking
+// can_use_tool, and MINI_CLAUDE_TOOL_RUN_MS=<ms> that long running a tool it was allowed to. With
+// MINI_CLAUDE_FAIL_RESUME=1 (or the name of a file that
 // exists), a process started with --resume fails at its first message.
 
 import { appendFileSync, existsSync } from "node:fs";
@@ -161,8 +163,10 @@ async function step(text) {
     const id = `toolu_${++ids}`;
     const input = JSON.parse(json);
     out({ type: "assistant", message: { id: `msg_${process.pid}_${++msgs}`, model: "mini", content: [{ type: "tool_use", id, name, input }] }, parent_tool_use_id: null, session_id: session });
+    await sleep(Number(process.env.MINI_CLAUDE_ASK_DELAY ?? 0));
     const r = await ask({ subtype: "can_use_tool", tool_name: name, input, tool_use_id: id });
     const allowed = r.response.behavior === "allow";
+    if (allowed) await sleep(Number(process.env.MINI_CLAUDE_TOOL_RUN_MS ?? 0));
     out({
       type: "user",
       message: { role: "user", content: [{ type: "tool_result", tool_use_id: id, content: allowed ? "done" : r.response.message, is_error: !allowed }] },

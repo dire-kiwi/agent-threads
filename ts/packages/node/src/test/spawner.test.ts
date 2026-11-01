@@ -196,6 +196,18 @@ describe.skipIf(process.platform === "win32")("shim()", () => {
     expect(await wait(() => !alive(stubborn))).toBe(true);
   });
 
+  it("sends SIGTERM once when it's signalled during a stop whose SIGTERM is still to come", async () => {
+    const { run } = setup();
+    // It says so each time it gets SIGTERM, and doesn't exit at it, nor when its input closes.
+    const p = run(`trap 'echo term' TERM; echo ready; while :; do sleep 0.05; done`);
+    expect(await wait(() => p.lines.length === 1)).toBe(true);
+    p.proc.stop!(300);
+    p.proc.kill("SIGTERM");
+    expect(await wait(p.exit)).toBe(true);
+    expect(p.exit()).toMatchObject({ signal: "SIGKILL" });
+    expect(p.lines).toEqual(["ready", "term"]);
+  });
+
   it("stops a run nothing follows once the shim has started it, though it hadn't when it was asked to", async () => {
     const { runsDir, spawner, run } = setup();
     const p = run("sleep 30");
