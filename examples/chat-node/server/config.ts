@@ -42,6 +42,8 @@ export interface Config {
    * tool only if they were recorded with it (the fake CLI checks what the backend says it has).
    */
   fake: false | { tools: boolean };
+  /** Where the fake CLIs keep their state across restarts. */
+  fakeState?: string;
   /** Started by supervise.ts, which starts it again when it exits for a restart. */
   supervised: boolean;
 }
@@ -79,6 +81,7 @@ export function config(env = process.env): Config {
     harnesses,
     ...(shim ? { shim } : {}),
     fake: fake && { tools: fakeTools },
+    ...(env.CHAT_FAKE_STATE ? { fakeState: resolve(env.CHAT_FAKE_STATE) } : {}),
     supervised: env.CHAT_SUPERVISED === "1",
   };
 }

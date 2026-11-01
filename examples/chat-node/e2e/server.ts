@@ -49,10 +49,21 @@ export async function startServer(env: { [k: string]: string }, { supervised = f
     },
     stop: async () => {
       proc.kill("SIGTERM");
+      const timer = setTimeout(() => {
+        process.stdout.write("[server] didn't stop within 15s: killing it\n");
+        proc.kill("SIGKILL");
+      }, 15_000);
       await exited;
+      clearTimeout(timer);
     },
   };
-  await server.listening();
+  // Not for ever: say why if it doesn't start.
+  let timer: NodeJS.Timeout | undefined;
+  await Promise.race([
+    server.listening(),
+    exited.then(() => Promise.reject(new Error("the server exited before it was listening"))),
+    new Promise((_, reject) => (timer = setTimeout(() => reject(new Error("the server didn't start within 20s")), 20_000))),
+  ]).finally(() => clearTimeout(timer));
   return server;
 }
 

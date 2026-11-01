@@ -33,19 +33,19 @@ mkdirSync(workspace, { recursive: true });
 
 const FAKE_CLI = join(REPO, "spec/tools/fake-cli.mjs");
 
+/** The fake CLI, replaying a fixture's recorded session (and checking what the backend sends it). */
+function fakeCli(name: string, fixture: string) {
+  // Where it keeps which of the session's runs is next: afresh each time, or kept across restarts
+  // in CHAT_FAKE_STATE, for a session that has several runs.
+  const state = cfg.fakeState ? join(cfg.fakeState, name) : join(cfg.data, `fake-${name}`);
+  if (!cfg.fakeState) rmSync(state, { recursive: true, force: true });
+  mkdirSync(state, { recursive: true });
+  return { bin: process.execPath, binArgs: [FAKE_CLI], env: { AGENT_THREADS_FIXTURE: fixture, AGENT_THREADS_FIXTURE_STATE: state } };
+}
+
 function harness(h: HarnessInfo): Harness {
-  // With a fixture, the fake CLI replays its recorded session (and checks what we send it).
-  const fake = h.fake
-    ? (() => {
-        // Where it keeps which of the session's runs is next: afresh each time, unless it's given
-        // (CHAT_FAKE_STATE, so a session that has several runs can carry on after a restart).
-        const state = process.env.CHAT_FAKE_STATE ? join(process.env.CHAT_FAKE_STATE, h.name) : join(cfg.data, `fake-${h.name}`);
-        if (!process.env.CHAT_FAKE_STATE) rmSync(state, { recursive: true, force: true });
-        mkdirSync(state, { recursive: true });
-        return { bin: process.execPath, binArgs: [FAKE_CLI], env: { AGENT_THREADS_FIXTURE: h.fake, AGENT_THREADS_FIXTURE_STATE: state } };
-      })()
-    : {};
-  if (h.name === "claude") return claudeCode({ ...fake });
+  const fake = h.fake ? fakeCli(h.name, h.fake) : {};
+  if (h.name === "claude") return claudeCode(fake);
   // Codex keeps the app's sessions in a CODEX_HOME of the app's own (with the user's login linked in).
   return codex({ ...fake, home: join(cfg.data, "codex-home") });
 }
