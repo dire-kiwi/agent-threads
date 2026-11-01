@@ -23,6 +23,7 @@ import (
 func main() {
 	in := flag.String("in", "../spec/protocol.schema.json", "the bundled schema")
 	out := flag.String("out", "protocol/protocol_gen.go", "the Go file to write")
+	schemaOut := flag.String("schema-out", "protocol/protocol.schema.json", "where to copy the bundled schema, for protocol.Validate to embed")
 	flag.Parse()
 	log.SetFlags(0)
 	log.SetPrefix("gen: ")
@@ -47,6 +48,10 @@ func main() {
 		log.Fatalf("formatting %s: %v", *out, err)
 	}
 	if err := os.WriteFile(*out, formatted, 0o644); err != nil {
+		log.Fatal(err)
+	}
+	// go:embed can't reach outside the module, so the schema is copied into it.
+	if err := os.WriteFile(*schemaOut, data, 0o644); err != nil {
 		log.Fatal(err)
 	}
 }
@@ -230,7 +235,7 @@ func (g *generator) enum(name, description string, values []any) {
 
 type field struct {
 	doc, name, json, typ string
-	omitempty       bool
+	omitempty            bool
 	// A required array or map, which must marshal as [] or {} rather than null.
 	nonNil string
 }
@@ -281,26 +286,46 @@ func (g *generator) object(name string, def *object) {
 		}
 		g.p("%s %s `json:\"%s%s\"`\n", f.name, f.typ, f.json, opt)
 	}
+	g.p("\n// Extra has the fields the spec doesn't name, as they came, so that they're written again\n")
+	g.p("// unchanged (receivers ignore fields they don't know, and stores keep them).\n")
+	g.p("Extra map[string]json.RawMessage `json:\"-\"`\n")
 	g.p("}\n\n")
 
-	var nonNil []field
+	known := []string{}
+	if isVariant {
+		known = append(known, "type")
+	}
+	for _, f := range fields {
+		known = append(known, f.json)
+	}
+	g.p("var known%s = fieldSet(", name)
+	for i, k := range known {
+		if i > 0 {
+			g.p(", ")
+		}
+		g.p("%q", k)
+	}
+	g.p(")\n\n")
+
+	g.p("func (v %s) MarshalJSON() ([]byte, error) {\ntype plain %s\np := plain(v)\n", name, name)
 	for _, f := range fields {
 		if f.nonNil != "" {
-			nonNil = append(nonNil, f)
+			g.p("if p.%s == nil {\np.%s = %s{}\n}\n", f.name, f.name, f.nonNil)
 		}
 	}
-	if !isVariant && len(nonNil) == 0 {
-		return
-	}
-	g.p("func (v %s) MarshalJSON() ([]byte, error) {\ntype plain %s\np := plain(v)\n", name, name)
-	for _, f := range nonNil {
-		g.p("if p.%s == nil {\np.%s = %s{}\n}\n", f.name, f.name, f.nonNil)
-	}
 	if isVariant {
-		g.p("return json.Marshal(struct {\nType string `json:\"type\"`\nplain\n}{%q, p})\n}\n\n", tag)
+		g.p("data, err := json.Marshal(struct {\nType string `json:\"type\"`\nplain\n}{%q, p})\n", tag)
 	} else {
-		g.p("return json.Marshal(p)\n}\n\n")
+		g.p("data, err := json.Marshal(p)\n")
 	}
+	g.p("if err != nil {\nreturn nil, err\n}\nreturn withExtra(data, v.Extra, known%s)\n}\n\n", name)
+
+	g.p("func (v *%s) UnmarshalJSON(data []byte) error {\n", name)
+	g.p("if isNull(data) {\nreturn nil\n}\n")
+	g.p("type plain %s\nvar p plain\n", name)
+	g.p("if err := json.Unmarshal(data, &p); err != nil {\nreturn err\n}\n")
+	g.p("extra, err := extraFields(data, known%s)\nif err != nil {\nreturn err\n}\n", name)
+	g.p("p.Extra = extra\n*v = %s(p)\nreturn nil\n}\n\n", name)
 }
 
 // typeOf is the Go type of a property, and what kind of type it is: string, bool, number,

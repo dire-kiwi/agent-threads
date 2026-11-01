@@ -76,15 +76,43 @@ type SendCommand struct {
 
 	// The client's own id for the message, copied to the user_message item.
 	ClientID string `json:"client_id,omitempty"`
+
+	// Extra has the fields the spec doesn't name, as they came, so that they're written again
+	// unchanged (receivers ignore fields they don't know, and stores keep them).
+	Extra map[string]json.RawMessage `json:"-"`
 }
+
+var knownSendCommand = fieldSet("type", "thread_id", "text", "attachments", "client_id")
 
 func (v SendCommand) MarshalJSON() ([]byte, error) {
 	type plain SendCommand
 	p := plain(v)
-	return json.Marshal(struct {
+	data, err := json.Marshal(struct {
 		Type string `json:"type"`
 		plain
 	}{"send", p})
+	if err != nil {
+		return nil, err
+	}
+	return withExtra(data, v.Extra, knownSendCommand)
+}
+
+func (v *SendCommand) UnmarshalJSON(data []byte) error {
+	if isNull(data) {
+		return nil
+	}
+	type plain SendCommand
+	var p plain
+	if err := json.Unmarshal(data, &p); err != nil {
+		return err
+	}
+	extra, err := extraFields(data, knownSendCommand)
+	if err != nil {
+		return err
+	}
+	p.Extra = extra
+	*v = SendCommand(p)
+	return nil
 }
 
 // InterruptCommand: Stop the running turn. Does nothing if none is running.
@@ -92,15 +120,43 @@ func (v SendCommand) MarshalJSON() ([]byte, error) {
 // It's the "interrupt" variant of Command.
 type InterruptCommand struct {
 	ThreadID string `json:"thread_id"`
+
+	// Extra has the fields the spec doesn't name, as they came, so that they're written again
+	// unchanged (receivers ignore fields they don't know, and stores keep them).
+	Extra map[string]json.RawMessage `json:"-"`
 }
+
+var knownInterruptCommand = fieldSet("type", "thread_id")
 
 func (v InterruptCommand) MarshalJSON() ([]byte, error) {
 	type plain InterruptCommand
 	p := plain(v)
-	return json.Marshal(struct {
+	data, err := json.Marshal(struct {
 		Type string `json:"type"`
 		plain
 	}{"interrupt", p})
+	if err != nil {
+		return nil, err
+	}
+	return withExtra(data, v.Extra, knownInterruptCommand)
+}
+
+func (v *InterruptCommand) UnmarshalJSON(data []byte) error {
+	if isNull(data) {
+		return nil
+	}
+	type plain InterruptCommand
+	var p plain
+	if err := json.Unmarshal(data, &p); err != nil {
+		return err
+	}
+	extra, err := extraFields(data, knownInterruptCommand)
+	if err != nil {
+		return err
+	}
+	p.Extra = extra
+	*v = InterruptCommand(p)
+	return nil
 }
 
 // RespondCommand: Answer an open request.
@@ -110,15 +166,43 @@ type RespondCommand struct {
 	ThreadID   string     `json:"thread_id"`
 	RequestID  string     `json:"request_id"`
 	Resolution Resolution `json:"resolution"`
+
+	// Extra has the fields the spec doesn't name, as they came, so that they're written again
+	// unchanged (receivers ignore fields they don't know, and stores keep them).
+	Extra map[string]json.RawMessage `json:"-"`
 }
+
+var knownRespondCommand = fieldSet("type", "thread_id", "request_id", "resolution")
 
 func (v RespondCommand) MarshalJSON() ([]byte, error) {
 	type plain RespondCommand
 	p := plain(v)
-	return json.Marshal(struct {
+	data, err := json.Marshal(struct {
 		Type string `json:"type"`
 		plain
 	}{"respond", p})
+	if err != nil {
+		return nil, err
+	}
+	return withExtra(data, v.Extra, knownRespondCommand)
+}
+
+func (v *RespondCommand) UnmarshalJSON(data []byte) error {
+	if isNull(data) {
+		return nil
+	}
+	type plain RespondCommand
+	var p plain
+	if err := json.Unmarshal(data, &p); err != nil {
+		return err
+	}
+	extra, err := extraFields(data, knownRespondCommand)
+	if err != nil {
+		return err
+	}
+	p.Extra = extra
+	*v = RespondCommand(p)
+	return nil
 }
 
 // SetOptionsCommand: Change the thread's options. Fields left out stay as they are. They apply from
@@ -130,15 +214,43 @@ type SetOptionsCommand struct {
 	Model          string         `json:"model,omitempty"`
 	Effort         string         `json:"effort,omitempty"`
 	PermissionMode PermissionMode `json:"permission_mode,omitempty"`
+
+	// Extra has the fields the spec doesn't name, as they came, so that they're written again
+	// unchanged (receivers ignore fields they don't know, and stores keep them).
+	Extra map[string]json.RawMessage `json:"-"`
 }
+
+var knownSetOptionsCommand = fieldSet("type", "thread_id", "model", "effort", "permission_mode")
 
 func (v SetOptionsCommand) MarshalJSON() ([]byte, error) {
 	type plain SetOptionsCommand
 	p := plain(v)
-	return json.Marshal(struct {
+	data, err := json.Marshal(struct {
 		Type string `json:"type"`
 		plain
 	}{"set_options", p})
+	if err != nil {
+		return nil, err
+	}
+	return withExtra(data, v.Extra, knownSetOptionsCommand)
+}
+
+func (v *SetOptionsCommand) UnmarshalJSON(data []byte) error {
+	if isNull(data) {
+		return nil
+	}
+	type plain SetOptionsCommand
+	var p plain
+	if err := json.Unmarshal(data, &p); err != nil {
+		return err
+	}
+	extra, err := extraFields(data, knownSetOptionsCommand)
+	if err != nil {
+		return err
+	}
+	p.Extra = extra
+	*v = SetOptionsCommand(p)
+	return nil
 }
 
 // ThreadEvent: An event, told apart by type. All but delta are saved, and each saved event's seq is
@@ -227,15 +339,43 @@ type ThreadUpdatedEvent struct {
 
 	// The harness's own payload, for debugging.
 	Raw json.RawMessage `json:"raw,omitempty"`
+
+	// Extra has the fields the spec doesn't name, as they came, so that they're written again
+	// unchanged (receivers ignore fields they don't know, and stores keep them).
+	Extra map[string]json.RawMessage `json:"-"`
 }
+
+var knownThreadUpdatedEvent = fieldSet("type", "thread_id", "seq", "thread", "raw")
 
 func (v ThreadUpdatedEvent) MarshalJSON() ([]byte, error) {
 	type plain ThreadUpdatedEvent
 	p := plain(v)
-	return json.Marshal(struct {
+	data, err := json.Marshal(struct {
 		Type string `json:"type"`
 		plain
 	}{"thread.updated", p})
+	if err != nil {
+		return nil, err
+	}
+	return withExtra(data, v.Extra, knownThreadUpdatedEvent)
+}
+
+func (v *ThreadUpdatedEvent) UnmarshalJSON(data []byte) error {
+	if isNull(data) {
+		return nil
+	}
+	type plain ThreadUpdatedEvent
+	var p plain
+	if err := json.Unmarshal(data, &p); err != nil {
+		return err
+	}
+	extra, err := extraFields(data, knownThreadUpdatedEvent)
+	if err != nil {
+		return err
+	}
+	p.Extra = extra
+	*v = ThreadUpdatedEvent(p)
+	return nil
 }
 
 // TurnStartedEvent: A turn started: the agent is working on a message.
@@ -248,15 +388,43 @@ type TurnStartedEvent struct {
 
 	// The harness's own payload, for debugging.
 	Raw json.RawMessage `json:"raw,omitempty"`
+
+	// Extra has the fields the spec doesn't name, as they came, so that they're written again
+	// unchanged (receivers ignore fields they don't know, and stores keep them).
+	Extra map[string]json.RawMessage `json:"-"`
 }
+
+var knownTurnStartedEvent = fieldSet("type", "thread_id", "seq", "turn_id", "raw")
 
 func (v TurnStartedEvent) MarshalJSON() ([]byte, error) {
 	type plain TurnStartedEvent
 	p := plain(v)
-	return json.Marshal(struct {
+	data, err := json.Marshal(struct {
 		Type string `json:"type"`
 		plain
 	}{"turn.started", p})
+	if err != nil {
+		return nil, err
+	}
+	return withExtra(data, v.Extra, knownTurnStartedEvent)
+}
+
+func (v *TurnStartedEvent) UnmarshalJSON(data []byte) error {
+	if isNull(data) {
+		return nil
+	}
+	type plain TurnStartedEvent
+	var p plain
+	if err := json.Unmarshal(data, &p); err != nil {
+		return err
+	}
+	extra, err := extraFields(data, knownTurnStartedEvent)
+	if err != nil {
+		return err
+	}
+	p.Extra = extra
+	*v = TurnStartedEvent(p)
+	return nil
 }
 
 // TurnCompletedEvent: A turn ended, however it ended. Its turn_result item comes just before.
@@ -269,15 +437,43 @@ type TurnCompletedEvent struct {
 
 	// The harness's own payload, for debugging.
 	Raw json.RawMessage `json:"raw,omitempty"`
+
+	// Extra has the fields the spec doesn't name, as they came, so that they're written again
+	// unchanged (receivers ignore fields they don't know, and stores keep them).
+	Extra map[string]json.RawMessage `json:"-"`
 }
+
+var knownTurnCompletedEvent = fieldSet("type", "thread_id", "seq", "turn_id", "raw")
 
 func (v TurnCompletedEvent) MarshalJSON() ([]byte, error) {
 	type plain TurnCompletedEvent
 	p := plain(v)
-	return json.Marshal(struct {
+	data, err := json.Marshal(struct {
 		Type string `json:"type"`
 		plain
 	}{"turn.completed", p})
+	if err != nil {
+		return nil, err
+	}
+	return withExtra(data, v.Extra, knownTurnCompletedEvent)
+}
+
+func (v *TurnCompletedEvent) UnmarshalJSON(data []byte) error {
+	if isNull(data) {
+		return nil
+	}
+	type plain TurnCompletedEvent
+	var p plain
+	if err := json.Unmarshal(data, &p); err != nil {
+		return err
+	}
+	extra, err := extraFields(data, knownTurnCompletedEvent)
+	if err != nil {
+		return err
+	}
+	p.Extra = extra
+	*v = TurnCompletedEvent(p)
+	return nil
 }
 
 // ItemAddedEvent: An item was added to the end of the thread. If the thread already has an item
@@ -291,15 +487,43 @@ type ItemAddedEvent struct {
 
 	// The harness's own payload, for debugging.
 	Raw json.RawMessage `json:"raw,omitempty"`
+
+	// Extra has the fields the spec doesn't name, as they came, so that they're written again
+	// unchanged (receivers ignore fields they don't know, and stores keep them).
+	Extra map[string]json.RawMessage `json:"-"`
 }
+
+var knownItemAddedEvent = fieldSet("type", "thread_id", "seq", "item", "raw")
 
 func (v ItemAddedEvent) MarshalJSON() ([]byte, error) {
 	type plain ItemAddedEvent
 	p := plain(v)
-	return json.Marshal(struct {
+	data, err := json.Marshal(struct {
 		Type string `json:"type"`
 		plain
 	}{"item.added", p})
+	if err != nil {
+		return nil, err
+	}
+	return withExtra(data, v.Extra, knownItemAddedEvent)
+}
+
+func (v *ItemAddedEvent) UnmarshalJSON(data []byte) error {
+	if isNull(data) {
+		return nil
+	}
+	type plain ItemAddedEvent
+	var p plain
+	if err := json.Unmarshal(data, &p); err != nil {
+		return err
+	}
+	extra, err := extraFields(data, knownItemAddedEvent)
+	if err != nil {
+		return err
+	}
+	p.Extra = extra
+	*v = ItemAddedEvent(p)
+	return nil
 }
 
 // ItemUpdatedEvent: An item changed: patch's fields replace the item's, and a field set to null is
@@ -316,7 +540,13 @@ type ItemUpdatedEvent struct {
 
 	// The harness's own payload, for debugging.
 	Raw json.RawMessage `json:"raw,omitempty"`
+
+	// Extra has the fields the spec doesn't name, as they came, so that they're written again
+	// unchanged (receivers ignore fields they don't know, and stores keep them).
+	Extra map[string]json.RawMessage `json:"-"`
 }
+
+var knownItemUpdatedEvent = fieldSet("type", "thread_id", "seq", "item_id", "patch", "raw")
 
 func (v ItemUpdatedEvent) MarshalJSON() ([]byte, error) {
 	type plain ItemUpdatedEvent
@@ -324,10 +554,32 @@ func (v ItemUpdatedEvent) MarshalJSON() ([]byte, error) {
 	if p.Patch == nil {
 		p.Patch = map[string]json.RawMessage{}
 	}
-	return json.Marshal(struct {
+	data, err := json.Marshal(struct {
 		Type string `json:"type"`
 		plain
 	}{"item.updated", p})
+	if err != nil {
+		return nil, err
+	}
+	return withExtra(data, v.Extra, knownItemUpdatedEvent)
+}
+
+func (v *ItemUpdatedEvent) UnmarshalJSON(data []byte) error {
+	if isNull(data) {
+		return nil
+	}
+	type plain ItemUpdatedEvent
+	var p plain
+	if err := json.Unmarshal(data, &p); err != nil {
+		return err
+	}
+	extra, err := extraFields(data, knownItemUpdatedEvent)
+	if err != nil {
+		return err
+	}
+	p.Extra = extra
+	*v = ItemUpdatedEvent(p)
+	return nil
 }
 
 // DeltaEvent: Streamed text to append to an assistant_message (kind text) or reasoning (kind
@@ -349,15 +601,43 @@ type DeltaEvent struct {
 
 	// The harness's own payload, for debugging.
 	Raw json.RawMessage `json:"raw,omitempty"`
+
+	// Extra has the fields the spec doesn't name, as they came, so that they're written again
+	// unchanged (receivers ignore fields they don't know, and stores keep them).
+	Extra map[string]json.RawMessage `json:"-"`
 }
+
+var knownDeltaEvent = fieldSet("type", "thread_id", "seq", "item_id", "kind", "offset", "text", "raw")
 
 func (v DeltaEvent) MarshalJSON() ([]byte, error) {
 	type plain DeltaEvent
 	p := plain(v)
-	return json.Marshal(struct {
+	data, err := json.Marshal(struct {
 		Type string `json:"type"`
 		plain
 	}{"delta", p})
+	if err != nil {
+		return nil, err
+	}
+	return withExtra(data, v.Extra, knownDeltaEvent)
+}
+
+func (v *DeltaEvent) UnmarshalJSON(data []byte) error {
+	if isNull(data) {
+		return nil
+	}
+	type plain DeltaEvent
+	var p plain
+	if err := json.Unmarshal(data, &p); err != nil {
+		return err
+	}
+	extra, err := extraFields(data, knownDeltaEvent)
+	if err != nil {
+		return err
+	}
+	p.Extra = extra
+	*v = DeltaEvent(p)
+	return nil
 }
 
 type DeltaEventKind string
@@ -377,15 +657,43 @@ type RequestOpenedEvent struct {
 
 	// The harness's own payload, for debugging.
 	Raw json.RawMessage `json:"raw,omitempty"`
+
+	// Extra has the fields the spec doesn't name, as they came, so that they're written again
+	// unchanged (receivers ignore fields they don't know, and stores keep them).
+	Extra map[string]json.RawMessage `json:"-"`
 }
+
+var knownRequestOpenedEvent = fieldSet("type", "thread_id", "seq", "request", "raw")
 
 func (v RequestOpenedEvent) MarshalJSON() ([]byte, error) {
 	type plain RequestOpenedEvent
 	p := plain(v)
-	return json.Marshal(struct {
+	data, err := json.Marshal(struct {
 		Type string `json:"type"`
 		plain
 	}{"request.opened", p})
+	if err != nil {
+		return nil, err
+	}
+	return withExtra(data, v.Extra, knownRequestOpenedEvent)
+}
+
+func (v *RequestOpenedEvent) UnmarshalJSON(data []byte) error {
+	if isNull(data) {
+		return nil
+	}
+	type plain RequestOpenedEvent
+	var p plain
+	if err := json.Unmarshal(data, &p); err != nil {
+		return err
+	}
+	extra, err := extraFields(data, knownRequestOpenedEvent)
+	if err != nil {
+		return err
+	}
+	p.Extra = extra
+	*v = RequestOpenedEvent(p)
+	return nil
 }
 
 // RequestResolvedEvent: A request was answered or cancelled, and is no longer open.
@@ -399,15 +707,43 @@ type RequestResolvedEvent struct {
 
 	// The harness's own payload, for debugging.
 	Raw json.RawMessage `json:"raw,omitempty"`
+
+	// Extra has the fields the spec doesn't name, as they came, so that they're written again
+	// unchanged (receivers ignore fields they don't know, and stores keep them).
+	Extra map[string]json.RawMessage `json:"-"`
 }
+
+var knownRequestResolvedEvent = fieldSet("type", "thread_id", "seq", "request_id", "resolution", "raw")
 
 func (v RequestResolvedEvent) MarshalJSON() ([]byte, error) {
 	type plain RequestResolvedEvent
 	p := plain(v)
-	return json.Marshal(struct {
+	data, err := json.Marshal(struct {
 		Type string `json:"type"`
 		plain
 	}{"request.resolved", p})
+	if err != nil {
+		return nil, err
+	}
+	return withExtra(data, v.Extra, knownRequestResolvedEvent)
+}
+
+func (v *RequestResolvedEvent) UnmarshalJSON(data []byte) error {
+	if isNull(data) {
+		return nil
+	}
+	type plain RequestResolvedEvent
+	var p plain
+	if err := json.Unmarshal(data, &p); err != nil {
+		return err
+	}
+	extra, err := extraFields(data, knownRequestResolvedEvent)
+	if err != nil {
+		return err
+	}
+	p.Extra = extra
+	*v = RequestResolvedEvent(p)
+	return nil
 }
 
 // Item: One entry in a thread, told apart by type.
@@ -508,15 +844,43 @@ type UserMessage struct {
 	// The harness's own payload this came from, for debugging. Backends can leave it out; clients
 	// mustn't depend on it.
 	Raw json.RawMessage `json:"raw,omitempty"`
+
+	// Extra has the fields the spec doesn't name, as they came, so that they're written again
+	// unchanged (receivers ignore fields they don't know, and stores keep them).
+	Extra map[string]json.RawMessage `json:"-"`
 }
+
+var knownUserMessage = fieldSet("type", "id", "text", "attachments", "steered", "queued", "client_id", "parent_id", "turn_id", "created_at", "raw")
 
 func (v UserMessage) MarshalJSON() ([]byte, error) {
 	type plain UserMessage
 	p := plain(v)
-	return json.Marshal(struct {
+	data, err := json.Marshal(struct {
 		Type string `json:"type"`
 		plain
 	}{"user_message", p})
+	if err != nil {
+		return nil, err
+	}
+	return withExtra(data, v.Extra, knownUserMessage)
+}
+
+func (v *UserMessage) UnmarshalJSON(data []byte) error {
+	if isNull(data) {
+		return nil
+	}
+	type plain UserMessage
+	var p plain
+	if err := json.Unmarshal(data, &p); err != nil {
+		return err
+	}
+	extra, err := extraFields(data, knownUserMessage)
+	if err != nil {
+		return err
+	}
+	p.Extra = extra
+	*v = UserMessage(p)
+	return nil
 }
 
 // AssistantMessage: Text from the agent. While it streams, delta events append to text; an
@@ -539,15 +903,43 @@ type AssistantMessage struct {
 	// The harness's own payload this came from, for debugging. Backends can leave it out; clients
 	// mustn't depend on it.
 	Raw json.RawMessage `json:"raw,omitempty"`
+
+	// Extra has the fields the spec doesn't name, as they came, so that they're written again
+	// unchanged (receivers ignore fields they don't know, and stores keep them).
+	Extra map[string]json.RawMessage `json:"-"`
 }
+
+var knownAssistantMessage = fieldSet("type", "id", "text", "parent_id", "turn_id", "created_at", "raw")
 
 func (v AssistantMessage) MarshalJSON() ([]byte, error) {
 	type plain AssistantMessage
 	p := plain(v)
-	return json.Marshal(struct {
+	data, err := json.Marshal(struct {
 		Type string `json:"type"`
 		plain
 	}{"assistant_message", p})
+	if err != nil {
+		return nil, err
+	}
+	return withExtra(data, v.Extra, knownAssistantMessage)
+}
+
+func (v *AssistantMessage) UnmarshalJSON(data []byte) error {
+	if isNull(data) {
+		return nil
+	}
+	type plain AssistantMessage
+	var p plain
+	if err := json.Unmarshal(data, &p); err != nil {
+		return err
+	}
+	extra, err := extraFields(data, knownAssistantMessage)
+	if err != nil {
+		return err
+	}
+	p.Extra = extra
+	*v = AssistantMessage(p)
+	return nil
 }
 
 // Reasoning: The agent's thinking, or a summary of it, as the harness gives it. Streams like
@@ -568,15 +960,43 @@ type Reasoning struct {
 	// The harness's own payload this came from, for debugging. Backends can leave it out; clients
 	// mustn't depend on it.
 	Raw json.RawMessage `json:"raw,omitempty"`
+
+	// Extra has the fields the spec doesn't name, as they came, so that they're written again
+	// unchanged (receivers ignore fields they don't know, and stores keep them).
+	Extra map[string]json.RawMessage `json:"-"`
 }
+
+var knownReasoning = fieldSet("type", "id", "text", "parent_id", "turn_id", "created_at", "raw")
 
 func (v Reasoning) MarshalJSON() ([]byte, error) {
 	type plain Reasoning
 	p := plain(v)
-	return json.Marshal(struct {
+	data, err := json.Marshal(struct {
 		Type string `json:"type"`
 		plain
 	}{"reasoning", p})
+	if err != nil {
+		return nil, err
+	}
+	return withExtra(data, v.Extra, knownReasoning)
+}
+
+func (v *Reasoning) UnmarshalJSON(data []byte) error {
+	if isNull(data) {
+		return nil
+	}
+	type plain Reasoning
+	var p plain
+	if err := json.Unmarshal(data, &p); err != nil {
+		return err
+	}
+	extra, err := extraFields(data, knownReasoning)
+	if err != nil {
+		return err
+	}
+	p.Extra = extra
+	*v = Reasoning(p)
+	return nil
 }
 
 // ToolCall: A tool the agent called, with its result once it has one. A subagent is a tool_call of
@@ -634,15 +1054,43 @@ type ToolCall struct {
 	// The harness's own payload this came from, for debugging. Backends can leave it out; clients
 	// mustn't depend on it.
 	Raw json.RawMessage `json:"raw,omitempty"`
+
+	// Extra has the fields the spec doesn't name, as they came, so that they're written again
+	// unchanged (receivers ignore fields they don't know, and stores keep them).
+	Extra map[string]json.RawMessage `json:"-"`
 }
+
+var knownToolCall = fieldSet("type", "id", "name", "kind", "input", "status", "result", "title", "command", "path", "changes", "query", "url", "server", "todos", "parent_id", "turn_id", "created_at", "raw")
 
 func (v ToolCall) MarshalJSON() ([]byte, error) {
 	type plain ToolCall
 	p := plain(v)
-	return json.Marshal(struct {
+	data, err := json.Marshal(struct {
 		Type string `json:"type"`
 		plain
 	}{"tool_call", p})
+	if err != nil {
+		return nil, err
+	}
+	return withExtra(data, v.Extra, knownToolCall)
+}
+
+func (v *ToolCall) UnmarshalJSON(data []byte) error {
+	if isNull(data) {
+		return nil
+	}
+	type plain ToolCall
+	var p plain
+	if err := json.Unmarshal(data, &p); err != nil {
+		return err
+	}
+	extra, err := extraFields(data, knownToolCall)
+	if err != nil {
+		return err
+	}
+	p.Extra = extra
+	*v = ToolCall(p)
+	return nil
 }
 
 // ToolKind: What a tool does, for permission policies and for picking a renderer. shell: runs a
@@ -693,6 +1141,40 @@ type ToolResult struct {
 
 	// shell: the command's exit code.
 	ExitCode *int64 `json:"exit_code,omitempty"`
+
+	// Extra has the fields the spec doesn't name, as they came, so that they're written again
+	// unchanged (receivers ignore fields they don't know, and stores keep them).
+	Extra map[string]json.RawMessage `json:"-"`
+}
+
+var knownToolResult = fieldSet("content", "structured", "truncated", "exit_code")
+
+func (v ToolResult) MarshalJSON() ([]byte, error) {
+	type plain ToolResult
+	p := plain(v)
+	data, err := json.Marshal(p)
+	if err != nil {
+		return nil, err
+	}
+	return withExtra(data, v.Extra, knownToolResult)
+}
+
+func (v *ToolResult) UnmarshalJSON(data []byte) error {
+	if isNull(data) {
+		return nil
+	}
+	type plain ToolResult
+	var p plain
+	if err := json.Unmarshal(data, &p); err != nil {
+		return err
+	}
+	extra, err := extraFields(data, knownToolResult)
+	if err != nil {
+		return err
+	}
+	p.Extra = extra
+	*v = ToolResult(p)
+	return nil
 }
 
 type FileChange struct {
@@ -704,6 +1186,40 @@ type FileChange struct {
 
 	// The file's new path, when the change renames it.
 	MoveTo string `json:"move_to,omitempty"`
+
+	// Extra has the fields the spec doesn't name, as they came, so that they're written again
+	// unchanged (receivers ignore fields they don't know, and stores keep them).
+	Extra map[string]json.RawMessage `json:"-"`
+}
+
+var knownFileChange = fieldSet("path", "op", "diff", "move_to")
+
+func (v FileChange) MarshalJSON() ([]byte, error) {
+	type plain FileChange
+	p := plain(v)
+	data, err := json.Marshal(p)
+	if err != nil {
+		return nil, err
+	}
+	return withExtra(data, v.Extra, knownFileChange)
+}
+
+func (v *FileChange) UnmarshalJSON(data []byte) error {
+	if isNull(data) {
+		return nil
+	}
+	type plain FileChange
+	var p plain
+	if err := json.Unmarshal(data, &p); err != nil {
+		return err
+	}
+	extra, err := extraFields(data, knownFileChange)
+	if err != nil {
+		return err
+	}
+	p.Extra = extra
+	*v = FileChange(p)
+	return nil
 }
 
 type FileChangeOp string
@@ -717,6 +1233,40 @@ const (
 type Todo struct {
 	Text   string     `json:"text"`
 	Status TodoStatus `json:"status"`
+
+	// Extra has the fields the spec doesn't name, as they came, so that they're written again
+	// unchanged (receivers ignore fields they don't know, and stores keep them).
+	Extra map[string]json.RawMessage `json:"-"`
+}
+
+var knownTodo = fieldSet("text", "status")
+
+func (v Todo) MarshalJSON() ([]byte, error) {
+	type plain Todo
+	p := plain(v)
+	data, err := json.Marshal(p)
+	if err != nil {
+		return nil, err
+	}
+	return withExtra(data, v.Extra, knownTodo)
+}
+
+func (v *Todo) UnmarshalJSON(data []byte) error {
+	if isNull(data) {
+		return nil
+	}
+	type plain Todo
+	var p plain
+	if err := json.Unmarshal(data, &p); err != nil {
+		return err
+	}
+	extra, err := extraFields(data, knownTodo)
+	if err != nil {
+		return err
+	}
+	p.Extra = extra
+	*v = Todo(p)
+	return nil
 }
 
 type TodoStatus string
@@ -746,15 +1296,43 @@ type Compaction struct {
 	// The harness's own payload this came from, for debugging. Backends can leave it out; clients
 	// mustn't depend on it.
 	Raw json.RawMessage `json:"raw,omitempty"`
+
+	// Extra has the fields the spec doesn't name, as they came, so that they're written again
+	// unchanged (receivers ignore fields they don't know, and stores keep them).
+	Extra map[string]json.RawMessage `json:"-"`
 }
+
+var knownCompaction = fieldSet("type", "id", "trigger", "summary", "tokens_before", "parent_id", "turn_id", "created_at", "raw")
 
 func (v Compaction) MarshalJSON() ([]byte, error) {
 	type plain Compaction
 	p := plain(v)
-	return json.Marshal(struct {
+	data, err := json.Marshal(struct {
 		Type string `json:"type"`
 		plain
 	}{"compaction", p})
+	if err != nil {
+		return nil, err
+	}
+	return withExtra(data, v.Extra, knownCompaction)
+}
+
+func (v *Compaction) UnmarshalJSON(data []byte) error {
+	if isNull(data) {
+		return nil
+	}
+	type plain Compaction
+	var p plain
+	if err := json.Unmarshal(data, &p); err != nil {
+		return err
+	}
+	extra, err := extraFields(data, knownCompaction)
+	if err != nil {
+		return err
+	}
+	p.Extra = extra
+	*v = Compaction(p)
+	return nil
 }
 
 type CompactionTrigger string
@@ -791,15 +1369,43 @@ type Notice struct {
 	// The harness's own payload this came from, for debugging. Backends can leave it out; clients
 	// mustn't depend on it.
 	Raw json.RawMessage `json:"raw,omitempty"`
+
+	// Extra has the fields the spec doesn't name, as they came, so that they're written again
+	// unchanged (receivers ignore fields they don't know, and stores keep them).
+	Extra map[string]json.RawMessage `json:"-"`
 }
+
+var knownNotice = fieldSet("type", "id", "level", "text", "code", "detail", "parent_id", "turn_id", "created_at", "raw")
 
 func (v Notice) MarshalJSON() ([]byte, error) {
 	type plain Notice
 	p := plain(v)
-	return json.Marshal(struct {
+	data, err := json.Marshal(struct {
 		Type string `json:"type"`
 		plain
 	}{"notice", p})
+	if err != nil {
+		return nil, err
+	}
+	return withExtra(data, v.Extra, knownNotice)
+}
+
+func (v *Notice) UnmarshalJSON(data []byte) error {
+	if isNull(data) {
+		return nil
+	}
+	type plain Notice
+	var p plain
+	if err := json.Unmarshal(data, &p); err != nil {
+		return err
+	}
+	extra, err := extraFields(data, knownNotice)
+	if err != nil {
+		return err
+	}
+	p.Extra = extra
+	*v = Notice(p)
+	return nil
 }
 
 type NoticeLevel string
@@ -837,15 +1443,43 @@ type TurnResult struct {
 	// The harness's own payload this came from, for debugging. Backends can leave it out; clients
 	// mustn't depend on it.
 	Raw json.RawMessage `json:"raw,omitempty"`
+
+	// Extra has the fields the spec doesn't name, as they came, so that they're written again
+	// unchanged (receivers ignore fields they don't know, and stores keep them).
+	Extra map[string]json.RawMessage `json:"-"`
 }
+
+var knownTurnResult = fieldSet("type", "id", "ok", "interrupted", "error", "usage", "duration_ms", "parent_id", "turn_id", "created_at", "raw")
 
 func (v TurnResult) MarshalJSON() ([]byte, error) {
 	type plain TurnResult
 	p := plain(v)
-	return json.Marshal(struct {
+	data, err := json.Marshal(struct {
 		Type string `json:"type"`
 		plain
 	}{"turn_result", p})
+	if err != nil {
+		return nil, err
+	}
+	return withExtra(data, v.Extra, knownTurnResult)
+}
+
+func (v *TurnResult) UnmarshalJSON(data []byte) error {
+	if isNull(data) {
+		return nil
+	}
+	type plain TurnResult
+	var p plain
+	if err := json.Unmarshal(data, &p); err != nil {
+		return err
+	}
+	extra, err := extraFields(data, knownTurnResult)
+	if err != nil {
+		return err
+	}
+	p.Extra = extra
+	*v = TurnResult(p)
+	return nil
 }
 
 // Attachment: A file sent with a message: inline as base64 data, or by path on the backend's
@@ -856,6 +1490,40 @@ type Attachment struct {
 	MediaType string         `json:"media_type,omitempty"`
 	Data      string         `json:"data,omitempty"`
 	Path      string         `json:"path,omitempty"`
+
+	// Extra has the fields the spec doesn't name, as they came, so that they're written again
+	// unchanged (receivers ignore fields they don't know, and stores keep them).
+	Extra map[string]json.RawMessage `json:"-"`
+}
+
+var knownAttachment = fieldSet("kind", "name", "media_type", "data", "path")
+
+func (v Attachment) MarshalJSON() ([]byte, error) {
+	type plain Attachment
+	p := plain(v)
+	data, err := json.Marshal(p)
+	if err != nil {
+		return nil, err
+	}
+	return withExtra(data, v.Extra, knownAttachment)
+}
+
+func (v *Attachment) UnmarshalJSON(data []byte) error {
+	if isNull(data) {
+		return nil
+	}
+	type plain Attachment
+	var p plain
+	if err := json.Unmarshal(data, &p); err != nil {
+		return err
+	}
+	extra, err := extraFields(data, knownAttachment)
+	if err != nil {
+		return err
+	}
+	p.Extra = extra
+	*v = Attachment(p)
+	return nil
 }
 
 type AttachmentKind string
@@ -944,15 +1612,43 @@ type PermissionRequest struct {
 
 	// The harness's own payload, for debugging.
 	Raw json.RawMessage `json:"raw,omitempty"`
+
+	// Extra has the fields the spec doesn't name, as they came, so that they're written again
+	// unchanged (receivers ignore fields they don't know, and stores keep them).
+	Extra map[string]json.RawMessage `json:"-"`
 }
+
+var knownPermissionRequest = fieldSet("type", "id", "tool_call_id", "name", "kind", "input", "title", "reason", "parent_id", "turn_id", "created_at", "raw")
 
 func (v PermissionRequest) MarshalJSON() ([]byte, error) {
 	type plain PermissionRequest
 	p := plain(v)
-	return json.Marshal(struct {
+	data, err := json.Marshal(struct {
 		Type string `json:"type"`
 		plain
 	}{"permission", p})
+	if err != nil {
+		return nil, err
+	}
+	return withExtra(data, v.Extra, knownPermissionRequest)
+}
+
+func (v *PermissionRequest) UnmarshalJSON(data []byte) error {
+	if isNull(data) {
+		return nil
+	}
+	type plain PermissionRequest
+	var p plain
+	if err := json.Unmarshal(data, &p); err != nil {
+		return err
+	}
+	extra, err := extraFields(data, knownPermissionRequest)
+	if err != nil {
+		return err
+	}
+	p.Extra = extra
+	*v = PermissionRequest(p)
+	return nil
 }
 
 // QuestionRequest: The agent asks the user one or more questions (Claude's AskUserQuestion, Codex's
@@ -973,7 +1669,13 @@ type QuestionRequest struct {
 
 	// The harness's own payload, for debugging.
 	Raw json.RawMessage `json:"raw,omitempty"`
+
+	// Extra has the fields the spec doesn't name, as they came, so that they're written again
+	// unchanged (receivers ignore fields they don't know, and stores keep them).
+	Extra map[string]json.RawMessage `json:"-"`
 }
+
+var knownQuestionRequest = fieldSet("type", "id", "questions", "tool_call_id", "parent_id", "turn_id", "created_at", "raw")
 
 func (v QuestionRequest) MarshalJSON() ([]byte, error) {
 	type plain QuestionRequest
@@ -981,10 +1683,32 @@ func (v QuestionRequest) MarshalJSON() ([]byte, error) {
 	if p.Questions == nil {
 		p.Questions = []Question{}
 	}
-	return json.Marshal(struct {
+	data, err := json.Marshal(struct {
 		Type string `json:"type"`
 		plain
 	}{"question", p})
+	if err != nil {
+		return nil, err
+	}
+	return withExtra(data, v.Extra, knownQuestionRequest)
+}
+
+func (v *QuestionRequest) UnmarshalJSON(data []byte) error {
+	if isNull(data) {
+		return nil
+	}
+	type plain QuestionRequest
+	var p plain
+	if err := json.Unmarshal(data, &p); err != nil {
+		return err
+	}
+	extra, err := extraFields(data, knownQuestionRequest)
+	if err != nil {
+		return err
+	}
+	p.Extra = extra
+	*v = QuestionRequest(p)
+	return nil
 }
 
 type Question struct {
@@ -1007,6 +1731,40 @@ type Question struct {
 
 	// The answer is a secret: don't show or log it.
 	Secret bool `json:"secret,omitempty"`
+
+	// Extra has the fields the spec doesn't name, as they came, so that they're written again
+	// unchanged (receivers ignore fields they don't know, and stores keep them).
+	Extra map[string]json.RawMessage `json:"-"`
+}
+
+var knownQuestion = fieldSet("id", "question", "header", "options", "multi_select", "allow_other", "secret")
+
+func (v Question) MarshalJSON() ([]byte, error) {
+	type plain Question
+	p := plain(v)
+	data, err := json.Marshal(p)
+	if err != nil {
+		return nil, err
+	}
+	return withExtra(data, v.Extra, knownQuestion)
+}
+
+func (v *Question) UnmarshalJSON(data []byte) error {
+	if isNull(data) {
+		return nil
+	}
+	type plain Question
+	var p plain
+	if err := json.Unmarshal(data, &p); err != nil {
+		return err
+	}
+	extra, err := extraFields(data, knownQuestion)
+	if err != nil {
+		return err
+	}
+	p.Extra = extra
+	*v = Question(p)
+	return nil
 }
 
 type QuestionOption struct {
@@ -1014,6 +1772,40 @@ type QuestionOption struct {
 	// The option's text, which is also its answer.
 	Label       string `json:"label"`
 	Description string `json:"description,omitempty"`
+
+	// Extra has the fields the spec doesn't name, as they came, so that they're written again
+	// unchanged (receivers ignore fields they don't know, and stores keep them).
+	Extra map[string]json.RawMessage `json:"-"`
+}
+
+var knownQuestionOption = fieldSet("label", "description")
+
+func (v QuestionOption) MarshalJSON() ([]byte, error) {
+	type plain QuestionOption
+	p := plain(v)
+	data, err := json.Marshal(p)
+	if err != nil {
+		return nil, err
+	}
+	return withExtra(data, v.Extra, knownQuestionOption)
+}
+
+func (v *QuestionOption) UnmarshalJSON(data []byte) error {
+	if isNull(data) {
+		return nil
+	}
+	type plain QuestionOption
+	var p plain
+	if err := json.Unmarshal(data, &p); err != nil {
+		return err
+	}
+	extra, err := extraFields(data, knownQuestionOption)
+	if err != nil {
+		return err
+	}
+	p.Extra = extra
+	*v = QuestionOption(p)
+	return nil
 }
 
 // Resolution: How a request was answered: sent in respond, and repeated in request.resolved.
@@ -1031,6 +1823,40 @@ type Resolution struct {
 
 	// answer: for each question id, the chosen option labels or the free text.
 	Answers map[string][]string `json:"answers,omitempty"`
+
+	// Extra has the fields the spec doesn't name, as they came, so that they're written again
+	// unchanged (receivers ignore fields they don't know, and stores keep them).
+	Extra map[string]json.RawMessage `json:"-"`
+}
+
+var knownResolution = fieldSet("outcome", "always", "message", "answers")
+
+func (v Resolution) MarshalJSON() ([]byte, error) {
+	type plain Resolution
+	p := plain(v)
+	data, err := json.Marshal(p)
+	if err != nil {
+		return nil, err
+	}
+	return withExtra(data, v.Extra, knownResolution)
+}
+
+func (v *Resolution) UnmarshalJSON(data []byte) error {
+	if isNull(data) {
+		return nil
+	}
+	type plain Resolution
+	var p plain
+	if err := json.Unmarshal(data, &p); err != nil {
+		return err
+	}
+	extra, err := extraFields(data, knownResolution)
+	if err != nil {
+		return err
+	}
+	p.Extra = extra
+	*v = Resolution(p)
+	return nil
 }
 
 // ResolutionOutcome: allow, deny: for a permission. answer: for a question. cancel: for either,
@@ -1055,7 +1881,13 @@ type Snapshot struct {
 
 	// The seq of the last saved event it includes; 0 for none.
 	Seq int64 `json:"seq"`
+
+	// Extra has the fields the spec doesn't name, as they came, so that they're written again
+	// unchanged (receivers ignore fields they don't know, and stores keep them).
+	Extra map[string]json.RawMessage `json:"-"`
 }
+
+var knownSnapshot = fieldSet("thread", "items", "requests", "seq")
 
 func (v Snapshot) MarshalJSON() ([]byte, error) {
 	type plain Snapshot
@@ -1066,7 +1898,29 @@ func (v Snapshot) MarshalJSON() ([]byte, error) {
 	if p.Requests == nil {
 		p.Requests = []ThreadRequest{}
 	}
-	return json.Marshal(p)
+	data, err := json.Marshal(p)
+	if err != nil {
+		return nil, err
+	}
+	return withExtra(data, v.Extra, knownSnapshot)
+}
+
+func (v *Snapshot) UnmarshalJSON(data []byte) error {
+	if isNull(data) {
+		return nil
+	}
+	type plain Snapshot
+	var p plain
+	if err := json.Unmarshal(data, &p); err != nil {
+		return err
+	}
+	extra, err := extraFields(data, knownSnapshot)
+	if err != nil {
+		return err
+	}
+	p.Extra = extra
+	*v = Snapshot(p)
+	return nil
 }
 
 // Thread: A thread's own state. Sent whole in thread.updated and in snapshots.
@@ -1107,6 +1961,40 @@ type Thread struct {
 	Metadata  map[string]json.RawMessage `json:"metadata,omitempty"`
 	CreatedAt string                     `json:"created_at"`
 	UpdatedAt string                     `json:"updated_at,omitempty"`
+
+	// Extra has the fields the spec doesn't name, as they came, so that they're written again
+	// unchanged (receivers ignore fields they don't know, and stores keep them).
+	Extra map[string]json.RawMessage `json:"-"`
+}
+
+var knownThread = fieldSet("id", "harness", "status", "title", "model", "effort", "permission_mode", "cwd", "session_id", "usage", "error", "run", "metadata", "created_at", "updated_at")
+
+func (v Thread) MarshalJSON() ([]byte, error) {
+	type plain Thread
+	p := plain(v)
+	data, err := json.Marshal(p)
+	if err != nil {
+		return nil, err
+	}
+	return withExtra(data, v.Extra, knownThread)
+}
+
+func (v *Thread) UnmarshalJSON(data []byte) error {
+	if isNull(data) {
+		return nil
+	}
+	type plain Thread
+	var p plain
+	if err := json.Unmarshal(data, &p); err != nil {
+		return err
+	}
+	extra, err := extraFields(data, knownThread)
+	if err != nil {
+		return err
+	}
+	p.Extra = extra
+	*v = Thread(p)
+	return nil
 }
 
 // ThreadStatus: idle: no turn is running. running: a turn is running. waiting: a turn is waiting on
@@ -1147,6 +2035,40 @@ type Run struct {
 
 	// When a restarted backend last re-attached to the run. Absent if it never has.
 	ReattachedAt string `json:"reattached_at,omitempty"`
+
+	// Extra has the fields the spec doesn't name, as they came, so that they're written again
+	// unchanged (receivers ignore fields they don't know, and stores keep them).
+	Extra map[string]json.RawMessage `json:"-"`
+}
+
+var knownRun = fieldSet("id", "spawner", "started_at", "reattached_at")
+
+func (v Run) MarshalJSON() ([]byte, error) {
+	type plain Run
+	p := plain(v)
+	data, err := json.Marshal(p)
+	if err != nil {
+		return nil, err
+	}
+	return withExtra(data, v.Extra, knownRun)
+}
+
+func (v *Run) UnmarshalJSON(data []byte) error {
+	if isNull(data) {
+		return nil
+	}
+	type plain Run
+	var p plain
+	if err := json.Unmarshal(data, &p); err != nil {
+		return err
+	}
+	extra, err := extraFields(data, knownRun)
+	if err != nil {
+		return err
+	}
+	p.Extra = extra
+	*v = Run(p)
+	return nil
 }
 
 // RunSpawner: direct: a child process of the backend, which ends with it. shim: supervised by
@@ -1167,4 +2089,38 @@ type Usage struct {
 
 	// What the tokens cost, when the harness says.
 	CostUSD *float64 `json:"cost_usd,omitempty"`
+
+	// Extra has the fields the spec doesn't name, as they came, so that they're written again
+	// unchanged (receivers ignore fields they don't know, and stores keep them).
+	Extra map[string]json.RawMessage `json:"-"`
+}
+
+var knownUsage = fieldSet("input_tokens", "output_tokens", "cache_read_tokens", "cache_write_tokens", "cost_usd")
+
+func (v Usage) MarshalJSON() ([]byte, error) {
+	type plain Usage
+	p := plain(v)
+	data, err := json.Marshal(p)
+	if err != nil {
+		return nil, err
+	}
+	return withExtra(data, v.Extra, knownUsage)
+}
+
+func (v *Usage) UnmarshalJSON(data []byte) error {
+	if isNull(data) {
+		return nil
+	}
+	type plain Usage
+	var p plain
+	if err := json.Unmarshal(data, &p); err != nil {
+		return err
+	}
+	extra, err := extraFields(data, knownUsage)
+	if err != nil {
+		return err
+	}
+	p.Extra = extra
+	*v = Usage(p)
+	return nil
 }

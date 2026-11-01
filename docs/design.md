@@ -80,10 +80,10 @@ hand. The wire format is specified in [spec/PROTOCOL.md](../spec/PROTOCOL.md) an
 | `ts/packages/protocol` | Generated TS types and the pure `applyEvent` reducer, shared by the Node backend and React. |
 | `ts/packages/node` | The Node backend (Memory, JSONL file and SQLite stores). |
 | `ts/packages/react` | React hooks and components. |
-| `go/` | Go module `github.com/dire-kiwi/agent-threads/go`; generated types in `go/protocol`. |
+| `go/` | Go module `github.com/dire-kiwi/agent-threads/go`, the Go backend ([go/README.md](../go/README.md)); generated types in `go/protocol`, SQLite in `go/sqlitestore`. |
 | `rust/` | Cargo workspace with the `agent-threads` crate, the Rust backend (generated types in `agent_threads::protocol`), and its `codegen`. |
 | `shim/` | `agent-threads-shim` (see below). |
-| `examples/` | A minimal chat app per backend, each with its own WebSocket transport, to show the "bring your own network" seam: `chat-node` and `chat-rust`, whose servers share chat-node's React frontend ([examples/PROTOCOL.md](../examples/PROTOCOL.md)). |
+| `examples/` | A minimal chat app per backend, each with its own WebSocket transport, to show the "bring your own network" seam: `chat-node`, `chat-go` and `chat-rust`, whose servers share chat-node's React frontend ([examples/PROTOCOL.md](../examples/PROTOCOL.md)). |
 
 `make gen` regenerates the types from `spec/schema/`, and CI fails if they're out of date.
 
@@ -208,9 +208,9 @@ process runs a thread and with which spawner, and its `reattached_at` is set whe
 backend re-attaches; a `notice` item with code `run.reattached` (or `run.lost`, for a run it
 couldn't pick up, whose turn it ended) tells the user. A backend saves a run's offset, with what its
 driver needs to carry on reading, in the same store write as the events it made from the output
-before it, so a restart neither loses events nor makes them twice. The Node backend has the shim
-spawner and `recover()`, and both its drivers re-attach; so does the Rust backend, whose run
-checkpoints are the same as Node's.
+before it, so a restart neither loses events nor makes them twice. The Node, Go and Rust backends
+have the shim spawner and `recover()`, and all their drivers re-attach (the Rust drivers' run
+checkpoints are the same as Node's).
 
 ## React package
 
