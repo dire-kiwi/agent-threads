@@ -30,6 +30,7 @@ use axum::routing::get;
 use config::{Config, DEV_PORT, HarnessInfo, RESTART_CODE};
 use futures_util::{SinkExt, StreamExt};
 use serde_json::{Value, json};
+use tokio::signal::unix::{SignalKind, signal};
 use tokio::sync::{mpsc, watch};
 
 #[derive(Clone)]
@@ -209,6 +210,17 @@ async fn serve(cfg: Config) -> i32 {
             return 1;
         }
     };
+    // Before it says it's listening, so a signal straight after that stops it as any other does.
+    let signals = app.shutdown.clone();
+    let mut interrupt = signal(SignalKind::interrupt()).unwrap();
+    let mut terminate = signal(SignalKind::terminate()).unwrap();
+    tokio::spawn(async move {
+        tokio::select! {
+            _ = interrupt.recv() => {}
+            _ = terminate.recv() => {}
+        }
+        signals.send_replace(Some(0));
+    });
     let what: Vec<String> = cfg
         .harnesses
         .iter()
@@ -223,15 +235,6 @@ async fn serve(cfg: Config) -> i32 {
     );
     tokio::spawn(async move {
         let _ = axum::serve(listener, router).await;
-    });
-    let signals = app.shutdown.clone();
-    tokio::spawn(async move {
-        let mut term = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()).unwrap();
-        tokio::select! {
-            _ = tokio::signal::ctrl_c() => {}
-            _ = term.recv() => {}
-        }
-        signals.send_replace(Some(0));
     });
     let code = loop {
         if let Some(code) = *stop.borrow_and_update() {
@@ -510,22 +513,38 @@ fn percent_decode(path: &str) -> Option<String> {
 
 /// Runs the server, and starts it again when it exits asking to (the frontend's Restart button, for
 /// the restart demo): with CHAT_SHIM set, its harness runs carry on meanwhile, and the new server
-/// re-attaches to them.
+/// re-attaches to them. SIGINT or SIGTERM is passed on to the server, which isn't started again: the
+/// supervisor exits once the server has, so it never leaves one behind.
 async fn supervise() -> i32 {
     let me = std::env::current_exe().expect("the server's own path");
+    // Made once, so that a signal between one server and the next isn't missed.
+    let (Ok(mut interrupt), Ok(mut terminate)) = (signal(SignalKind::interrupt()), signal(SignalKind::terminate()))
+    else {
+        eprintln!("chat-rust: the supervisor couldn't handle signals");
+        return 1;
+    };
+    let mut stopping = false;
     loop {
         let Ok(mut child) = tokio::process::Command::new(&me).env("CHAT_SUPERVISED", "1").spawn() else {
             eprintln!("chat-rust: the server couldn't be started");
             return 1;
         };
-        // Ctrl-C goes to the whole process group, so the server gets it too and shuts down by itself.
+        // Ctrl-C goes to the whole process group, so the server has it already: having it twice
+        // is harmless.
         let status = loop {
-            tokio::select! {
+            let sig = tokio::select! {
                 s = child.wait() => break s,
-                _ = tokio::signal::ctrl_c() => {}
+                _ = interrupt.recv() => libc::SIGINT,
+                _ = terminate.recv() => libc::SIGTERM,
+            };
+            stopping = true;
+            if let Some(pid) = child.id() {
+                // SAFETY: kill has no memory safety requirements; the pid is our child's, not reaped yet.
+                unsafe { libc::kill(pid as libc::pid_t, sig) };
             }
         };
         match status.ok().and_then(|s| s.code()) {
+            Some(RESTART_CODE) if stopping => return 0,
             Some(RESTART_CODE) => println!("restarting the server…"),
             Some(code) => return code,
             None => return 1,

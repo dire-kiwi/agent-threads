@@ -10,9 +10,21 @@ import { join } from "node:path";
 import { FIXTURES, SHIM, startServer, type Server } from "./server.ts";
 
 let server: Server | undefined;
-test.afterEach(async () => {
-  await server?.stop();
+const ON_PURPOSE = "failing on purpose";
+// Every test's server is stopped, and checked to have gone with everything it started, whether the
+// test passed or not.
+test.afterEach(async ({}, testInfo) => {
+  const s = server;
   server = undefined;
+  const problems: string[] = [];
+  if (testInfo.expectedStatus === "failed" && !testInfo.error?.message?.includes(ON_PURPOSE)) problems.push(`it didn't fail on purpose: ${testInfo.error?.message}`);
+  if (s) {
+    await s.stop().catch((e: Error) => problems.push(e.message));
+    problems.push(...(await s.remains()).map((r) => `${r} outlived its teardown`));
+  }
+  // So that a test that's meant to fail (test.fail()) doesn't pass whatever its teardown finds.
+  if (problems.length) testInfo.expectedStatus = "passed";
+  expect(problems).toEqual([]);
 });
 
 const LOOKUP = "Look up order 42 with the lookup_order tool and tell me in one short sentence what's in it.";
@@ -128,6 +140,24 @@ test("with the shim, a turn waiting on the user outlives a server restart", asyn
   // The same request, still open: answering it carries on the same run.
   await page.getByRole("button", { name: "Allow", exact: true }).click();
   await expect(page.getByText("created", { exact: true })).toBeVisible();
+});
+
+test("a supervised server and its run with a request open are stopped after a test fails", async ({ page }) => {
+  test.skip(!existsSync(SHIM), "agent-threads-shim isn't built (make shim)");
+  // What's tested is the teardown that follows (afterEach's).
+  test.fail();
+  server = await startServer(
+    { CHAT_FAKE_CLAUDE: join(FIXTURES, "claude/permission-allow"), CHAT_SHIM: SHIM, CHAT_FAKE_STATE: mkdtempSync(join(tmpdir(), "chat-e2e-fake-")) },
+    { supervised: true },
+  );
+  await page.goto(server.url);
+  await start(page, "Run this shell command with the Bash tool: touch allowed.txt — then reply with just: created");
+  await expect(page.getByRole("button", { name: "Allow", exact: true })).toBeVisible();
+  // So that afterEach's check that none of it is left is worth something.
+  const running = await server.remains();
+  expect(running).toHaveLength(3);
+  expect(running.at(-1)).toMatch(/^its run /);
+  throw new Error(`${ON_PURPOSE}, with the request open`);
 });
 
 test("the server takes WebSockets only from its own pages, and survives malformed input", async () => {

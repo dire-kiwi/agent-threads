@@ -19,7 +19,7 @@ fn repo() -> std::path::PathBuf {
 /// The server on a free port, with a data directory of its own; killed when dropped.
 struct Server {
     port: u16,
-    _child: tokio::process::Child,
+    child: tokio::process::Child,
     _data: tempfile::TempDir,
 }
 
@@ -28,6 +28,11 @@ async fn start(fixture: &str) -> Server {
 }
 
 async fn start_with(fixture: &str, env: &[(&str, &std::path::Path)]) -> Server {
+    launch(&[], fixture, env).await
+}
+
+/// The server run with these arguments (`supervise`, say).
+async fn launch(args: &[&str], fixture: &str, env: &[(&str, &std::path::Path)]) -> Server {
     let port = std::net::TcpListener::bind("127.0.0.1:0")
         .unwrap()
         .local_addr()
@@ -35,6 +40,7 @@ async fn start_with(fixture: &str, env: &[(&str, &std::path::Path)]) -> Server {
         .port();
     let data = tempfile::tempdir().unwrap();
     let mut child = tokio::process::Command::new(env!("CARGO_BIN_EXE_chat-rust"))
+        .args(args)
         .env("PORT", port.to_string())
         .env("CHAT_DATA", data.path())
         .env("CHAT_FAKE_CLAUDE", repo().join("spec/fixtures").join(fixture))
@@ -53,7 +59,7 @@ async fn start_with(fixture: &str, env: &[(&str, &std::path::Path)]) -> Server {
     tokio::spawn(async move { while let Ok(Some(_)) = lines.next_line().await {} });
     Server {
         port,
-        _child: child,
+        child,
         _data: data,
     }
 }
@@ -320,4 +326,25 @@ async fn trusts_vites_port_only_behind_vite() {
     let p = server.port;
     let r = raw(p, "GET /ws HTTP/1.1\r\nHost: localhost:5173\r\nConnection: Upgrade\r\nUpgrade: websocket\r\nSec-WebSocket-Version: 13\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\r\n").await;
     assert!(r.starts_with("HTTP/1.1 403"), "{r}");
+}
+
+/// SIGTERM to `chat-rust supervise` (all that a test's teardown sends) stops the server too: the
+/// supervisor exits once the server has, and doesn't leave it listening.
+#[tokio::test]
+async fn the_supervisor_stops_the_server_it_runs() {
+    let mut server = launch(&["supervise"], "claude/plain-reply", &[]).await;
+    let addr = ("127.0.0.1", server.port);
+    tokio::net::TcpStream::connect(addr).await.unwrap();
+    let pid = server.child.id().unwrap() as libc::pid_t;
+    // SAFETY: kill has no memory safety requirements; the pid is our child's, not reaped yet.
+    assert_eq!(unsafe { libc::kill(pid, libc::SIGTERM) }, 0);
+    let status = tokio::time::timeout(Duration::from_secs(20), server.child.wait())
+        .await
+        .expect("the supervisor exits")
+        .unwrap();
+    assert!(status.success(), "{status}");
+    assert!(
+        tokio::net::TcpStream::connect(addr).await.is_err(),
+        "the server is still listening"
+    );
 }

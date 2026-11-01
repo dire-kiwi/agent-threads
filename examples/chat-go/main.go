@@ -71,14 +71,15 @@ func main() {
 	if cfg.shim != "" {
 		shim = ", under the shim"
 	}
-	// Unprefixed, so whatever starts it (chat-node's smoke tests) sees it's listening.
-	fmt.Printf("chat-go on http://127.0.0.1:%d with %s%s; data in %s\n", cfg.port, strings.Join(what, ", "), shim, cfg.data)
+	// Before it says it's listening, so a signal straight after that stops it as any other does.
 	signals := make(chan os.Signal, 1)
 	signal.Notify(signals, syscall.SIGINT, syscall.SIGTERM)
 	go func() {
 		<-signals
 		app.shutdown(0)
 	}()
+	// Unprefixed, so whatever starts it (chat-node's smoke tests) sees it's listening.
+	fmt.Printf("chat-go on http://127.0.0.1:%d with %s%s; data in %s\n", cfg.port, strings.Join(what, ", "), shim, cfg.data)
 	server := &http.Server{Handler: app, ReadHeaderTimeout: 30 * time.Second}
 	app.server = server
 	if err := server.Serve(ln); err != nil && !errors.Is(err, http.ErrServerClosed) {
@@ -511,13 +512,42 @@ func supervise() int {
 	if err != nil {
 		log.Fatal(err)
 	}
-	// Ctrl-C goes to the whole process group, so the server gets it too and shuts down by itself.
-	signal.Ignore(syscall.SIGINT)
-	for {
+	signals := make(chan os.Signal, 1)
+	signal.Notify(signals, syscall.SIGINT, syscall.SIGTERM)
+	return superviseWith(func() *exec.Cmd {
 		cmd := exec.Command(exe)
 		cmd.Stdin, cmd.Stdout, cmd.Stderr = os.Stdin, os.Stdout, os.Stderr
 		cmd.Env = append(os.Environ(), "CHAT_SUPERVISED=1")
-		err := cmd.Run()
+		return cmd
+	}, signals)
+}
+
+// superviseWith runs the servers server makes, one after another while each exits asking for a
+// restart, and returns the last one's exit code. A signal from signals is passed on to the server,
+// which isn't started again: it returns once the server has exited, so it never leaves one behind.
+func superviseWith(server func() *exec.Cmd, signals <-chan os.Signal) int {
+	stopping := false
+	for {
+		cmd := server()
+		if err := cmd.Start(); err != nil {
+			log.Print(err)
+			return 1
+		}
+		done := make(chan error, 1)
+		go func() { done <- cmd.Wait() }()
+		var err error
+	wait:
+		for {
+			select {
+			case err = <-done:
+				break wait
+			// Ctrl-C goes to the whole process group, so the server has it already: having it twice
+			// is harmless.
+			case sig := <-signals:
+				stopping = true
+				cmd.Process.Signal(sig)
+			}
+		}
 		code := 0
 		if err != nil {
 			var exit *exec.ExitError
@@ -527,10 +557,12 @@ func supervise() int {
 			}
 			code = exit.ExitCode()
 		}
-		if code != restartCode {
-			if code < 0 {
-				return 1
-			}
+		switch {
+		case code < 0:
+			return 1
+		case code == restartCode && stopping:
+			return 0
+		case code != restartCode:
 			return code
 		}
 		log.Print("restarting the server…")
