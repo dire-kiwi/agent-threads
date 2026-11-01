@@ -177,6 +177,17 @@ pub struct Recovered {
 /// How often the shim spawner's finished runs are pruned.
 const PRUNE_EVERY: std::time::Duration = std::time::Duration::from_secs(3600);
 
+/// Runs a function when it's dropped (however the scope it's in ends).
+struct Finally<F: FnOnce()>(Option<F>);
+
+impl<F: FnOnce()> Drop for Finally<F> {
+    fn drop(&mut self) {
+        if let Some(f) = self.0.take() {
+            f();
+        }
+    }
+}
+
 /// A deletion under way: its outcome once it's done.
 type Deletion = tokio::sync::watch::Receiver<Option<Result<bool>>>;
 
@@ -234,7 +245,12 @@ struct Inner {
     /// Threads being deleted, which aren't loaded again.
     deleting: StdMutex<HashMap<String, Deletion>>,
     closed: AtomicBool,
-    stopped: Mutex<bool>,
+    /// The shutdown close() started (waiting for deletions, stopping every thread, settling the
+    /// spawner): a task of its own, so it finishes even if close()'s caller stops waiting; true once
+    /// it's done.
+    shutdown: StdMutex<Option<tokio::sync::watch::Receiver<bool>>>,
+    /// One save_all() at a time.
+    saving: Mutex<()>,
     pruner: StdMutex<Option<JoinHandle<()>>>,
 }
 
@@ -270,7 +286,8 @@ impl AgentThreads {
                 configs: StdMutex::new(HashMap::new()),
                 deleting: StdMutex::new(Default::default()),
                 closed: AtomicBool::new(false),
-                stopped: Mutex::new(false),
+                shutdown: StdMutex::new(None),
+                saving: Mutex::new(()),
                 pruner: StdMutex::new(None),
             }),
         }
@@ -431,14 +448,29 @@ impl AgentThreads {
             if let Some(d) = deleting.get(thread_id) {
                 d.clone()
             } else {
+                // Checked again under the lock close() collects deletions under, so a close() that
+                // started meanwhile either sees this one or refuses it here.
+                self.open()?;
                 let (tx, rx) = tokio::sync::watch::channel(None);
                 deleting.insert(thread_id.to_string(), rx.clone());
                 let handle = threads.remove(thread_id);
                 let (me, id) = (self.clone(), thread_id.to_string());
                 tokio::spawn(async move {
-                    let result = me.delete_now(&id, handle).await;
-                    me.inner.deleting.lock().unwrap().remove(&id);
-                    tx.send_replace(Some(result));
+                    // However it ends (a panic in delete_now included), the mark goes and those
+                    // waiting are told.
+                    let result: Arc<StdMutex<Option<Result<bool>>>> = Arc::default();
+                    let _done = {
+                        let (me, id, result) = (me.clone(), id.clone(), result.clone());
+                        Finally(Some(move || {
+                            me.inner.deleting.lock().unwrap().remove(&id);
+                            let r = result.lock().unwrap().take();
+                            tx.send_replace(Some(
+                                r.unwrap_or_else(|| Err(Error::Other(format!("deleting thread {id} failed")))),
+                            ));
+                        }))
+                    };
+                    let r = me.delete_now(&id, handle).await;
+                    *result.lock().unwrap() = Some(r);
                 });
                 rx
             }
@@ -673,24 +705,47 @@ impl AgentThreads {
     /// is the app's to close.
     pub async fn close(&self, stop: bool) -> Result<()> {
         let i = &self.inner;
-        {
-            let mut stopped = i.stopped.lock().await;
-            if !*stopped {
-                *stopped = true;
-                i.closed.store(true, Ordering::SeqCst);
-                if let Some(p) = i.pruner.lock().unwrap().take() {
-                    p.abort();
-                }
-                // Deletions under way finish first.
-                let deletions: Vec<Deletion> = i.deleting.lock().unwrap().values().cloned().collect();
-                for d in deletions {
-                    let _ = deleted(d).await;
-                }
-                self.stop_all(stop).await;
-                i.spawner.settle().await;
-            }
-        }
+        let mut shutdown = {
+            let mut shutdown = i.shutdown.lock().unwrap();
+            shutdown
+                .get_or_insert_with(|| {
+                    i.closed.store(true, Ordering::SeqCst);
+                    if let Some(p) = i.pruner.lock().unwrap().take() {
+                        p.abort();
+                    }
+                    let (tx, rx) = tokio::sync::watch::channel(false);
+                    let me = self.clone();
+                    tokio::spawn(async move {
+                        // Done however it ends (a panic in a harness's close included), so close()
+                        // goes on to save what there is.
+                        let _done = Finally(Some(move || {
+                            tx.send_replace(true);
+                        }));
+                        me.shut_down(stop).await;
+                    });
+                    rx
+                })
+                .clone()
+        };
+        let _ = shutdown.wait_for(|done| *done).await;
         self.save_all().await
+    }
+
+    /// Waits for the deletions under way, then stops every thread's harness, and settles the
+    /// spawner.
+    async fn shut_down(&self, stop: bool) {
+        let i = &self.inner;
+        // A delete() that started before `closed` was set has marked its thread by the time the
+        // threads lock is free (it rechecks `closed` under it), so none is missed.
+        let deletions: Vec<Deletion> = {
+            let _threads = i.threads.lock().await;
+            i.deleting.lock().unwrap().values().cloned().collect()
+        };
+        for d in deletions {
+            let _ = deleted(d).await;
+        }
+        self.stop_all(stop).await;
+        i.spawner.settle().await;
     }
 
     /// Stops every thread's harness.
@@ -734,6 +789,7 @@ impl AgentThreads {
 
     /// Saves every thread's events and a snapshot, then lets the thread go.
     async fn save_all(&self) -> Result<()> {
+        let _one = self.inner.saving.lock().await;
         let handles: Vec<(String, Handle)> = self
             .inner
             .threads
@@ -744,9 +800,18 @@ impl AgentThreads {
             .collect();
         let mut failed = Vec::new();
         for (id, h) in handles {
-            if let Err(e) = h.saved().await {
-                failed.push(e.to_string());
-                continue;
+            match h.saved().await {
+                Ok(()) => {}
+                // Its task has ended: a close() that saved and disposed of it was cut short before
+                // it let go of the handle.
+                Err(Error::Command(_)) if h.tx.is_closed() => {
+                    self.inner.threads.lock().await.remove(&id);
+                    continue;
+                }
+                Err(e) => {
+                    failed.push(e.to_string());
+                    continue;
+                }
             }
             let _ = h
                 .call(|a| {

@@ -1354,3 +1354,50 @@ async fn close_waits_for_a_deletion_under_way() {
     assert!(env.sdk.store().get_thread(&id).await.unwrap().is_none());
     assert!(deleting.await.unwrap().unwrap());
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_close_cut_short_mid_grace_finishes_and_a_retry_saves_the_interrupted_turn() {
+    let claude = ClaudeCodeOptions {
+        close_grace: Duration::from_millis(500),
+        ..Default::default()
+    };
+    let env = setup(Setup {
+        claude,
+        ..Default::default()
+    });
+    let id = stubborn_thread(&env).await;
+    let sdk = env.sdk.clone();
+    let first = tokio::spawn(async move { sdk.close(true).await });
+    // The caller gives up while Claude, which doesn't stop at its input closing, has its grace.
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    first.abort();
+    assert!(first.await.unwrap_err().is_cancelled());
+    // Commands are refused from the moment close() started.
+    assert!(matches!(
+        env.sdk.send(&id, "reply hi", SendOptions::default()).await,
+        Err(Error::Command(_))
+    ));
+    env.sdk.close(true).await.unwrap();
+    // The harness was stopped, and the turn it cut short is saved as interrupted, with the thread
+    // idle and its run gone.
+    let events: Vec<Value> = env
+        .sdk
+        .events_since(&id, 0, None)
+        .await
+        .unwrap()
+        .iter()
+        .map(|e| serde_json::to_value(e).unwrap())
+        .collect();
+    let result = events
+        .iter()
+        .rev()
+        .find(|e| e["type"] == "item.added" && e["item"]["type"] == "turn_result")
+        .unwrap();
+    assert_eq!(result["item"]["interrupted"], true);
+    let thread = &events.iter().rev().find(|e| e["type"] == "thread.updated").unwrap()["thread"];
+    assert_eq!(thread["status"], "idle");
+    assert!(thread.get("run").is_none());
+    assert!(events.iter().any(|e| e["type"] == "turn.completed"));
+    // Closing again is fine.
+    env.sdk.close(true).await.unwrap();
+}
