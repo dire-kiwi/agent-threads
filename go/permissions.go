@@ -85,8 +85,11 @@ func (f PolicyFunc) Decide(ctx context.Context, q PermissionQuery, t PermissionC
 	return f(ctx, q, t)
 }
 
-// permissionKey says which tool a query is about, for a standing answer: its kind, its MCP server
-// and its name, since two servers (or an app tool and a built-in) can have tools of the same name.
+// PermissionKey says which tool a query is about, for an answer given "always" (ThreadContext.Ask's
+// standing): its kind, its MCP server and its name, since two servers (or an app tool and a
+// built-in) can have tools of the same name.
+func PermissionKey(q PermissionQuery) string { return permissionKey(q.Kind, q.Server, q.Name) }
+
 func permissionKey(kind protocol.ToolKind, server, name string) string {
 	var s any
 	if server != "" {

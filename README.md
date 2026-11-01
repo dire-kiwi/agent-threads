@@ -18,13 +18,14 @@ for the protocol.
 | `spec/tools/` | The fake CLI that replays them in backends' tests, the recorder, and the event comparator ([README](spec/tools/README.md)) |
 | `spec/conformance/` | The cases every store must pass ([store.md](spec/conformance/store.md)) |
 | `ts/` | pnpm workspace: `@dire-kiwi/agent-threads-protocol`, `-node`, `-react` |
-| `go/` | Go module `github.com/dire-kiwi/agent-threads/go` |
+| `go/` | Go module `github.com/dire-kiwi/agent-threads/go`: the Go backend ([README](go/README.md)) |
 | `rust/` | Cargo workspace with the `agent-threads` crate |
+| `examples/chat-go/` | The chat example's server in Go, for chat-node's React frontend ([README](examples/chat-go/README.md)) |
 | `shim/` | `agent-threads-shim`, which keeps runs alive across backend restarts ([README](shim/README.md), [spec/RUNDIR.md](spec/RUNDIR.md)) |
 
 ## Building
 
-You need Node 24+ with pnpm 10, Go 1.24+ and stable Rust (the Node tests build the shim with cargo).
+You need Node 24+ with pnpm 10, Go 1.26+ and stable Rust (the Node and Go tests build the shim with cargo).
 
 ```sh
 (cd ts && pnpm install)

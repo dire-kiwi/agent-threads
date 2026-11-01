@@ -230,7 +230,12 @@ func runFixture(t *testing.T, scenario, spawnerName string) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	from := 0
+	// Its first event is delivered (subscribers get events on a goroutine of their own) before the
+	// steps begin, so a wait doesn't match it.
+	if rec.waitFor(0, json.RawMessage(`{"type":"thread.updated","seq":1}`), waitFor) < 0 {
+		t.Fatal("no first thread.updated")
+	}
+	from := 1
 	for i, step := range fx.Steps {
 		where := fmt.Sprintf("step %d", i+1)
 		switch {

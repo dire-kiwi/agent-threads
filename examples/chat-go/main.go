@@ -71,7 +71,8 @@ func main() {
 	if cfg.shim != "" {
 		shim = ", under the shim"
 	}
-	log.Printf("chat-go on http://127.0.0.1:%d with %s%s; data in %s", cfg.port, strings.Join(what, ", "), shim, cfg.data)
+	// Unprefixed, so whatever starts it (chat-node's smoke tests) sees it's listening.
+	fmt.Printf("chat-go on http://127.0.0.1:%d with %s%s; data in %s\n", cfg.port, strings.Join(what, ", "), shim, cfg.data)
 	signals := make(chan os.Signal, 1)
 	signal.Notify(signals, syscall.SIGINT, syscall.SIGTERM)
 	go func() {

@@ -33,8 +33,10 @@ test-spec:
 test-ts: shim
 	cd ts && pnpm build && pnpm test
 
-test-go:
+# The Go backend's tests run agent-threads-shim and the fake CLI (node).
+test-go: shim
 	cd go && go vet ./... && go test ./...
+	cd examples/chat-go && go vet ./... && go test ./...
 
 test-rust:
 	cd rust && cargo test --locked && cargo clippy --locked --all-targets -- -D warnings && cargo fmt --check

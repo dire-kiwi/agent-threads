@@ -600,7 +600,8 @@ func (a *AgentThreads) do(ctx context.Context, threadID string, fn func(rt *thre
 	return nil
 }
 
-// Close stops every harness process and saves everything. With a durable spawner (Shim), runs are
+// Close stops every harness process, saves everything, and returns once the subscribers have had
+// every event. With a durable spawner (Shim), runs are
 // left going instead (their turns too), for Recover to re-attach to when the app starts again; a
 // driver that can't re-attach has its runs stopped. It returns an error if some thread's events
 // can't be saved (the store is failing): they're kept, and calling Close again tries again. After
@@ -641,7 +642,13 @@ func (a *AgentThreads) shutdown(ctx context.Context, stop bool) error {
 		}
 	}
 	if err == nil {
+		// Every event is delivered before it returns.
 		a.events.close()
+		select {
+		case <-a.events.closedCh:
+		case <-ctx.Done():
+			return ctx.Err()
+		}
 	}
 	return err
 }
