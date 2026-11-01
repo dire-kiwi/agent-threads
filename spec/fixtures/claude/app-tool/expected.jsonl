@@ -8,11 +8,11 @@
 {"type":"item.added","thread_id":"{{thread}}","seq":8,"item":{"id":"toolu_01B3jg41W6Bw4KorTMhY9bSr","type":"tool_call","name":"lookup_order","kind":"app","input":{"order_id":"42"},"status":"running","turn_id":"{{t1}}"}}
 {"type":"item.updated","thread_id":"{{thread}}","seq":9,"item_id":"toolu_01B3jg41W6Bw4KorTMhY9bSr","patch":{"status":"completed","result":{"content":"Order 42: 3 blue widgets, shipped on 2026-10-30."}}}
 {"type":"item.added","thread_id":"{{thread}}","seq":10,"item":{"id":"msg_011CgaTeZV8sExMBgNvDCRF7:0","type":"assistant_message","text":"","turn_id":"{{t1}}"}}
-{"type":"delta","thread_id":"{{thread}}","seq":10,"item_id":"msg_011CgaTeZV8sExMBgNvDCRF7:0","kind":"text","text":"Order 42 contains "}
-{"type":"delta","thread_id":"{{thread}}","seq":10,"item_id":"msg_011CgaTeZV8sExMBgNvDCRF7:0","kind":"text","text":"3 blue widgets and"}
-{"type":"delta","thread_id":"{{thread}}","seq":10,"item_id":"msg_011CgaTeZV8sExMBgNvDCRF7:0","kind":"text","text":" sh"}
-{"type":"delta","thread_id":"{{thread}}","seq":10,"item_id":"msg_011CgaTeZV8sExMBgNvDCRF7:0","kind":"text","text":"ipped on 2026-10"}
-{"type":"delta","thread_id":"{{thread}}","seq":10,"item_id":"msg_011CgaTeZV8sExMBgNvDCRF7:0","kind":"text","text":"-30."}
+{"type":"delta","thread_id":"{{thread}}","seq":10,"item_id":"msg_011CgaTeZV8sExMBgNvDCRF7:0","kind":"text","offset":0,"text":"Order 42 contains "}
+{"type":"delta","thread_id":"{{thread}}","seq":10,"item_id":"msg_011CgaTeZV8sExMBgNvDCRF7:0","kind":"text","offset":18,"text":"3 blue widgets and"}
+{"type":"delta","thread_id":"{{thread}}","seq":10,"item_id":"msg_011CgaTeZV8sExMBgNvDCRF7:0","kind":"text","offset":36,"text":" sh"}
+{"type":"delta","thread_id":"{{thread}}","seq":10,"item_id":"msg_011CgaTeZV8sExMBgNvDCRF7:0","kind":"text","offset":39,"text":"ipped on 2026-10"}
+{"type":"delta","thread_id":"{{thread}}","seq":10,"item_id":"msg_011CgaTeZV8sExMBgNvDCRF7:0","kind":"text","offset":55,"text":"-30."}
 {"type":"item.updated","thread_id":"{{thread}}","seq":11,"item_id":"msg_011CgaTeZV8sExMBgNvDCRF7:0","patch":{"text":"Order 42 contains 3 blue widgets and shipped on 2026-10-30."}}
 {"type":"item.added","thread_id":"{{thread}}","seq":12,"item":{"id":"{{tr1}}","type":"turn_result","ok":true,"usage":{"input_tokens":6,"output_tokens":172,"cache_read_tokens":52256,"cache_write_tokens":6958,"cost_usd":0.00200076},"duration_ms":2751,"turn_id":"{{t1}}"}}
 {"type":"turn.completed","thread_id":"{{thread}}","seq":13,"turn_id":"{{t1}}"}

@@ -164,11 +164,13 @@ impl ::std::convert::TryFrom<::std::string::String> for CompactionTrigger {
         value.parse()
     }
 }
-///Streamed text to append to an assistant_message (kind text) or reasoning (kind reasoning) item's text. Not saved, and doesn't advance seq: its seq is that of the last saved event. An item.updated with the final text follows.
+///Streamed text to append to an assistant_message (kind text) or reasoning (kind reasoning) item's text, at offset. Not saved, and doesn't advance seq: its seq is that of the last saved event. An item.updated with the final text follows.
 #[derive(::serde::Deserialize, ::serde::Serialize, Clone, Debug)]
 pub struct DeltaEvent {
     pub item_id: ::std::string::String,
     pub kind: DeltaEventKind,
+    ///Where text goes in the item's text: its length before this delta, in UTF-16 code units (JavaScript's string length). A client that already has the text up to offset + text's length (from a snapshot taken after the delta) skips it.
+    pub offset: u64,
     ///The harness's own payload, for debugging.
     #[serde(skip_serializing_if = "::std::option::Option::is_none")]
     pub raw: ::std::option::Option<::serde_json::Value>,

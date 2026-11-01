@@ -114,7 +114,7 @@ describe("ThreadProvider", () => {
       </ThreadProvider>,
     );
     act(() => emit(added(1, msg("a"))));
-    act(() => emit({ type: "delta", thread_id: "th", seq: 1, item_id: "a", kind: "text", text: "more" }));
+    act(() => emit({ type: "delta", thread_id: "th", seq: 1, item_id: "a", kind: "text", offset: 0, text: "more" }));
     expect(draws).toEqual({ status: 1, items: 2 });
     act(() => emit({ type: "thread.updated", thread_id: "th", seq: 2, thread: { ...thread, status: "running" } }));
     expect(draws).toEqual({ status: 2, items: 2 });

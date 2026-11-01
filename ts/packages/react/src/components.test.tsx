@@ -59,7 +59,7 @@ describe("<Thread>", () => {
     const { snapshot } = fixture("claude/plain-reply", (e) => e.type === "item.added" && e.item.type === "assistant_message");
     const id = snapshot.items.findLast((i) => i.type === "assistant_message")!.id;
     const { emit, container } = mount(snapshot);
-    act(() => emit({ type: "delta", thread_id: snapshot.thread.id, seq: snapshot.seq, item_id: id, kind: "text", text: "Hello `there`" }));
+    act(() => emit({ type: "delta", thread_id: snapshot.thread.id, seq: snapshot.seq, item_id: id, kind: "text", offset: 0, text: "Hello `there`" }));
     expect(container.querySelector(".at-streaming")?.textContent).toBe("Hello `there`");
     act(() => emit({ type: "item.updated", thread_id: snapshot.thread.id, seq: snapshot.seq + 1, item_id: id, patch: { text: "Hello `there`" } }));
     expect(container.querySelector(".at-streaming")).toBeNull();

@@ -10,7 +10,7 @@
     "E3": { "type": "turn.started", "thread_id": "th_1", "seq": 3, "turn_id": "t1" },
     "E4": { "type": "item.added", "thread_id": "th_1", "seq": 4, "item": { "id": "tc1", "type": "tool_call", "name": "Bash", "kind": "shell", "input": { "command": "echo 'ünïcödé ✓' && printf '%s\\n' \"a\tb\"", "nested": { "list": [1, 2.5, null, true, { "x": "" }] } }, "status": "running", "command": "echo 'ünïcödé ✓'", "turn_id": "t1" }, "raw": { "type": "assistant", "unknown_field": { "kept": true } } },
     "E5": { "type": "item.updated", "thread_id": "th_1", "seq": 5, "item_id": "tc1", "patch": { "status": "completed", "result": { "content": "ünïcödé ✓\na\tb\n", "exit_code": 0 } }, "future_field": "kept too" },
-    "D": { "type": "delta", "thread_id": "th_1", "seq": 3, "item_id": "a1", "kind": "text", "text": "Hel" },
+    "D": { "type": "delta", "thread_id": "th_1", "seq": 3, "item_id": "a1", "kind": "text", "offset": 0, "text": "Hel" },
     "F1": { "type": "thread.updated", "thread_id": "th_2", "seq": 1, "thread": { "id": "th_2", "harness": "codex", "status": "idle", "created_at": "2026-11-01T00:00:05Z" } },
     "F2": { "type": "turn.started", "thread_id": "th_2", "seq": 2, "turn_id": "t9" },
     "S2": {

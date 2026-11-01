@@ -21,10 +21,16 @@ export function applyEvent(state: Snapshot, event: ThreadEvent): Snapshot {
   if (event.thread_id !== state.thread.id) return state;
   if (event.type === "delta") {
     // A delta from before the last saved event the state has is already in it.
-    if (event.seq < state.seq) return state;
-    return withItem(state, event.item_id, (item) =>
-      item.type === "assistant_message" || item.type === "reasoning" ? { ...item, text: item.text + event.text } : item,
-    );
+    if (event.seq < state.seq || !event.text) return state;
+    return withItem(state, event.item_id, (item) => {
+      if (item.type !== (event.kind === "text" ? "assistant_message" : "reasoning")) return item;
+      // The text from offset on. Some of it may be in already (a snapshot taken after the delta
+      // was sent has it), and the rest is appended. One past the end of the text means deltas
+      // were missed: it's skipped, and the item's final text puts it right.
+      const have = item.text.length - event.offset;
+      if (have < 0 || have >= event.text.length) return item;
+      return { ...item, text: item.text + event.text.slice(have) };
+    });
   }
   if (event.seq <= state.seq) return state;
   const next = apply(state, event);
