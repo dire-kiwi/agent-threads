@@ -329,7 +329,7 @@ func (a *AgentThreads) Delete(ctx context.Context, threadID string) (bool, error
 	}
 	if rt := a.live(threadID); rt != nil {
 		// Not deleted while its harness is still being stopped (which its goroutine does): Delete
-		// again once it has.
+		// again once it has. Commands for it are refused meanwhile.
 		if err := a.closeSession(ctx, rt); err != nil {
 			return false, err
 		}
@@ -347,9 +347,9 @@ func (a *AgentThreads) Delete(ctx context.Context, threadID string) (bool, error
 // closeSession stops the thread's harness process, and waits for it (or ctx: then it goes on being
 // stopped, and a later call waits for the same stop).
 func (a *AgentThreads) closeSession(ctx context.Context, rt *threadRuntime) error {
-	done := rt.closeSession()
-	if done == nil {
-		return nil
+	done, err := rt.closeSession(ctx)
+	if err != nil || done == nil {
+		return err
 	}
 	select {
 	case <-done:
@@ -627,13 +627,23 @@ func (a *AgentThreads) do(ctx context.Context, threadID string, fn func(rt *thre
 	if err := a.open(); err != nil {
 		return err
 	}
-	if err := rt.loop.callCtx(ctx, func() { fn(rt) }); err != nil {
+	var refused error
+	if err := rt.loop.callCtx(ctx, func() {
+		// Its harness is being stopped: a command for it would start a run that can't go anywhere.
+		if rt.sessionClosing() {
+			if refused = a.open(); refused == nil {
+				refused = commandErr("thread %s is being deleted", threadID)
+			}
+			return
+		}
+		fn(rt)
+	}); err != nil {
 		if errors.Is(err, errLoopStopped) {
 			return commandErr("this AgentThreads is closed")
 		}
 		return err
 	}
-	return nil
+	return refused
 }
 
 // Close stops every harness process, saves everything, and returns once the subscribers have had
@@ -708,8 +718,9 @@ func (a *AgentThreads) stopAll(ctx context.Context, stop bool) {
 			defer wg.Done()
 			left := false
 			rt.loop.call(func() {
-				// Left going, saved as it is now, to be re-attached to (saveAll reports a failure).
-				if d, ok := rt.session.(DurableSession); !stop && durable && ok && d.Detach() {
+				// Left going, saved as it is now, to be re-attached to (saveAll reports a failure). One
+				// already being stopped (by a Delete whose context ran out) goes on being stopped.
+				if d, ok := rt.session.(DurableSession); !stop && durable && ok && !rt.sessionClosing() && d.Detach() {
 					left = true
 					rt.markDetached()
 					rt.scheduleFlush()
