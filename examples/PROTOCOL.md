@@ -21,7 +21,8 @@ own permission requests. So the server refuses the WebSocket upgrade (403) unles
 name can't be, and its `Origin`, when it has one, is that same host (the app's own page; clients
 that aren't browsers send none). That's the examples' only check: a real app authenticates its
 users here. It also mustn't let a malformed frame or URL take it down: frames that aren't requests
-are ignored, and a path that doesn't decode is a 400.
+are ignored, one the socket can't take (text that isn't UTF-8, one too big) closes that socket
+only, and a path that doesn't decode is a 400.
 
 In development the frontend runs under Vite (`chat-node/web`, port 5173), which proxies `/ws` to
 `http://127.0.0.1:$PORT`, so any server on that port works with it.

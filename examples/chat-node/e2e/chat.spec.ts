@@ -132,6 +132,22 @@ test("the server takes WebSockets only from its own pages, and survives malforme
     client.send(JSON.stringify({ id: 9, method: "list" }));
   });
   expect(reply).toEqual({ id: 9, result: [] });
-  client.close();
+
+  // Nor do frames the socket itself can't take: text that isn't UTF-8, and one too big. They end
+  // that socket only.
+  for (const send of [(s: WebSocket) => s.send(Buffer.from([0xff]), { binary: false }), (s: WebSocket) => s.send("x".repeat(17 * 1024 * 1024))]) {
+    const bad = (await connect({}))!;
+    const closed = new Promise((r) => bad.on("close", r));
+    send(bad);
+    await closed;
+  }
   expect((await fetch(server.url)).status).toBe(200);
+  const again = (await connect({}))!;
+  const listed = await new Promise((resolve) => {
+    again.on("message", (data) => resolve(JSON.parse(String(data))));
+    again.send(JSON.stringify({ id: 1, method: "list" }));
+  });
+  expect(listed).toEqual({ id: 1, result: [] });
+  again.close();
+  client.close();
 });

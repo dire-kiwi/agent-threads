@@ -5,7 +5,7 @@ import { test } from "node:test";
 import { permissions, readsOnly } from "./policy.ts";
 
 test("commands that only read", () => {
-  for (const c of ["cat a.txt", "cat 'a b.txt'", "ls -la", "head -n 5 notes.txt", "grep -rn widget .", "sed -n '1,240p' /tmp/x/SKILL.md", "sed -n 5p a b"])
+  for (const c of ["cat a.txt", "cat 'a b.txt'", "cat '*.txt'", "ls -la", "head -n 5 notes.txt", "grep -rn widget .", "sed -n '1,240p' /tmp/x/SKILL.md", "sed -n 5p a b"])
     assert.equal(readsOnly(c), true, c);
 });
 
@@ -29,6 +29,14 @@ test("commands that could do something else", () => {
     "sed -n 1p -e 'w /tmp/x' f",
     "sed -n 1p f -i",
     "sed -n 1p -- -i",
+    // Globs: with a file called -i there, `sed -n 1p *` is `sed -n 1p -i notes.txt`.
+    "sed -n 1p *",
+    "sed -n 1p notes.?",
+    "sed -n 1p [-]i notes.txt",
+    "cat *",
+    // Quotes partway through a word, which the shell joins up.
+    "sed -n 1p -'i' notes.txt",
+    "sed -n 1p 'notes'.txt -'-in-place'",
   ])
     assert.equal(readsOnly(c), false, c);
 });

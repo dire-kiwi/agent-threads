@@ -10,13 +10,20 @@ const READ_ONLY_TOOLS = new Set(["lookup_order", "Skill"]);
 const READERS = new Set(["cat", "head", "tail", "ls", "wc", "grep", "pwd", "nl", "stat"]);
 
 /**
- * Whether a shell command only reads: one of READERS, or `sed -n '<lines>p' <files>`, with no shell syntax
- * (pipes, redirections, substitutions, several commands) that could make it do anything else.
+ * Whether a shell command only reads: one of READERS, or `sed -n '<lines>p' <files>`, with no shell
+ * syntax (pipes, redirections, substitutions, several commands) that could make it do anything
+ * else, and no globs: the shell would expand those into names the check never sees, and a file
+ * called `-i` would make `sed -n 1p *` edit files in place.
  */
 export function readsOnly(command: string): boolean {
   if (/[;&|<>`$(){}\n\\"]/.test(command)) return false;
-  // Words, with single quotes taken off (nothing in single quotes is expanded).
-  const words = command.trim().match(/'[^']*'|[^\s']+/g)?.map((w) => w.replace(/^'|'$/g, "")) ?? [];
+  // Words: each either quoted whole in single quotes (nothing in them is expanded) or not quoted at all.
+  const words: string[] = [];
+  for (const [, quoted, bare] of command.trim().matchAll(/'([^']*)'(?=\s|$)|(\S+)/g)) {
+    if (quoted !== undefined) words.push(quoted);
+    else if (/['*?[\]]/.test(bare!)) return false; // a quote partway through a word, or a glob
+    else words.push(bare!);
+  }
   const [program, ...args] = words;
   // GNU sed takes options anywhere (`sed -n 1p -i file` edits in place, `-e 'w file'` writes), so
   // after the script there must be only files, none that looks like an option.

@@ -97,7 +97,12 @@ function trusted(req: IncomingMessage): boolean {
 }
 const TRUSTED_HOSTS = new Set(["localhost", "127.0.0.1", "[::1]"].flatMap((name) => [cfg.port, DEV_PORT].map((port) => `${name}:${port}`)));
 
-const wss = new WebSocketServer({ server: http, path: "/ws", verifyClient: ({ req }: { req: IncomingMessage }) => trusted(req) });
+const wss = new WebSocketServer({
+  server: http,
+  path: "/ws",
+  verifyClient: ({ req }: { req: IncomingMessage }) => trusted(req),
+  maxPayload: 16 * 1024 * 1024, // enough for a message with attachments
+});
 
 // Events out: every thread's events (deltas included) to every client, as they happen.
 const clients = new Set<WebSocket>();
@@ -149,6 +154,9 @@ const methods: { [name: string]: (params: any) => unknown } = {
 };
 
 wss.on("connection", (ws) => {
+  // A frame the socket can't take (text that isn't UTF-8, one too big) is an error on it: without
+  // a listener that would be an uncaught exception, taking the server down. It ends that socket only.
+  ws.on("error", () => ws.terminate());
   clients.add(ws);
   ws.on("close", () => clients.delete(ws));
   ws.on("message", async (data) => {
