@@ -3,6 +3,7 @@
 // what the recording has, so these need no login and cost nothing.
 
 import { expect, test, type Page } from "@playwright/test";
+import WebSocket from "ws";
 import { existsSync, mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -98,4 +99,39 @@ test("with the shim, a turn waiting on the user outlives a server restart", asyn
   // The same request, still open: answering it carries on the same run.
   await page.getByRole("button", { name: "Allow", exact: true }).click();
   await expect(page.getByText("created", { exact: true })).toBeVisible();
+});
+
+test("the server takes WebSockets only from its own pages, and survives malformed input", async () => {
+  server = await startServer({ CHAT_FAKE_CLAUDE: join(FIXTURES, "claude/plain-reply") });
+  const { port } = new URL(server.url);
+  const ws = `ws://127.0.0.1:${port}/ws`;
+  /** Whether a socket opened with these headers is taken, and if it is, the socket. */
+  const connect = (options: WebSocket.ClientOptions) =>
+    new Promise<WebSocket | null>((resolve) => {
+      const s = new WebSocket(ws, options);
+      s.on("open", () => resolve(s));
+      s.on("error", () => resolve(null));
+    });
+
+  // Another site's page, or one reached through a rebound DNS name, is refused.
+  expect(await connect({ origin: "https://attacker.example" })).toBeNull();
+  expect(await connect({ origin: "http://127.0.0.1:1" })).toBeNull();
+  expect(await connect({ headers: { host: `attacker.example:${port}` }, origin: `http://attacker.example:${port}` })).toBeNull();
+  // The app's own page, and a client that isn't a browser, are taken.
+  (await connect({ origin: `http://127.0.0.1:${port}` }))!.close();
+  const client = (await connect({}))!;
+
+  // Frames that aren't requests, and a URL that doesn't decode, don't take the server down.
+  for (const frame of ["null", "42", '"x"', "[]", '{"id":1}', '{"id":1,"method":"list","params":7}', '{"id":2,"method":"toString"}']) client.send(frame);
+  expect((await fetch(`${server.url}/%E0`)).status).toBe(400);
+  const reply = await new Promise((resolve) => {
+    client.on("message", (data) => {
+      const msg = JSON.parse(String(data));
+      if (msg.id === 9) resolve(msg);
+    });
+    client.send(JSON.stringify({ id: 9, method: "list" }));
+  });
+  expect(reply).toEqual({ id: 9, result: [] });
+  client.close();
+  expect((await fetch(server.url)).status).toBe(200);
 });

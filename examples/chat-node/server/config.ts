@@ -48,6 +48,9 @@ export interface Config {
   supervised: boolean;
 }
 
+/** Vite's dev server's port (vite.config.ts), whose pages may use the server too. */
+export const DEV_PORT = 5173;
+
 /** The exit code that asks supervise.ts to start the server again. */
 export const RESTART_CODE = 75;
 

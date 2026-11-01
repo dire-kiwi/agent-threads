@@ -8,7 +8,7 @@
     "dev": "node server/dev.ts",
     "build": "vite build",
     "start": "node server/supervise.ts",
-    "test": "tsc --noEmit -p tsconfig.json && tsc --noEmit -p web/tsconfig.json",
+    "test": "tsc --noEmit -p tsconfig.json && tsc --noEmit -p web/tsconfig.json && node --test server/*.test.ts",
     "test:e2e": "vite build && playwright test"
   },
   "dependencies": {

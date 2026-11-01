@@ -6,7 +6,7 @@
 //   node server/main.ts      (or pnpm dev / pnpm start; see the README)
 
 import { mkdirSync, rmSync } from "node:fs";
-import { createServer } from "node:http";
+import { createServer, type IncomingMessage } from "node:http";
 import { join } from "node:path";
 import { WebSocketServer, type WebSocket } from "ws";
 import {
@@ -20,7 +20,7 @@ import {
   type Harness,
   type Thread,
 } from "@dire-kiwi/agent-threads-node";
-import { config, REPO, RESTART_CODE, ROOT, type HarnessInfo } from "./config.ts";
+import { config, DEV_PORT, REPO, RESTART_CODE, ROOT, type HarnessInfo } from "./config.ts";
 import { lookupOrder } from "./orders.ts";
 import { permissions } from "./policy.ts";
 import { serveStatic } from "./static.ts";
@@ -75,7 +75,29 @@ if (cfg.shim) {
 // ---------- the transport ----------
 
 const http = createServer((req, res) => serveStatic(join(ROOT, "web/dist"), req, res));
-const wss = new WebSocketServer({ server: http, path: "/ws" });
+
+/**
+ * Whether a WebSocket may connect. Listening on 127.0.0.1 isn't enough: any page the user has open
+ * can open a WebSocket to it, and the socket can read every thread, send the agent anything and
+ * allow its own permission requests. So it must come from this app's own page (its Origin is the
+ * host it connects to), on a loopback name (which a rebound DNS name isn't), at this server or
+ * Vite's dev server (whose proxy keeps the Host and Origin). Clients that aren't browsers send no
+ * Origin. This is the example's only check: a real app authenticates its users here too.
+ */
+function trusted(req: IncomingMessage): boolean {
+  const host = req.headers.host ?? "";
+  if (!TRUSTED_HOSTS.has(host)) return false;
+  const origin = req.headers.origin;
+  if (origin === undefined) return true;
+  try {
+    return new URL(origin).host === host;
+  } catch {
+    return false;
+  }
+}
+const TRUSTED_HOSTS = new Set(["localhost", "127.0.0.1", "[::1]"].flatMap((name) => [cfg.port, DEV_PORT].map((port) => `${name}:${port}`)));
+
+const wss = new WebSocketServer({ server: http, path: "/ws", verifyClient: ({ req }: { req: IncomingMessage }) => trusted(req) });
 
 // Events out: every thread's events (deltas included) to every client, as they happen.
 const clients = new Set<WebSocket>();
@@ -84,7 +106,15 @@ sdk.subscribe((event) => {
   for (const ws of clients) ws.send(frame);
 });
 
-type Request = { id: number; method: string; params?: any };
+type Request = { id: number | string; method: string; params?: any };
+
+/** Whether a frame is a request: anything else is ignored (with no id, it can't be answered). */
+const isRequest = (r: unknown): r is Request =>
+  typeof r === "object" &&
+  r !== null &&
+  (typeof (r as Request).id === "number" || typeof (r as Request).id === "string") &&
+  typeof (r as Request).method === "string" &&
+  ((r as Request).params === undefined || (typeof (r as Request).params === "object" && (r as Request).params !== null));
 
 /** The app's methods: what a client asks for, and what the backend says (see examples/PROTOCOL.md). */
 const methods: { [name: string]: (params: any) => unknown } = {
@@ -122,20 +152,22 @@ wss.on("connection", (ws) => {
   clients.add(ws);
   ws.on("close", () => clients.delete(ws));
   ws.on("message", async (data) => {
-    let req: Request;
+    let req: unknown;
     try {
       req = JSON.parse(String(data));
     } catch {
       return;
     }
-    const reply = (msg: object) => ws.readyState === ws.OPEN && ws.send(JSON.stringify({ id: req.id, ...msg }));
-    const method = methods[req.method];
-    if (!method) return reply({ error: `there's no method ${JSON.stringify(req.method)}` });
+    if (!isRequest(req)) return;
+    const { id, method: name, params } = req;
+    const reply = (msg: object) => ws.readyState === ws.OPEN && ws.send(JSON.stringify({ id, ...msg }));
+    const method = Object.hasOwn(methods, name) ? methods[name] : undefined;
+    if (!method) return reply({ error: `there's no method ${JSON.stringify(name)}` });
     try {
-      reply({ result: (await method(req.params ?? {})) ?? null });
+      reply({ result: (await method(params ?? {})) ?? null });
     } catch (e) {
       // A CommandError is the client's mistake (an unknown thread, a malformed command); anything else is ours.
-      if (!(e instanceof CommandError)) console.error(`${req.method}:`, e);
+      if (!(e instanceof CommandError)) console.error(`${name}:`, e);
       reply({ error: e instanceof Error ? e.message : String(e) });
     }
   });

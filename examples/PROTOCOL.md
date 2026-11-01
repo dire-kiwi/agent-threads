@@ -14,6 +14,15 @@ the SDK's: the SDK's part is only what goes inside it, the [protocol](../spec/PR
 | `GET /*` | The built frontend, `chat-node/web/dist` (`index.html` for any path that isn't a file). |
 | `PORT` | The port to listen on, `3001` by default, on 127.0.0.1. |
 
+**Who may connect.** Listening on 127.0.0.1 isn't enough: any web page the user has open can open
+a WebSocket to it, and that socket could read every thread, send the agent anything and allow its
+own permission requests. So the server refuses the WebSocket upgrade (403) unless its `Host` is
+`localhost`, `127.0.0.1` or `[::1]` with the server's port or Vite's (5173), which a rebound DNS
+name can't be, and its `Origin`, when it has one, is that same host (the app's own page; clients
+that aren't browsers send none). That's the examples' only check: a real app authenticates its
+users here. It also mustn't let a malformed frame or URL take it down: frames that aren't requests
+are ignored, and a path that doesn't decode is a 400.
+
 In development the frontend runs under Vite (`chat-node/web`, port 5173), which proxies `/ws` to
 `http://127.0.0.1:$PORT`, so any server on that port works with it.
 

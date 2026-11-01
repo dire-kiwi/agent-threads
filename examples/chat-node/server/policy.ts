@@ -10,7 +10,7 @@ const READ_ONLY_TOOLS = new Set(["lookup_order", "Skill"]);
 const READERS = new Set(["cat", "head", "tail", "ls", "wc", "grep", "pwd", "nl", "stat"]);
 
 /**
- * Whether a shell command only reads: one of READERS, or `sed -n '<lines>p'`, with no shell syntax
+ * Whether a shell command only reads: one of READERS, or `sed -n '<lines>p' <files>`, with no shell syntax
  * (pipes, redirections, substitutions, several commands) that could make it do anything else.
  */
 export function readsOnly(command: string): boolean {
@@ -18,7 +18,9 @@ export function readsOnly(command: string): boolean {
   // Words, with single quotes taken off (nothing in single quotes is expanded).
   const words = command.trim().match(/'[^']*'|[^\s']+/g)?.map((w) => w.replace(/^'|'$/g, "")) ?? [];
   const [program, ...args] = words;
-  if (program === "sed") return args[0] === "-n" && /^\d+(,\d+)?p$/.test(args[1] ?? "") && args.length > 2;
+  // GNU sed takes options anywhere (`sed -n 1p -i file` edits in place, `-e 'w file'` writes), so
+  // after the script there must be only files, none that looks like an option.
+  if (program === "sed") return args[0] === "-n" && /^\d+(,\d+)?p$/.test(args[1] ?? "") && args.length > 2 && args.slice(2).every((a) => !a.startsWith("-"));
   return !!program && READERS.has(program);
 }
 

@@ -117,13 +117,20 @@ const source: ThreadSource = {
 </ThreadProvider>
 ```
 
+**Who may connect.** The server only listens on 127.0.0.1, but any page open in the browser
+could still open a WebSocket to it, read the threads, and send the agent commands and allow its
+permission requests. So it takes the WebSocket only from the app's own page on a loopback host
+(`trusted()` in main.ts; see [../PROTOCOL.md](../PROTOCOL.md#what-a-server-serves)). That's all the
+example does: an app that's more than a local demo authenticates its users there, before they get
+near `sdk.handle`.
+
 The rest is the app's own: creating and listing threads (`sdk.create`, `sdk.list`, with the
 sidebar kept up to date from `thread.updated` events), the harness picker, and the restart button.
 
 ## Tests
 
 ```sh
-pnpm test                             # type-checks the server and the frontend
+pnpm test                             # type-checks the server and the frontend, and tests the policy
 pnpm test:e2e                         # builds the frontend, and runs the Playwright smoke tests
 ```
 
@@ -135,7 +142,9 @@ recording has), and drive the app in Chromium:
 - a Codex command asking first, and the user allowing it;
 - the server going away and coming back, the client reconnecting, and the thread resuming its session;
 - with the shim (built by `make shim`, or the test is skipped), a turn waiting on a permission
-  outliving a server restart.
+  outliving a server restart;
+- the WebSocket refusing other sites' pages and rebound hosts, and the server surviving malformed
+  frames and URLs.
 
 They need Playwright's Chromium (`pnpm exec playwright install chromium`), or set `CHAT_E2E_BROWSER`
 to the path of a Chromium or Chrome of your own.

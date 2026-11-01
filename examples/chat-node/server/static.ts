@@ -16,7 +16,14 @@ const TYPES: { [ext: string]: string } = {
 };
 
 export function serveStatic(root: string, req: IncomingMessage, res: ServerResponse): void {
-  const path = decodeURIComponent(new URL(req.url ?? "/", "http://x").pathname);
+  let path: string;
+  try {
+    path = decodeURIComponent(new URL(req.url ?? "/", "http://x").pathname);
+  } catch {
+    // A malformed escape (/%E0): thrown from here, it would take the server down.
+    res.writeHead(400, { "content-type": "text/plain" }).end("Bad request\n");
+    return;
+  }
   let file = normalize(join(root, path));
   if (!file.startsWith(root + sep)) file = join(root, "index.html");
   const isFile = (f: string) => {
@@ -36,5 +43,7 @@ export function serveStatic(root: string, req: IncomingMessage, res: ServerRespo
     // Vite's assets have their hash in their names; index.html must be fetched fresh.
     "cache-control": file.includes(`${sep}assets${sep}`) ? "public, max-age=31536000, immutable" : "no-cache",
   });
-  createReadStream(file).pipe(res);
+  createReadStream(file)
+    .on("error", () => res.destroy()) // gone since it was looked at
+    .pipe(res);
 }

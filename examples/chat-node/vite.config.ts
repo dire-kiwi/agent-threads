@@ -3,6 +3,7 @@
 
 import react from "@vitejs/plugin-react";
 import { defineConfig } from "vite";
+import { DEV_PORT } from "./server/config.ts";
 
 const server = `http://127.0.0.1:${process.env.PORT || 3001}`;
 
@@ -11,6 +12,6 @@ export default defineConfig({
   plugins: [react()],
   // One React, however the workspace links the packages.
   resolve: { dedupe: ["react", "react-dom"] },
-  server: { port: 5173, proxy: { "/ws": { target: server, ws: true } } },
+  server: { port: DEV_PORT, strictPort: true, proxy: { "/ws": { target: server, ws: true } } },
   build: { outDir: "dist", emptyOutDir: true },
 });
