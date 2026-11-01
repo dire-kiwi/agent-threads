@@ -27,9 +27,12 @@ const MAX_BODY = 16 * 1024 * 1024;
 
 type Json = { [k: string]: any };
 
-/** Starts a loopback MCP server for the tools. */
-export async function serveTools(name: string, handlers: ToolServerHandlers): Promise<LoopbackMcp> {
-  const token = randomBytes(24).toString("base64url");
+/**
+ * Starts a loopback MCP server for the tools: on a new port with a new token, or on those of one
+ * before it (for a process configured with it that outlived the backend).
+ */
+export async function serveTools(name: string, handlers: ToolServerHandlers, again?: { port: number; token: string }): Promise<LoopbackMcp> {
+  const token = again?.token ?? randomBytes(24).toString("base64url");
   const expected = Buffer.from(`Bearer ${token}`);
   const authorized = (req: IncomingMessage) => {
     const got = Buffer.from(req.headers.authorization ?? "");
@@ -103,7 +106,7 @@ export async function serveTools(name: string, handlers: ToolServerHandlers): Pr
   });
   await new Promise<void>((resolve, reject) => {
     server.once("error", reject);
-    server.listen(0, "127.0.0.1", () => resolve());
+    server.listen(again?.port ?? 0, "127.0.0.1", () => resolve());
   });
   const { port } = server.address() as AddressInfo;
   return {

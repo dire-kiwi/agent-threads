@@ -97,9 +97,6 @@ again to finish saving. The file store undoes a write that fails partway, so a r
 
 ## Codex
 
-Codex runs aren't re-attached after a backend restart yet; see AT-15 (and
-[Processes](#processes-and-runs-that-survive-a-restart)).
-
 - **One `codex app-server` process per thread**, started at its first message and kept between
   turns. It's sent `initialize` (with `experimentalApi`) and `initialized`, then `thread/start`, or
   `thread/resume` once the thread has a session (after a restart, or a change of model, effort,
@@ -190,14 +187,17 @@ await sdk.recover(); // at startup, before taking commands
   loads before `recover()` gets to it is re-attached then.
 - `close()` leaves shim runs going, for the next start to re-attach to; `close({ stop: true })`
   stops them.
-- A run that can't be re-attached to is stopped, and its turn ends with a `run.lost` notice.
-  **Codex runs aren't re-attached yet; see AT-15**: the Codex driver has no checkpoint yet, so its
-  runs are stopped when the backend restarts. It's so too for a run in a
-  newer run-directory format. (A backend that has gone back to the direct spawner can't stop shim
-  runs: it only ends their turns.)
-- An app tool is saved as running before it runs, so one that was running when the backend
-  stopped isn't run again (it may have done what it does): Claude is told it may or may not have
-  finished.
+- Both drivers re-attach. The Claude driver saves which of Claude's control requests are open and
+  what it needs to translate the rest of the stream; the Codex driver saves its JSON-RPC client's
+  pending requests, Codex's open requests, the Codex thread and turn, and serves the app's tools
+  on the loopback MCP server again on the port and with the token Codex was told about.
+- A run that can't be re-attached to is stopped, and its turn ends with a `run.lost` notice: one
+  in a newer run-directory format, or one still starting when the backend went (Codex's handshake
+  hadn't finished). (A backend that has gone back to the direct spawner can't stop shim runs: it
+  only ends their turns.)
+- An app tool is saved as running before it runs (and isn't run if that can't be saved), so one
+  that was running when the backend stopped isn't run again (it may have done what it does): the
+  agent is told it may or may not have finished.
 - A change of options or config before the restart still starts a new process at the next turn.
 - `recover()` also prunes, now and every hour: finished runs' directories go after `keepDays`
   (14), and a run nothing follows any more (its backend died before saving it, or while stopping

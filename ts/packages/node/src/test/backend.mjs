@@ -5,7 +5,8 @@
 //
 // Environment: STORE, RUNS, CODEX_HOME_DIR (directories), SHIM (the binary), FAKE_CLI, and the fake
 // CLI's own (AGENT_THREADS_FIXTURE...). POLICY is the permission policy (allow or ask). CLAUDE_BIN
-// runs another `claude` (mini-claude.mjs) instead of the fake CLI. With TOOL_MARKER, there's an app
+// and CODEX_BIN run another `claude` or `codex` (mini-claude.mjs, mini-codex.mjs) instead of the
+// fake CLI. With TOOL_MARKER, there's an app
 // tool `lookup`, which appends a line to that file each time it runs, and then (with TOOL_HANG)
 // doesn't return.
 
@@ -19,7 +20,7 @@ const sdk = new AgentThreads({
   store: new FileStore(env.STORE),
   harnesses: {
     claude: claudeCode({ bin: env.CLAUDE_BIN ?? env.FAKE_CLI, env: fakeEnv }),
-    codex: codex({ bin: env.FAKE_CLI, env: fakeEnv, home: env.CODEX_HOME_DIR, login: false }),
+    codex: codex({ bin: env.CODEX_BIN ?? env.FAKE_CLI, env: fakeEnv, home: env.CODEX_HOME_DIR, login: false }),
   },
   permissions: env.POLICY ?? "allow",
   tools: env.TOOL_MARKER

@@ -97,7 +97,9 @@ function scene(fixture: string, extra: { [k: string]: string } = {}) {
     ...extra,
   };
   const fixtureJson = JSON.parse(readFileSync(join(specDir, "fixtures", fixture, "fixture.json"), "utf8"));
-  return { dirs, env, fixture: fixtureJson, start: () => new Backend(env) };
+  // The fixture's permission policy, unless the test says.
+  const all = { POLICY: fixtureJson.permissions ?? "allow", ...env };
+  return { dirs, env: all, fixture: fixtureJson, start: () => new Backend(all) };
 }
 
 /** The store's events for the thread, read once the backends are done. */
@@ -135,146 +137,125 @@ describe.skipIf(process.platform === "win32")("a backend restart", () => {
     shimPath();
   }, 120_000);
 
-  it("while the turn waits on the user: the request is still open after, and answering it finishes the turn", { timeout: 60_000 }, async () => {
-    const s = scene("claude/permission-allow", { POLICY: "ask" });
-    const a = s.start();
-    const thread = await a.call<{ id: string }>("create", { ...s.fixture.thread, cwd: s.dirs.cwd });
-    await a.call("handle", { ...s.fixture.steps[0].command, thread_id: thread.id });
-    await a.waitFor({ type: "request.opened" });
-    await a.crash();
-
-    const b = s.start();
-    expect(await b.call("recover")).toEqual({ reattached: [thread.id], lost: [] });
-    const snap = await b.call<Snapshot>("snapshot", thread.id);
-    expect(snap.thread.status).toBe("waiting");
-    expect(snap.thread.run?.reattached_at).toBeDefined();
-    expect(snap.requests).toHaveLength(1);
-    await b.call("handle", { type: "respond", thread_id: thread.id, request_id: snap.requests[0]!.id, resolution: { outcome: "allow" } } satisfies Command);
-    await b.waitFor({ type: "thread.updated", thread: { status: "idle" } });
-    await b.call("close", { stop: true });
-    await b.exited;
-
-    checkThread("claude/permission-allow", await savedEvents(s.dirs.store, thread.id), s.dirs.state, 1);
-  });
-
-  it("while output streams in: the new backend carries on reading from where the last left off", { timeout: 60_000 }, async () => {
-    // Replayed at a fifth of the recorded pace, so the backend is killed partway through the turn.
-    const s = scene("claude/tool-calls", { AGENT_THREADS_FIXTURE_SPEED: "0.2" });
-    const a = s.start();
-    const thread = await a.call<{ id: string }>("create", { ...s.fixture.thread, cwd: s.dirs.cwd });
-    await a.call("handle", { ...s.fixture.steps[0].command, thread_id: thread.id });
-    // The first of its three tool calls; text streams in after it.
-    await a.waitFor({ type: "item.added", item: { type: "tool_call" } });
-    await sleep(100);
-    await a.crash();
-
-    const b = s.start();
-    expect(await b.call("recover")).toEqual({ reattached: [thread.id], lost: [] });
-    // The rest of the turn includes a permission the policy answers.
-    await b.waitFor({ type: "thread.updated", thread: { status: "idle" } });
-    await b.call("close", { stop: true });
-    await b.exited;
-
-    checkThread("claude/tool-calls", await savedEvents(s.dirs.store, thread.id), s.dirs.state, 1);
-  });
-
-  it("when the run ends while it's down: the new backend reads the rest and finishes the turn", { timeout: 60_000 }, async () => {
-    const s = scene("claude/subagent", { AGENT_THREADS_FIXTURE_SPEED: "0.2" });
-    const a = s.start();
-    const thread = await a.call<{ id: string }>("create", { ...s.fixture.thread, cwd: s.dirs.cwd });
-    await a.call("handle", { ...s.fixture.steps[0].command, thread_id: thread.id });
-    await a.waitFor({ type: "item.added", item: { type: "tool_call" } });
-    await a.crash();
-
-    // While it's down, the turn finishes and the run ends (its input closed, as a backend would).
-    const [runId] = readdirSync(s.dirs.runs);
-    const runDir = join(s.dirs.runs, runId!);
-    await until(() => readFileSync(join(runDir, "out.jsonl"), "utf8").includes('"type":"result"'));
-    writeFileSync(join(runDir, "input.closed"), "");
-    await until(() => existsSync(join(runDir, "exit")));
-
-    const b = s.start();
-    expect(await b.call("recover")).toEqual({ reattached: [thread.id], lost: [] });
-    await b.waitFor({ type: "thread.updated", thread: { status: "idle" } });
-    // The run's over, and the backend is done with it.
-    await until(() => b.events.some((e) => e.type === "thread.updated" && e.thread.status === "idle" && !e.thread.run));
-    await b.call("close");
-    await b.exited;
-
-    checkThread("claude/subagent", await savedEvents(s.dirs.store, thread.id), s.dirs.state, 1);
-    const store = new FileStore(s.dirs.store);
-    expect(await store.activeRuns()).toEqual([]);
-    expect((await store.getRun(runId!))?.offset).toBe(readFileSync(join(runDir, "out.jsonl")).length);
-    await store.close();
-  });
-
-  it("when it's shut down: close() leaves the run going, and recover() picks it up again", { timeout: 60_000 }, async () => {
-    const s = scene("claude/permission-allow", { POLICY: "ask" });
-    const a = s.start();
-    const thread = await a.call<{ id: string }>("create", { ...s.fixture.thread, cwd: s.dirs.cwd });
-    await a.call("handle", { ...s.fixture.steps[0].command, thread_id: thread.id });
-    await a.waitFor({ type: "request.opened" });
-    await a.call("close");
-    await a.exited;
-
-    const b = s.start();
-    expect(await b.call("recover")).toEqual({ reattached: [thread.id], lost: [] });
-    const snap = await b.call<Snapshot>("snapshot", thread.id);
-    await b.call("handle", { type: "respond", thread_id: thread.id, request_id: snap.requests[0]!.id, resolution: { outcome: "allow" } } satisfies Command);
-    await b.waitFor({ type: "thread.updated", thread: { status: "idle" } });
-    await b.call("close", { stop: true });
-    await b.exited;
-
-    checkThread("claude/permission-allow", await savedEvents(s.dirs.store, thread.id), s.dirs.state, 1);
-  });
-
-  it("with a driver that can't re-attach (Codex, for now): the run is stopped, and its turn ends", { timeout: 60_000 }, async () => {
-    const s = scene("codex/permission-allow", { POLICY: "ask" });
-    const a = s.start();
-    const thread = await a.call<{ id: string }>("create", { ...s.fixture.thread, cwd: s.dirs.cwd });
-    await a.call("handle", { ...s.fixture.steps[0].command, thread_id: thread.id });
-    await a.waitFor({ type: "request.opened" });
-    await a.crash();
-    const [runId] = readdirSync(s.dirs.runs);
-    const runDir = join(s.dirs.runs, runId!);
-    expect(existsSync(join(runDir, "exit"))).toBe(false);
-
-    const b = s.start();
-    expect(await b.call("recover")).toEqual({ reattached: [], lost: [thread.id] });
-    const snap = await b.call<Snapshot>("snapshot", thread.id);
-    expect(snap.thread).toMatchObject({ status: "error", error: expect.stringMatching(/stopped/) });
-    expect(snap.thread.run).toBeUndefined();
-    expect(snap.requests).toEqual([]);
-    expect(snap.items.filter((i) => i.type === "notice").map((i) => i.type === "notice" && i.code)).toEqual(["run.lost"]);
-    // It's stopped: its input closed, then SIGTERM (whichever the fake CLI ends on first).
-    await until(() => existsSync(join(runDir, "exit")));
-    const pid = Number(readFileSync(join(runDir, "pid"), "utf8"));
-    await until(() => {
-      try {
-        process.kill(pid, 0);
-        return false;
-      } catch {
-        return true;
-      }
-    });
-    await b.call("close");
-    await b.exited;
-    const store = new FileStore(s.dirs.store);
-    expect(await store.activeRuns()).toEqual([]);
-    await store.close();
-  });
-
-  // With mini-claude.mjs as Claude, for what the recordings don't cover.
-  const mini = (extra: { [k: string]: string } = {}) => {
-    const log = join(tempDir(), "log.jsonl");
-    return { ...scene("claude/plain-reply", { CLAUDE_BIN: join(pkg, "src/test/mini-claude.mjs"), MINI_CLAUDE_LOG: log, ...extra }), log };
+  // The same with each harness: a fixture whose turn waits on the user, one that streams (with
+  // approvals the policy answers), and one that needs no input after it starts, which can end
+  // while the backend is down; and what marks its end in its output.
+  const harnesses = {
+    claude: { waits: "claude/permission-allow", streams: "claude/tool-calls", ends: "claude/subagent", partway: { type: "item.added", item: { type: "tool_call" } }, ended: '"type":"result"' },
+    codex: { waits: "codex/permission-allow", streams: "codex/tool-calls", ends: "codex/plain-reply", partway: { type: "delta" }, ended: '"method":"turn/completed"' },
   };
 
-  it("doesn't run an app tool again that was running when the backend died", { timeout: 60_000 }, async () => {
+  describe.each(Object.entries(harnesses))("with %s", (_harness, f) => {
+    it("while the turn waits on the user: the request is still open after, and answering it finishes the turn", { timeout: 60_000 }, async () => {
+      const s = scene(f.waits);
+      const a = s.start();
+      const thread = await a.call<{ id: string }>("create", { ...s.fixture.thread, cwd: s.dirs.cwd });
+      await a.call("handle", { ...s.fixture.steps[0].command, thread_id: thread.id });
+      await a.waitFor({ type: "request.opened" });
+      await a.crash();
+
+      const b = s.start();
+      expect(await b.call("recover")).toEqual({ reattached: [thread.id], lost: [] });
+      const snap = await b.call<Snapshot>("snapshot", thread.id);
+      expect(snap.thread.status).toBe("waiting");
+      expect(snap.thread.run?.reattached_at).toBeDefined();
+      expect(snap.requests).toHaveLength(1);
+      await b.call("handle", { type: "respond", thread_id: thread.id, request_id: snap.requests[0]!.id, resolution: { outcome: "allow" } } satisfies Command);
+      await b.waitFor({ type: "thread.updated", thread: { status: "idle" } });
+      await b.call("close", { stop: true });
+      await b.exited;
+
+      checkThread(f.waits, await savedEvents(s.dirs.store, thread.id), s.dirs.state, 1);
+    });
+
+    it("while output streams in: the new backend carries on reading from where the last left off", { timeout: 60_000 }, async () => {
+      // Replayed at a fifth of the recorded pace, so the backend is killed partway through the turn.
+      const s = scene(f.streams, { AGENT_THREADS_FIXTURE_SPEED: "0.2" });
+      const a = s.start();
+      const thread = await a.call<{ id: string }>("create", { ...s.fixture.thread, cwd: s.dirs.cwd });
+      await a.call("handle", { ...s.fixture.steps[0].command, thread_id: thread.id });
+      // The first of its tool calls; more comes after it.
+      await a.waitFor({ type: "item.added", item: { type: "tool_call" } });
+      await sleep(100);
+      await a.crash();
+
+      const b = s.start();
+      expect(await b.call("recover")).toEqual({ reattached: [thread.id], lost: [] });
+      // The rest of the turn includes approvals the policy answers.
+      await b.waitFor({ type: "thread.updated", thread: { status: "idle" } });
+      await b.call("close", { stop: true });
+      await b.exited;
+
+      checkThread(f.streams, await savedEvents(s.dirs.store, thread.id), s.dirs.state, 1);
+    });
+
+    it("when the run ends while it's down: the new backend reads the rest and finishes the turn", { timeout: 60_000 }, async () => {
+      const s = scene(f.ends, { AGENT_THREADS_FIXTURE_SPEED: "0.2" });
+      const a = s.start();
+      const thread = await a.call<{ id: string }>("create", { ...s.fixture.thread, cwd: s.dirs.cwd });
+      await a.call("handle", { ...s.fixture.steps[0].command, thread_id: thread.id });
+      // Partway through the turn.
+      await a.waitFor(f.partway);
+      await a.crash();
+
+      // While it's down, the turn finishes and the run ends (its input closed, as a backend would).
+      const [runId] = readdirSync(s.dirs.runs);
+      const runDir = join(s.dirs.runs, runId!);
+      expect(readFileSync(join(runDir, "out.jsonl"), "utf8")).not.toContain(f.ended);
+      await until(() => readFileSync(join(runDir, "out.jsonl"), "utf8").includes(f.ended));
+      writeFileSync(join(runDir, "input.closed"), "");
+      await until(() => existsSync(join(runDir, "exit")));
+
+      const b = s.start();
+      expect(await b.call("recover")).toEqual({ reattached: [thread.id], lost: [] });
+      await b.waitFor({ type: "thread.updated", thread: { status: "idle" } });
+      // The run's over, and the backend is done with it.
+      await until(() => b.events.some((e) => e.type === "thread.updated" && e.thread.status === "idle" && !e.thread.run));
+      await b.call("close");
+      await b.exited;
+
+      checkThread(f.ends, await savedEvents(s.dirs.store, thread.id), s.dirs.state, 1);
+      const store = new FileStore(s.dirs.store);
+      expect(await store.activeRuns()).toEqual([]);
+      expect((await store.getRun(runId!))?.offset).toBe(readFileSync(join(runDir, "out.jsonl")).length);
+      await store.close();
+    });
+
+    it("when it's shut down: close() leaves the run going, and recover() picks it up again", { timeout: 60_000 }, async () => {
+      const s = scene(f.waits);
+      const a = s.start();
+      const thread = await a.call<{ id: string }>("create", { ...s.fixture.thread, cwd: s.dirs.cwd });
+      await a.call("handle", { ...s.fixture.steps[0].command, thread_id: thread.id });
+      await a.waitFor({ type: "request.opened" });
+      await a.call("close");
+      await a.exited;
+
+      const b = s.start();
+      expect(await b.call("recover")).toEqual({ reattached: [thread.id], lost: [] });
+      const snap = await b.call<Snapshot>("snapshot", thread.id);
+      await b.call("handle", { type: "respond", thread_id: thread.id, request_id: snap.requests[0]!.id, resolution: { outcome: "allow" } } satisfies Command);
+      await b.waitFor({ type: "thread.updated", thread: { status: "idle" } });
+      await b.call("close", { stop: true });
+      await b.exited;
+
+      checkThread(f.waits, await savedEvents(s.dirs.store, thread.id), s.dirs.state, 1);
+    });
+  });
+
+  // With mini-claude.mjs as Claude (and mini-codex.mjs as Codex), for what the recordings don't cover.
+  const mini = (extra: { [k: string]: string } = {}) => {
+    const log = join(tempDir(), "log.jsonl");
+    return {
+      ...scene("claude/plain-reply", { CLAUDE_BIN: join(pkg, "src/test/mini-claude.mjs"), CODEX_BIN: join(pkg, "src/test/mini-codex.mjs"), MINI_CLAUDE_LOG: log, ...extra }),
+      log,
+    };
+  };
+
+  it.each(["claude", "codex"])("doesn't run an app tool again that was running when the backend died (%s)", { timeout: 60_000 }, async (harness) => {
     const marker = join(tempDir(), "marker");
-    const s = mini({ TOOL_MARKER: marker, TOOL_HANG: "1", MINI_CLAUDE_TOOL_DELAY: "300" });
+    const s = mini({ TOOL_MARKER: marker, TOOL_HANG: "1", MINI_CLAUDE_TOOL_DELAY: "300", MINI_CODEX_TOOL_DELAY: "300" });
     const a = s.start();
-    const thread = await a.call<{ id: string }>("create", { harness: "claude", cwd: s.dirs.cwd });
+    const thread = await a.call<{ id: string }>("create", { harness, cwd: s.dirs.cwd });
     await a.call("handle", { type: "send", thread_id: thread.id, text: "app lookup {}" } satisfies Command);
     // It has done what it does, and hasn't returned.
     await until(() => existsSync(marker));
