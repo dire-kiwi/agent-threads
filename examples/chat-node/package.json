@@ -1,0 +1,31 @@
+{
+  "name": "@dire-kiwi/agent-threads-example-chat-node",
+  "private": true,
+  "version": "0.0.0",
+  "description": "A minimal chat app on agent-threads: a Node server with its own WebSocket, and a React frontend.",
+  "type": "module",
+  "scripts": {
+    "dev": "node server/dev.ts",
+    "build": "vite build",
+    "start": "node server/supervise.ts",
+    "test": "tsc --noEmit -p tsconfig.json && tsc --noEmit -p web/tsconfig.json",
+    "test:e2e": "vite build && playwright test"
+  },
+  "dependencies": {
+    "@dire-kiwi/agent-threads-node": "workspace:*",
+    "@dire-kiwi/agent-threads-react": "workspace:*",
+    "react": "^19.3.1",
+    "react-dom": "^19.3.1",
+    "ws": "^8.22.1"
+  },
+  "devDependencies": {
+    "@playwright/test": "^1.64.1",
+    "@types/node": "^26.6.6",
+    "@types/react": "^19.3.0",
+    "@types/react-dom": "^19.3.0",
+    "@types/ws": "^8.18.2",
+    "@vitejs/plugin-react": "^6.1.2",
+    "typescript": "^7.0.2",
+    "vite": "^8.3.5"
+  }
+}

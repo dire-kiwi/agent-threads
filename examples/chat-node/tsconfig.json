@@ -1,0 +1,11 @@
+{
+  // The server (run by Node as it is, with its types stripped) and the tests. web/ has its own.
+  "extends": "../../ts/tsconfig.base.json",
+  "compilerOptions": {
+    "noEmit": true,
+    "allowImportingTsExtensions": true,
+    "erasableSyntaxOnly": true,
+    "types": ["node"]
+  },
+  "include": ["server", "e2e", "playwright.config.ts", "vite.config.ts"]
+}
