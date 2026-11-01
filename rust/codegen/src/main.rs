@@ -5,13 +5,14 @@
 //! by a `type` constant. typify would make them untagged enums whose structs keep `type` as a
 //! `serde_json::Value`, which matches any variant. So the `type` properties are taken out of the
 //! schema before typify sees it, and the enums typify makes are turned into serde internally
-//! tagged enums (`#[serde(tag = "type")]`) afterwards.
+//! tagged enums (`#[serde(tag = "type")]`) afterwards, with their variants named without the
+//! union's last word (`ThreadEvent::ItemAdded(ItemAddedEvent)`).
 
 use std::collections::BTreeMap;
 use std::fs;
 use std::path::Path;
 
-use quote::quote;
+use quote::{format_ident, quote};
 use serde_json::{Map, Value};
 use typify::{TypeSpace, TypeSpaceSettings};
 
@@ -96,11 +97,15 @@ fn untag(defs: &mut Map<String, Value>) -> BTreeMap<String, Vec<(String, String)
     unions
 }
 
-/// Makes each union's enum internally tagged by `type`.
+/// Makes each union's enum internally tagged by `type`, and names its variants without the
+/// union's last word (`ThreadEvent::ItemAdded` holds an `ItemAddedEvent`, `Command::Interrupt` an
+/// `InterruptCommand`); the structs keep their names.
 fn tag(file: &mut syn::File, unions: &BTreeMap<String, Vec<(String, String)>>) {
+    let mut renamed = BTreeMap::new(); // (union, variant type) -> variant name
     for item in &mut file.items {
         let syn::Item::Enum(e) = item else { continue };
-        let Some(variants) = unions.get(&e.ident.to_string()) else {
+        let union = e.ident.to_string();
+        let Some(variants) = unions.get(&union) else {
             continue;
         };
         let untagged = e
@@ -109,6 +114,7 @@ fn tag(file: &mut syn::File, unions: &BTreeMap<String, Vec<(String, String)>>) {
             .position(|a| a.path().is_ident("serde") && quote!(#a).to_string().contains("untagged"));
         e.attrs[untagged.unwrap_or_else(|| panic!("{} isn't untagged", e.ident))] =
             syn::parse_quote!(#[serde(tag = "type")]);
+        let suffix = &union[union.rfind(char::is_uppercase).unwrap()..];
         for v in &mut e.variants {
             let syn::Fields::Unnamed(fields) = &v.fields else {
                 panic!("{}::{} isn't a newtype variant", e.ident, v.ident)
@@ -120,6 +126,26 @@ fn tag(file: &mut syn::File, unions: &BTreeMap<String, Vec<(String, String)>>) {
                 .find(|(name, _)| *name == ty)
                 .unwrap_or_else(|| panic!("{}::{}: unknown type {ty}", e.ident, v.ident));
             v.attrs.push(syn::parse_quote!(#[serde(rename = #tag)]));
+            if let Some(short) = ty.strip_suffix(suffix).filter(|s| !s.is_empty()) {
+                v.ident = format_ident!("{short}");
+            }
+            renamed.insert((union.clone(), ty), v.ident.clone());
+        }
+    }
+    // The From impls typify makes for each variant's type name the variant too.
+    for item in &mut file.items {
+        let syn::Item::Impl(imp) = item else { continue };
+        let Some((_, path, _)) = &imp.trait_ else { continue };
+        let last = path.segments.last().unwrap();
+        let syn::PathArguments::AngleBracketed(args) = &last.arguments else {
+            continue;
+        };
+        let Some(syn::GenericArgument::Type(ty)) = args.args.first().filter(|_| last.ident == "From") else {
+            continue;
+        };
+        let self_ty = &imp.self_ty;
+        if let Some(variant) = renamed.get(&(quote!(#self_ty).to_string(), quote!(#ty).to_string())) {
+            imp.items = vec![syn::parse_quote!(fn from(value: #ty) -> Self { Self::#variant(value) })];
         }
     }
 }

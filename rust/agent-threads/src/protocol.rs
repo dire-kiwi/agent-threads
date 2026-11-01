@@ -76,32 +76,32 @@ impl ::std::convert::TryFrom<::std::string::String> for AttachmentKind {
 #[serde(tag = "type")]
 pub enum Command {
     #[serde(rename = "send")]
-    SendCommand(SendCommand),
+    Send(SendCommand),
     #[serde(rename = "interrupt")]
-    InterruptCommand(InterruptCommand),
+    Interrupt(InterruptCommand),
     #[serde(rename = "respond")]
-    RespondCommand(RespondCommand),
+    Respond(RespondCommand),
     #[serde(rename = "set_options")]
-    SetOptionsCommand(SetOptionsCommand),
+    SetOptions(SetOptionsCommand),
 }
 impl ::std::convert::From<SendCommand> for Command {
     fn from(value: SendCommand) -> Self {
-        Self::SendCommand(value)
+        Self::Send(value)
     }
 }
 impl ::std::convert::From<InterruptCommand> for Command {
     fn from(value: InterruptCommand) -> Self {
-        Self::InterruptCommand(value)
+        Self::Interrupt(value)
     }
 }
 impl ::std::convert::From<RespondCommand> for Command {
     fn from(value: RespondCommand) -> Self {
-        Self::RespondCommand(value)
+        Self::Respond(value)
     }
 }
 impl ::std::convert::From<SetOptionsCommand> for Command {
     fn from(value: SetOptionsCommand) -> Self {
-        Self::SetOptionsCommand(value)
+        Self::SetOptions(value)
     }
 }
 ///The harness compacted the conversation's context.
@@ -775,60 +775,60 @@ pub struct Thread {
 #[serde(tag = "type")]
 pub enum ThreadEvent {
     #[serde(rename = "thread.updated")]
-    ThreadUpdatedEvent(ThreadUpdatedEvent),
+    ThreadUpdated(ThreadUpdatedEvent),
     #[serde(rename = "turn.started")]
-    TurnStartedEvent(TurnStartedEvent),
+    TurnStarted(TurnStartedEvent),
     #[serde(rename = "turn.completed")]
-    TurnCompletedEvent(TurnCompletedEvent),
+    TurnCompleted(TurnCompletedEvent),
     #[serde(rename = "item.added")]
-    ItemAddedEvent(ItemAddedEvent),
+    ItemAdded(ItemAddedEvent),
     #[serde(rename = "item.updated")]
-    ItemUpdatedEvent(ItemUpdatedEvent),
+    ItemUpdated(ItemUpdatedEvent),
     #[serde(rename = "delta")]
-    DeltaEvent(DeltaEvent),
+    Delta(DeltaEvent),
     #[serde(rename = "request.opened")]
-    RequestOpenedEvent(RequestOpenedEvent),
+    RequestOpened(RequestOpenedEvent),
     #[serde(rename = "request.resolved")]
-    RequestResolvedEvent(RequestResolvedEvent),
+    RequestResolved(RequestResolvedEvent),
 }
 impl ::std::convert::From<ThreadUpdatedEvent> for ThreadEvent {
     fn from(value: ThreadUpdatedEvent) -> Self {
-        Self::ThreadUpdatedEvent(value)
+        Self::ThreadUpdated(value)
     }
 }
 impl ::std::convert::From<TurnStartedEvent> for ThreadEvent {
     fn from(value: TurnStartedEvent) -> Self {
-        Self::TurnStartedEvent(value)
+        Self::TurnStarted(value)
     }
 }
 impl ::std::convert::From<TurnCompletedEvent> for ThreadEvent {
     fn from(value: TurnCompletedEvent) -> Self {
-        Self::TurnCompletedEvent(value)
+        Self::TurnCompleted(value)
     }
 }
 impl ::std::convert::From<ItemAddedEvent> for ThreadEvent {
     fn from(value: ItemAddedEvent) -> Self {
-        Self::ItemAddedEvent(value)
+        Self::ItemAdded(value)
     }
 }
 impl ::std::convert::From<ItemUpdatedEvent> for ThreadEvent {
     fn from(value: ItemUpdatedEvent) -> Self {
-        Self::ItemUpdatedEvent(value)
+        Self::ItemUpdated(value)
     }
 }
 impl ::std::convert::From<DeltaEvent> for ThreadEvent {
     fn from(value: DeltaEvent) -> Self {
-        Self::DeltaEvent(value)
+        Self::Delta(value)
     }
 }
 impl ::std::convert::From<RequestOpenedEvent> for ThreadEvent {
     fn from(value: RequestOpenedEvent) -> Self {
-        Self::RequestOpenedEvent(value)
+        Self::RequestOpened(value)
     }
 }
 impl ::std::convert::From<RequestResolvedEvent> for ThreadEvent {
     fn from(value: RequestResolvedEvent) -> Self {
-        Self::RequestResolvedEvent(value)
+        Self::RequestResolved(value)
     }
 }
 ///An open request, told apart by type.
@@ -836,18 +836,18 @@ impl ::std::convert::From<RequestResolvedEvent> for ThreadEvent {
 #[serde(tag = "type")]
 pub enum ThreadRequest {
     #[serde(rename = "permission")]
-    PermissionRequest(PermissionRequest),
+    Permission(PermissionRequest),
     #[serde(rename = "question")]
-    QuestionRequest(QuestionRequest),
+    Question(QuestionRequest),
 }
 impl ::std::convert::From<PermissionRequest> for ThreadRequest {
     fn from(value: PermissionRequest) -> Self {
-        Self::PermissionRequest(value)
+        Self::Permission(value)
     }
 }
 impl ::std::convert::From<QuestionRequest> for ThreadRequest {
     fn from(value: QuestionRequest) -> Self {
-        Self::QuestionRequest(value)
+        Self::Question(value)
     }
 }
 ///idle: no turn is running. running: a turn is running. waiting: a turn is waiting on a request (permission or question). error: the last turn failed, or the harness couldn't start; the next send tries again.
