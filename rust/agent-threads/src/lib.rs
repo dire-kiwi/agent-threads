@@ -42,6 +42,8 @@ pub use harness::{
 };
 pub use permissions::{Decided, PermissionContext, PermissionDecision, PermissionPolicy, PermissionQuery};
 pub use protocol::{Command, Item, Snapshot, Thread, ThreadEvent};
+#[doc(hidden)]
+pub use shim::kill_runs;
 pub use shim::{RUN_FORMAT, ShimOptions, shim};
 pub use spawner::{ExitStatus, HarnessProcess, ProcessEvent, Signal, SpawnOptions, Spawned, Spawner, direct};
 pub use store::{RunRecord, Store, StoreError, StoreErrorKind, StoreResult};

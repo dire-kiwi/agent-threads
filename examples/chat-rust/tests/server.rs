@@ -24,6 +24,10 @@ struct Server {
 }
 
 async fn start(fixture: &str) -> Server {
+    start_with(fixture, &[]).await
+}
+
+async fn start_with(fixture: &str, env: &[(&str, &std::path::Path)]) -> Server {
     let port = std::net::TcpListener::bind("127.0.0.1:0")
         .unwrap()
         .local_addr()
@@ -34,6 +38,7 @@ async fn start(fixture: &str) -> Server {
         .env("PORT", port.to_string())
         .env("CHAT_DATA", data.path())
         .env("CHAT_FAKE_CLAUDE", repo().join("spec/fixtures").join(fixture))
+        .envs(env.iter().copied())
         .stdout(Stdio::piped())
         .kill_on_drop(true)
         .spawn()
@@ -267,6 +272,34 @@ async fn answers_a_path_that_doesnt_decode_with_400() {
     )
     .await;
     assert!(r.starts_with("HTTP/1.1 400"), "{r}");
+}
+
+#[tokio::test]
+async fn caches_only_the_frontends_own_assets_for_good() {
+    // A web root that's under a directory called assets itself.
+    let dir = tempfile::tempdir().unwrap();
+    let web = dir.path().join("assets/dist");
+    std::fs::create_dir_all(web.join("assets")).unwrap();
+    std::fs::write(web.join("index.html"), "<!doctype html>").unwrap();
+    std::fs::write(web.join("app.js"), "").unwrap();
+    std::fs::write(web.join("assets/index-abc123.js"), "").unwrap();
+    let server = start_with("claude/plain-reply", &[("CHAT_WEB", &web)]).await;
+    let get = |path: &'static str| {
+        let p = server.port;
+        async move {
+            let r = raw(
+                p,
+                &format!("GET {path} HTTP/1.1\r\nHost: 127.0.0.1:{p}\r\nConnection: close\r\n\r\n"),
+            )
+            .await;
+            assert!(r.starts_with("HTTP/1.1 200"), "{r}");
+            r.to_ascii_lowercase()
+        }
+    };
+    assert!(get("/").await.contains("cache-control: no-cache"));
+    assert!(get("/thread/1").await.contains("cache-control: no-cache"));
+    assert!(get("/app.js").await.contains("cache-control: no-cache"));
+    assert!(get("/assets/index-abc123.js").await.contains("immutable"));
 }
 
 /// What the server answers to a raw HTTP request.

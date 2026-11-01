@@ -9,7 +9,7 @@ use std::collections::HashMap;
 use std::fs::{self, File, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, MutexGuard};
 
 use async_trait::async_trait;
 use serde_json::{Value, json};
@@ -22,12 +22,21 @@ const SUFFIX: &str = ".jsonl";
 /// A store in a directory of JSONL files.
 pub struct FileStore {
     dir: PathBuf,
-    inner: Arc<Mutex<Inner>>,
+    shared: Arc<Shared>,
 }
 
-struct Inner {
+struct Shared {
+    /// What's in the files. Its lock is only held to read it, or for a write to check and apply its
+    /// change, never across the I/O: reads, which run on the async runtime's threads, don't wait
+    /// for a write to reach the disk.
+    mem: Mutex<State>,
+    /// The files, held by one write at a time across its I/O, off the runtime's threads (and
+    /// taken before `mem`, if both are).
+    io: Mutex<Io>,
+}
+
+struct Io {
     dir: PathBuf,
-    mem: State,
     files: HashMap<String, (File, u64)>,
     // A run's lines carry a revision, counted across the store, since a run moved to another
     // thread is in two files: the latest of its lines says where it is (or, if it's `run_moved`,
@@ -43,16 +52,18 @@ impl FileStore {
         let dir = dir.into();
         fs::create_dir_all(&dir).map_err(StoreError::failed)?;
         let (mem, rev) = load(&dir)?;
-        let inner = Inner {
+        let io = Io {
             dir: dir.clone(),
-            mem,
             files: HashMap::new(),
             rev,
             broken: None,
         };
         Ok(FileStore {
             dir,
-            inner: Arc::new(Mutex::new(inner)),
+            shared: Arc::new(Shared {
+                mem: Mutex::new(mem),
+                io: Mutex::new(io),
+            }),
         })
     }
 
@@ -60,20 +71,28 @@ impl FileStore {
         &self.dir
     }
 
-    fn lock(&self) -> std::sync::MutexGuard<'_, Inner> {
-        self.inner.lock().unwrap_or_else(|e| e.into_inner())
+    fn mem(&self) -> MutexGuard<'_, State> {
+        lock(&self.shared.mem)
     }
 
-    /// Runs a write off the async runtime's threads, after every operation before it.
+    /// Runs a write off the async runtime's threads, after every write before it. It's given the
+    /// files and the state, whose lock it takes only to check its change and to apply it once it's
+    /// written.
     async fn write<T: Send + 'static>(
         &self,
-        op: impl FnOnce(&mut Inner) -> StoreResult<T> + Send + 'static,
+        op: impl FnOnce(&mut Io, &Mutex<State>) -> StoreResult<T> + Send + 'static,
     ) -> StoreResult<T> {
-        let inner = self.inner.clone();
-        tokio::task::spawn_blocking(move || op(&mut inner.lock().unwrap_or_else(|e| e.into_inner())))
+        let shared = self.shared.clone();
+        tokio::task::spawn_blocking(move || op(&mut lock(&shared.io), &shared.mem))
             .await
             .map_err(StoreError::failed)?
     }
+}
+
+/// A lock, even one a panic left poisoned: each change to what it guards is made whole or not at
+/// all.
+fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
+    m.lock().unwrap_or_else(|e| e.into_inner())
 }
 
 fn path(dir: &Path, id: &str) -> PathBuf {
@@ -173,7 +192,7 @@ fn load(dir: &Path) -> StoreResult<(State, u64)> {
     Ok((state, rev))
 }
 
-impl Inner {
+impl Io {
     fn file(&mut self, id: &str) -> std::io::Result<&mut (File, u64)> {
         if !self.files.contains_key(id) {
             let f = OpenOptions::new().create(true).append(true).open(path(&self.dir, id))?;
@@ -222,86 +241,89 @@ impl Inner {
         }
         result
     }
+}
 
-    fn known(&self, id: &str) -> StoreResult<()> {
-        if self.mem.threads.contains_key(id) {
-            Ok(())
-        } else {
-            Err(StoreError::not_found(id))
-        }
+fn known(mem: &State, id: &str) -> StoreResult<()> {
+    if mem.threads.contains_key(id) {
+        Ok(())
+    } else {
+        Err(StoreError::not_found(id))
     }
+}
 
-    /// The thread a run was in before, if putting it in another moves it out of that one's file.
-    fn moved(&self, run: &RunRecord) -> Option<String> {
-        let before = self.mem.runs.get(&run.id)?;
-        (before.thread_id != run.thread_id && self.mem.threads.contains_key(&before.thread_id))
-            .then(|| before.thread_id.clone())
-    }
+/// The thread a run was in before, if putting it in another moves it out of that one's file.
+fn moved(mem: &State, run: &RunRecord) -> Option<String> {
+    let before = mem.runs.get(&run.id)?;
+    (before.thread_id != run.thread_id && mem.threads.contains_key(&before.thread_id)).then(|| before.thread_id.clone())
 }
 
 #[async_trait]
 impl Store for FileStore {
     async fn create_thread(&self, thread: &Value) -> StoreResult<()> {
         let thread = thread.clone();
-        self.write(move |s| {
+        self.write(move |io, mem| {
             let id = str_field(&thread, "id").to_string();
-            if s.mem.threads.contains_key(&id) {
+            if lock(mem).threads.contains_key(&id) {
                 return Err(StoreError::new(StoreErrorKind::Exists, format!("thread {id} exists")));
             }
-            s.append(vec![(id, json!({ "thread": thread }))])?;
-            s.mem.create_thread(&thread)
+            io.append(vec![(id, json!({ "thread": thread }))])?;
+            lock(mem).create_thread(&thread)
         })
         .await
     }
 
     async fn get_thread(&self, id: &str) -> StoreResult<Option<Value>> {
-        Ok(self.lock().mem.threads.get(id).cloned())
+        Ok(self.mem().threads.get(id).cloned())
     }
 
     async fn list_threads(&self) -> StoreResult<Vec<Value>> {
-        Ok(self.lock().mem.list_threads())
+        Ok(self.mem().list_threads())
     }
 
     async fn update_thread(&self, thread: &Value) -> StoreResult<()> {
         let thread = thread.clone();
-        self.write(move |s| {
+        self.write(move |io, mem| {
             let id = str_field(&thread, "id").to_string();
-            s.known(&id)?;
-            s.append(vec![(id, json!({ "thread": thread }))])?;
-            s.mem.update_thread(&thread)
+            known(&lock(mem), &id)?;
+            io.append(vec![(id, json!({ "thread": thread }))])?;
+            lock(mem).update_thread(&thread)
         })
         .await
     }
 
     async fn delete_thread(&self, id: &str) -> StoreResult<bool> {
         let id = id.to_string();
-        self.write(move |s| {
-            if !s.mem.threads.contains_key(&id) {
+        self.write(move |io, mem| {
+            if !lock(mem).threads.contains_key(&id) {
                 return Ok(false);
             }
-            s.files.remove(&id);
-            match fs::remove_file(path(&s.dir, &id)) {
+            io.files.remove(&id);
+            match fs::remove_file(path(&io.dir, &id)) {
                 Ok(()) => {}
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
                 Err(e) => return Err(StoreError::failed(e)),
             }
-            Ok(s.mem.delete_thread(&id))
+            Ok(lock(mem).delete_thread(&id))
         })
         .await
     }
 
     async fn append_events(&self, id: &str, events: &[Value], runs: &[RunRecord]) -> StoreResult<()> {
         let (id, events, runs) = (id.to_string(), events.to_vec(), runs.to_vec());
-        self.write(move |s| {
-            check_events(&id, s.mem.last(&id)?, &events, &runs)?;
+        self.write(move |io, mem| {
+            let moves: Vec<Option<String>> = {
+                let mem = lock(mem);
+                check_events(&id, mem.last(&id)?, &events, &runs)?;
+                runs.iter().map(|r| moved(&mem, r)).collect()
+            };
             if events.is_empty() && runs.is_empty() {
                 return Ok(());
             }
-            let mut rev = s.rev;
+            let mut rev = io.rev;
             let mut lines = Vec::new();
             let mut revs = Vec::new();
-            for run in &runs {
-                if let Some(from) = s.moved(run) {
+            for (run, moved) in runs.iter().zip(moves) {
+                if let Some(from) = moved {
                     rev += 1;
                     lines.push((from, json!({ "run_moved": run.id, "rev": rev })));
                 }
@@ -313,64 +335,67 @@ impl Store for FileStore {
                 line["runs"] = Value::Array(revs);
             }
             lines.push((id.clone(), line));
-            s.append(lines)?;
-            s.rev = rev;
-            s.mem.append_events(&id, &events, &runs)
+            io.append(lines)?;
+            io.rev = rev;
+            lock(mem).append_events(&id, &events, &runs)
         })
         .await
     }
 
     async fn read_events(&self, id: &str, after: u64, limit: Option<usize>) -> StoreResult<Vec<Value>> {
-        self.lock().mem.read_events(id, after, limit)
+        self.mem().read_events(id, after, limit)
     }
 
     async fn last_seq(&self, id: &str) -> StoreResult<u64> {
-        self.lock().mem.last(id)
+        self.mem().last(id)
     }
 
     async fn save_snapshot(&self, id: &str, snapshot: &Value) -> StoreResult<()> {
         let (id, snapshot) = (id.to_string(), snapshot.clone());
-        self.write(move |s| {
-            s.known(&id)?;
-            s.append(vec![(id.clone(), json!({ "snapshot": snapshot }))])?;
-            s.mem.save_snapshot(&id, &snapshot)
+        self.write(move |io, mem| {
+            known(&lock(mem), &id)?;
+            io.append(vec![(id.clone(), json!({ "snapshot": snapshot }))])?;
+            lock(mem).save_snapshot(&id, &snapshot)
         })
         .await
     }
 
     async fn load_snapshot(&self, id: &str) -> StoreResult<Option<Value>> {
-        self.lock().mem.load_snapshot(id)
+        self.mem().load_snapshot(id)
     }
 
     async fn put_run(&self, run: &RunRecord) -> StoreResult<()> {
         let run = run.clone();
-        self.write(move |s| {
-            s.known(&run.thread_id)?;
-            let moved = s.moved(&run);
-            let rev = s.rev + if moved.is_some() { 2 } else { 1 };
+        self.write(move |io, mem| {
+            let moved = {
+                let mem = lock(mem);
+                known(&mem, &run.thread_id)?;
+                moved(&mem, &run)
+            };
+            let rev = io.rev + if moved.is_some() { 2 } else { 1 };
             let mut lines = Vec::new();
             if let Some(from) = moved {
                 lines.push((from, json!({ "run_moved": run.id, "rev": rev - 1 })));
             }
             lines.push((run.thread_id.clone(), json!({ "run": run, "rev": rev })));
-            s.append(lines)?;
-            s.rev = rev;
-            s.mem.put_run(&run)
+            io.append(lines)?;
+            io.rev = rev;
+            lock(mem).put_run(&run)
         })
         .await
     }
 
     async fn get_run(&self, id: &str) -> StoreResult<Option<RunRecord>> {
-        Ok(self.lock().mem.runs.get(id).cloned())
+        Ok(self.mem().runs.get(id).cloned())
     }
 
     async fn active_runs(&self) -> StoreResult<Vec<RunRecord>> {
-        Ok(self.lock().mem.active_runs())
+        Ok(self.mem().active_runs())
     }
 
     async fn close(&self) -> StoreResult<()> {
-        self.write(|s| {
-            s.files.clear();
+        self.write(|io, _| {
+            io.files.clear();
             Ok(())
         })
         .await

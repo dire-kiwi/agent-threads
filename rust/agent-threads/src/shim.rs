@@ -38,7 +38,9 @@ pub struct ShimOptions {
     /// How long a run that's stopped has to exit after SIGTERM before it's sent SIGKILL. 10s by
     /// default.
     pub kill_grace: Duration,
-    /// How often a run's output is read. 50ms by default.
+    /// How often a run's directory is read when nothing says it changed. On Linux it's watched
+    /// (inotify), which wakes the backend when the run writes, so this is only a fallback: 200ms by
+    /// default. Elsewhere it's how often a run's output is read: 50ms by default.
     pub poll: Duration,
 }
 
@@ -48,7 +50,7 @@ impl ShimOptions {
             runs_dir: runs_dir.into(),
             keep: Duration::from_secs(14 * 86_400),
             kill_grace: Duration::from_secs(10),
-            poll: Duration::from_millis(50),
+            poll: Duration::from_millis(if cfg!(target_os = "linux") { 200 } else { 50 }),
         }
     }
 }
@@ -433,6 +435,8 @@ impl ShimProcess {
         let mut announced = self.lock().caught_up;
         let mut checked = 0u64;
         let mut identity: Option<Identity> = None;
+        // Watched from before the first read, so nothing written after it goes unnoticed.
+        let watch = DirWatch::new(&self.dir);
         loop {
             if let Some(e) = {
                 let mut st = self.lock();
@@ -502,7 +506,14 @@ impl ShimProcess {
                 terminate(&self.dir, self.grace, Signal::Term);
                 continue;
             }
-            tokio::time::sleep(poll).await;
+            // Until the run writes something, or (as the watch can't see everything: whether the
+            // shim is still there, say) for the poll at most.
+            match &watch {
+                Some(w) => {
+                    let _ = tokio::time::timeout(poll, w.changed()).await;
+                }
+                None => tokio::time::sleep(poll).await,
+            }
         }
     }
 
@@ -649,6 +660,79 @@ impl HarnessProcess for ShimProcess {
     fn dir(&self) -> Option<String> {
         Some(self.dir.to_string_lossy().into())
     }
+}
+
+/// A run directory, watched with inotify: what the run writes to it (output, its pid, its exit)
+/// wakes whoever's following it.
+#[cfg(target_os = "linux")]
+struct DirWatch(tokio::io::unix::AsyncFd<std::os::fd::OwnedFd>);
+
+#[cfg(target_os = "linux")]
+impl DirWatch {
+    /// None if the directory can't be watched (it's followed by polling alone).
+    fn new(dir: &Path) -> Option<Self> {
+        use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+        use std::os::unix::ffi::OsStrExt;
+        let path = std::ffi::CString::new(dir.as_os_str().as_bytes()).ok()?;
+        let fd = unsafe { libc::inotify_init1(libc::IN_NONBLOCK | libc::IN_CLOEXEC) };
+        if fd < 0 {
+            return None;
+        }
+        let fd = unsafe { OwnedFd::from_raw_fd(fd) };
+        let mask = libc::IN_MODIFY
+            | libc::IN_CLOSE_WRITE
+            | libc::IN_CREATE
+            | libc::IN_MOVED_TO
+            | libc::IN_DELETE_SELF
+            | libc::IN_MOVE_SELF;
+        if unsafe { libc::inotify_add_watch(fd.as_raw_fd(), path.as_ptr(), mask) } < 0 {
+            return None;
+        }
+        // Safety: the fd is ours alone, and is closed only when the AsyncFd is dropped.
+        unsafe { tokio::io::unix::AsyncFd::register(fd) }.ok().map(DirWatch)
+    }
+
+    /// Resolves once something in the directory has changed since the last call. Which change is
+    /// left to the caller to find out: it reads the directory again.
+    async fn changed(&self) {
+        use std::os::fd::AsRawFd;
+        loop {
+            let Ok(mut ready) = self.0.readable().await else {
+                // Can't be waited on: the caller's poll goes on alone.
+                return std::future::pending().await;
+            };
+            let mut any = false;
+            let mut buf = [0u8; 4096];
+            loop {
+                let n = unsafe { libc::read(self.0.as_raw_fd(), buf.as_mut_ptr().cast(), buf.len()) };
+                if n > 0 {
+                    any = true;
+                    continue;
+                }
+                if n < 0 && io::Error::last_os_error().kind() == io::ErrorKind::Interrupted {
+                    continue;
+                }
+                break;
+            }
+            ready.clear_ready();
+            if any {
+                return;
+            }
+        }
+    }
+}
+
+/// Where there's no inotify, runs are followed by polling alone.
+#[cfg(not(target_os = "linux"))]
+struct DirWatch;
+
+#[cfg(not(target_os = "linux"))]
+impl DirWatch {
+    fn new(_dir: &Path) -> Option<Self> {
+        None
+    }
+
+    async fn changed(&self) {}
 }
 
 /// Reads a file's whole lines as they're appended, from an offset.
@@ -1205,6 +1289,27 @@ fn started_at(dir: &Path) -> u64 {
         }
     }
     0
+}
+
+/// Kills every run in `runs_dir` at once, without waiting for anything: SIGKILL to each run's shim
+/// and to its group (if they're still the run's). For tests, so one that fails leaves no process
+/// behind; an app stops its runs with [`AgentThreads::close`](crate::AgentThreads::close).
+#[doc(hidden)]
+pub fn kill_runs(runs_dir: &Path) {
+    let Ok(entries) = fs::read_dir(runs_dir) else { return };
+    for dir in entries.flatten().map(|e| e.path()).filter(|d| d.is_dir()) {
+        let _ = fs::write(dir.join("input.closed"), "");
+        // The shim first, so it starts nothing more.
+        if let Some(pid) = read_pid(&dir, "shim.pid")
+            && proc_info(pid).is_some()
+            && shim_alive(&dir, None)
+        {
+            unsafe { libc::kill(pid as i32, libc::SIGKILL) };
+        }
+        if let Some(group) = live_group(&dir) {
+            signal_group(group, Signal::Kill);
+        }
+    }
 }
 
 /// Stops the run in `dir`, which nothing follows: ends its input, then SIGTERM to its group and

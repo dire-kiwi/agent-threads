@@ -121,6 +121,13 @@ struct ShimSetup {
     spawner: Arc<dyn Spawner>,
 }
 
+impl Drop for ShimSetup {
+    /// Kills what's left running, so a test that fails leaves nothing behind.
+    fn drop(&mut self) {
+        agent_threads::kill_runs(&self.runs_dir);
+    }
+}
+
 fn shim_setup() -> ShimSetup {
     let runs_dir = common::temp_dir();
     let mut o = ShimOptions::new(&runs_dir);
@@ -172,6 +179,41 @@ async fn shim_passes_whole_lines_through_with_the_offset_after_each_and_says_how
         ),
         (json!(1), json!("run_1"), json!("th"), json!("sh"))
     );
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test(flavor = "multi_thread")]
+async fn shim_reads_what_a_run_writes_as_it_writes_it_without_waiting_for_the_poll() {
+    let runs_dir = common::temp_dir();
+    let mut o = ShimOptions::new(&runs_dir);
+    // Longer than wait() waits: only the run's directory being watched gets anything through.
+    o.poll = Duration::from_secs(60);
+    let s = ShimSetup {
+        spawner: shim(common::shim_path(), o),
+        runs_dir,
+    };
+    let p = s.run(r#"read x; echo "got $x"; sleep 0.2; echo bye"#, "run_1");
+    p.proc.write("hi");
+    assert!(wait(|| p.lines().len() == 1).await);
+    assert_eq!(p.lines(), ["got hi"]);
+    assert!(wait(|| p.exit().is_some()).await);
+    assert_eq!(p.lines(), ["got hi", "bye"]);
+    assert_eq!(p.exit().unwrap().code, Some(0));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn shim_kill_runs_leaves_nothing_running() {
+    let s = shim_setup();
+    let p = s.run("sleep 30 & echo $!; wait", "run_1");
+    assert!(wait(|| p.lines().len() == 1).await);
+    let sleeper: i32 = p.lines()[0].parse().unwrap();
+    let shim_pid: i32 = std::fs::read_to_string(s.runs_dir.join("run_1/shim.pid"))
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap();
+    drop(s);
+    assert!(wait(|| !alive(sleeper) && !alive(shim_pid)).await);
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -329,7 +371,8 @@ async fn shim_says_why_a_run_couldnt_be_started() {
     );
     assert!(wait(|| p.exit().is_some()).await);
     assert!(p.exit().unwrap().error.unwrap().contains("couldn't be started"));
-    let q = shim_setup().run("true", "r");
+    let s = shim_setup();
+    let q = s.run("true", "r");
     assert!(wait(|| q.exit().is_some()).await);
     assert_eq!(q.exit().unwrap().code, Some(0));
 }

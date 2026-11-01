@@ -1401,3 +1401,188 @@ async fn a_close_cut_short_mid_grace_finishes_and_a_retry_saves_the_interrupted_
     // Closing again is fine.
     env.sdk.close(true).await.unwrap();
 }
+
+/// A store that holds up loading one thread (its get_thread) until it's let go, and counts its
+/// loads.
+struct Gated {
+    inner: MemoryStore,
+    id: String,
+    open: tokio::sync::watch::Sender<bool>,
+    loads: std::sync::atomic::AtomicUsize,
+}
+
+impl Gated {
+    fn new(inner: MemoryStore, id: &str) -> Arc<Self> {
+        Arc::new(Gated {
+            inner,
+            id: id.into(),
+            open: tokio::sync::watch::channel(false).0,
+            loads: Default::default(),
+        })
+    }
+
+    fn loads(&self) -> usize {
+        self.loads.load(std::sync::atomic::Ordering::SeqCst)
+    }
+}
+
+#[async_trait]
+impl Store for Gated {
+    async fn create_thread(&self, t: &Value) -> StoreResult<()> {
+        self.inner.create_thread(t).await
+    }
+    async fn get_thread(&self, id: &str) -> StoreResult<Option<Value>> {
+        if id == self.id {
+            self.loads.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let _ = self.open.subscribe().wait_for(|open| *open).await;
+        }
+        self.inner.get_thread(id).await
+    }
+    async fn list_threads(&self) -> StoreResult<Vec<Value>> {
+        self.inner.list_threads().await
+    }
+    async fn update_thread(&self, t: &Value) -> StoreResult<()> {
+        self.inner.update_thread(t).await
+    }
+    async fn delete_thread(&self, id: &str) -> StoreResult<bool> {
+        self.inner.delete_thread(id).await
+    }
+    async fn append_events(&self, id: &str, events: &[Value], runs: &[RunRecord]) -> StoreResult<()> {
+        self.inner.append_events(id, events, runs).await
+    }
+    async fn read_events(&self, id: &str, after: u64, limit: Option<usize>) -> StoreResult<Vec<Value>> {
+        self.inner.read_events(id, after, limit).await
+    }
+    async fn last_seq(&self, id: &str) -> StoreResult<u64> {
+        self.inner.last_seq(id).await
+    }
+    async fn save_snapshot(&self, id: &str, s: &Value) -> StoreResult<()> {
+        self.inner.save_snapshot(id, s).await
+    }
+    async fn load_snapshot(&self, id: &str) -> StoreResult<Option<Value>> {
+        self.inner.load_snapshot(id).await
+    }
+    async fn put_run(&self, r: &RunRecord) -> StoreResult<()> {
+        self.inner.put_run(r).await
+    }
+    async fn get_run(&self, id: &str) -> StoreResult<Option<RunRecord>> {
+        self.inner.get_run(id).await
+    }
+    async fn active_runs(&self) -> StoreResult<Vec<RunRecord>> {
+        self.inner.active_runs().await
+    }
+}
+
+/// Two threads made by a backend before, and a new backend whose store holds up loading the first.
+async fn gated() -> (Env, AgentThreads, Arc<Gated>, String, String) {
+    let env = setup(Setup::default());
+    let (a, b) = (
+        env.sdk.create(create()).await.unwrap(),
+        env.sdk.create(create()).await.unwrap(),
+    );
+    env.sdk.close(false).await.unwrap();
+    let state = env.sdk.store().clone();
+    let inner = MemoryStore::new();
+    for id in [&a.id, &b.id] {
+        inner
+            .create_thread(&state.get_thread(id).await.unwrap().unwrap())
+            .await
+            .unwrap();
+        let events = state.read_events(id, 0, None).await.unwrap();
+        inner.append_events(id, &events, &[]).await.unwrap();
+    }
+    let store = Gated::new(inner, &a.id);
+    let sdk = env.make(store.clone());
+    (env, sdk, store, a.id, b.id)
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn loads_each_thread_on_its_own_and_a_thread_once_however_many_ask() {
+    let (_env, sdk, store, a, b) = gated().await;
+    let first = tokio::spawn({
+        let (sdk, a) = (sdk.clone(), a.clone());
+        async move { sdk.snapshot(&a).await }
+    });
+    let second = tokio::spawn({
+        let (sdk, a) = (sdk.clone(), a.clone());
+        async move { sdk.snapshot(&a).await }
+    });
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    // The other thread's commands don't wait for the slow load.
+    let other = tokio::time::timeout(Duration::from_secs(2), sdk.snapshot(&b)).await;
+    assert_eq!(other.expect("it isn't held up").unwrap().thread.id, b);
+    sdk.send(&b, "reply hi", SendOptions::default()).await.unwrap();
+    assert!(!first.is_finished() && !second.is_finished());
+    store.open.send_replace(true);
+    assert_eq!(first.await.unwrap().unwrap().thread.id, a);
+    assert_eq!(second.await.unwrap().unwrap().thread.id, a);
+    assert_eq!(store.loads(), 1, "the second waited for the first's load");
+    settle(&sdk, &b).await;
+    sdk.close(true).await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_deletion_waits_for_a_load_under_way_and_the_load_comes_to_nothing() {
+    let (_env, sdk, store, a, _) = gated().await;
+    let loading = tokio::spawn({
+        let (sdk, a) = (sdk.clone(), a.clone());
+        async move { sdk.snapshot(&a).await }
+    });
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let deleting = tokio::spawn({
+        let (sdk, a) = (sdk.clone(), a.clone());
+        async move { sdk.delete(&a).await }
+    });
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let sent = sdk.send(&a, "reply hi", SendOptions::default()).await;
+    assert!(
+        matches!(&sent, Err(Error::Command(m)) if m.contains("being deleted")),
+        "{sent:?}"
+    );
+    assert!(!deleting.is_finished());
+    store.open.send_replace(true);
+    let loaded = loading.await.unwrap();
+    assert!(
+        matches!(&loaded, Err(Error::Command(m)) if m.contains("being deleted")),
+        "{:?}",
+        loaded.err()
+    );
+    assert!(deleting.await.unwrap().unwrap());
+    assert!(sdk.get(&a).await.unwrap().is_none());
+    assert!(matches!(sdk.snapshot(&a).await, Err(Error::Command(m)) if m.contains("there's no thread")));
+    assert_eq!(
+        store.loads(),
+        3,
+        "the snapshot's load, then get() and a snapshot that found it gone"
+    );
+    sdk.close(true).await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn close_waits_for_a_load_under_way_and_refuses_loads_after_it() {
+    let (_env, sdk, store, a, b) = gated().await;
+    let loading = tokio::spawn({
+        let (sdk, a) = (sdk.clone(), a.clone());
+        async move { sdk.snapshot(&a).await }
+    });
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let closing = tokio::spawn({
+        let sdk = sdk.clone();
+        async move { sdk.close(false).await }
+    });
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert!(!closing.is_finished(), "close() waits for the load");
+    assert!(matches!(sdk.snapshot(&b).await, Err(Error::Command(m)) if m.contains("closed")));
+    store.open.send_replace(true);
+    closing.await.unwrap().unwrap();
+    // Loaded, but the AgentThreads closed meanwhile.
+    let loaded = loading.await.unwrap();
+    assert!(
+        matches!(&loaded, Err(Error::Command(m)) if m.contains("closed")),
+        "{:?}",
+        loaded.err()
+    );
+    // close() saved the thread it loaded, and let it go.
+    assert!(store.inner.load_snapshot(&a).await.unwrap().is_some());
+    assert!(store.inner.load_snapshot(&b).await.unwrap().is_none());
+}
