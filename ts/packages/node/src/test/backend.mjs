@@ -46,6 +46,8 @@ const ops = {
   create: (args) => sdk.create(args),
   handle: (command) => sdk.handle(command),
   snapshot: (id) => sdk.snapshot(id),
+  // Resolves once every event so far is saved (and the run with them).
+  saved: async (id) => void (await sdk.eventsSince(id, 0)),
   recover: () => sdk.recover(),
   close: async (options) => {
     await sdk.close(options);

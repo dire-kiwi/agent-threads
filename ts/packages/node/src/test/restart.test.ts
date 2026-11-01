@@ -291,7 +291,7 @@ describe.skipIf(process.platform === "win32")("a backend restart", () => {
     const text = () => a.events.filter((e) => e.type === "delta").map((e) => (e.type === "delta" ? e.text : "")).join("");
     await until(() => text() === "the streamed words ");
     // The item, and the offset past all its deltas, are saved.
-    await sleep(200);
+    await a.call("saved", thread.id);
     await a.crash();
 
     const b = s.start();
@@ -324,7 +324,7 @@ describe.skipIf(process.platform === "win32")("a backend restart", () => {
     await a.waitFor({ type: "turn.completed" });
     await a.call("handle", { type: "set_options", thread_id: thread.id, model: "new" } satisfies Command);
     await a.waitFor({ type: "thread.updated", thread: { model: "new" } });
-    await sleep(100);
+    await a.call("saved", thread.id);
     await a.crash();
 
     const b = s.start();
