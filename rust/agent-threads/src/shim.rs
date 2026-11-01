@@ -85,11 +85,15 @@ impl Shim {
     fn follow(&self, id: &str, dir: PathBuf, offset: u64, launched: bool, input: Option<u64>) -> (Arc<ShimProcess>, mpsc::UnboundedReceiver<ProcessEvent>) {
         let (tx, rx) = mpsc::unbounded_channel();
         self.live.lock().unwrap().insert(id.to_string());
-        let proc = ShimProcess::new(dir, offset, launched, input, self.o.kill_grace);
-        let (live, id, poll, p) = (self.live.clone(), id.to_string(), self.o.poll, proc.clone());
+        let (live, run_id) = (self.live.clone(), id.to_string());
+        let done: Box<dyn Fn() + Send + Sync> = Box::new(move || {
+            live.lock().unwrap().remove(&run_id);
+        });
+        let proc = ShimProcess::new(dir, offset, launched, input, self.o.kill_grace, done);
+        let (poll, p) = (self.o.poll, proc.clone());
         tokio::spawn(async move {
-            p.follow(tx, poll).await;
-            live.lock().unwrap().remove(&id);
+            p.clone().follow(tx, poll).await;
+            (p.done)();
         });
         (proc, rx)
     }
@@ -296,10 +300,12 @@ struct ShimProcess {
     /// How much of out.jsonl there was when it was re-attached to.
     out_at_attach: u64,
     state: Mutex<State>,
+    /// Lets pruning have the run: it isn't followed any more.
+    done: Box<dyn Fn() + Send + Sync>,
 }
 
 impl ShimProcess {
-    fn new(dir: PathBuf, offset: u64, launched: bool, input: Option<u64>, grace: Duration) -> Arc<Self> {
+    fn new(dir: PathBuf, offset: u64, launched: bool, input: Option<u64>, grace: Duration, done: Box<dyn Fn() + Send + Sync>) -> Arc<Self> {
         let mut st = State {
             pid: None,
             input_closed: false,
@@ -334,7 +340,7 @@ impl ShimProcess {
                 escalate(&dir);
             }
         }
-        Arc::new(ShimProcess { dir, grace, launched_here: launched, since: now_ms(), offset, out_at_attach, state: Mutex::new(st) })
+        Arc::new(ShimProcess { dir, grace, launched_here: launched, since: now_ms(), offset, out_at_attach, state: Mutex::new(st), done })
     }
 
     fn lock(&self) -> std::sync::MutexGuard<'_, State> {
@@ -526,6 +532,7 @@ impl HarnessProcess for ShimProcess {
 
     fn detach(&self) {
         self.lock().over = true;
+        (self.done)();
     }
 
     fn can_detach(&self) -> bool {
