@@ -91,6 +91,10 @@ type ThreadContext interface {
 	SetThread(change func(*protocol.Thread))
 	// TookIn says the harness took in the queued message with this id, and whether it was queued.
 	TookIn(id string) bool
+	// ToolOutput says an app tool returned structured output for the tool call toolCallID: it goes
+	// in the call's result.structured when the harness gives the call its result (harnesses pass on
+	// only the text).
+	ToolOutput(toolCallID string, structured any)
 
 	// Decide is the permission policy's answer (or the user's standing one).
 	Decide(query PermissionQuery) Decision

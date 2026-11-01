@@ -1307,6 +1307,9 @@ func (s *claudeSession) canUseTool(run *claudeRun, requestID string, req jmap, e
 
 	t := claudeTool(req.str("tool_name"), input)
 	query := PermissionQuery{Name: t.Name, Kind: t.Kind, Input: input, Title: toolTitle(t), Server: t.Server, Reason: req.str("decision_reason"), ToolCallID: toolUseID}
+	if t.Kind == protocol.ToolKindShell {
+		query.Command = t.Command
+	}
 	if call, ok := ctx.Item(toolUseID); ok && toolUseID != "" {
 		query.ParentID = call.ParentID()
 	}
@@ -1414,6 +1417,9 @@ func (s *claudeSession) mcp(run *claudeRun, requestID string, req jmap) {
 					// the backend that re-attaches to answer.
 					if run.detached {
 						return
+					}
+					if toolCallID != "" {
+						ctx.ToolOutput(toolCallID, out.Structured)
 					}
 					reply(map[string]any{"result": mcpResult(out)})
 					// Saved as answered, though no event says so: a restart doesn't answer it again.

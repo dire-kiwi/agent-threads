@@ -18,6 +18,9 @@ type PermissionQuery struct {
 	Kind  protocol.ToolKind
 	Input json.RawMessage
 	Title string
+	// Command is the command, for a shell call, as the tool_call shows it (Codex's bash -lc wrapper
+	// taken off; Input has it as the harness gave it).
+	Command string
 	// Server is the MCP server, for an mcp tool.
 	Server string
 	// Reason is why the harness is asking, when it says.

@@ -1603,7 +1603,7 @@ func (s *codexSession) request(run *codexRun, m jmap, resume *codexResume) {
 		itemID := p.str("itemId")
 		t, ok := s.callFields(itemID)
 		if !ok {
-			t = &protocol.ToolCall{Name: "commandExecution", Kind: protocol.ToolKindShell, Input: rawObject("command", p.raw("command"), "cwd", p.raw("cwd")), Command: p.str("command")}
+			t = &protocol.ToolCall{Name: "commandExecution", Kind: protocol.ToolKindShell, Input: rawObject("command", p.raw("command"), "cwd", p.raw("cwd")), Command: unwrapCommand(p.str("command"))}
 		}
 		s.permit(run, key, s.query(t, itemID, p.str("reason"), parent), wanted, func(ok bool, _ string) { answer(decision(ok)) }, existing)
 	case "item/fileChange/requestApproval":
@@ -1659,6 +1659,9 @@ func (s *codexSession) callFields(itemID string) (*protocol.ToolCall, bool) {
 // query is a permission query about a call (the item, or what the request says about it).
 func (s *codexSession) query(t *protocol.ToolCall, itemID, reason, parent string) PermissionQuery {
 	q := PermissionQuery{Name: t.Name, Kind: t.Kind, Input: t.Input, Title: t.Title, Server: t.Server, Reason: reason, ParentID: parent}
+	if t.Kind == protocol.ToolKindShell {
+		q.Command = t.Command
+	}
 	if q.Title == "" {
 		q.Title = toolTitle(t)
 	}
@@ -1972,7 +1975,12 @@ func (s *codexSession) runApp(run *codexRun, name string, args json.RawMessage, 
 	call := ToolContext{ThreadID: ctx.ThreadID(), Metadata: metadataOf(t), ToolCallID: toolCallID}
 	go func() {
 		out := runTool(run.toolCtx, tool, args, call)
-		ctx.Post(func() { done(out) })
+		ctx.Post(func() {
+			if toolCallID != "" && !run.detached {
+				ctx.ToolOutput(toolCallID, out.Structured)
+			}
+			done(out)
+		})
 	}()
 }
 

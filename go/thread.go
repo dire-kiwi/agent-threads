@@ -104,6 +104,9 @@ type threadRuntime struct {
 	// streaming is the items text has streamed into since the turn began (whose text may not be
 	// saved yet).
 	streaming map[string]bool
+	// structured is app tools' structured output, by tool call, until the harness gives the call its
+	// result.
+	structured map[string]json.RawMessage
 
 	// The writer's side: batches taken on the loop, written in order.
 	wmu      sync.Mutex
@@ -127,8 +130,9 @@ func newRuntime(sdk *AgentThreads, state protocol.Snapshot, config ThreadConfig,
 		policy:    policy,
 		requests:  map[string]*openRequest{},
 		always:    map[string]Decision{},
-		streaming: map[string]bool{},
-		changed:   make(chan struct{}),
+		streaming:  map[string]bool{},
+		structured: map[string]json.RawMessage{},
+		changed:    make(chan struct{}),
 	}
 	// Messages left queued (by a harness that kept failing, or before a restart) go with the next.
 	for _, it := range state.Items {
@@ -398,6 +402,10 @@ func (rt *threadRuntime) runs() []RunRecord {
 	if live := rt.liveText(); len(live) > 0 {
 		data["live"] = live
 	}
+	// App tools' structured output whose calls the harness hasn't given their result yet.
+	if len(rt.structured) > 0 {
+		data["structured"] = rt.structured
+	}
 	dataJSON, err := json.Marshal(data)
 	if err != nil {
 		rt.sdk.reportError(fmt.Errorf("agentthreads: the run's state can't be saved: %w", err))
@@ -443,9 +451,14 @@ func (rt *threadRuntime) adoptRun(record RunRecord) {
 	j, _ := json.Marshal(record)
 	rt.run = &savedRun{record: record, json: string(j)}
 	var data struct {
-		Live map[string]string `json:"live"`
+		Live       map[string]string          `json:"live"`
+		Structured map[string]json.RawMessage `json:"structured"`
 	}
 	json.Unmarshal(record.Data, &data)
+	rt.structured = map[string]json.RawMessage{}
+	for id, v := range data.Structured {
+		rt.structured[id] = v
+	}
 	for id, text := range data.Live {
 		item, ok := rt.Item(id)
 		if !ok {
@@ -541,6 +554,21 @@ func (rt *threadRuntime) UpdateItem(id string, patch Patch) {
 	if !ok {
 		return
 	}
+	if structured, ok := rt.structured[id]; ok && patch["result"] != nil {
+		var result map[string]json.RawMessage
+		if json.Unmarshal(mustJSON(patch["result"]), &result) == nil {
+			if _, has := result["structured"]; !has {
+				result["structured"] = structured
+			}
+			next := Patch{}
+			for k, v := range patch {
+				next[k] = v
+			}
+			next["result"] = result
+			patch = next
+		}
+		delete(rt.structured, id)
+	}
 	fields := itemFields(item)
 	changed := map[string]json.RawMessage{}
 	for k, v := range patch {
@@ -572,6 +600,18 @@ func itemFields(item protocol.Item) map[string]json.RawMessage {
 	var fields map[string]json.RawMessage
 	json.Unmarshal(data, &fields)
 	return fields
+}
+
+func (rt *threadRuntime) ToolOutput(toolCallID string, structured any) {
+	if structured == nil {
+		return
+	}
+	data, err := json.Marshal(structured)
+	if err != nil {
+		rt.sdk.reportError(fmt.Errorf("agentthreads: a tool's structured output isn't JSON: %w", err))
+		return
+	}
+	rt.structured[toolCallID] = data
 }
 
 func (rt *threadRuntime) Delta(itemID string, kind protocol.DeltaEventKind, text string) {
@@ -721,6 +761,7 @@ func (rt *threadRuntime) endTurn(end TurnEnd, carry bool) {
 		}
 	}
 	clear(rt.streaming)
+	clear(rt.structured)
 	for _, it := range rt.state.Items {
 		if c, ok := it.Value.(*protocol.ToolCall); ok && c.TurnID == turn.ID && (c.Status == protocol.ToolStatusRunning || c.Status == protocol.ToolStatusPending) {
 			rt.UpdateItem(c.ID, Patch{"status": protocol.ToolStatusCancelled})
