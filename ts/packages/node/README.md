@@ -183,7 +183,7 @@ await sdk.recover(); // at startup, before taking commands
   and removes the runs in it the store doesn't follow), so there's no default. It and a shim path
   with a `/` in it are taken relative to the backend's working directory.
 - Whenever a thread's events are saved, its run's offset (how far into `out.jsonl` they go), the
-  driver's state for it, the running turn and the text streamed so far are saved with them, in the
+  driver's state for it, the running turn, the text streamed so far and app tools' structured output not yet given to their calls are saved with them, in the
   same `appendEvents`. So however the backend
   stops, after a restart it reads the output again from exactly where the saved events end: none
   are lost, and none are made twice.

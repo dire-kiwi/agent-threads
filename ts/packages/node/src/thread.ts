@@ -226,6 +226,8 @@ export class ThreadRuntime implements ThreadContext {
         turn: this.turn,
         state: cp.state,
         ...(live ? { live } : {}),
+        // App tools' structured output whose calls the harness hasn't given their result yet.
+        ...(this.#structured.size ? { structured: Object.fromEntries(this.#structured) } : {}),
       },
     };
     // A copy, taken now: the store may write it later, after more of the run's output has changed
@@ -252,11 +254,14 @@ export class ThreadRuntime implements ThreadContext {
 
   /**
    * The run record saved last, for a backend that re-attached to it, with the text that had
-   * streamed in as of it: shown again, as deltas, before the run's output is read on.
+   * streamed in as of it (shown again, as deltas, before the run's output is read on) and the app
+   * tools' structured output still waiting for their calls' results.
    */
   adoptRun(record: RunRecord): void {
     this.#run = { record, json: JSON.stringify(record) };
-    const live = (record.data as { live?: { [id: string]: string } } | undefined)?.live ?? {};
+    const data = record.data as { live?: { [id: string]: string }; structured?: { [id: string]: unknown } } | undefined;
+    this.#structured = new Map(Object.entries(data?.structured ?? {}));
+    const live = data?.live ?? {};
     for (const [id, text] of Object.entries(live)) {
       const item = this.item(id);
       if (!item || (item.type !== "assistant_message" && item.type !== "reasoning") || !text.startsWith(item.text)) continue;
