@@ -6,7 +6,8 @@
 
 import { createInterface } from "node:readline";
 
-const PARCELS: { [orderId: string]: { tracking: string; events: string[] } } = {
+// A Map, so an order id like `__proto__` or `toString` is just one that isn't there.
+const PARCELS = new Map<string, { tracking: string; events: string[] }>(Object.entries({
   "42": {
     tracking: "NZP-4410-2291",
     events: ["2026-10-30 09:12 Picked up in Auckland", "2026-10-31 06:40 At the Christchurch depot", "2026-11-01 08:05 Out for delivery"],
@@ -15,7 +16,7 @@ const PARCELS: { [orderId: string]: { tracking: string; events: string[] } } = {
     tracking: "NZP-3982-0017",
     events: ["2026-10-21 10:30 Picked up in Auckland", "2026-10-22 14:02 Delivered, left at the front door"],
   },
-};
+}));
 
 const tools = [
   {
@@ -45,7 +46,7 @@ createInterface({ input: process.stdin }).on("line", (line) => {
       return send({ id: msg.id, result: { tools } });
     case "tools/call": {
       const id = String(msg.params?.arguments?.order_id ?? "").replace(/^#/, "");
-      const parcel = PARCELS[id];
+      const parcel = PARCELS.get(id);
       const text = parcel ? `Parcel ${parcel.tracking} for order ${id}:\n${parcel.events.join("\n")}` : `No parcel has been shipped for order ${id}.`;
       return send({ id: msg.id, result: { content: [{ type: "text", text }], ...(parcel ? {} : { isError: true }) } });
     }

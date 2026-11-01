@@ -22,8 +22,8 @@ It has, as a real app would:
 - **A permission policy** ([server/policy.ts](server/policy.ts)) that allows what only reads and
   asks the user about everything else (the MCP tool, edits, other commands).
 - **Runs that outlive the server**, optionally: with `CHAT_SHIM` the harnesses run under
-  `agent-threads-shim`, and the **Restart server** button shows a turn carrying on across a
-  restart.
+  `agent-threads-shim`, and the **Restart server** button (shown only then) has a turn carry on
+  across a restart.
 
 ## Running it
 
@@ -66,7 +66,7 @@ again. On startup, `sdk.recover()` re-attaches to the run, and the frontend reco
 fresh snapshot. The thread says it was picked up again, and the same permission can still be
 answered, so the turn finishes. You can also restart it yourself (Ctrl-C, then `pnpm dev` again).
 Without `CHAT_SHIM`, a turn that's running when the server stops is lost, and ends with a `run.lost`
-notice.
+notice, so the button isn't offered.
 
 ![After a restart: the run was picked up again, and the turn finished](screenshots/claude-restart.png)
 

@@ -6,7 +6,7 @@ import { join } from "node:path";
 import { ROOT } from "./config.ts";
 
 const children = [
-  spawn(process.execPath, [join(ROOT, "server/supervise.ts")], { stdio: "inherit" }),
+  spawn(process.execPath, [join(ROOT, "server/supervise.ts")], { stdio: "inherit", env: { ...process.env, CHAT_DEV: "1" } }),
   spawn(process.execPath, [join(ROOT, "node_modules/vite/bin/vite.js")], { stdio: "inherit", cwd: ROOT }),
 ];
 for (const c of children) c.on("exit", (code) => {

@@ -80,8 +80,8 @@ const http = createServer((req, res) => serveStatic(join(ROOT, "web/dist"), req,
  * Whether a WebSocket may connect. Listening on 127.0.0.1 isn't enough: any page the user has open
  * can open a WebSocket to it, and the socket can read every thread, send the agent anything and
  * allow its own permission requests. So it must come from this app's own page (its Origin is the
- * host it connects to), on a loopback name (which a rebound DNS name isn't), at this server or
- * Vite's dev server (whose proxy keeps the Host and Origin). Clients that aren't browsers send no
+ * host it connects to), on a loopback name (which a rebound DNS name isn't), at this server or,
+ * under pnpm dev, Vite's dev server (whose proxy keeps the Host and Origin). Clients that aren't browsers send no
  * Origin. This is the example's only check: a real app authenticates its users here too.
  */
 function trusted(req: IncomingMessage): boolean {
@@ -95,7 +95,9 @@ function trusted(req: IncomingMessage): boolean {
     return false;
   }
 }
-const TRUSTED_HOSTS = new Set(["localhost", "127.0.0.1", "[::1]"].flatMap((name) => [cfg.port, DEV_PORT].map((port) => `${name}:${port}`)));
+// Vite's dev server only under pnpm dev: otherwise whatever else listens on its port isn't ours.
+const TRUSTED_PORTS = cfg.dev ? [cfg.port, DEV_PORT] : [cfg.port];
+const TRUSTED_HOSTS = new Set(["localhost", "127.0.0.1", "[::1]"].flatMap((name) => TRUSTED_PORTS.map((port) => `${name}:${port}`)));
 
 const wss = new WebSocketServer({
   server: http,
@@ -125,7 +127,8 @@ const isRequest = (r: unknown): r is Request =>
 const methods: { [name: string]: (params: any) => unknown } = {
   hello: () => ({
     harnesses: cfg.harnesses.map(({ name, label, model, models }) => ({ name, label, model, models })),
-    restart: cfg.supervised,
+    // Only with the shim: without it, a restart would lose the running turns.
+    restart: cfg.supervised && !!cfg.shim,
   }),
   list: async () => (await sdk.list()).sort(newestFirst),
   create: (p: { harness?: string; model?: string; title?: string }) => {
@@ -147,7 +150,7 @@ const methods: { [name: string]: (params: any) => unknown } = {
     return null;
   },
   restart: () => {
-    if (!cfg.supervised) throw new Error("this server isn't run by supervise.ts, so it can't restart");
+    if (!cfg.supervised || !cfg.shim) throw new Error("restarting is only offered with the shim, under supervise.ts");
     setTimeout(() => void shutdown(RESTART_CODE), 50);
     return null;
   },

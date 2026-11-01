@@ -46,9 +46,11 @@ export interface Config {
   fakeState?: string;
   /** Started by supervise.ts, which starts it again when it exits for a restart. */
   supervised: boolean;
+  /** Started by pnpm dev (dev.ts), behind Vite's dev server. */
+  dev: boolean;
 }
 
-/** Vite's dev server's port (vite.config.ts), whose pages may use the server too. */
+/** Vite's dev server's port (vite.config.ts), whose pages may use the server too under pnpm dev. */
 export const DEV_PORT = 5173;
 
 /** The exit code that asks supervise.ts to start the server again. */
@@ -86,5 +88,6 @@ export function config(env = process.env): Config {
     fake: fake && { tools: fakeTools },
     ...(env.CHAT_FAKE_STATE ? { fakeState: resolve(env.CHAT_FAKE_STATE) } : {}),
     supervised: env.CHAT_SUPERVISED === "1",
+    dev: env.CHAT_DEV === "1",
   };
 }

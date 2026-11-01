@@ -45,6 +45,35 @@ test("Claude Code: the app's tool is drawn as an order card, and a reload starts
   await check();
 });
 
+test("a snapshot cut off by the connection dropping is taken again on the next connection", async ({ page }) => {
+  server = await startServer({ CHAT_FAKE_CLAUDE: join(FIXTURES, "claude/app-tool") });
+  await page.goto(server.url);
+  await start(page, LOOKUP);
+  await expect(page.getByTestId("order-card")).toContainText("Shipped");
+
+  // From now on, the first time the page asks for a snapshot, the connection drops before the
+  // answer comes. The page reconnects, asks again, and shows the thread.
+  let dropped = 0;
+  await page.routeWebSocket(/\/ws$/, (ws) => {
+    const toServer = ws.connectToServer();
+    ws.onMessage((message) => {
+      if (!dropped && typeof message === "string" && JSON.parse(message).method === "snapshot") {
+        dropped++;
+        ws.close();
+        toServer.close();
+        return;
+      }
+      toServer.send(message);
+    });
+  });
+  await page.reload();
+  await expect(connection(page)).toHaveText("Connected");
+  await expect(page.getByTestId("order-card")).toContainText("Shipped");
+  await expect(page.getByText("Order 42 contains 3 blue widgets and shipped on 2026-10-30.")).toBeVisible();
+  await expect(page.getByText("the connection to the server dropped")).toHaveCount(0);
+  expect(dropped).toBe(1);
+});
+
 test("Codex: a command asks first, and runs once the user allows it", async ({ page }) => {
   server = await startServer({ CHAT_FAKE_CODEX: join(FIXTURES, "codex/permission-allow") });
   await page.goto(server.url);
@@ -117,6 +146,8 @@ test("the server takes WebSockets only from its own pages, and survives malforme
   expect(await connect({ origin: "https://attacker.example" })).toBeNull();
   expect(await connect({ origin: "http://127.0.0.1:1" })).toBeNull();
   expect(await connect({ headers: { host: `attacker.example:${port}` }, origin: `http://attacker.example:${port}` })).toBeNull();
+  // Vite's dev server's port is only the app's under pnpm dev.
+  expect(await connect({ headers: { host: "localhost:5173" }, origin: "http://localhost:5173" })).toBeNull();
   // The app's own page, and a client that isn't a browser, are taken.
   (await connect({ origin: `http://127.0.0.1:${port}` }))!.close();
   const client = (await connect({}))!;

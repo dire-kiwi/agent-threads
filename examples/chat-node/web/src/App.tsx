@@ -84,7 +84,7 @@ export function App() {
             {status === "open" ? "Connected" : status === "connecting" ? "Connecting…" : "Reconnecting…"}
           </span>
           {hello?.restart && (
-            <button className="restart" title="Restart the server: with the shim, running turns carry on" disabled={status !== "open"} onClick={() => void conn.call("restart").catch(() => {})}>
+            <button className="restart" title="Restart the server: its runs are under the shim, so running turns carry on" disabled={status !== "open"} onClick={() => void conn.call("restart").catch(() => {})}>
               Restart server
             </button>
           )}
@@ -110,8 +110,15 @@ function ThreadPane({ id, status, generation }: { id: string; status: string; ge
   useEffect(() => {
     if (status !== "open") return;
     let live = true;
+    // Asked again on each connection: an error from the last one (it dropped while the snapshot
+    // was on its way, say) is gone until this one says otherwise.
+    setError(null);
     conn.call<Snapshot>("snapshot", { thread_id: id }).then(
-      (snap) => live && setSnapshot({ snap, generation }),
+      (snap) => {
+        if (!live) return;
+        setError(null);
+        setSnapshot({ snap, generation });
+      },
       (e) => live && setError(String(e.message ?? e)),
     );
     return () => void (live = false);

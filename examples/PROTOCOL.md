@@ -17,8 +17,8 @@ the SDK's: the SDK's part is only what goes inside it, the [protocol](../spec/PR
 **Who may connect.** Listening on 127.0.0.1 isn't enough: any web page the user has open can open
 a WebSocket to it, and that socket could read every thread, send the agent anything and allow its
 own permission requests. So the server refuses the WebSocket upgrade (403) unless its `Host` is
-`localhost`, `127.0.0.1` or `[::1]` with the server's port or Vite's (5173), which a rebound DNS
-name can't be, and its `Origin`, when it has one, is that same host (the app's own page; clients
+`localhost`, `127.0.0.1` or `[::1]` with the server's port (or, in development, Vite's: 5173),
+which a rebound DNS name can't be, and its `Origin`, when it has one, is that same host (the app's own page; clients
 that aren't browsers send none). That's the examples' only check: a real app authenticates its
 users here. It also mustn't let a malformed frame or URL take it down: frames that aren't requests
 are ignored, one the socket can't take (text that isn't UTF-8, one too big) closes that socket
@@ -44,7 +44,7 @@ and gets exactly one reply with that `id`, either a `result` or an `error` (a me
 
 | Method | Params | Result |
 | --- | --- | --- |
-| `hello` | | `{harnesses, restart}`: the harnesses threads can run on, as `[{name, label, model, models}]` (`model` the default, `models` suggestions; the user may type another), and whether `restart` is offered. |
+| `hello` | | `{harnesses, restart}`: the harnesses threads can run on, as `[{name, label, model, models}]` (`model` the default, `models` suggestions; the user may type another), and whether `restart` is offered (chat-node offers it only when its runs are under the shim, which a restart doesn't lose). |
 | `list` | | `Thread[]`, newest first. |
 | `create` | `{harness, model?, title?}` | The new `Thread`, with the server's defaults for what's left out (the harness's model, an effort, the working directory). Its first `thread.updated` is pushed too. |
 | `snapshot` | `{thread_id}` | The thread's `Snapshot` (`sdk.snapshot`). |
