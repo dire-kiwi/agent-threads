@@ -32,7 +32,8 @@ mod thread;
 mod tools;
 
 pub use agent_threads::{
-    AgentThreads, Capabilities, CreateOptions, Error, Options, Recovered, Result, SendOptions, ThreadOptions,
+    AgentThreads, Capabilities, CapabilitiesUpdate, CreateOptions, Error, Options, Recovered, Result, SendOptions,
+    ThreadOptions,
 };
 pub use claude::{ClaudeCodeOptions, claude_code};
 pub use codex::{AppTools, CodexOptions, codex};

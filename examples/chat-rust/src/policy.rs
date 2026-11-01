@@ -96,6 +96,10 @@ mod tests {
             "sed -i 's/a/b/' a.txt",
             "sed -n 1p",
             "cat it's",
+            "sed -n 1p *",
+            "'cat'chsegv",
+            "cat a'b'",
+            "sed -n '1p' -i a.txt",
             "echo hi",
             "",
         ] {

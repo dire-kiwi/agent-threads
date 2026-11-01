@@ -53,7 +53,7 @@ let missed = sdk.events_since(&thread.id, seq, None).await?; // for one catching
 out (an unknown thread, a malformed command, an AgentThreads that's closed) is an `Error::Command`,
 for the app to tell its client; the store failing is an `Error::Store`. `get`, `list`, `delete`,
 `configure` (a thread's own tools, servers, skills and policy, which aren't stored: give them again
-after a restart) and `close` round it off.
+after a restart; a `CapabilitiesUpdate` changes only what it gives) and `close` round it off.
 
 `subscribe()` is a `tokio::sync::broadcast` receiver of every thread's events. One that falls more
 than `Options::event_capacity` (4096) events behind gets `RecvError::Lagged`: it should catch up with

@@ -863,6 +863,8 @@ struct Flaky {
     /// after it happened.
     plan: Mutex<Vec<Result<bool, ()>>>,
     broken: std::sync::atomic::AtomicBool,
+    /// get_run fails.
+    runs_broken: std::sync::atomic::AtomicBool,
 }
 
 #[async_trait]
@@ -915,6 +917,9 @@ impl Store for Flaky {
         self.inner.put_run(r).await
     }
     async fn get_run(&self, id: &str) -> StoreResult<Option<RunRecord>> {
+        if self.runs_broken.load(std::sync::atomic::Ordering::SeqCst) {
+            return Err(StoreError::failed("the database is locked"));
+        }
         self.inner.get_run(id).await
     }
     async fn active_runs(&self) -> StoreResult<Vec<RunRecord>> {
@@ -927,6 +932,7 @@ fn flaky(plan: Vec<Result<bool, ()>>) -> Arc<Flaky> {
         inner: MemoryStore::new(),
         plan: Mutex::new(plan),
         broken: Default::default(),
+        runs_broken: Default::default(),
     })
 }
 
@@ -1127,4 +1133,131 @@ async fn writes_attached_files_where_only_the_user_can_read_them() {
         })
         .unwrap();
     assert_eq!(mode(private), 0o700, "{}", private.display());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn configure_changes_only_what_its_given() {
+    use agent_threads::CapabilitiesUpdate;
+    let lookup = tool("lookup", "Looks up.", json!({"type": "object"}), |_, _| async {
+        "found it"
+    });
+    let env = setup(Setup::default());
+    let own = Capabilities {
+        tools: vec![lookup],
+        ..Default::default()
+    };
+    let t = env
+        .sdk
+        .create(CreateOptions {
+            capabilities: own,
+            ..create()
+        })
+        .await
+        .unwrap();
+    // Only the policy: the thread keeps its tool.
+    let policy = CapabilitiesUpdate {
+        permissions: Some(PermissionPolicy::allow()),
+        ..Default::default()
+    };
+    env.sdk.configure(&t.id, policy).await.unwrap();
+    env.sdk
+        .send(&t.id, "app lookup {}", SendOptions::default())
+        .await
+        .unwrap();
+    assert_eq!(
+        texts(&settle(&env.sdk, &t.id).await).last().unwrap(),
+        "app said found it"
+    );
+
+    // A thread's own deny policy stays when something else changes, though the instance's allows.
+    let deny = CapabilitiesUpdate {
+        permissions: Some(PermissionPolicy::deny()),
+        ..Default::default()
+    };
+    env.sdk.configure(&t.id, deny).await.unwrap();
+    let prompt = CapabilitiesUpdate {
+        system_prompt: Some("Be brief.".into()),
+        tools: Some(vec![]),
+        ..Default::default()
+    };
+    env.sdk.configure(&t.id, prompt).await.unwrap();
+    env.sdk
+        .send(&t.id, "tool Bash {}", SendOptions::default())
+        .await
+        .unwrap();
+    let s = settle(&env.sdk, &t.id).await;
+    assert_eq!(items(&s, "tool_call").last().unwrap()["status"], "denied");
+    // And the tools given (none) replaced the thread's.
+    env.sdk
+        .send(&t.id, "app lookup {}", SendOptions::default())
+        .await
+        .unwrap();
+    assert!(
+        texts(&settle(&env.sdk, &t.id).await)
+            .last()
+            .unwrap()
+            .contains("no tool lookup")
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn refuses_commands_for_a_thread_being_deleted_and_leaves_nothing_behind() {
+    let claude = ClaudeCodeOptions {
+        close_grace: Duration::from_millis(500),
+        ..Default::default()
+    };
+    let env = setup(Setup {
+        claude,
+        ..Default::default()
+    });
+    let t = env.sdk.create(create()).await.unwrap();
+    env.sdk.send(&t.id, "stubborn", SendOptions::default()).await.unwrap();
+    until(5, || async {
+        env.sdk.snapshot(&t.id).await.unwrap().thread.session_id.map(|_| ())
+    })
+    .await;
+    // Claude doesn't stop at its input closing, so deleting takes the close grace.
+    let (sdk, id) = (env.sdk.clone(), t.id.clone());
+    let deleting = tokio::spawn(async move { sdk.delete(&id).await });
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let sent = env.sdk.send(&t.id, "reply resurrected", SendOptions::default()).await;
+    assert!(matches!(sent, Err(Error::Command(_))), "{sent:?}");
+    assert!(matches!(env.sdk.snapshot(&t.id).await, Err(Error::Command(_))));
+    assert!(deleting.await.unwrap().unwrap());
+    assert!(env.sdk.get(&t.id).await.unwrap().is_none());
+    assert!(matches!(env.sdk.snapshot(&t.id).await, Err(Error::Command(_))));
+    assert_eq!(env.runs().len(), 1);
+    env.sdk.close(true).await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_store_that_cant_say_whether_a_thread_has_a_run_loads_nothing() {
+    let store = flaky(Vec::new());
+    // A thread left running under the shim by a backend before this one.
+    let thread = json!({"id": "th_1", "harness": "claude", "status": "running", "permission_mode": "default",
+        "created_at": "2026-11-01T00:00:00Z", "run": {"id": "run_1", "spawner": "shim"}});
+    store.inner.create_thread(&thread).await.unwrap();
+    let events = [
+        json!({"type": "thread.updated", "thread_id": "th_1", "seq": 1, "thread": thread}),
+        json!({"type": "turn.started", "thread_id": "th_1", "seq": 2, "turn_id": "t1"}),
+    ];
+    store.inner.append_events("th_1", &events, &[]).await.unwrap();
+    store.runs_broken.store(true, std::sync::atomic::Ordering::SeqCst);
+    let env = setup(Setup {
+        store: Some(store.clone()),
+        ..Default::default()
+    });
+    let r = env.sdk.snapshot("th_1").await;
+    assert!(matches!(&r, Err(Error::Store(_))), "{:?}", r.err());
+    // Nothing was made of it: its turn isn't ended as lost, and it isn't loaded.
+    assert_eq!(store.inner.last_seq("th_1").await.unwrap(), 2);
+    assert!(matches!(
+        env.sdk.send("th_1", "reply hi", SendOptions::default()).await,
+        Err(Error::Store(_))
+    ));
+    assert_eq!(store.inner.last_seq("th_1").await.unwrap(), 2);
+    // Once it can, the thread loads (its run, which no store has, is lost).
+    store.runs_broken.store(false, std::sync::atomic::Ordering::SeqCst);
+    let s = env.sdk.snapshot("th_1").await.unwrap();
+    assert_eq!(s.thread.status, agent_threads::protocol::ThreadStatus::Error);
 }

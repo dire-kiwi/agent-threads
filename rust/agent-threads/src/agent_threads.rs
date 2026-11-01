@@ -68,6 +68,31 @@ pub struct Capabilities {
     pub system_prompt: Option<String>,
 }
 
+/// Changes to a thread's own capabilities, for [`AgentThreads::configure`]: what's left out (`None`)
+/// stays as it is, and what's given replaces what the thread had (an empty list clears it).
+#[derive(Clone, Default)]
+pub struct CapabilitiesUpdate {
+    pub tools: Option<Vec<Arc<dyn Tool>>>,
+    pub mcp_servers: Option<BTreeMap<String, McpServer>>,
+    pub skills: Option<Vec<Skill>>,
+    pub permissions: Option<PermissionPolicy>,
+    /// `Some("")` clears it.
+    pub system_prompt: Option<String>,
+}
+
+impl From<Capabilities> for CapabilitiesUpdate {
+    /// Every capability given (a policy or prompt left out of `Capabilities` stays as it is).
+    fn from(c: Capabilities) -> Self {
+        CapabilitiesUpdate {
+            tools: Some(c.tools),
+            mcp_servers: Some(c.mcp_servers),
+            skills: Some(c.skills),
+            permissions: c.permissions,
+            system_prompt: c.system_prompt,
+        }
+    }
+}
+
 /// How an [`AgentThreads`] runs.
 #[derive(Clone)]
 pub struct Options {
@@ -195,6 +220,8 @@ struct Inner {
     events: broadcast::Sender<ThreadEvent>,
     threads: Mutex<HashMap<String, Handle>>,
     configs: StdMutex<HashMap<String, Capabilities>>,
+    /// Threads being deleted, which aren't loaded again.
+    deleting: StdMutex<std::collections::HashSet<String>>,
     closed: AtomicBool,
     stopped: Mutex<bool>,
     pruner: StdMutex<Option<JoinHandle<()>>>,
@@ -230,6 +257,7 @@ impl AgentThreads {
                 events,
                 threads: Mutex::new(HashMap::new()),
                 configs: StdMutex::new(HashMap::new()),
+                deleting: StdMutex::new(Default::default()),
                 closed: AtomicBool::new(false),
                 stopped: Mutex::new(false),
                 pruner: StdMutex::new(None),
@@ -300,14 +328,30 @@ impl AgentThreads {
     }
 
     /// Sets a thread's own tools, MCP servers, skills, policy or system prompt, which aren't
-    /// stored: e.g. for a thread created before the app restarted. They apply from its next turn.
-    pub async fn configure(&self, thread_id: &str, capabilities: Capabilities) -> Result<()> {
+    /// stored: e.g. for a thread created before the app restarted. What `update` leaves out stays as
+    /// it is. They apply from its next turn.
+    pub async fn configure(&self, thread_id: &str, update: impl Into<CapabilitiesUpdate>) -> Result<()> {
         self.open()?;
-        self.inner
-            .configs
-            .lock()
-            .unwrap()
-            .insert(thread_id.to_string(), capabilities);
+        let update = update.into();
+        {
+            let mut configs = self.inner.configs.lock().unwrap();
+            let own = configs.entry(thread_id.to_string()).or_default();
+            if let Some(t) = update.tools {
+                own.tools = t;
+            }
+            if let Some(m) = update.mcp_servers {
+                own.mcp_servers = m;
+            }
+            if let Some(s) = update.skills {
+                own.skills = s;
+            }
+            if let Some(p) = update.permissions {
+                own.permissions = Some(p);
+            }
+            if let Some(p) = update.system_prompt {
+                own.system_prompt = Some(p).filter(|p| !p.is_empty());
+            }
+        }
         let handle = self.inner.threads.lock().await.get(thread_id).cloned();
         if let Some(h) = handle {
             let (config, policy) = (self.config(thread_id), self.policy(thread_id));
@@ -360,15 +404,32 @@ impl AgentThreads {
     /// Deletes a thread, stopping its harness first. Whether there was one.
     pub async fn delete(&self, thread_id: &str) -> Result<bool> {
         self.open()?;
-        let handle = self.inner.threads.lock().await.remove(thread_id);
-        if let Some(h) = handle {
-            if let Ok(close) = h.call(|a| a.session.close(&mut a.core)).await {
-                close.await;
+        // Marked as being deleted under the lock loads take, so nothing loads it again meanwhile:
+        // commands for it are refused until it's gone.
+        let handle = {
+            let mut threads = self.inner.threads.lock().await;
+            if !self.inner.deleting.lock().unwrap().insert(thread_id.to_string()) {
+                return Err(Error::Command(format!("thread {thread_id} is being deleted")));
             }
-            let _ = h.call(|a| a.core.dispose()).await;
+            threads.remove(thread_id)
+        };
+        let result = async {
+            if let Some(h) = handle {
+                if let Ok(close) = h.call(|a| a.session.close(&mut a.core)).await {
+                    close.await;
+                }
+                let _ = h.call(|a| a.core.dispose()).await;
+                let task = h.task.lock().unwrap().take();
+                if let Some(task) = task {
+                    let _ = task.await;
+                }
+            }
+            self.inner.configs.lock().unwrap().remove(thread_id);
+            Ok(self.inner.store.delete_thread(thread_id).await?)
         }
-        self.inner.configs.lock().unwrap().remove(thread_id);
-        Ok(self.inner.store.delete_thread(thread_id).await?)
+        .await;
+        self.inner.deleting.lock().unwrap().remove(thread_id);
+        result
     }
 
     /// The thread's state now, including text streamed so far.
@@ -779,6 +840,9 @@ impl AgentThreads {
         if let Some(h) = threads.get(thread_id) {
             return Ok(h.clone());
         }
+        if self.inner.deleting.lock().unwrap().contains(thread_id) {
+            return Err(Error::Command(format!("thread {thread_id} is being deleted")));
+        }
         let h = self.load_from_store(thread_id).await?;
         threads.insert(thread_id.to_string(), h.clone());
         Ok(h)
@@ -807,7 +871,7 @@ impl AgentThreads {
             state = initial_state(thread);
         }
         let (handle, mut actor, rx) = self.actor(state)?;
-        if !self.reattach(&mut actor).await {
+        if !self.reattach(&mut actor).await? {
             // The process that ran its turn went with the backend before this one, or can't be
             // followed.
             let t = actor.core.thread();
@@ -824,20 +888,19 @@ impl AgentThreads {
     /// before: its turn and open requests are as they were when the run was last saved, and the
     /// session carries on reading the run from there. Whether it did; if it couldn't, the run is
     /// stopped.
-    async fn reattach(&self, actor: &mut Actor) -> bool {
+    async fn reattach(&self, actor: &mut Actor) -> Result<bool> {
         let Some(run) = actor.core.thread().run.clone() else {
-            return false;
+            return Ok(false);
         };
         if run.spawner.to_string() == "direct" {
-            return false;
+            return Ok(false);
         }
         let record = match self.inner.store.get_run(&run.id).await {
             Ok(Some(r)) if r.ended_at.is_none() => r,
-            Ok(_) => return false,
-            Err(e) => {
-                (self.inner.on_error)(Error::Store(e));
-                return false;
-            }
+            Ok(_) => return Ok(false),
+            // Whether it has a run to carry on with can't be told: nothing is made of the
+            // thread (no turn ended as lost), and the error is the caller's.
+            Err(e) => return Err(Error::Store(e)),
         };
         let saved_turn: Option<Turn> = record
             .data
@@ -865,7 +928,7 @@ impl AgentThreads {
         if !ok {
             actor.core.turn = None;
             self.abandon(record).await;
-            return false;
+            return Ok(false);
         }
         let c = &mut actor.core;
         // Requests the session didn't take up again can't be answered.
@@ -896,7 +959,7 @@ impl AgentThreads {
                 "text": "The backend restarted while this turn was running, and picked it up again.",
             }));
         }
-        true
+        Ok(true)
     }
 }
 

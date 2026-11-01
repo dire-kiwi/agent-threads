@@ -832,8 +832,10 @@ fn pid_alive(pid: i32) -> bool {
 
 /// A run that ignores an interrupt is still stopped when the backend dies right after sending it:
 /// the interrupt is saved before it's sent.
-async fn stops_a_run_that_ignores_an_interrupt(harness: &str, interrupt: &str) {
-    let s = mini_scene(&[("STOP_GRACE_MS", "1000"), ("CLOSE_GRACE_MS", "500")]);
+async fn stops_a_run_that_ignores_an_interrupt(harness: &str, interrupt: &str, shut_down: bool) {
+    // Shutting down waits on a save or two (SAVE_DELAY_MS), which must end within the grace.
+    let grace = if shut_down { "4000" } else { "1000" };
+    let s = mini_scene(&[("STOP_GRACE_MS", grace), ("CLOSE_GRACE_MS", "500")]);
     // Saving takes a while, so the backend is killed after the interrupt is sent, and before any
     // save that comes after it would be done.
     let mut a = s.start_with(&[("SAVE_DELAY_MS", "500")]);
@@ -859,7 +861,13 @@ async fn stops_a_run_that_ignores_an_interrupt(harness: &str, interrupt: &str) {
         .await;
     let input = run_dir.join("input.jsonl");
     until(|| std::fs::read_to_string(&input).unwrap_or_default().contains(interrupt)).await;
-    a.crash().await;
+    if shut_down {
+        // Shut down before the interrupt's grace is over: the stop it's due is saved with the run.
+        a.call("close", json!({"stop": false})).await;
+        a.exited().await;
+    } else {
+        a.crash().await;
+    }
     let pid: i32 = std::fs::read_to_string(&pid_file).unwrap().trim().parse().unwrap();
     assert!(pid_alive(pid));
 
@@ -884,13 +892,25 @@ async fn stops_a_run_that_ignores_an_interrupt(harness: &str, interrupt: &str) {
 #[tokio::test(flavor = "multi_thread")]
 async fn claude_stops_a_run_that_ignores_an_interrupt_when_the_backend_dies_right_after_it() {
     let _one = serial().await;
-    stops_a_run_that_ignores_an_interrupt("claude", r#""subtype":"interrupt""#).await;
+    stops_a_run_that_ignores_an_interrupt("claude", r#""subtype":"interrupt""#, false).await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn claude_stops_a_run_that_ignores_an_interrupt_after_the_backend_shuts_down_during_its_grace() {
+    let _one = serial().await;
+    stops_a_run_that_ignores_an_interrupt("claude", r#""subtype":"interrupt""#, true).await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn codex_stops_a_run_that_ignores_an_interrupt_after_the_backend_shuts_down_during_its_grace() {
+    let _one = serial().await;
+    stops_a_run_that_ignores_an_interrupt("codex", r#""method":"turn/interrupt""#, true).await;
 }
 
 #[tokio::test(flavor = "multi_thread")]
 async fn codex_stops_a_run_that_ignores_an_interrupt_when_the_backend_dies_right_after_it() {
     let _one = serial().await;
-    stops_a_run_that_ignores_an_interrupt("codex", r#""method":"turn/interrupt""#).await;
+    stops_a_run_that_ignores_an_interrupt("codex", r#""method":"turn/interrupt""#, false).await;
 }
 
 /// What the user answered just before the backend died isn't asked again (whether or not the
