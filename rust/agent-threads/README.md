@@ -16,7 +16,7 @@ WebSocket.
 
 Nothing is published yet: depend on it with `agent-threads = { git =
 "https://github.com/dire-kiwi/agent-threads", branch = "main" }`, or a `path` into a checkout
-([how](../../README.md#rust)).
+([how](../../README.md#rust-crate)).
 
 ```rust
 use std::sync::Arc;
@@ -90,8 +90,8 @@ backends.
 `tool(name, description, schema, |args, ctx| async move { … })` makes an app tool from a closure
 returning text, a `ToolOutput` (with `is_error` or `structured` output, which goes in the call's
 `result.structured`), or a `Result` of either; or implement the `Tool` trait. `ctx` has the thread's
-id and metadata, the tool call's id, and `cancelled`, which resolves if the harness process goes
-away first. A tool that panics returns its panic to the agent as an error.
+id and metadata, the tool call's id, and `cancelled`, a `Cancellation` whose `cancelled().await`
+resolves if the harness process goes away first (`is_cancelled()` asks without waiting). A tool that panics returns its panic to the agent as an error.
 
 `PermissionPolicy` is `allow()`, `ask()` (the default), `deny()`, `from_fn` (decided at once) or
 `from_async` (one that looks something up). A `PermissionQuery` has the tool's name, kind, input,

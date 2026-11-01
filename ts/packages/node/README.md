@@ -7,7 +7,7 @@ wire `subscribe()` and `handle()` to your own transport (a WebSocket, SSE, IPC..
 is a whole app on this package and the React one.
 
 It needs Node 24+. Nothing is published yet: build it from a checkout and link it into your app
-([how](../../../README.md#typescript)).
+([how](../../../README.md#typescript-packages)).
 
 ```ts
 import { AgentThreads, FileStore, claudeCode, codex, defineTool } from "@dire-kiwi/agent-threads-node";
@@ -29,8 +29,9 @@ const sdk = new AgentThreads({
 });
 
 const thread = await sdk.create({ model: "sonnet", cwd: "/srv/work", metadata: { user: "u1" } });
-const off = sdk.subscribe((event) => ws.broadcast(event)); // every thread's events, deltas included
-ws.on("message", (cmd) => sdk.handle(JSON.parse(cmd))); // send / interrupt / respond / set_options
+// broadcast and onCommandFromClient are the app's transport: docs/transport.md has real ones.
+const off = sdk.subscribe((event) => broadcast(event)); // every thread's events, deltas included
+onCommandFromClient((command) => sdk.handle(command)); // send / interrupt / respond / set_options
 await sdk.snapshot(thread.id); // for a client that just connected
 await sdk.eventsSince(thread.id, seq); // for one catching up
 await sdk.close(); // on shutdown: stops the harness processes (or with the shim, leaves them going) and saves everything

@@ -29,12 +29,13 @@ or when the harness can't outlive the backend anyway:
 ## Getting the binary
 
 `agent-threads-shim` is a small Rust binary in [shim/](../shim/README.md), with no dependency but
-libc. Build it from the repository, or install it from git:
+libc. Build it from the repository, or install it from git (the repository is private, so Cargo
+fetches it with git's own credentials):
 
 ```sh
 make shim                                   # shim/target/debug/agent-threads-shim
 (cd shim && cargo build --release)          # shim/target/release/agent-threads-shim
-cargo install --git https://github.com/dire-kiwi/agent-threads agent-threads-shim   # into ~/.cargo/bin
+CARGO_NET_GIT_FETCH_WITH_CLI=true cargo install --git https://github.com/dire-kiwi/agent-threads agent-threads-shim   # into ~/.cargo/bin
 ```
 
 Ship it with the app and give the backend its path. Running shims aren't upgraded when the app is:
@@ -48,8 +49,10 @@ before taking commands:
 
 ```ts
 // Node
+import { mkdirSync } from "node:fs";
 import { AgentThreads, SqliteStore, shim } from "@dire-kiwi/agent-threads-node";
 
+mkdirSync("data", { recursive: true }); // SQLite makes the file, not the directory
 const sdk = new AgentThreads({
   store: new SqliteStore("data/threads.db"),
   spawner: shim("/usr/local/lib/myapp/agent-threads-shim", { runsDir: "data/runs" }),
@@ -61,8 +64,15 @@ await sdk.close(); // on shutdown: leaves the runs going, for the next start
 
 ```go
 // Go
+if err := os.MkdirAll("data", 0o755); err != nil { // SQLite makes the file, not the directory
+	return err
+}
+store, err := sqlitestore.Open("data/threads.db") // or agentthreads.NewFileStore("data/threads")
+if err != nil {
+	return err
+}
 sdk := agentthreads.New(agentthreads.Options{
-	Store:   store, // sqlitestore.Open("data/threads.db"), or NewFileStore
+	Store:   store,
 	Spawner: agentthreads.Shim("/usr/local/lib/myapp/agent-threads-shim", agentthreads.ShimOptions{RunsDir: "data/runs"}),
 })
 recovered, err := sdk.Recover(ctx)
@@ -72,6 +82,7 @@ err = sdk.Close(ctx) // leaves the runs going; sdk.Stop(ctx) stops them
 
 ```rust
 // Rust
+std::fs::create_dir_all("data")?; // SQLite makes the file, not the directory
 let sdk = AgentThreads::new(Options {
     store: Some(Arc::new(SqliteStore::open("data/threads.db")?)),
     spawner: Some(shim("/usr/local/lib/myapp/agent-threads-shim", ShimOptions::new("data/runs"))),
@@ -87,7 +98,8 @@ sdk.close(false).await?; // leaves the runs going; close(true) stops them
   restarted backend read on from exactly there.
 - **`runsDir` must last too, and be the store's alone**: the backend prunes it, stopping and
   removing runs its store doesn't follow, so two stores sharing one would stop each other's runs.
-  There's no default. A relative path is the backend's working directory's.
+  There's no default. A relative path is the backend's working directory's. The spawner creates
+  it, as the file stores do their directory; a SQLite store's directory must exist already.
 - **`close()` leaves the runs going** (Node `close()`, Go `Close`, Rust `close(false)`): that's
   the point. To stop them too, when the app is really going away (it's uninstalled, the user signs
   out), use `close({ stop: true })`, `Stop` or `close(true)`.
@@ -108,9 +120,10 @@ sdk.close(false).await?; // leaves the runs going; close(true) stops them
 - A run it **can't follow** (a newer run-directory format, or one still starting when the backend
   went) is stopped, and its turn ends with a `run.lost` notice.
 
-It returns the threads it re-attached to and those it lost. Each re-attached thread gets a
-`notice` with code `run.reattached` (the React package shows it) and its `run.reattached_at` is
-set. A thread that a command loads before `recover()` gets to it is re-attached then, but call
+It returns the threads it re-attached to and those it lost. Each re-attached thread's
+`run.reattached_at` is set, and one whose turn was running gets a `notice` with code
+`run.reattached` too (the React package shows it); an idle one, whose process was only waiting for
+its next message, gets no notice. A thread that a command loads before `recover()` gets to it is re-attached then, but call
 `recover()` first: it's also what starts pruning (now, and every hour), which stops runs no thread
 follows any more and removes old run directories.
 

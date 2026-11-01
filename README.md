@@ -193,15 +193,20 @@ transports, end to end.
 ## Using it from this repository
 
 Nothing is published yet: apps use the packages from this repository until the API settles. The
-repository is private, so each tool fetching it needs your GitHub credentials (a git credential
-helper, or SSH).
+repository is private, so each tool fetching it needs your GitHub credentials: a git credential
+helper for `https://github.com` (what `gh auth setup-git` sets up), or SSH with git told to fetch
+GitHub's https URLs over it, which `go get` needs since it asks for the https URL:
 
-### TypeScript
+```sh
+git config --global url."git@github.com:".insteadOf "https://github.com/"
+```
+
+### TypeScript packages
 
 The packages are built to `dist/` (their `exports` point there), which isn't committed, and they
 depend on each other with pnpm's `workspace:*`. So use them from a checkout, **built**: clone the
 repository (or add it as a git submodule) and run `pnpm install && pnpm build` in its `ts/`
-directory, then link the packages into your app:
+directory, then link the packages into your app with pnpm:
 
 ```sh
 git clone https://github.com/dire-kiwi/agent-threads ../agent-threads
@@ -212,20 +217,51 @@ git clone https://github.com/dire-kiwi/agent-threads ../agent-threads
 {
   "dependencies": {
     "@dire-kiwi/agent-threads-node": "link:../agent-threads/ts/packages/node",
-    "@dire-kiwi/agent-threads-react": "link:../agent-threads/ts/packages/react"
+    "@dire-kiwi/agent-threads-react": "link:../agent-threads/ts/packages/react",
+    "react": "^19.0.0",
+    "react-dom": "^19.0.0"
   }
 }
 ```
 
-Run `pnpm build` in `ts/` again after pulling. (npm and yarn take `file:../agent-threads/ts/packages/node`
-the same way.) An app inside this repository, like the examples, is in the `ts/` pnpm workspace
-(`ts/pnpm-workspace.yaml`) and uses `workspace:*`; it still needs `pnpm build` first.
+Run `pnpm build` in `ts/` again after pulling. (`file:` doesn't work: pnpm then installs the
+package's own dependencies, and can't resolve `workspace:*` outside the workspace.) An app inside
+this repository, like the examples, is in the `ts/` pnpm workspace (`ts/pnpm-workspace.yaml`) and
+uses `workspace:*`; it still needs `pnpm build` first.
+
+**One React.** A linked package is resolved where it really is, in the checkout, which has React of
+its own (for its tests and stories). So a bundler finds the checkout's React for the React package
+and the app's for the app, and with two Reacts the components fail with "Invalid hook call" (or
+"Cannot read properties of null (reading 'useContext')"). Tell the bundler to use the app's:
+
+```js
+// vite.config.js
+export default defineConfig({
+  plugins: [react()],
+  resolve: { dedupe: ["react", "react-dom"] },
+});
+```
+
+```js
+// webpack.config.js
+const path = require("node:path");
+module.exports = {
+  resolve: {
+    alias: {
+      react: path.resolve(__dirname, "node_modules/react"),
+      "react-dom": path.resolve(__dirname, "node_modules/react-dom"),
+    },
+  },
+};
+```
+
+(Vitest takes the same `resolve.dedupe`.) The Node package has no such problem.
 
 There's no source export condition: the packages' sources import each other's `.js` files, which
 Node runs only once built. The Node backend needs Node 24+ (for `node:sqlite`, which `SqliteStore`
 uses), and the React package React 18+.
 
-### Go
+### Go module
 
 The module is in the repository's `go/` directory, so its path is
 `github.com/dire-kiwi/agent-threads/go`. Without tags, `go get` takes a commit as a pseudo-version:
@@ -245,7 +281,7 @@ replace github.com/dire-kiwi/agent-threads/go => ../agent-threads/go
 
 It needs Go 1.26+, and no cgo (SQLite is modernc.org/sqlite).
 
-### Rust
+### Rust crate
 
 Cargo finds the `agent-threads` crate in the repository's `rust/` workspace by its name:
 
@@ -254,19 +290,23 @@ Cargo finds the `agent-threads` crate in the repository's `rust/` workspace by i
 agent-threads = { git = "https://github.com/dire-kiwi/agent-threads", branch = "main" } # or rev = "<commit>"
 # or, from a checkout, as examples/chat-rust does:
 # agent-threads = { path = "../agent-threads/rust/agent-threads" }
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+serde_json = "1"
+async-trait = "0.1" # only to implement the Tool trait yourself
 ```
 
-For a private repository, let Cargo fetch with git's own credentials: `CARGO_NET_GIT_FETCH_WITH_CLI=true`
-(or `net.git-fetch-with-cli = true` in `.cargo/config.toml`). The crate is async on tokio, and bundles
-SQLite (rusqlite's `bundled`).
+The crate is async on tokio, so the app needs tokio's runtime, and `serde_json` for the JSON it takes
+and gives (tool schemas and arguments, commands). For a private repository, let Cargo fetch with
+git's own credentials: `CARGO_NET_GIT_FETCH_WITH_CLI=true` (or `net.git-fetch-with-cli = true` in
+`.cargo/config.toml`). It bundles SQLite (rusqlite's `bundled`).
 
-### The shim
+### Shim binary
 
 ```sh
 CARGO_NET_GIT_FETCH_WITH_CLI=true cargo install --git https://github.com/dire-kiwi/agent-threads agent-threads-shim
 ```
 
-or `make shim` in a checkout. See [docs/shim.md](docs/shim.md).
+or `make shim` in a checkout (`shim/target/debug/agent-threads-shim`). See [docs/shim.md](docs/shim.md).
 
 ## Building and testing
 

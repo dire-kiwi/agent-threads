@@ -5,8 +5,9 @@ actions back as commands. There's no network layer: the app brings the events ov
 transport and carries the commands back ([docs/transport.md](../../../docs/transport.md) has
 WebSocket, SSE, Electron and Tauri versions; [spec/PROTOCOL.md](../../../spec/PROTOCOL.md) the
 events and commands). It works with any of the backends (Node, Go, Rust), and needs React 18+.
-Nothing is published yet: build it from a checkout and link it into your app
-([how](../../../README.md#typescript)).
+Nothing is published yet: build it from a checkout and link it into your app, telling the bundler
+to use the app's one React (Vite's `resolve.dedupe: ["react", "react-dom"]`), as
+[the root README](../../../README.md#typescript-packages) says.
 
 ## Use it
 
@@ -14,14 +15,15 @@ Nothing is published yet: build it from a checkout and link it into your app
 import { Thread, type ThreadSource } from "@dire-kiwi/agent-threads-react";
 import "@dire-kiwi/agent-threads-react/styles.css";
 
-// Wired to the app's transport: a snapshot from the backend, its events, and catching up after a gap.
+// Wired to the app's own transport (onThreadEvent, fetchEventsSince and sendCommand are the app's:
+// docs/transport.md has them over WebSocket, SSE, Electron and Tauri).
 const source: ThreadSource = {
-  snapshot,                                   // sdk.snapshot(threadId), sent to the client
-  subscribe: (fn) => ws.on("event", fn),      // returns how to stop
-  resync: (seq) => api.eventsAfter(threadId, seq), // or a fresh snapshot
+  snapshot,                                         // sdk.snapshot(threadId), sent to the client
+  subscribe: (fn) => onThreadEvent(threadId, fn),   // returns how to stop
+  resync: (seq) => fetchEventsSince(threadId, seq), // sdk.eventsSince(threadId, seq), or a fresh snapshot
 };
 
-<Thread source={source} onCommand={(command) => ws.send(command)} />;
+<Thread source={source} onCommand={(command) => sendCommand(command)} />;
 ```
 
 A `ThreadSource` is the thread's `snapshot` (from the backend's `snapshot(threadId)`), a

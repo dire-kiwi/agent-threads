@@ -26,7 +26,7 @@ after a restart.
 ```sh
 cargo build --release   # target/release/agent-threads-shim
 cargo test              # runs the shim on sh scripts
-make shim               # from the repository's root: target/debug/agent-threads-shim, which the backends' tests use
+make shim               # from the repository's root: shim/target/debug/agent-threads-shim, which the backends' tests use
 CARGO_NET_GIT_FETCH_WITH_CLI=true cargo install --git https://github.com/dire-kiwi/agent-threads agent-threads-shim
 ```
 

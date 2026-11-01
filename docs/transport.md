@@ -84,9 +84,10 @@ client that can send commands to a thread can let its agent act. A local app lis
 make, which are the least a real app does).
 
 **Don't block the subscriber.** Node calls subscribers synchronously, as events happen, on the
-event loop everything else runs on. Go calls `Subscribe`'s function on one goroutine of the SDK's
-own, one event at a time, and `Events(ctx)` waits for its reader: a subscriber that blocks holds up
-every subscriber's events (they queue up in memory meanwhile), though not the threads. Rust's `subscribe()` is a broadcast channel holding `Options::event_capacity` (4096)
+event loop everything else runs on. Go calls `Subscribe`'s functions on one goroutine of the SDK's
+own, one event at a time: a function that blocks holds up every subscriber's events (they queue up
+in memory meanwhile), though not the threads. Each `Events(ctx)` channel has a queue of its own, so
+a slow reader only grows that one. Rust's `subscribe()` is a broadcast channel holding `Options::event_capacity` (4096)
 events: a receiver that falls further behind gets `RecvError::Lagged`, misses some, and should carry
 on, since its clients will see the gap and resync. In each case, hand events to a per-client queue
 or write and move on.
@@ -143,7 +144,8 @@ sdk.subscribe((event) => {
 });
 
 // Requests in: {id, method, params}, each answered with {id, result} or {id, error}.
-const methods: { [name: string]: (p: any) => unknown } = {
+type Request = { id: number | string; method: string; params?: { [k: string]: any } };
+const methods: { [name: string]: (p: { [k: string]: any }) => unknown } = {
   list: () => sdk.list(),
   create: (p) => sdk.create({ harness: p.harness, model: p.model }),
   snapshot: (p) => sdk.snapshot(p.thread_id),
@@ -151,25 +153,40 @@ const methods: { [name: string]: (p: any) => unknown } = {
   command: async (p) => void (await sdk.handle(p.command)),
 };
 
+/** Whether a frame is a request. Anything else (`null`, an array, a number) is ignored. */
+function isRequest(r: unknown): r is Request {
+  if (typeof r !== "object" || r === null || Array.isArray(r)) return false;
+  const { id, method, params } = r as Request;
+  return (typeof id === "number" || typeof id === "string") && typeof method === "string" && (params === undefined || (typeof params === "object" && params !== null));
+}
+
 wss.on("connection", (ws) => {
-  ws.on("error", () => ws.terminate());
+  ws.on("error", () => ws.terminate()); // a frame the socket can't take ends this socket only
   clients.add(ws);
   ws.on("close", () => clients.delete(ws));
   ws.on("message", async (data) => {
-    let req;
+    // Nothing a client sends may throw out of here: an unhandled rejection would stop the server,
+    // and every thread with it.
     try {
-      req = JSON.parse(String(data));
-    } catch {
-      return;
-    }
-    const reply = (msg: object) => ws.readyState === ws.OPEN && ws.send(JSON.stringify({ id: req.id, ...msg }));
-    const method = Object.hasOwn(methods, req.method) ? methods[req.method] : undefined;
-    if (!method) return reply({ error: `there's no method ${req.method}` });
-    try {
-      reply({ result: (await method(req.params ?? {})) ?? null });
+      let req: unknown;
+      try {
+        req = JSON.parse(String(data));
+      } catch {
+        return;
+      }
+      if (!isRequest(req)) return;
+      const { id, method: name, params = {} } = req;
+      const reply = (msg: object) => ws.readyState === ws.OPEN && ws.send(JSON.stringify({ id, ...msg }));
+      const method = Object.hasOwn(methods, name) ? methods[name] : undefined;
+      if (!method) return reply({ error: `there's no method ${JSON.stringify(name)}` });
+      try {
+        reply({ result: (await method(params)) ?? null });
+      } catch (e) {
+        if (!(e instanceof CommandError)) console.error(e); // a CommandError is the client's mistake
+        reply({ error: e instanceof Error ? e.message : String(e) });
+      }
     } catch (e) {
-      if (!(e instanceof CommandError)) console.error(e); // a CommandError is the client's mistake
-      reply({ error: e instanceof Error ? e.message : String(e) });
+      console.error(e);
     }
   });
 });
@@ -326,16 +343,30 @@ app.whenReady().then(() => {
 });
 
 // Save everything (and stop the harnesses) before quitting.
+let quitting: Promise<void> | undefined;
 let closed = false;
 app.on("before-quit", (e) => {
   if (closed) return;
   e.preventDefault();
-  sdk.close().finally(async () => {
-    await sdk.store.close?.();
-    closed = true;
-    app.quit();
-  });
+  quitting ??= closeAndQuit();
 });
+
+async function closeAndQuit() {
+  // close() rejects while the store is failing; it keeps the events, and calling it again retries.
+  for (let attempt = 1; ; attempt++) {
+    try {
+      await sdk.close();
+      break;
+    } catch (e) {
+      console.error(`couldn't save the threads (attempt ${attempt}):`, e);
+      if (attempt === 3) break; // give up: what isn't saved yet is lost
+      await new Promise((r) => setTimeout(r, 1000));
+    }
+  }
+  await sdk.store.close?.().catch((e: unknown) => console.error(e));
+  closed = true;
+  app.quit();
+}
 ```
 
 ```ts
@@ -403,9 +434,11 @@ async fn at_command(sdk: State<'_, AgentThreads>, command: serde_json::Value) ->
 pub fn run() {
     tauri::Builder::default()
         .setup(|app| {
-            let db = app.path().app_data_dir()?.join("threads.db");
+            // app_data_dir() is only a path: on the first launch, it doesn't exist yet.
+            let dir = app.path().app_data_dir()?;
+            std::fs::create_dir_all(&dir)?;
             let sdk = AgentThreads::new(Options {
-                store: Some(Arc::new(SqliteStore::open(db)?)),
+                store: Some(Arc::new(SqliteStore::open(dir.join("threads.db"))?)),
                 ..Default::default()
             });
             // Events out: every thread's, to the webview.

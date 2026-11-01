@@ -23,8 +23,13 @@ and its own permission policy if it has one, or else the instance's (which asks,
 
 A thread's own capabilities are code, so they **aren't stored**: after the app restarts, give them
 again with `configure` before the thread's next turn (its items, session and options come back by
-themselves). They apply from the thread's next turn: a running turn keeps what it started with.
-`configure` changes only what it's given (in Node, the fields it has; in Go, those that aren't nil, or for the system prompt empty; in Rust, those that are `Some`).
+themselves). The policy and the tools' code change at once, even for a running turn: its next
+permission decision is the new policy's, and a call to an app tool runs the tool as it is now (or
+fails, for one that's gone). What the harness is told when its process starts (which tools there
+are, the MCP servers, the skills, the system prompt) changes from the thread's next turn, which
+starts a new process. `configure` changes only what it's given: in Node, the fields it has; in Go,
+those that aren't nil, and the system prompt only when it isn't empty (so it can't be cleared); in
+Rust, those that are `Some` (`Some("")` clears the system prompt).
 
 ## App tools
 
@@ -92,8 +97,9 @@ let lookup_order = tool(
 ```
 
 The closure returns anything that's `Into<ToolOutput>`: a `String` or `&str`, a `ToolOutput`, or a
-`Result` of either. Or implement the `Tool` trait (`async_trait`). `ctx.cancelled` resolves if the
-harness process goes away first.
+`Result` of either. Or implement the `Tool` trait (`async_trait`). `ctx.cancelled` is a `Cancellation`:
+`ctx.cancelled.cancelled().await` resolves if the harness process goes away first (to
+`tokio::select!` on), and `ctx.cancelled.is_cancelled()` says whether it has.
 
 **Per-user tools.** Tools get the thread's `metadata`, so one set of tools can serve every user,
 each thread seeing only its own user's data (`create({ metadata: { user } })`). Or give a thread
