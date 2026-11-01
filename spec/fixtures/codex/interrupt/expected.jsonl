@@ -4,13 +4,13 @@
 {"type":"thread.updated","thread_id":"{{thread}}","seq":4,"thread":{"id":"{{thread}}","harness":"codex","status":"running","model":"gpt-5.6-luna","effort":"low","permission_mode":"default","cwd":"{{cwd}}","created_at":"2026-11-01T00:00:00Z"}}
 {"type":"thread.updated","thread_id":"{{thread}}","seq":5,"thread":{"id":"{{thread}}","harness":"codex","status":"running","model":"gpt-5.6-luna","effort":"low","permission_mode":"default","cwd":"{{cwd}}","created_at":"2026-11-01T00:00:00Z","session_id":"01a19254-5381-78c0-a6e7-c572cd7cd8b9"}}
 {"type":"item.added","thread_id":"{{thread}}","seq":6,"item":{"id":"msg_049c5c70e3c2af71016ae5f8edea4c8191a80be175e3736a0a","type":"assistant_message","text":"","turn_id":"{{t1}}"}}
-{"type":"delta","thread_id":"{{thread}}","seq":6,"item_id":"msg_049c5c70e3c2af71016ae5f8edea4c8191a80be175e3736a0a","kind":"text","text":"I"}
-{"type":"delta","thread_id":"{{thread}}","seq":6,"item_id":"msg_049c5c70e3c2af71016ae5f8edea4c8191a80be175e3736a0a","kind":"text","text":"’m"}
-{"type":"delta","thread_id":"{{thread}}","seq":6,"item_id":"msg_049c5c70e3c2af71016ae5f8edea4c8191a80be175e3736a0a","kind":"text","text":" running"}
-{"type":"delta","thread_id":"{{thread}}","seq":6,"item_id":"msg_049c5c70e3c2af71016ae5f8edea4c8191a80be175e3736a0a","kind":"text","text":" the"}
-{"type":"delta","thread_id":"{{thread}}","seq":6,"item_id":"msg_049c5c70e3c2af71016ae5f8edea4c8191a80be175e3736a0a","kind":"text","text":" command"}
-{"type":"delta","thread_id":"{{thread}}","seq":6,"item_id":"msg_049c5c70e3c2af71016ae5f8edea4c8191a80be175e3736a0a","kind":"text","text":" now"}
-{"type":"delta","thread_id":"{{thread}}","seq":6,"item_id":"msg_049c5c70e3c2af71016ae5f8edea4c8191a80be175e3736a0a","kind":"text","text":"."}
+{"type":"delta","thread_id":"{{thread}}","seq":6,"item_id":"msg_049c5c70e3c2af71016ae5f8edea4c8191a80be175e3736a0a","kind":"text","offset":0,"text":"I"}
+{"type":"delta","thread_id":"{{thread}}","seq":6,"item_id":"msg_049c5c70e3c2af71016ae5f8edea4c8191a80be175e3736a0a","kind":"text","offset":1,"text":"’m"}
+{"type":"delta","thread_id":"{{thread}}","seq":6,"item_id":"msg_049c5c70e3c2af71016ae5f8edea4c8191a80be175e3736a0a","kind":"text","offset":3,"text":" running"}
+{"type":"delta","thread_id":"{{thread}}","seq":6,"item_id":"msg_049c5c70e3c2af71016ae5f8edea4c8191a80be175e3736a0a","kind":"text","offset":11,"text":" the"}
+{"type":"delta","thread_id":"{{thread}}","seq":6,"item_id":"msg_049c5c70e3c2af71016ae5f8edea4c8191a80be175e3736a0a","kind":"text","offset":15,"text":" command"}
+{"type":"delta","thread_id":"{{thread}}","seq":6,"item_id":"msg_049c5c70e3c2af71016ae5f8edea4c8191a80be175e3736a0a","kind":"text","offset":23,"text":" now"}
+{"type":"delta","thread_id":"{{thread}}","seq":6,"item_id":"msg_049c5c70e3c2af71016ae5f8edea4c8191a80be175e3736a0a","kind":"text","offset":27,"text":"."}
 {"type":"item.updated","thread_id":"{{thread}}","seq":7,"item_id":"msg_049c5c70e3c2af71016ae5f8edea4c8191a80be175e3736a0a","patch":{"text":"I’m running the command now."}}
 {"type":"item.added","thread_id":"{{thread}}","seq":8,"item":{"id":"exec-65d8e05a-a7e9-4c8d-a128-5af26f131642","type":"tool_call","name":"commandExecution","kind":"shell","input":{"command":"/usr/bin/bash -lc 'sleep 30 && echo finished'","cwd":"/work"},"command":"sleep 30 && echo finished","status":"running","turn_id":"{{t1}}"}}
 {"type":"item.updated","thread_id":"{{thread}}","seq":9,"item_id":"exec-65d8e05a-a7e9-4c8d-a128-5af26f131642","patch":{"status":"cancelled"}}

@@ -773,11 +773,22 @@ export function draft(dir) {
   if (meta.harness === "claude") draftClaude(d, runs);
   else draftCodex(d, runs);
   d.finish();
-  // Number the saved events; a delta carries the seq of the last saved event before it.
+  // Number the saved events; a delta carries the seq of the last saved event before it, and the
+  // length of its item's text before it.
   let seq = 0;
+  const texts = new Map(); // item id -> its text so far
   const events = d.events.map((e) => {
     if (e.type !== "delta") seq++;
-    return { type: e.type, thread_id: e.thread_id, seq, ...Object.fromEntries(Object.entries(e).filter(([k]) => k !== "type" && k !== "thread_id")) };
+    let { type, thread_id, ...rest } = e;
+    if (type === "item.added" && typeof e.item.text === "string") texts.set(e.item.id, e.item.text);
+    if (type === "item.updated" && typeof e.patch.text === "string") texts.set(e.item_id, e.patch.text);
+    if (type === "delta") {
+      const offset = texts.get(e.item_id)?.length ?? 0;
+      texts.set(e.item_id, (texts.get(e.item_id) ?? "") + e.text);
+      const { item_id, kind, text, ...more } = rest;
+      rest = { item_id, kind, offset, text, ...more };
+    }
+    return { type, thread_id, seq, ...rest };
   });
   return { meta, fixture, events, steps: d.steps };
 }

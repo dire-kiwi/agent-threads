@@ -59,7 +59,8 @@ function cleanPatch(patch, itemSchema) {
 
 /**
  * A stream of events as compared: cleaned, with thread.run left out, a thread.updated that
- * changes nothing (once cleaned) dropped, and runs of deltas to the same item joined.
+ * changes nothing (once cleaned) dropped, and runs of deltas to the same item joined (with the
+ * first one's offset).
  */
 export function normalize(events) {
   const out = [];
@@ -111,6 +112,20 @@ export function checkSeq(events) {
   return null;
 }
 
+/** The first delta whose offset isn't the length of its item's text before it. */
+export function checkOffsets(events) {
+  const texts = new Map(); // item id -> its text so far
+  for (const [i, e] of events.entries()) {
+    if (e.type === "item.added" && typeof e.item.text === "string") texts.set(e.item.id, e.item.text);
+    if (e.type === "item.updated" && typeof e.patch.text === "string") texts.set(e.item_id, e.patch.text);
+    if (e.type !== "delta") continue;
+    const text = texts.get(e.item_id) ?? "";
+    if (e.offset !== text.length) return `event ${i + 1} (a delta) has offset ${e.offset}, not ${text.length}, the length of its item's text before it`;
+    texts.set(e.item_id, text + e.text);
+  }
+  return null;
+}
+
 const PLACEHOLDER = /^\{\{([a-z0-9_]+)\}\}$/;
 
 /**
@@ -122,6 +137,8 @@ export function compare(expectedEvents, actualEvents) {
   if (invalid) return { ok: false, error: invalid };
   const seqProblem = checkSeq(actualEvents);
   if (seqProblem) return { ok: false, error: seqProblem };
+  const offsetProblem = checkOffsets(actualEvents);
+  if (offsetProblem) return { ok: false, error: offsetProblem };
   const want = normalize(expectedEvents);
   const got = normalize(actualEvents);
   const bindings = {};

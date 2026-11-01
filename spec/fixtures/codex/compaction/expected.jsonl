@@ -4,7 +4,7 @@
 {"type":"thread.updated","thread_id":"{{thread}}","seq":4,"thread":{"id":"{{thread}}","harness":"codex","status":"running","model":"gpt-5.6-luna","effort":"low","permission_mode":"default","cwd":"{{cwd}}","created_at":"2026-11-01T00:00:00Z"}}
 {"type":"thread.updated","thread_id":"{{thread}}","seq":5,"thread":{"id":"{{thread}}","harness":"codex","status":"running","model":"gpt-5.6-luna","effort":"low","permission_mode":"default","cwd":"{{cwd}}","created_at":"2026-11-01T00:00:00Z","session_id":"01a19254-7d92-7910-945f-9f69de0442e8"}}
 {"type":"item.added","thread_id":"{{thread}}","seq":6,"item":{"id":"msg_0476f3f03fb94b05016ae5f8f72f908191ba70bc240d51a02f","type":"assistant_message","text":"","turn_id":"{{t1}}"}}
-{"type":"delta","thread_id":"{{thread}}","seq":6,"item_id":"msg_0476f3f03fb94b05016ae5f8f72f908191ba70bc240d51a02f","kind":"text","text":"ready"}
+{"type":"delta","thread_id":"{{thread}}","seq":6,"item_id":"msg_0476f3f03fb94b05016ae5f8f72f908191ba70bc240d51a02f","kind":"text","offset":0,"text":"ready"}
 {"type":"item.updated","thread_id":"{{thread}}","seq":7,"item_id":"msg_0476f3f03fb94b05016ae5f8f72f908191ba70bc240d51a02f","patch":{"text":"ready"}}
 {"type":"item.added","thread_id":"{{thread}}","seq":8,"item":{"id":"{{tr1}}","type":"turn_result","ok":true,"usage":{"input_tokens":12024,"output_tokens":5,"cache_read_tokens":0,"cache_write_tokens":0},"duration_ms":1828,"turn_id":"{{t1}}"}}
 {"type":"turn.completed","thread_id":"{{thread}}","seq":9,"turn_id":"{{t1}}"}

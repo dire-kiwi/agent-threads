@@ -293,13 +293,14 @@
     },
     "DeltaEvent": {
       "type": "object",
-      "description": "Streamed text to append to an assistant_message (kind text) or reasoning (kind reasoning) item's text. Not saved, and doesn't advance seq: its seq is that of the last saved event. An item.updated with the final text follows.",
+      "description": "Streamed text to append to an assistant_message (kind text) or reasoning (kind reasoning) item's text, at offset. Not saved, and doesn't advance seq: its seq is that of the last saved event. An item.updated with the final text follows.",
       "required": [
         "type",
         "thread_id",
         "seq",
         "item_id",
         "kind",
+        "offset",
         "text"
       ],
       "properties": {
@@ -322,6 +323,11 @@
             "text",
             "reasoning"
           ]
+        },
+        "offset": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Where text goes in the item's text: its length before this delta, in UTF-16 code units (JavaScript's string length). A client that already has the text up to offset + text's length (from a snapshot taken after the delta) skips it."
         },
         "text": {
           "type": "string"

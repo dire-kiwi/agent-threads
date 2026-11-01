@@ -134,7 +134,7 @@ Every event has `type`, `thread_id` and `seq`, and may have `raw`.
 | `turn.completed` | `turn_id` | A turn ended. Its `turn_result` item comes just before. |
 | `item.added` | `item` | An item was added at the end of the list. If the thread already has an item with its id, it replaces that one in place. |
 | `item.updated` | `item_id`, `patch` | Fields of an item changed: each of the patch's fields replaces the item's, and one set to `null` is removed. `id` and `type` never change. |
-| `delta` | `item_id`, `kind`, `text` | Streamed text to append to an `assistant_message` (`kind: text`) or `reasoning` (`kind: reasoning`) item's `text`. |
+| `delta` | `item_id`, `kind`, `offset`, `text` | Streamed text to append to an `assistant_message` (`kind: text`) or `reasoning` (`kind: reasoning`) item's `text`, which was `offset` long before it. |
 | `request.opened` | `request` | A request was opened. |
 | `request.resolved` | `request_id`, `resolution` | A request was answered or cancelled. |
 
@@ -145,7 +145,9 @@ a turn starts, `waiting` while a request is open, and back), and doesn't leave a
 
 Every event but `delta` is **saved**: it's stored, and a thread's saved events have `seq` 1, 2, 3...
 with no gaps. `delta` events aren't saved and don't advance `seq`: a delta's `seq` is that of the
-last saved event before it.
+last saved event before it. Its `offset` is the length of the item's text before it (after the
+item's `item.added` or last `item.updated` with `text`, and the deltas since), in UTF-16 code units,
+as JavaScript counts a string's length.
 
 A streamed message goes: `item.added` with the item and the text so far (often `""`), any number of
 `delta`s, then an `item.updated` with the final `text`. A client that misses the deltas still ends
@@ -165,12 +167,17 @@ the same rules:
 3. Otherwise the event is applied as described above, and the state's `seq` becomes the event's.
    (`turn.*` events change nothing else.) An `item.updated` or `request.resolved` for an id the
    state doesn't have only advances `seq`.
-4. A `delta` is applied whenever the state has its item and the delta's `seq` isn't below the
-   state's (one from before the last saved event the state has is already in it). It doesn't
-   change `seq`.
+4. A `delta` is applied when the state has its item, the item is the delta's `kind`'s type, and
+   the delta's `seq` isn't below the state's (one from before the last saved event the state has
+   is already in it). Its `text` goes at `offset` in the item's text: what's already there (the
+   item's text is longer than `offset`) is skipped, and the rest appended. A delta whose `offset`
+   is past the end of the item's text (deltas were missed) or with nothing new changes nothing,
+   and the item's final text puts it right. A delta doesn't change `seq`.
 
 A backend's live snapshot includes the deltas it has applied, so a client that connects in the
-middle of a message gets the text so far.
+middle of a message gets the text so far. Deltas it gets after the snapshot that the snapshot
+already has (it subscribed first, so as to miss nothing) carry offsets the snapshot's text is
+already past, and are skipped rather than added twice.
 
 ### Reconnecting
 

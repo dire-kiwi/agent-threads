@@ -351,8 +351,10 @@ func (g *generator) typeOf(parent, key string, prop *object) (string, string) {
 			typ, _ := g.typeOf(parent, key+"_value", extra)
 			return "map[string]" + typ, "map"
 		case bool:
+			// Open objects keep their values as they came, as anything ({}) does: decoded into
+			// any, integers would become float64s and lose precision past 2^53.
 			if extra {
-				return "map[string]any", "map"
+				return "map[string]json.RawMessage", "map"
 			}
 		}
 		log.Fatalf("%s.%s: an object property needs additionalProperties", parent, key)

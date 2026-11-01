@@ -13,5 +13,8 @@
 //	}
 //
 // Optional strings and booleans are left out when empty or false (the spec gives them no other
-// meaning); optional numbers and objects are pointers.
+// meaning); optional numbers and objects are pointers. Values the spec doesn't describe (a tool's
+// input, an item.updated's patch, a thread's metadata) are json.RawMessage, or maps of them, so
+// they pass through unchanged: decode them into the type you expect (with json.Decoder.UseNumber
+// for large integers, if into any).
 package protocol

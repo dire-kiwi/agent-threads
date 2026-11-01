@@ -8,11 +8,11 @@
 {"type":"item.updated","thread_id":"{{thread}}","seq":8,"item_id":"toolu_01AdiFBCZbmGs7psADyRJ4rk","patch":{"status":"completed","result":{"content":"first"}}}
 {"type":"item.updated","thread_id":"{{thread}}","seq":9,"item_id":"{{u2}}","patch":{"queued":null}}
 {"type":"item.added","thread_id":"{{thread}}","seq":10,"item":{"id":"msg_011CgaTgLDEdfhK8qKR9j1ah:0","type":"assistant_message","text":"","turn_id":"{{t1}}"}}
-{"type":"delta","thread_id":"{{thread}}","seq":10,"item_id":"msg_011CgaTgLDEdfhK8qKR9j1ah:0","kind":"text","text":"The command"}
-{"type":"delta","thread_id":"{{thread}}","seq":10,"item_id":"msg_011CgaTgLDEdfhK8qKR9j1ah:0","kind":"text","text":" print"}
-{"type":"delta","thread_id":"{{thread}}","seq":10,"item_id":"msg_011CgaTgLDEdfhK8qKR9j1ah:0","kind":"text","text":"ed:"}
-{"type":"delta","thread_id":"{{thread}}","seq":10,"item_id":"msg_011CgaTgLDEdfhK8qKR9j1ah:0","kind":"text","text":"\n\n```\nfirst\n```\n\nste"}
-{"type":"delta","thread_id":"{{thread}}","seq":10,"item_id":"msg_011CgaTgLDEdfhK8qKR9j1ah:0","kind":"text","text":"ered"}
+{"type":"delta","thread_id":"{{thread}}","seq":10,"item_id":"msg_011CgaTgLDEdfhK8qKR9j1ah:0","kind":"text","offset":0,"text":"The command"}
+{"type":"delta","thread_id":"{{thread}}","seq":10,"item_id":"msg_011CgaTgLDEdfhK8qKR9j1ah:0","kind":"text","offset":11,"text":" print"}
+{"type":"delta","thread_id":"{{thread}}","seq":10,"item_id":"msg_011CgaTgLDEdfhK8qKR9j1ah:0","kind":"text","offset":17,"text":"ed:"}
+{"type":"delta","thread_id":"{{thread}}","seq":10,"item_id":"msg_011CgaTgLDEdfhK8qKR9j1ah:0","kind":"text","offset":20,"text":"\n\n```\nfirst\n```\n\nste"}
+{"type":"delta","thread_id":"{{thread}}","seq":10,"item_id":"msg_011CgaTgLDEdfhK8qKR9j1ah:0","kind":"text","offset":40,"text":"ered"}
 {"type":"item.updated","thread_id":"{{thread}}","seq":11,"item_id":"msg_011CgaTgLDEdfhK8qKR9j1ah:0","patch":{"text":"The command printed:\n\n```\nfirst\n```\n\nsteered"}}
 {"type":"item.added","thread_id":"{{thread}}","seq":12,"item":{"id":"{{tr1}}","type":"turn_result","ok":true,"usage":{"input_tokens":4,"output_tokens":106,"cache_read_tokens":32464,"cache_write_tokens":6813,"cost_usd":0.00174064},"duration_ms":8780,"turn_id":"{{t1}}"}}
 {"type":"turn.completed","thread_id":"{{thread}}","seq":13,"turn_id":"{{t1}}"}
