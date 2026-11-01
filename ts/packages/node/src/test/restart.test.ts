@@ -245,9 +245,17 @@ describe.skipIf(process.platform === "win32")("a backend restart", () => {
     expect(snap.thread.run).toBeUndefined();
     expect(snap.requests).toEqual([]);
     expect(snap.items.filter((i) => i.type === "notice").map((i) => i.type === "notice" && i.code)).toEqual(["run.lost"]);
-    // It was sent SIGTERM (which the fake CLI exits 143 on).
+    // It's stopped: its input closed, then SIGTERM (whichever the fake CLI ends on first).
     await until(() => existsSync(join(runDir, "exit")));
-    expect(JSON.parse(readFileSync(join(runDir, "exit"), "utf8"))).toMatchObject({ code: 143 });
+    const pid = Number(readFileSync(join(runDir, "pid"), "utf8"));
+    await until(() => {
+      try {
+        process.kill(pid, 0);
+        return false;
+      } catch {
+        return true;
+      }
+    });
     await b.call("close");
     await b.exited;
     const store = new FileStore(s.dirs.store);
