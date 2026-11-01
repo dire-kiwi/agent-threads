@@ -625,6 +625,10 @@ impl HarnessProcess for ShimProcess {
         true
     }
 
+    fn answered(&self, id: &str) -> bool {
+        self.lock().delivered.iter().any(|d| d.answers.as_deref() == Some(id))
+    }
+
     fn input_offset(&self, unanswered: &[String]) -> Option<u64> {
         let mut st = self.lock();
         // Not past a line that's to be written again (and isn't): a restart before it is must know
@@ -1055,12 +1059,18 @@ fn read_stopping(dir: &Path) -> Option<(Option<u64>, u64)> {
 /// written down (`stopping`), so a backend that restarts before then carries on with it.
 fn terminate(dir: &Path, grace: Duration, signal: Signal) {
     let Some(pid) = live_group(dir) else { return };
-    if signal != Signal::Kill && read_stopping(dir).is_none() {
-        write_atomic(
+    match read_stopping(dir) {
+        // A stop under way whose SIGTERM is still to come doesn't send it again: written down
+        // first.
+        Some((Some(_), kill_at)) if signal == Signal::Term => {
+            write_atomic(dir, "stopping", &json!({"kill_at": kill_at}).to_string())
+        }
+        None if signal != Signal::Kill => write_atomic(
             dir,
             "stopping",
             &json!({"kill_at": now_ms() + grace.as_millis() as u64}).to_string(),
-        );
+        ),
+        _ => {}
     }
     signal_group(pid, signal);
     if signal != Signal::Kill {

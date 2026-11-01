@@ -955,6 +955,15 @@ impl ClaudeSession {
             "user" => self.user(ctx, id, m),
             "control_request" => {
                 let request_id = m["request_id"].as_str().unwrap_or("").to_string();
+                // Read again after a restart, and answered before it (though that wasn't saved):
+                // Claude has its answer, and the user isn't asked again.
+                if self
+                    .run(id)
+                    .and_then(|r| r.proc.as_ref())
+                    .is_some_and(|p| p.answered(&request_id))
+                {
+                    return;
+                }
                 self.control_request(ctx, id, &request_id, m.get("request").cloned().unwrap_or(json!({})));
             }
             "control_cancel_request" => {
@@ -1469,9 +1478,26 @@ impl HarnessSession for ClaudeSession {
 
     fn interrupt(&mut self, ctx: &mut ThreadContext) {
         let Some(id) = self.live_id() else { return };
-        self.run(&id).unwrap().control(json!({"subtype": "interrupt"}));
         let grace = self.o.stop_grace;
         self.stop_after(ctx, &id, grace);
+        let turn = ctx.turn_id().map(String::from);
+        let send = move |s: &mut ClaudeSession, ctx: &mut ThreadContext| {
+            if s.live_id().as_deref() == Some(id.as_str())
+                && ctx.turn_id().map(String::from) == turn
+                && let Some(run) = s.run(&id)
+                && !run.detached
+            {
+                run.control(json!({"subtype": "interrupt"}));
+            }
+        };
+        // A run that outlives the backend is saved first, its turn interrupted and when it's
+        // stopped if the turn doesn't end: after a restart, one that Claude ignores the interrupt
+        // in is still stopped.
+        if ctx.spawner().durable() {
+            ctx.persist::<ClaudeSession>(move |s, ctx, _| send(s, ctx));
+        } else {
+            send(self, ctx);
+        }
     }
 
     fn live(&self) -> bool {
@@ -1582,7 +1608,14 @@ impl HarnessSession for ClaudeSession {
         self.stale = st.stale || st.launched.as_ref() != Some(&now);
         // Claude's requests that were open: the user's questions are taken up again, and the rest
         // (a policy that hadn't decided, a tool that was running) are dealt with again.
+        // One answered before the restart, though that wasn't saved, is closed: Claude has its
+        // answer.
         for (request_id, open) in st.open.clone() {
+            let run = self.run(&id).unwrap();
+            if run.proc.as_ref().is_some_and(|p| p.answered(&request_id)) {
+                run.take_open(&request_id);
+                continue;
+            }
             self.reopen_request(ctx, &id, &request_id, open);
         }
         if let Some(at) = st.steer_at {

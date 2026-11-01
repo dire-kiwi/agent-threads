@@ -880,6 +880,10 @@ impl AgentThreads {
         for id in stale {
             c.emit_resolved(&id, &cancel_resolution());
         }
+        // With none left (one answered before the restart is closed, say), the turn runs on.
+        if c.turn.is_some() && open.is_empty() && c.thread().status == ThreadStatus::Waiting {
+            c.set_thread(|t| t.status = ThreadStatus::Running);
+        }
         c.set_thread(|t| {
             if let Some(r) = &mut t.run {
                 r.reattached_at = Some(now_iso());

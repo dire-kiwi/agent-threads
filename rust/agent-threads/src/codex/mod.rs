@@ -1438,7 +1438,12 @@ impl CodexSession {
             }
             return;
         }
-        if m.get("id").is_some() {
+        if let Some(rid) = m.get("id") {
+            // A request read again after a restart, and answered before it (though that wasn't
+            // saved): Codex has its answer, and the user isn't asked again.
+            if run.proc.as_ref().is_some_and(|p| p.answered(&id_string(rid))) {
+                return;
+            }
             self.server_request(ctx, id, m, None);
         } else {
             self.notification(ctx, id, &m);
@@ -2611,22 +2616,37 @@ impl HarnessSession for CodexSession {
 
     fn interrupt(&mut self, ctx: &mut ThreadContext) {
         let Some(run) = self.live_id() else { return };
-        self.with_turn(
-            ctx,
-            &run.clone(),
-            Box::new(move |s, ctx, turn| {
-                let Some(r) = s.runs.get(&run) else { return };
-                if let Some(turn) = turn
-                    && !r.exited
-                {
-                    let params = json!({"threadId": r.thread_id, "turnId": turn});
-                    s.request(ctx, &run, "turn/interrupt", params, None, Box::new(|_, _, _, _| {}));
-                }
-            }),
-        );
         let grace = self.o.stop_grace;
-        if let Some(run) = self.live_id() {
-            self.stop_after(ctx, &run, grace);
+        self.stop_after(ctx, &run, grace);
+        let turn = ctx.turn_id().map(String::from);
+        let send = move |s: &mut CodexSession, ctx: &mut ThreadContext| {
+            if s.live_id().as_deref() != Some(run.as_str())
+                || ctx.turn_id().map(String::from) != turn
+                || s.runs.get(&run).is_none_or(|r| r.detached)
+            {
+                return;
+            }
+            s.with_turn(
+                ctx,
+                &run.clone(),
+                Box::new(move |s, ctx, turn| {
+                    let Some(r) = s.runs.get(&run) else { return };
+                    if let Some(turn) = turn
+                        && !r.exited
+                    {
+                        let params = json!({"threadId": r.thread_id, "turnId": turn});
+                        s.request(ctx, &run, "turn/interrupt", params, None, Box::new(|_, _, _, _| {}));
+                    }
+                }),
+            );
+        };
+        // A run that outlives the backend is saved first, its turn interrupted and when it's
+        // stopped if the turn doesn't end: after a restart, one that Codex ignores the interrupt in
+        // is still stopped.
+        if ctx.spawner().durable() {
+            ctx.persist::<CodexSession>(move |s, ctx, _| send(s, ctx));
+        } else {
+            send(self, ctx);
         }
     }
 
@@ -2797,7 +2817,14 @@ impl HarnessSession for CodexSession {
         self.stale = st.stale || st.launched.as_ref() != Some(&now);
         // Codex's requests that were open: the user's questions are taken up again, an app tool
         // that was running is answered (not run again), and the rest are dealt with again.
+        // One answered before the restart, though that wasn't saved, is closed: Codex has its
+        // answer.
         for (rid, open) in st.open.clone() {
+            let r = self.run(&id).unwrap();
+            if r.proc.as_ref().is_some_and(|p| p.answered(&id_string(&rid))) {
+                r.take_open(&rid);
+                continue;
+            }
             self.reopen_request(ctx, &id, rid, open);
         }
         if let Some(at) = st.stop_at {

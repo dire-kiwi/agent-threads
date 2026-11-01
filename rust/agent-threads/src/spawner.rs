@@ -107,6 +107,12 @@ pub trait HarnessProcess: Send + Sync {
     /// Stops following it and leaves it running, for a backend that's shutting down and will
     /// re-attach (a process that outlives the backend only). No event comes after this.
     fn detach(&self) {}
+    /// Whether an answer to its request `id` was written to its input already, after the checkpoint
+    /// it was re-attached from (and before the backend restarted): the harness has it, so the
+    /// request isn't asked again.
+    fn answered(&self, _id: &str) -> bool {
+        false
+    }
     /// Whether it can be left running with [`detach`](Self::detach).
     fn can_detach(&self) -> bool {
         false

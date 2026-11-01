@@ -8,6 +8,9 @@
 mod common;
 
 use std::path::{Path, PathBuf};
+
+use agent_threads::{RunRecord, StoreResult};
+use async_trait::async_trait;
 use std::process::Stdio;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -49,8 +52,10 @@ impl Backend {
         let mut lines = BufReader::new(child.stdout.take().unwrap()).lines();
         tokio::spawn(async move {
             while let Ok(Some(line)) = lines.next_line().await {
-                // The test harness's own output is mixed in: only our JSON counts.
-                let Ok(msg) = serde_json::from_str::<Value>(&line) else {
+                // The test harness's own output is mixed in (`test backend_process ... ` goes before
+                // the first line, with no newline): only our JSON counts.
+                let Some(at) = line.find('{') else { continue };
+                let Ok(msg) = serde_json::from_str::<Value>(&line[at..]) else {
                     continue;
                 };
                 if let Some(e) = msg.get("event") {
@@ -84,6 +89,14 @@ impl Backend {
             .unwrap();
         assert!(r.get("error").is_none(), "{op}: {}", r["error"]);
         r["result"].clone()
+    }
+
+    /// Sends a request without waiting for its reply.
+    async fn send_only(&mut self, op: &str, args: Value) {
+        let id = self.next;
+        self.next += 1;
+        let line = json!({"id": id, "op": op, "args": args}).to_string() + "\n";
+        self.stdin.write_all(line.as_bytes()).await.unwrap();
     }
 
     async fn wait_for(&self, pattern: &Value) -> Value {
@@ -187,6 +200,13 @@ fn scene(fixture: &str, extra: &[(&str, &str)]) -> Scene {
 impl Scene {
     fn start(&self) -> Backend {
         Backend::start(&self.env)
+    }
+
+    /// A backend with more environment.
+    fn start_with(&self, more: &[(&str, &str)]) -> Backend {
+        let mut env = self.env.clone();
+        env.extend(more.iter().map(|(k, v)| (k.to_string(), v.to_string())));
+        Backend::start(&env)
     }
 
     fn create_args(&self) -> Value {
@@ -558,7 +578,17 @@ async fn backend() {
         .filter(|(k, _)| k.starts_with("AGENT_THREADS_FIXTURE"))
         .map(|(k, v)| (k, Some(v)))
         .collect();
-    let store: Arc<dyn Store> = Arc::new(FileStore::open(env("STORE").unwrap()).unwrap());
+    let file: Arc<dyn Store> = Arc::new(FileStore::open(env("STORE").unwrap()).unwrap());
+    // With SAVE_DELAY_MS, each save (append_events) takes that long.
+    let store: Arc<dyn Store> = match env("SAVE_DELAY_MS") {
+        Some(ms) => Arc::new(SlowStore {
+            inner: file,
+            delay: Duration::from_millis(ms.parse().unwrap()),
+        }),
+        None => file,
+    };
+    let ms = |k: &str| env(k).map(|v| Duration::from_millis(v.parse().unwrap()));
+    let (stop_grace, close_grace) = (ms("STOP_GRACE_MS"), ms("CLOSE_GRACE_MS"));
     let fake = env("FAKE_CLI").unwrap();
     let mut tools = Vec::new();
     if let Some(marker) = env("TOOL_MARKER") {
@@ -593,6 +623,8 @@ async fn backend() {
             claude_code(ClaudeCodeOptions {
                 bin: env("CLAUDE_BIN").unwrap_or(fake.clone()),
                 env: fake_env.clone(),
+                stop_grace: stop_grace.unwrap_or(Duration::from_secs(10)),
+                close_grace: close_grace.unwrap_or(Duration::from_secs(5)),
                 ..Default::default()
             }),
             codex(CodexOptions {
@@ -600,6 +632,8 @@ async fn backend() {
                 env: fake_env,
                 home: env("CODEX_HOME_DIR").map(PathBuf::from),
                 login: None,
+                stop_grace: stop_grace.unwrap_or(Duration::from_secs(10)),
+                close_grace: close_grace.unwrap_or(Duration::from_secs(5)),
                 ..Default::default()
             }),
         ],
@@ -668,6 +702,12 @@ async fn backend() {
                 .await
                 .map(|s| serde_json::to_value(s).unwrap())
                 .map_err(|e| e.to_string()),
+            // Resolves once every event so far is saved (and the run with them).
+            "saved" => sdk
+                .events_since(args.as_str().unwrap(), 0, None)
+                .await
+                .map(|_| Value::Null)
+                .map_err(|e| e.to_string()),
             "recover" => sdk
                 .recover()
                 .await
@@ -692,4 +732,233 @@ async fn backend() {
             Err(e) => json!({"reply": id, "error": e}),
         });
     }
+}
+
+/// A store whose appends take a while.
+struct SlowStore {
+    inner: Arc<dyn Store>,
+    delay: Duration,
+}
+
+#[async_trait]
+impl Store for SlowStore {
+    async fn create_thread(&self, t: &Value) -> StoreResult<()> {
+        self.inner.create_thread(t).await
+    }
+    async fn get_thread(&self, id: &str) -> StoreResult<Option<Value>> {
+        self.inner.get_thread(id).await
+    }
+    async fn list_threads(&self) -> StoreResult<Vec<Value>> {
+        self.inner.list_threads().await
+    }
+    async fn update_thread(&self, t: &Value) -> StoreResult<()> {
+        self.inner.update_thread(t).await
+    }
+    async fn delete_thread(&self, id: &str) -> StoreResult<bool> {
+        self.inner.delete_thread(id).await
+    }
+    async fn append_events(&self, id: &str, events: &[Value], runs: &[RunRecord]) -> StoreResult<()> {
+        tokio::time::sleep(self.delay).await;
+        self.inner.append_events(id, events, runs).await
+    }
+    async fn read_events(&self, id: &str, after: u64, limit: Option<usize>) -> StoreResult<Vec<Value>> {
+        self.inner.read_events(id, after, limit).await
+    }
+    async fn last_seq(&self, id: &str) -> StoreResult<u64> {
+        self.inner.last_seq(id).await
+    }
+    async fn save_snapshot(&self, id: &str, s: &Value) -> StoreResult<()> {
+        self.inner.save_snapshot(id, s).await
+    }
+    async fn load_snapshot(&self, id: &str) -> StoreResult<Option<Value>> {
+        self.inner.load_snapshot(id).await
+    }
+    async fn put_run(&self, r: &RunRecord) -> StoreResult<()> {
+        self.inner.put_run(r).await
+    }
+    async fn get_run(&self, id: &str) -> StoreResult<Option<RunRecord>> {
+        self.inner.get_run(id).await
+    }
+    async fn active_runs(&self) -> StoreResult<Vec<RunRecord>> {
+        self.inner.active_runs().await
+    }
+    async fn close(&self) -> StoreResult<()> {
+        self.inner.close().await
+    }
+}
+
+/// A scene with mini-claude.mjs as Claude and mini-codex.mjs as Codex, for what the recordings don't
+/// cover.
+fn mini_scene(extra: &[(&str, &str)]) -> Scene {
+    let (claude, codex) = (common::mini("claude"), common::mini("codex"));
+    let log = common::temp_dir().join("log.jsonl");
+    let mut all = vec![
+        ("CLAUDE_BIN", claude.to_string_lossy().to_string()),
+        ("CODEX_BIN", codex.to_string_lossy().to_string()),
+        ("MINI_CLAUDE_LOG", log.to_string_lossy().to_string()),
+    ];
+    all.extend(extra.iter().map(|(k, v)| (*k, v.to_string())));
+    let all: Vec<(&str, &str)> = all.iter().map(|(k, v)| (*k, v.as_str())).collect();
+    scene("claude/plain-reply", &all)
+}
+
+fn pid_alive(pid: i32) -> bool {
+    unsafe { libc::kill(pid, 0) == 0 }
+}
+
+/// A run that ignores an interrupt is still stopped when the backend dies right after sending it:
+/// the interrupt is saved before it's sent.
+async fn stops_a_run_that_ignores_an_interrupt(harness: &str, interrupt: &str) {
+    let s = mini_scene(&[("STOP_GRACE_MS", "1000"), ("CLOSE_GRACE_MS", "500")]);
+    // Saving takes a while, so the backend is killed after the interrupt is sent, and before any
+    // save that comes after it would be done.
+    let mut a = s.start_with(&[("SAVE_DELAY_MS", "500")]);
+    let thread = a.call("create", json!({"harness": harness, "cwd": s.cwd})).await;
+    let id = thread["id"].as_str().unwrap().to_string();
+    a.call("handle", json!({"type": "send", "thread_id": id, "text": "stubborn"}))
+        .await;
+    a.wait_for(&json!({"type": "turn.started"})).await;
+    let runs = s.runs.clone();
+    until(|| {
+        std::fs::read_dir(&runs)
+            .map(|mut d| d.next().is_some())
+            .unwrap_or(false)
+    })
+    .await;
+    let run_dir = std::fs::read_dir(&s.runs).unwrap().next().unwrap().unwrap().path();
+    let pid_file = run_dir.join("pid");
+    until(|| pid_file.exists()).await;
+    // It has taken in the message, and ignores interrupts from now on.
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    a.call("saved", json!(id)).await;
+    a.send_only("handle", json!({"type": "interrupt", "thread_id": id}))
+        .await;
+    let input = run_dir.join("input.jsonl");
+    until(|| std::fs::read_to_string(&input).unwrap_or_default().contains(interrupt)).await;
+    a.crash().await;
+    let pid: i32 = std::fs::read_to_string(&pid_file).unwrap().trim().parse().unwrap();
+    assert!(pid_alive(pid));
+
+    let mut b = s.start();
+    assert_eq!(
+        b.call("recover", json!(null)).await,
+        json!({"reattached": [id], "lost": []})
+    );
+    // Stopped once the interrupt's grace is over, and the turn ends as interrupted.
+    until(|| !pid_alive(pid)).await;
+    b.wait_for(&json!({"type": "turn.completed"})).await;
+    let result = b
+        .wait_for(&json!({"type": "item.added", "item": {"type": "turn_result"}}))
+        .await;
+    assert_eq!(result["item"]["interrupted"], true);
+    let stopping = run_dir.join("stopping");
+    until(|| !stopping.exists()).await;
+    b.call("close", json!({"stop": true})).await;
+    b.exited().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn claude_stops_a_run_that_ignores_an_interrupt_when_the_backend_dies_right_after_it() {
+    stops_a_run_that_ignores_an_interrupt("claude", r#""subtype":"interrupt""#).await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn codex_stops_a_run_that_ignores_an_interrupt_when_the_backend_dies_right_after_it() {
+    stops_a_run_that_ignores_an_interrupt("codex", r#""method":"turn/interrupt""#).await;
+}
+
+/// What the user answered just before the backend died isn't asked again (whether or not the
+/// request's opening was saved), and is answered once.
+async fn doesnt_ask_again(harness: &str, opening_saved: bool, text: &str, answer: &str) {
+    // Claude asks a while after the tool call, and the turn runs on for a while after it's allowed
+    // (Codex's turn waits before and after the command).
+    let s = mini_scene(&[
+        ("POLICY", "ask"),
+        ("MINI_CLAUDE_ASK_DELAY", "1000"),
+        ("MINI_CLAUDE_TOOL_RUN_MS", "3000"),
+    ]);
+    // Saving takes a while, so the backend is killed after the answer is sent, and before the save
+    // that has it is done: and, unless the request's opening is saved first, before that is.
+    let mut a = s.start_with(&[("SAVE_DELAY_MS", "500")]);
+    let thread = a.call("create", json!({"harness": harness, "cwd": s.cwd})).await;
+    let id = thread["id"].as_str().unwrap().to_string();
+    a.call("handle", json!({"type": "send", "thread_id": id, "text": text}))
+        .await;
+    a.wait_for(&json!({"type": "turn.started"})).await;
+    // The run and its turn are saved before the request comes.
+    a.call("saved", json!(id)).await;
+    let opened = a.wait_for(&json!({"type": "request.opened"})).await;
+    let request_id = opened["request"]["id"].as_str().unwrap().to_string();
+    if opening_saved {
+        a.call("saved", json!(id)).await;
+    }
+    let run_dir = std::fs::read_dir(&s.runs).unwrap().next().unwrap().unwrap().path();
+    let input = run_dir.join("input.jsonl");
+    let read = move || std::fs::read_to_string(&input).unwrap_or_default();
+    let respond =
+        json!({"type": "respond", "thread_id": id, "request_id": request_id, "resolution": {"outcome": "allow"}});
+    a.send_only("handle", respond).await;
+    let r = read.clone();
+    until(move || r().contains(answer)).await;
+    a.crash().await;
+
+    let mut b = s.start();
+    assert_eq!(
+        b.call("recover", json!(null)).await,
+        json!({"reattached": [id], "lost": []})
+    );
+    // The tool's still running: nothing's asked of the user, and the turn runs on.
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    let snap = b.call("snapshot", json!(id)).await;
+    assert_eq!(snap["requests"], json!([]));
+    assert_eq!(snap["thread"]["status"], "running");
+    let events = b.events.lock().unwrap().clone();
+    assert!(!events.iter().any(|e| e["type"] == "request.opened"));
+    if opening_saved {
+        // Closed as the run's picked up again.
+        let resolved = events
+            .iter()
+            .position(|e| e["type"] == "request.resolved" && e["request_id"] == request_id);
+        let notice = events
+            .iter()
+            .position(|e| e["type"] == "item.added" && e["item"]["code"] == "run.reattached");
+        assert!(resolved.is_some() && resolved < notice, "{resolved:?} {notice:?}");
+    }
+    b.wait_for(&json!({"type": "turn.completed"})).await;
+    b.call("close", json!({"stop": true})).await;
+    b.exited().await;
+    // Answered once.
+    assert_eq!(read().matches(answer).count(), 1);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn claude_doesnt_ask_again_what_the_user_answered_just_before_the_backend_died_saved() {
+    doesnt_ask_again("claude", true, "tool Bash {}", r#""behavior":"allow""#).await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn codex_doesnt_ask_again_what_the_user_answered_just_before_the_backend_died_saved() {
+    doesnt_ask_again(
+        "codex",
+        true,
+        "sleep 1000\nexec ls\nsleep 3000",
+        r#""decision":"accept""#,
+    )
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn claude_doesnt_ask_again_what_the_user_answered_just_before_the_backend_died_not_saved() {
+    doesnt_ask_again("claude", false, "tool Bash {}", r#""behavior":"allow""#).await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn codex_doesnt_ask_again_what_the_user_answered_just_before_the_backend_died_not_saved() {
+    doesnt_ask_again(
+        "codex",
+        false,
+        "sleep 1000\nexec ls\nsleep 3000",
+        r#""decision":"accept""#,
+    )
+    .await;
 }

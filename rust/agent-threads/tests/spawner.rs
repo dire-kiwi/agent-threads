@@ -389,3 +389,19 @@ async fn shim_prunes_runs_the_backend_finished_with_a_while_ago_and_stops_runs_n
     let exit: Value = serde_json::from_str(&std::fs::read_to_string(exit).unwrap()).unwrap();
     assert_eq!(exit["signal"], 15);
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn shim_sends_sigterm_once_when_its_signalled_during_a_stop_whose_sigterm_is_still_to_come() {
+    let s = shim_setup();
+    // It says so each time it gets SIGTERM, and doesn't exit at it, nor when its input closes.
+    let p = s.run(
+        "trap 'echo term' TERM; echo ready; while :; do sleep 0.05; done",
+        "run_1",
+    );
+    assert!(wait(|| p.lines().len() == 1).await);
+    assert!(p.proc.stop(Duration::from_millis(300), false));
+    p.proc.kill(Signal::Term);
+    assert!(wait(|| p.exit().is_some()).await);
+    assert_eq!(p.exit().unwrap().signal.as_deref(), Some("SIGKILL"));
+    assert_eq!(p.lines(), ["ready", "term"]);
+}
