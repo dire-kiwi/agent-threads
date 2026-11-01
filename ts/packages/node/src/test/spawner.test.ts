@@ -367,6 +367,27 @@ describe.skipIf(process.platform === "win32")("shim()", () => {
     }
   });
 
+  it("stops what an orphan ran when its shim is gone too, and keeps its directory until then", { timeout: 20_000 }, async () => {
+    const { runsDir, spawner, run } = setup();
+    const store = new MemoryStore();
+    await store.createThread({ id: "th", harness: "claude", status: "idle", created_at: "2026-11-01T00:00:00Z" });
+    // A run its backend gave up on as it died, whose shim has gone since, leaving what it ran.
+    const p = run("sleep 30", "orphan2");
+    const dir = join(runsDir, "orphan2");
+    expect(await wait(() => existsSync(join(dir, "pid")))).toBe(true);
+    p.proc.detach!();
+    await store.putRun({ id: "orphan2", thread_id: "th", spawner: "shim", offset: 0, started_at: "2026-11-01T00:00:00Z", ended_at: new Date().toISOString() });
+    const program = Number(readFileSync(join(dir, "pid"), "utf8"));
+    process.kill(Number(readFileSync(join(dir, "shim.pid"), "utf8")), "SIGKILL");
+    await new Promise((r) => setTimeout(r, 100));
+    expect(alive(program)).toBe(true);
+
+    await spawner.prune!(store);
+    expect(await wait(() => !alive(program))).toBe(true);
+    expect(existsSync(dir)).toBe(true);
+    expect(JSON.parse(readFileSync(join(dir, "exit"), "utf8"))).toMatchObject({ error: expect.stringMatching(/went away/) });
+  });
+
   it("needs a runs directory of the store's own", () => {
     expect(() => shim(shimPath(), {} as ShimOptions)).toThrow(/runsDir/);
   });

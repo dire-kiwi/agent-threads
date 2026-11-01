@@ -453,4 +453,41 @@ describe.skipIf(process.platform === "win32")("a backend restart", () => {
     expect(snap.items.filter((i) => i.type === "turn_result")).toHaveLength(1);
     expect(snap.items.filter((i) => i.type === "assistant_message").map((i) => (i.type === "assistant_message" ? i.text : ""))).toEqual(["hello"]);
   });
+
+  it("doesn't send a message again after two restarts in a row, the second before what led to it is read again", { timeout: 60_000 }, async () => {
+    // As above, but the backend that re-attaches is killed too, once it has saved the run as it
+    // re-attached to it (from before Claude answered initialize) and before Claude says anything.
+    const s = mini({ MINI_CLAUDE_START_DELAY: "4000" });
+    const a = s.start();
+    const thread = await a.call<{ id: string }>("create", { harness: "claude", cwd: s.dirs.cwd });
+    await a.call("handle", { type: "send", thread_id: thread.id, text: "reply hello" } satisfies Command);
+    const input = () => {
+      const [runId] = readdirSync(s.dirs.runs);
+      return runId ? readFileSync(join(s.dirs.runs, runId, "input.jsonl"), "utf8") : "";
+    };
+    await until(() => input().includes("reply hello"));
+    await a.crash();
+
+    const b = s.start();
+    expect(await b.call("recover")).toEqual({ reattached: [thread.id], lost: [] });
+    // Killed once what it saved as it re-attached is in the store, and before it saves anything
+    // else (nothing it reads again makes an event).
+    const stored = () => readdirSync(s.dirs.store).some((f) => readFileSync(join(s.dirs.store, f), "utf8").includes("run.reattached"));
+    await until(stored);
+    await b.crash();
+    expect(b.events.some((e) => e.type === "turn.completed")).toBe(false);
+
+
+    const c = s.start();
+    expect(await c.call("recover")).toEqual({ reattached: [thread.id], lost: [] });
+    await c.waitFor({ type: "turn.completed" });
+    await sleep(300);
+    const snap = await c.call<Snapshot>("snapshot", thread.id);
+    await c.call("close", { stop: true });
+    await c.exited;
+    expect(input().split("reply hello").length - 1).toBe(1);
+    const sent = readFileSync(s.log, "utf8").trim().split("\n").map((l) => JSON.parse(l)).filter((l) => l.type === "user");
+    expect(sent).toHaveLength(1);
+    expect(snap.items.filter((i) => i.type === "turn_result")).toHaveLength(1);
+  });
 });

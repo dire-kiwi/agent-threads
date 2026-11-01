@@ -131,7 +131,8 @@ export function shim(path: string, options: ShimOptions): Spawner {
         if (live.has(id)) continue;
         const record = await store.getRun(id);
         if (record && record.ended_at == null) continue; // A run the backend will follow.
-        const running = !existsSync(join(dir, "exit")) && shimAlive(dir);
+        // Its shim, or (with the shim gone) what it ran, which nothing would stop.
+        const running = (!existsSync(join(dir, "exit")) && shimAlive(dir)) || liveGroup(dir) !== undefined;
         if (running) {
           // Nothing follows it, so nothing will stop it: a run its backend gave up on (and was
           // stopping when it went), or one started by a backend that died before saving it.
@@ -182,8 +183,13 @@ class ShimProcess implements HarnessProcess {
   #checked = 0;
   /** input.jsonl's size, as written. */
   #input = 0;
-  /** Lines in input.jsonl after the checkpoint it was re-attached from, not yet written again. */
-  #delivered: string[] = [];
+  /**
+   * Lines in input.jsonl after the checkpoint it was re-attached from (and where each starts), in
+   * order, that reading the output again hasn't written again yet.
+   */
+  #delivered: { text: string; at: number }[] = [];
+  /** How much of out.jsonl there was when it was re-attached to: once that's read, nothing's written again. */
+  #outAtAttach = 0;
   /** The shim's identity, once it's been checked to be the run's. */
   #shim: { identity?: Identity } = {};
   #over = false;
@@ -197,9 +203,13 @@ class ShimProcess implements HarnessProcess {
         const all = readFileSync(join(dir, "input.jsonl"));
         this.#input = all.length;
         if (o.input !== undefined) {
-          const after = all.subarray(Math.min(o.input, all.length)).toString("utf8");
-          this.#delivered = after.split(/(?<=\n)/).filter((l) => l.endsWith("\n"));
+          let at = Math.min(o.input, all.length);
+          for (const text of all.subarray(at).toString("utf8").split(/(?<=\n)/)) {
+            if (text.endsWith("\n")) this.#delivered.push({ text, at });
+            at += Buffer.byteLength(text);
+          }
         }
+        this.#outAtAttach = statSync(join(dir, "out.jsonl")).size;
       } catch {
         // None.
       }
@@ -244,7 +254,9 @@ class ShimProcess implements HarnessProcess {
 
   /** How much of input.jsonl is written (bytes): a checkpoint keeps it, as of the driver's state. */
   get inputOffset(): number {
-    return this.#input;
+    // Not past a line that's to be written again (and isn't): a restart before it is must know it's
+    // there.
+    return this.#delivered[0]?.at ?? this.#input;
   }
 
   write(line: string): void {
@@ -252,7 +264,8 @@ class ShimProcess implements HarnessProcess {
     const text = line.endsWith("\n") ? line : line + "\n";
     // Written already, after the checkpoint this run was re-attached from: what's read again since
     // writes it again, and it isn't.
-    const at = this.#delivered.indexOf(text);
+    // The first (in order) of those it's the same as.
+    const at = this.#delivered.findIndex((d) => d.text === text);
     if (at >= 0) return void this.#delivered.splice(at, 1);
     try {
       // One write, so the shim never relays half a line.
@@ -342,6 +355,9 @@ class ShimProcess implements HarnessProcess {
       if (line) this.#handlers.line(line);
       if (this.#over) return;
     }
+    // What was there when it was re-attached to is read again, and what that writes is written (in
+    // the same tick, or the next): lines written before that aren't written again now.
+    if (this.#delivered.length && this.#offset >= this.#outAtAttach) setImmediate(() => (this.#delivered = []));
     if (this.#signals.length && this.pid !== undefined) for (const s of this.#signals.splice(0)) terminate(this.dir, this.#grace, s);
     if (exited) return this.#exited(readExit(this.dir));
     const gone = this.#gone();
@@ -564,7 +580,8 @@ function shimAlive(dir: string, known?: { identity?: Identity }): boolean {
   if (!info) return true;
   if (info.zombie) return false;
   const id = known?.identity;
-  if (id?.pid === pid) return id.source === info.source ? id.start === info.start : true;
+  // /proc and ps agree on a start to within a second (ps has it to the second).
+  if (id?.pid === pid) return id.source === info.source ? id.start === info.start : Math.abs(id.start - info.start) < 1000;
   const ours = info.start <= written + 1000;
   if (ours && known) known.identity = { pid, start: info.start, source: info.source };
   return ours;

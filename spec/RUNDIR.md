@@ -102,8 +102,12 @@ answered `initialize`, an answer to a request a policy allowed). `input.jsonl` i
 what was written, so the backend saves with the offset how much of `input.jsonl` it had written
 (the Node backend's `input`, in bytes). After a restart, the lines after that are written already:
 until it has written each of them again, a line it would write that's the same as one of them
-(byte for byte) is taken to be that one, and isn't written again. Whatever it's killed in the middle
-of, nothing that's in `input.jsonl` is written to it twice.
+(byte for byte; the first of them, in order, that it's the same as) is taken to be that one, and
+isn't written again. Until then, what it saves as written goes no further than the first of those
+lines it hasn't written again, so a backend that's killed again before it has still knows they're
+there. Once it has read again all the output there was when it re-attached (and written what that
+writes), the rest won't be written again: they're forgotten. Whatever it's killed in the middle of,
+however many times, nothing that's in `input.jsonl` is written to it twice.
 
 ## A run whose shim is gone
 
@@ -125,9 +129,11 @@ The shim is there if the process in `shim.pid` is, and is the shim:
   it was read) and checks it each time after: a process with the pid that started at another time
   is another process, given the pid since, and the shim is gone.
 
-When the start can't be told (no `/proc`, and `ps` isn't there, fails or times out), or it's read
-another way than the identity was (from `ps` when it was from `/proc`, or the other way round,
-which don't agree to the millisecond), the backend doesn't take the shim for gone: a running process with the pid (written this boot) counts as the
+A start read another way than the identity's (from `ps` when it was from `/proc`, or the other way
+round) is the same if they're within a second of each other: `ps` has it to the second.
+
+When the start can't be told (no `/proc`, and `ps` isn't there, fails or times out), the backend
+doesn't take the shim for gone: a running process with the pid (written this boot) counts as the
 shim, the identity isn't changed, and it tries again the next time. Nor does it signal anything on the
 strength of a start it couldn't tell (see below).
 
@@ -185,8 +191,10 @@ driver can't re-attach, or the run is in a newer format than it knows) stops it,
 the thread's turn.
 
 A run is the store's once its record is saved. A run directory whose run isn't in the store, or is
-there as finished, but whose shim is alive, is a run nothing follows (its backend died before
-saving it, or was stopping it when it died): a backend stops it.
+there as finished, but whose shim is alive, or whose process group is still the run's (its shim
+gone, what it ran not), is a run nothing follows (its backend died before saving it, or was
+stopping it when it died): a backend stops it, as above, and keeps its directory until that's
+done.
 
 ## Removing runs
 
