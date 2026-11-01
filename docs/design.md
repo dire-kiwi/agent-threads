@@ -83,7 +83,7 @@ hand. The wire format is specified in [spec/PROTOCOL.md](../spec/PROTOCOL.md) an
 | `go/` | Go module `github.com/dire-kiwi/agent-threads/go`; generated types in `go/protocol`. |
 | `rust/` | Cargo workspace with the `agent-threads` crate, the Rust backend (generated types in `agent_threads::protocol`), and its `codegen`. |
 | `shim/` | `agent-threads-shim` (see below). |
-| `examples/` | A minimal chat app per backend, each with its own WebSocket transport, to show the "bring your own network" seam: `chat-rust` is the Rust one. |
+| `examples/` | A minimal chat app per backend, each with its own WebSocket transport, to show the "bring your own network" seam: `chat-node` and `chat-rust`, whose servers share chat-node's React frontend ([examples/PROTOCOL.md](../examples/PROTOCOL.md)). |
 
 `make gen` regenerates the types from `spec/schema/`, and CI fails if they're out of date.
 

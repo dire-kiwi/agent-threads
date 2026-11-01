@@ -21,7 +21,8 @@ const source: ThreadSource = {
 ```
 
 Keep the same `source` object for a connection (memoize it): a new one starts again from its
-snapshot. `onCommand` can return a promise, and the components show a failure.
+snapshot. [examples/chat-node](../../../examples/chat-node/README.md) is a whole app wired
+this way, over a WebSocket. `onCommand` can return a promise, and the components show a failure.
 
 ## Headless
 

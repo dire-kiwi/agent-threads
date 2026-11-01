@@ -8,9 +8,10 @@ It's early: so far there's the spec, the generated types, the `applyEvent` reduc
 conformance suite the backends run (recorded sessions replayed by a fake CLI, and store cases),
 the Node backend with its stores and its Claude Code and Codex drivers
 ([ts/packages/node](ts/packages/node/README.md)), the Rust backend
-([rust/agent-threads](rust/agent-threads/README.md), with an axum example in
-[examples/chat-rust](examples/chat-rust/README.md)), and `agent-threads-shim`, which keeps runs going
-while a backend restarts ([shim/](shim/README.md)). See [docs/design.md](docs/design.md) for the design and [spec/PROTOCOL.md](spec/PROTOCOL.md)
+([rust/agent-threads](rust/agent-threads/README.md)), `agent-threads-shim`, which keeps runs going
+while a backend restarts ([shim/](shim/README.md)), the React package, and example chat apps
+([examples/chat-node](examples/chat-node/README.md), and
+[examples/chat-rust](examples/chat-rust/README.md) on the Rust backend). See [docs/design.md](docs/design.md) for the design and [spec/PROTOCOL.md](spec/PROTOCOL.md)
 for the protocol.
 
 | Path | What |
@@ -23,6 +24,7 @@ for the protocol.
 | `go/` | Go module `github.com/dire-kiwi/agent-threads/go` |
 | `rust/` | Cargo workspace with the `agent-threads` crate, the Rust backend ([README](rust/agent-threads/README.md)) |
 | `shim/` | `agent-threads-shim`, which keeps runs alive across backend restarts ([README](shim/README.md), [spec/RUNDIR.md](spec/RUNDIR.md)) |
+| `examples/` | Example apps: [chat-node](examples/chat-node/README.md), a chat app on the Node backend and the React package over its own WebSocket ([the wire protocol](examples/PROTOCOL.md) its frontend speaks) |
 
 ## Building
 

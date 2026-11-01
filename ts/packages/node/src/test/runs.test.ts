@@ -9,6 +9,7 @@ import type { Harness, HarnessSession, ThreadContext } from "../harness.js";
 import type { Spawner } from "../spawner.js";
 import type { RunRecord } from "../store.js";
 import { claudeCode } from "../claude/driver.js";
+import { codex } from "../codex/driver.js";
 import { shim } from "../shim.js";
 import { MemoryStore } from "../stores/memory.js";
 import { defineTool } from "../tools.js";
@@ -103,4 +104,44 @@ describe.skipIf(process.platform === "win32")("an app tool, with a run that outl
     const said = snap.items.map((i) => (i.type === "assistant_message" ? i.text : "")).join("\n");
     expect(said).toMatch(/couldn't save its state/);
   });
+});
+
+describe.skipIf(process.platform === "win32")("an app tool's structured output, with a run that outlives the backend", () => {
+  const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+  for (const harness of ["claude", "codex"] as const) {
+    it(`is kept for its call across a restart between the tool's answer and the harness's result (${harness})`, { timeout: 30_000 }, async () => {
+      const store = new MemoryStore();
+      const runsDir = tempDir();
+      let calls = 0;
+      const tools = [defineTool({ name: "lookup", description: "Looks up.", input: { type: "object" }, run: () => (calls++, { text: "found it", structured: { id: 7 } }) })];
+      const harnesses = {
+        claude: claudeCode({ bin: fileURLToPath(new URL("./mini-claude.mjs", import.meta.url)), env: { MINI_CLAUDE_RESULT_DELAY: "1500" } }),
+        codex: codex({
+          bin: fileURLToPath(new URL("./mini-codex.mjs", import.meta.url)),
+          env: { MINI_CODEX_RESULT_DELAY: "1500", HOME: tempDir() },
+          home: tempDir(),
+          login: false,
+        }),
+      };
+      const make = () => new AgentThreads({ store, harnesses, tools, permissions: "allow", spawner: shim(shimPath(), { runsDir, pollMs: 20 }) });
+      const a = make();
+      const t = await a.create({ harness, cwd: tempDir() });
+      await a.send(t.id, "app lookup {}");
+      while (!calls) await sleep(10);
+      // The tool has answered, and the run is saved as it is then: the backend goes before the
+      // harness says the call's result.
+      await sleep(200);
+      await a.close();
+
+      const b = make();
+      const events: ThreadEvent[] = [];
+      b.subscribe((e) => events.push(e));
+      expect(await b.recover()).toEqual({ reattached: [t.id], lost: [] });
+      while (!events.some((e) => e.type === "turn.completed")) await sleep(10);
+      const call = (await b.snapshot(t.id)).items.find((i) => i.type === "tool_call");
+      await b.close({ stop: true });
+      expect(calls).toBe(1);
+      expect(call).toMatchObject({ name: "lookup", kind: "app", status: "completed", result: { content: "found it", structured: { id: 7 } } });
+    });
+  }
 });

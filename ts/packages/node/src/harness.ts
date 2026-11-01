@@ -78,6 +78,11 @@ export interface ThreadContext {
   setThread(patch: Partial<Thread>): void;
   /** The harness took in the queued message with this id. Whether it was queued. */
   tookIn(id: string): boolean;
+  /**
+   * An app tool returned structured output for the tool call `toolCallId`: it goes in the call's
+   * `result.structured` when the harness gives the call its result (harnesses pass on only the text).
+   */
+  toolOutput(toolCallId: string, structured: unknown): void;
 
   /** The permission policy's answer, synchronously when it has one. */
   decide(query: PermissionQuery): PermissionDecision | Promise<PermissionDecision>;
