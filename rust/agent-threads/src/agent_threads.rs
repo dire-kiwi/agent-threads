@@ -5,7 +5,7 @@
 use std::collections::{BTreeMap, HashMap};
 use std::fmt;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
 
 use serde_json::{Map, Value, json};
@@ -264,6 +264,9 @@ struct Inner {
     events: broadcast::Sender<ThreadEvent>,
     threads: StdMutex<Threads>,
     configs: StdMutex<HashMap<String, Capabilities>>,
+    /// Counts configure()'s changes (under the configs lock), so a load that made its actor before
+    /// one knows to apply it when it publishes the thread.
+    configured: AtomicU64,
     /// Threads being deleted, which aren't loaded again.
     deleting: StdMutex<HashMap<String, Deletion>>,
     closed: AtomicBool,
@@ -306,6 +309,7 @@ impl AgentThreads {
                 events,
                 threads: StdMutex::new(Threads::default()),
                 configs: StdMutex::new(HashMap::new()),
+                configured: AtomicU64::new(0),
                 deleting: StdMutex::new(Default::default()),
                 closed: AtomicBool::new(false),
                 shutdown: StdMutex::new(None),
@@ -398,6 +402,7 @@ impl AgentThreads {
                 return Err(Error::Command(format!("thread {thread_id} is being deleted")));
             }
             let mut configs = self.inner.configs.lock().unwrap();
+            self.inner.configured.fetch_add(1, Ordering::SeqCst);
             let own = configs.entry(thread_id.to_string()).or_default();
             if let Some(t) = update.tools {
                 own.tools = t;
@@ -415,20 +420,32 @@ impl AgentThreads {
                 own.system_prompt = Some(p).filter(|p| !p.is_empty());
             }
         }
+        // A thread being loaded isn't live yet: its load applies this when it publishes it.
         let handle = self.live(thread_id);
         if let Some(h) = handle {
-            let (config, policy) = (self.config(thread_id), self.policy(thread_id));
-            h.call(move |a| {
-                a.core.config = config;
-                a.core.policy = policy;
-                a.core.options_changed();
-                // A run that outlives the backend is saved knowing it, without an event to save it
-                // with.
-                a.core.request_save();
-            })
-            .await?;
+            let (tx, rx) = oneshot::channel();
+            h.tx.send(self.reconfigure(thread_id, Some(tx)))
+                .map_err(|_| Error::Command("the thread is closed".into()))?;
+            rx.await.map_err(|_| Error::Command("the thread is closed".into()))?;
         }
         Ok(())
+    }
+
+    /// A job that gives a live thread its configuration and policy as they are now (and says when
+    /// it's done).
+    fn reconfigure(&self, thread_id: &str, done: Option<oneshot::Sender<()>>) -> Job {
+        let (config, policy) = (self.config(thread_id), self.policy(thread_id));
+        Box::new(move |a: &mut Actor| {
+            a.core.config = config;
+            a.core.policy = policy;
+            a.core.options_changed();
+            // A run that outlives the backend is saved knowing it, without an event to save it
+            // with.
+            a.core.request_save();
+            if let Some(done) = done {
+                let _ = done.send(());
+            }
+        })
     }
 
     /// The thread, or none.
@@ -1022,12 +1039,20 @@ impl AgentThreads {
                 ));
             }))
         };
+        // Read before the actor is made (with the configuration as it is then).
+        let configured = self.inner.configured.load(Ordering::SeqCst);
         let r = match self.load_from_store(thread_id).await {
             Ok(h) => {
                 let published = {
                     let mut threads = self.inner.threads.lock().unwrap();
                     let deleting = self.inner.deleting.lock().unwrap().contains_key(thread_id);
                     if !deleting {
+                        // A configure() that came meanwhile changed the configuration before it
+                        // looked for the thread under this lock, and didn't find it: it's applied
+                        // here, before any command can reach the thread.
+                        if self.inner.configured.load(Ordering::SeqCst) != configured {
+                            let _ = h.tx.send(self.reconfigure(thread_id, None));
+                        }
                         threads.live.insert(thread_id.to_string(), h.clone());
                         threads.loading.remove(thread_id);
                     }

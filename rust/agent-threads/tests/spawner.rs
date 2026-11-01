@@ -217,6 +217,41 @@ async fn shim_kill_runs_leaves_nothing_running() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn shim_kill_runs_waits_for_a_run_still_being_launched() {
+    use std::os::unix::fs::PermissionsExt;
+    // A launcher that takes a while to get the shim going.
+    let bin = common::temp_dir().join("slow-shim");
+    std::fs::write(
+        &bin,
+        format!(
+            "#!/bin/sh\nsleep 0.3\nexec '{}' \"$@\"\n",
+            common::shim_path().display()
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let runs_dir = common::temp_dir();
+    let mut o = ShimOptions::new(&runs_dir);
+    o.kill_grace = Duration::from_millis(500);
+    let s = ShimSetup {
+        spawner: shim(&bin, o),
+        runs_dir: runs_dir.clone(),
+    };
+    // It ignores its input closing.
+    let _p = s.run("exec sleep 30", "run_1");
+    let dir = runs_dir.join("run_1");
+    assert!(!dir.join("shim.pid").exists(), "dropped before the shim has started");
+    drop(s);
+    // It waited for the run to start, killed it, and saw it end.
+    assert!(dir.join("exit").exists());
+    let pid = |name: &str| -> i32 { std::fs::read_to_string(dir.join(name)).unwrap().trim().parse().unwrap() };
+    let (program, shim_pid) = (pid("pid"), pid("shim.pid"));
+    assert!(wait(|| !alive(program) && !alive(shim_pid)).await);
+    let exit: Value = serde_json::from_str(&std::fs::read_to_string(dir.join("exit")).unwrap()).unwrap();
+    assert_eq!(exit["signal"], 9);
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn shim_reattaches_from_an_offset_and_leaves_a_run_going_when_it_detaches() {
     let s = shim_setup();
     let a = s.run(r#"while read -r x; do echo "got $x"; done; echo bye"#, "run_1");

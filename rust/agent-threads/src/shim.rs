@@ -1291,24 +1291,51 @@ fn started_at(dir: &Path) -> u64 {
     0
 }
 
-/// Kills every run in `runs_dir` at once, without waiting for anything: SIGKILL to each run's shim
-/// and to its group (if they're still the run's). For tests, so one that fails leaves no process
-/// behind; an app stops its runs with [`AgentThreads::close`](crate::AgentThreads::close).
+/// Kills every run in `runs_dir`, and returns once none can start another process: SIGKILL to each
+/// run's group (if it's still the run's), waiting for a run that's still being launched to get as
+/// far as recording its program's pid, and for each shim to record how its run ended. Blocks for
+/// [`START_TIMEOUT_MS`] or so at most; a shim still there after that is killed too. For tests, so
+/// one that fails leaves no process behind; an app stops its runs with
+/// [`AgentThreads::close`](crate::AgentThreads::close).
 #[doc(hidden)]
 pub fn kill_runs(runs_dir: &Path) {
-    let Ok(entries) = fs::read_dir(runs_dir) else { return };
-    for dir in entries.flatten().map(|e| e.path()).filter(|d| d.is_dir()) {
-        let _ = fs::write(dir.join("input.closed"), "");
-        // The shim first, so it starts nothing more.
-        if let Some(pid) = read_pid(&dir, "shim.pid")
-            && proc_info(pid).is_some()
-            && shim_alive(&dir, None)
-        {
-            unsafe { libc::kill(pid as i32, libc::SIGKILL) };
+    let deadline = now_ms() + START_TIMEOUT_MS + 1000;
+    loop {
+        let Ok(entries) = fs::read_dir(runs_dir) else { return };
+        let dirs: Vec<PathBuf> = entries.flatten().map(|e| e.path()).filter(|d| d.is_dir()).collect();
+        let mut pending = Vec::new();
+        for dir in dirs {
+            let _ = fs::write(dir.join("input.closed"), "");
+            if let Some(group) = live_group(&dir) {
+                signal_group(group, Signal::Kill);
+            }
+            // The shim writes `exit` however the run ends (a program it couldn't start included).
+            let ended = dir.join("exit").exists();
+            let settled = if read_pid(&dir, "shim.pid").is_some() {
+                ended || !shim_alive(&dir, None)
+            } else {
+                // Still being launched, unless it isn't a run, or its launch has had its time.
+                ended || !dir.join("run.json").exists() || now_ms().saturating_sub(started_at(&dir)) > START_TIMEOUT_MS
+            };
+            if !settled || live_group(&dir).is_some() {
+                pending.push(dir);
+            }
         }
-        if let Some(group) = live_group(&dir) {
-            signal_group(group, Signal::Kill);
+        if pending.is_empty() {
+            return;
         }
+        if now_ms() > deadline {
+            for dir in pending {
+                if let Some(pid) = read_pid(&dir, "shim.pid")
+                    && proc_info(pid).is_some()
+                    && shim_alive(&dir, None)
+                {
+                    unsafe { libc::kill(pid as i32, libc::SIGKILL) };
+                }
+            }
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(20));
     }
 }
 

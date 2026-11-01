@@ -1403,10 +1403,12 @@ async fn a_close_cut_short_mid_grace_finishes_and_a_retry_saves_the_interrupted_
 }
 
 /// A store that holds up loading one thread (its get_thread) until it's let go, and counts its
-/// loads.
+/// loads; or (`runs`) holds up every get_run, which loading a thread with a run asks once it has
+/// made the thread's actor.
 struct Gated {
     inner: MemoryStore,
     id: String,
+    runs: bool,
     open: tokio::sync::watch::Sender<bool>,
     loads: std::sync::atomic::AtomicUsize,
 }
@@ -1416,9 +1418,25 @@ impl Gated {
         Arc::new(Gated {
             inner,
             id: id.into(),
+            runs: false,
             open: tokio::sync::watch::channel(false).0,
             loads: Default::default(),
         })
+    }
+
+    fn runs(inner: MemoryStore) -> Arc<Self> {
+        Arc::new(Gated {
+            inner,
+            id: String::new(),
+            runs: true,
+            open: tokio::sync::watch::channel(false).0,
+            loads: Default::default(),
+        })
+    }
+
+    async fn gate(&self) {
+        self.loads.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let _ = self.open.subscribe().wait_for(|open| *open).await;
     }
 
     fn loads(&self) -> usize {
@@ -1432,9 +1450,8 @@ impl Store for Gated {
         self.inner.create_thread(t).await
     }
     async fn get_thread(&self, id: &str) -> StoreResult<Option<Value>> {
-        if id == self.id {
-            self.loads.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-            let _ = self.open.subscribe().wait_for(|open| *open).await;
+        if !self.runs && id == self.id {
+            self.gate().await;
         }
         self.inner.get_thread(id).await
     }
@@ -1466,6 +1483,9 @@ impl Store for Gated {
         self.inner.put_run(r).await
     }
     async fn get_run(&self, id: &str) -> StoreResult<Option<RunRecord>> {
+        if self.runs {
+            self.gate().await;
+        }
         self.inner.get_run(id).await
     }
     async fn active_runs(&self) -> StoreResult<Vec<RunRecord>> {
@@ -1585,4 +1605,45 @@ async fn close_waits_for_a_load_under_way_and_refuses_loads_after_it() {
     // close() saved the thread it loaded, and let it go.
     assert!(store.inner.load_snapshot(&a).await.unwrap().is_some());
     assert!(store.inner.load_snapshot(&b).await.unwrap().is_none());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_thread_configured_while_its_being_loaded_has_the_new_configuration() {
+    // A thread left with a run by a backend before this one: loading it looks the run up after
+    // making its actor.
+    let thread = json!({"id": "th_1", "harness": "claude", "status": "idle", "permission_mode": "default",
+        "cwd": common::temp_dir(), "created_at": "2026-11-01T00:00:00Z", "run": {"id": "run_1", "spawner": "shim"}});
+    let inner = MemoryStore::new();
+    inner.create_thread(&thread).await.unwrap();
+    let events = [json!({"type": "thread.updated", "thread_id": "th_1", "seq": 1, "thread": thread})];
+    inner.append_events("th_1", &events, &[]).await.unwrap();
+    let store = Gated::runs(inner);
+    let env = setup(Setup {
+        store: Some(store.clone()),
+        ..Default::default()
+    });
+    let loading = tokio::spawn({
+        let sdk = env.sdk.clone();
+        async move { sdk.snapshot("th_1").await }
+    });
+    let s = store.clone();
+    until(5, || async { (s.loads() > 0).then_some(()) }).await;
+    // Its actor is made (with the instance's policy, allow), and it isn't live yet.
+    let policy = Capabilities {
+        permissions: Some(PermissionPolicy::deny()),
+        ..Default::default()
+    };
+    tokio::time::timeout(Duration::from_secs(2), env.sdk.configure("th_1", policy))
+        .await
+        .expect("configure doesn't wait for the load")
+        .unwrap();
+    store.open.send_replace(true);
+    loading.await.unwrap().unwrap();
+    env.sdk
+        .send("th_1", "tool Bash {}", SendOptions::default())
+        .await
+        .unwrap();
+    let s = settle(&env.sdk, "th_1").await;
+    assert_eq!(items(&s, "tool_call")[0]["status"], "denied");
+    env.sdk.close(true).await.unwrap();
 }
