@@ -75,6 +75,25 @@ Replies have an `id` and pushes a `type`, so a client tells them apart by that.
 - A new thread is `create` with the harness and model picked, titled with the first message, then
   a `send` of that message.
 
+## Running chat-node's smoke tests against another server
+
+chat-node's Playwright tests ([chat-node/e2e](chat-node/e2e/chat.spec.ts)) run against any server
+that speaks this protocol: set `CHAT_E2E_SERVER` to its command, and `CHAT_E2E_SUPERVISED` to the
+command that runs it under its supervisor (`$CHAT_E2E_SERVER supervise` by default), e.g.
+`CHAT_E2E_SERVER=../chat-go/chat-go pnpm test:e2e`. The tests start it with this environment:
+
+| Variable | |
+| --- | --- |
+| `PORT` | The port to listen on. |
+| `CHAT_DATA` | A directory of its own for its threads and runs, which the restart tests keep across a restart. |
+| `CHAT_FAKE_CLAUDE`, `CHAT_FAKE_CODEX` | A `spec/fixtures/<harness>/<scenario>` directory: offer only that harness, run `spec/tools/fake-cli.mjs` as its binary (with `AGENT_THREADS_FIXTURE` set to the directory), with the model and effort in its `fixture.json`, no MCP server or skill, and `lookup_order` only if the fixture has it. |
+| `CHAT_FAKE_STATE` | Where the fake CLI keeps its state (`AGENT_THREADS_FIXTURE_STATE`, a subdirectory per harness), kept across a restart; a fresh one each start when it isn't set. |
+| `CHAT_SHIM` | The `agent-threads-shim` binary to run the harnesses under. |
+
+It must print a line starting `chat-<name> on ` (on stdout or stderr) once it's listening, and
+again after each restart, and stop on SIGTERM. Supervised, `restart` must start it again with the
+same environment, and `hello` must say `restart: true`.
+
 ## The app's tool
 
 The frontend draws one app tool of its own, `lookup_order`, as an order card, so a server should

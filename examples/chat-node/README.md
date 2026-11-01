@@ -146,7 +146,9 @@ recording has), and drive the app in Chromium:
 - the WebSocket refusing other sites' pages and rebound hosts, and the server surviving malformed
   frames and URLs.
 
-They need Playwright's Chromium (`pnpm exec playwright install chromium`), or set `CHAT_E2E_BROWSER`
+`CHAT_E2E_SERVER` runs them against another server that speaks
+[the same protocol](../PROTOCOL.md#running-chat-nodes-smoke-tests-against-another-server), such as
+the Go or Rust example's. They need Playwright's Chromium (`pnpm exec playwright install chromium`), or set `CHAT_E2E_BROWSER`
 to the path of a Chromium or Chrome of your own.
 
 ## Files

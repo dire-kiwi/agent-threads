@@ -1,4 +1,7 @@
-// Starts the chat server for a test, on a free port with a data directory of its own.
+// Starts the chat server for a test, on a free port with a data directory of its own. It's
+// chat-node's own unless CHAT_E2E_SERVER gives another's command (e.g. the Go or Rust example's),
+// with CHAT_E2E_SUPERVISED for running it under its supervisor (`$CHAT_E2E_SERVER supervise` by
+// default). Words are split on spaces. See examples/PROTOCOL.md for what such a server must do.
 
 import { spawn, type ChildProcess } from "node:child_process";
 import { mkdtempSync } from "node:fs";
@@ -24,19 +27,19 @@ export async function startServer(env: { [k: string]: string }, { supervised = f
   const port = given ?? (await freePort());
   const data = env.CHAT_DATA ?? mkdtempSync(join(tmpdir(), "chat-e2e-"));
   const all = { ...env, PORT: String(port), CHAT_DATA: data };
-  const proc: ChildProcess = spawn(process.execPath, [join(ROOT, supervised ? "server/supervise.ts" : "server/main.ts")], {
-    env: { ...process.env, ...all },
-    stdio: ["ignore", "pipe", "inherit"],
-  });
+  const [bin, ...args] = command(supervised);
+  const proc: ChildProcess = spawn(bin!, args, { env: { ...process.env, ...all }, stdio: ["ignore", "pipe", "pipe"] });
   let waiting: (() => boolean)[] = [];
   let starts = 0;
-  createInterface({ input: proc.stdout! }).on("line", (line) => {
-    process.stdout.write(`[server] ${line}\n`);
-    if (line.startsWith("chat-node on")) {
-      starts++;
-      waiting = waiting.filter((w) => !w());
-    }
-  });
+  // A server says it's listening with a line starting `chat-<name> on`, on stdout or stderr.
+  for (const input of [proc.stdout!, proc.stderr!])
+    createInterface({ input }).on("line", (line) => {
+      process.stdout.write(`[server] ${line}\n`);
+      if (/^chat-\S+ on /.test(line)) {
+        starts++;
+        waiting = waiting.filter((w) => !w());
+      }
+    });
   const exited = new Promise<void>((r) => proc.on("exit", () => r()));
   let seen = 0;
   const server: Server = {
@@ -65,6 +68,13 @@ export async function startServer(env: { [k: string]: string }, { supervised = f
     new Promise((_, reject) => (timer = setTimeout(() => reject(new Error("the server didn't start within 20s")), 20_000))),
   ]).finally(() => clearTimeout(timer));
   return server;
+}
+
+/** The command that runs the server (under its supervisor, which restarts it when asked to). */
+function command(supervised: boolean): string[] {
+  const other = process.env.CHAT_E2E_SERVER?.trim();
+  if (!other) return [process.execPath, join(ROOT, supervised ? "server/supervise.ts" : "server/main.ts")];
+  return (supervised ? process.env.CHAT_E2E_SUPERVISED?.trim() || `${other} supervise` : other).split(/\s+/);
 }
 
 function freePort(): Promise<number> {
