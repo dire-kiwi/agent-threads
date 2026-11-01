@@ -97,6 +97,9 @@ again to finish saving. The file store undoes a write that fails partway, so a r
 
 ## Codex
 
+Codex runs aren't re-attached after a backend restart yet; see AT-15 (and
+[Processes](#processes-and-runs-that-survive-a-restart)).
+
 - **One `codex app-server` process per thread**, started at its first message and kept between
   turns. It's sent `initialize` (with `experimentalApi`) and `initialized`, then `thread/start`, or
   `thread/resume` once the thread has a session (after a restart, or a change of model, effort,
@@ -162,15 +165,21 @@ in its own process group, so they end with the backend. `shim(path)` runs them u
 [agent-threads-shim](../../../shim/README.md) (`path` is the binary), so they outlive it:
 
 ```ts
-const sdk = new AgentThreads({ store: new FileStore("./threads"), spawner: shim("/usr/local/bin/agent-threads-shim") });
+const sdk = new AgentThreads({
+  store: new FileStore("./threads"),
+  spawner: shim("/usr/local/bin/agent-threads-shim", { runsDir: "./threads-runs" }),
+});
 await sdk.recover(); // at startup, before taking commands
 ```
 
-- Each run gets a directory under `runsDir` (`~/.agent-threads/runs` by default; one store's runs
-  per directory), which the backend and the shim share as [spec/RUNDIR.md](../../../spec/RUNDIR.md)
-  says: input is appended to `input.jsonl`, and the backend follows `out.jsonl`, whole lines only.
-- Whenever a thread's events are saved, its run's offset (how far into `out.jsonl` they go) and the
-  driver's state for it are saved with them, in the same `appendEvents`. So however the backend
+- Each run gets a directory under `runsDir`, which the backend and the shim share as
+  [spec/RUNDIR.md](../../../spec/RUNDIR.md) says: input is appended to `input.jsonl`, and the
+  backend follows `out.jsonl`, whole lines only. `runsDir` must be the store's alone (pruning stops
+  and removes the runs in it the store doesn't follow), so there's no default. It and a shim path
+  with a `/` in it are taken relative to the backend's working directory.
+- Whenever a thread's events are saved, its run's offset (how far into `out.jsonl` they go), the
+  driver's state for it, the running turn and the text streamed so far are saved with them, in the
+  same `appendEvents`. So however the backend
   stops, after a restart it reads the output again from exactly where the saved events end: none
   are lost, and none are made twice.
 - `recover()` re-attaches to the runs that were going when the backend stopped. A run that's still
@@ -181,18 +190,23 @@ await sdk.recover(); // at startup, before taking commands
   loads before `recover()` gets to it is re-attached then.
 - `close()` leaves shim runs going, for the next start to re-attach to; `close({ stop: true })`
   stops them.
-- A run that can't be re-attached to is stopped, and its turn ends with a `run.lost` notice. That's
-  so for **Codex** runs for now: the Codex driver doesn't re-attach yet. It's so too for a run in a
+- A run that can't be re-attached to is stopped, and its turn ends with a `run.lost` notice.
+  **Codex runs aren't re-attached yet; see AT-15**: the Codex driver has no checkpoint yet, so its
+  runs are stopped when the backend restarts. It's so too for a run in a
   newer run-directory format. (A backend that has gone back to the direct spawner can't stop shim
   runs: it only ends their turns.)
-- An app tool that was running when the backend stopped isn't run again (it may have done what it
-  does): Claude is told it may or may not have finished.
+- An app tool is saved as running before it runs, so one that was running when the backend
+  stopped isn't run again (it may have done what it does): Claude is told it may or may not have
+  finished.
+- A change of options or config before the restart still starts a new process at the next turn.
 - `recover()` also prunes, now and every hour: finished runs' directories go after `keepDays`
   (14), and a run nothing follows any more (its backend died before saving it, or while stopping
   it) is stopped.
 - Stopping a run is the harness's interrupt, then closing its input, then SIGTERM and SIGKILL to
-  its process group. A shim that dies without saying how its run ended (SIGKILL, a reboot) is
-  noticed, and the run ends with an error.
+  its process group (the SIGKILL to whatever is left of it, even once the harness has exited). A
+  shim that dies without saying how its run ended (SIGKILL, a reboot) is noticed: the run ends with
+  an error, and its harness is stopped. A process group is only ever signalled while it's still the
+  run's, never one whose id has gone to another process (after a reboot, say).
 - On Windows, which the shim doesn't run on, `shim()` is `direct()`.
 
 ## Tests

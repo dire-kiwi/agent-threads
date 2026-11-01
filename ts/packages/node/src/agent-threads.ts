@@ -143,6 +143,8 @@ export class AgentThreads {
       rt.config = this.#config(threadId);
       rt.policy = this.#policy(threadId);
       rt.session?.optionsChanged();
+      // A run that outlives the backend is saved knowing it, without an event to save it with.
+      rt.persist().catch(() => {}); // A store that fails has said so.
     }
   }
 
@@ -311,8 +313,8 @@ export class AgentThreads {
     await Promise.allSettled([...this.#loading.values()]);
     await Promise.all(
       [...this.#threads.values()].map(async (rt) => {
-        // Left going, saved as it is now, to be re-attached to.
-        if (!stop && this.spawner.durable && rt.session?.detach?.()) return;
+        // Left going, saved as it is now, to be re-attached to (#saveAll reports a failure).
+        if (!stop && this.spawner.durable && rt.session?.detach?.()) return void (await rt.persist().catch(() => {}));
         // A turn cut short by shutting down ends as an interrupted one.
         rt.closing = true;
         if (rt.turn) rt.turn.interrupted = true;

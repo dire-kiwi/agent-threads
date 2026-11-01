@@ -86,6 +86,8 @@ export class ThreadRuntime implements ThreadContext {
   #backoff = 0;
   /** The run record last saved, while its run goes on (with a durable spawner). */
   #run: { record: RunRecord; json: string } | undefined;
+  /** Items text has streamed into since the turn began (whose text may not be saved yet). */
+  #streaming = new Set<string>();
 
   constructor(host: RuntimeHost, state: Snapshot, config: ThreadConfig, policy: PermissionPolicy) {
     this.#host = host;
@@ -203,23 +205,61 @@ export class ThreadRuntime implements ThreadContext {
     }
     // A run that's over is saved once more, as it ended.
     if (!cp || (before?.id === cp.id && before.ended_at != null)) return { runs, run };
-    const record: RunRecord = {
+    const live = this.#liveText();
+    const draft: RunRecord = {
       id: cp.id,
       thread_id: this.threadId,
       spawner: spawner.name,
       offset: cp.offset,
       started_at: before?.id === cp.id ? before.started_at : thread.run?.id === cp.id && thread.run.started_at ? thread.run.started_at : now,
       ...("ended" in cp && cp.ended ? { ended_at: now } : {}),
-      data: { ...("dir" in cp && cp.dir ? { dir: cp.dir } : {}), turn: this.turn, state: cp.state },
+      data: { ...("dir" in cp && cp.dir ? { dir: cp.dir } : {}), turn: this.turn, state: cp.state, ...(live ? { live } : {}) },
     };
-    const json = JSON.stringify(record);
+    // A copy, taken now: the store may write it later, after more of the run's output has changed
+    // the driver's state and the turn.
+    const json = JSON.stringify(draft);
+    const record = JSON.parse(json) as RunRecord;
     if (json !== this.#run?.json) runs.push(record);
     return { runs, run: { record, json } };
   }
 
-  /** The run record saved last, for a backend that re-attached to it. */
+  /**
+   * Text streamed into items that the saved events don't have yet (deltas aren't saved), by item:
+   * saved with the run, since the run's output it came from won't be read again.
+   */
+  #liveText(): { [id: string]: string } | undefined {
+    let live: { [id: string]: string } | undefined;
+    for (const id of this.#streaming) {
+      const now = findItem(this.#state.items, id);
+      const saved = findItem(this.#saved.items, id);
+      if (now && "text" in now && saved && "text" in saved && now.text !== saved.text) (live ??= {})[id] = now.text;
+    }
+    return live;
+  }
+
+  /**
+   * The run record saved last, for a backend that re-attached to it, with the text that had
+   * streamed in as of it: shown again, as deltas, before the run's output is read on.
+   */
   adoptRun(record: RunRecord): void {
     this.#run = { record, json: JSON.stringify(record) };
+    const live = (record.data as { live?: { [id: string]: string } } | undefined)?.live ?? {};
+    for (const [id, text] of Object.entries(live)) {
+      const item = this.item(id);
+      if (!item || (item.type !== "assistant_message" && item.type !== "reasoning") || !text.startsWith(item.text)) continue;
+      this.delta(id, item.type === "assistant_message" ? "text" : "reasoning", text.slice(item.text.length));
+    }
+  }
+
+  /**
+   * Saves the run's checkpoint now, with whatever events there are, and resolves once it's saved
+   * (with a durable spawner; otherwise at once): for a driver about to do something that mustn't
+   * be done again after a restart. Rejects with the store's error if it can't be saved.
+   */
+  async persist(): Promise<void> {
+    if (!this.#host.spawner.durable) return;
+    this.#scheduleFlush();
+    await this.saved();
   }
 
   #retryLater(): void {
@@ -294,7 +334,9 @@ export class ThreadRuntime implements ThreadContext {
   }
 
   delta(itemId: string, kind: "text" | "reasoning", text: string): void {
-    if (text) this.emit({ type: "delta", item_id: itemId, kind, text });
+    if (!text) return;
+    this.#streaming.add(itemId);
+    this.emit({ type: "delta", item_id: itemId, kind, text });
   }
 
   setThread(patch: Partial<Thread>): void {
@@ -368,6 +410,7 @@ export class ThreadRuntime implements ThreadContext {
       const saved = this.item(it.id);
       if (saved && "text" in saved && saved.text !== it.text) this.updateItem(it.id, { text: it.text });
     }
+    this.#streaming.clear();
     for (const it of this.#state.items) {
       if (it.type === "tool_call" && it.turn_id === turn.id && (it.status === "running" || it.status === "pending")) {
         this.updateItem(it.id, { status: "cancelled" });
@@ -532,4 +575,9 @@ export function addUsage(a: Usage | undefined, b: Usage | undefined): Usage | un
     out[k] = k === "cost_usd" ? Math.round(((out[k] ?? 0) + v) * 1e12) / 1e12 : (out[k] ?? 0) + v;
   }
   return out as unknown as Usage;
+}
+
+function findItem(items: Item[], id: string): Item | undefined {
+  for (let i = items.length - 1; i >= 0; i--) if (items[i]!.id === id) return items[i];
+  return undefined;
 }

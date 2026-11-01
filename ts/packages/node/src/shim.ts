@@ -4,10 +4,10 @@
 // the offset it has read to is saved with the events it made of the lines (see Spawner.durable),
 // so a backend that restarts re-attaches (attach()) and carries on from exactly there.
 
-import { spawn as spawnChild } from "node:child_process";
+import { execFileSync, spawn as spawnChild } from "node:child_process";
 import { appendFileSync, closeSync, existsSync, mkdirSync, openSync, readdirSync, readFileSync, readSync, renameSync, rmSync, statSync, watch, writeFileSync, type FSWatcher } from "node:fs";
-import { constants, homedir } from "node:os";
-import { join } from "node:path";
+import { constants, uptime } from "node:os";
+import { isAbsolute, join, resolve } from "node:path";
 import { direct, type ExitStatus, type HarnessProcess, type ProcessHandlers, type SpawnOptions, type Spawner } from "./spawner.js";
 import type { RunRecord, Store } from "./store.js";
 
@@ -15,8 +15,11 @@ import type { RunRecord, Store } from "./store.js";
 export const RUN_FORMAT = 1;
 
 export interface ShimOptions {
-  /** Where run directories go: `~/.agent-threads/runs` by default. One store's runs per directory. */
-  runsDir?: string;
+  /**
+   * Where run directories go. It must be this store's alone: pruning stops and removes the runs in
+   * it that the store doesn't follow, so two stores sharing one would stop each other's runs.
+   */
+  runsDir: string;
   /** How long a finished run's directory is kept, for debugging. 14 days by default. */
   keepDays?: number;
   /** How long a run that's stopped has to exit after SIGTERM before it's sent SIGKILL. 10s by default. */
@@ -41,12 +44,16 @@ const STDERR_TAIL = 4096;
 const CHUNK = 1 << 20;
 
 /**
- * Runs harness processes under agent-threads-shim (`path`, the binary), so they survive the
- * backend. On Windows, which the shim doesn't run on, it's `direct()`.
+ * Runs harness processes under agent-threads-shim (`path`, the binary: a path, or a name looked for
+ * on the PATH), so they survive the backend. On Windows, which the shim doesn't run on, it's
+ * `direct()`.
  */
-export function shim(path: string, options: ShimOptions = {}): Spawner {
+export function shim(path: string, options: ShimOptions): Spawner {
   if (process.platform === "win32") return direct();
-  const runsDir = options.runsDir ?? join(homedir(), ".agent-threads", "runs");
+  if (!options?.runsDir) throw new TypeError("shim() needs a runsDir: a directory for this store's runs alone");
+  // Made absolute here, as the shim starts in the thread's working directory.
+  const runsDir = resolve(options.runsDir);
+  const bin = path.includes("/") && !isAbsolute(path) ? resolve(path) : path;
   const keepMs = (options.keepDays ?? 14) * 86_400_000;
   const grace = options.killGraceMs ?? 10_000;
   const poll = options.pollMs ?? 200;
@@ -54,7 +61,7 @@ export function shim(path: string, options: ShimOptions = {}): Spawner {
   const live = new Map<string, ShimProcess>();
 
   const follow = (id: string, dir: string, offset: number, handlers: ProcessHandlers, launched: boolean): ShimProcess => {
-    const proc = new ShimProcess(dir, offset, handlers, { poll, launched, done: () => live.delete(id) });
+    const proc = new ShimProcess(dir, offset, handlers, { poll, grace, launched, done: () => live.delete(id) });
     live.set(id, proc);
     return proc;
   };
@@ -72,7 +79,7 @@ export function shim(path: string, options: ShimOptions = {}): Spawner {
       writeFileSync(join(dir, "input.jsonl"), "");
       const proc = follow(o.runId, dir, 0, handlers, true);
       // The shim forks and its first process exits at once; the run is the fork's.
-      const launcher = spawnChild(path, [dir, "--", o.command, ...o.args], { cwd: o.cwd, env: o.env, stdio: "ignore", detached: true });
+      const launcher = spawnChild(bin, [dir, "--", o.command, ...o.args], { cwd: o.cwd, env: o.env, stdio: "ignore", detached: true });
       launcher.on("error", (e) => proc.launchFailed(`agent-threads-shim couldn't be started: ${e.message}`));
       launcher.on("exit", (code, signal) => {
         if (code === 0) proc.launched();
@@ -118,7 +125,7 @@ export function shim(path: string, options: ShimOptions = {}): Spawner {
         if (!st.isDirectory()) continue;
         const record = await store.getRun(id);
         if (record && record.ended_at == null) continue; // A run the backend will follow.
-        const running = !existsSync(join(dir, "exit")) && alive(readPid(dir, "shim.pid"));
+        const running = !existsSync(join(dir, "exit")) && shimAlive(dir);
         if (running) {
           // Nothing follows it, so nothing will stop it: a run its backend gave up on (and was
           // stopping when it went), or one started by a backend that died before saving it.
@@ -154,6 +161,7 @@ class ShimProcess implements HarnessProcess {
   #out: Tail;
   #err: Tail;
   #poll: number;
+  #grace: number;
   #timer: NodeJS.Timeout | undefined;
   #watcher: FSWatcher | undefined;
   #wake = false;
@@ -169,11 +177,12 @@ class ShimProcess implements HarnessProcess {
   #over = false;
   #onDone: () => void;
 
-  constructor(dir: string, offset: number, handlers: ProcessHandlers, o: { poll: number; launched: boolean; done: () => void }) {
+  constructor(dir: string, offset: number, handlers: ProcessHandlers, o: { poll: number; grace: number; launched: boolean; done: () => void }) {
     this.dir = dir;
     this.#offset = offset;
     this.#handlers = handlers;
     this.#poll = o.poll;
+    this.#grace = o.grace;
     this.#launchedHere = o.launched;
     this.#onDone = o.done;
     this.#out = new Tail(join(dir, "out.jsonl"), offset);
@@ -229,14 +238,13 @@ class ShimProcess implements HarnessProcess {
   }
 
   kill(signal: NodeJS.Signals = "SIGTERM"): void {
-    if (this.#over || existsSync(join(this.dir, "exit"))) return;
-    const pid = this.pid;
-    if (pid === undefined) {
+    if (this.pid === undefined) {
       // The shim hasn't started it yet: it's signalled once it has.
-      this.#signals.push(signal);
+      if (!this.#over) this.#signals.push(signal);
       return;
     }
-    signalGroup(pid, signal);
+    // Its group, even once the program has exited: what it started may still be running.
+    terminate(this.dir, this.#grace, signal);
   }
 
   detach(): void {
@@ -298,13 +306,15 @@ class ShimProcess implements HarnessProcess {
       if (line) this.#handlers.line(line);
       if (this.#over) return;
     }
-    if (this.#signals.length && this.pid !== undefined && !exited) for (const s of this.#signals.splice(0)) signalGroup(this.pid, s);
+    if (this.#signals.length && this.pid !== undefined) for (const s of this.#signals.splice(0)) terminate(this.dir, this.#grace, s);
     if (exited) return this.#exited(readExit(this.dir));
     const gone = this.#gone();
     if (gone) {
       // Recorded as the shim would have, unless it did after all.
       if (!existsSync(this.dir)) return this.#exited({ code: null, signal: null, error: new Error(gone) });
       writeExit(this.dir, { code: null, signal: null, error: gone });
+      // With its shim gone, nothing would stop the program, which may well still be running.
+      terminate(this.dir, this.#grace);
       return this.#schedule(0);
     }
     this.#schedule(this.#poll);
@@ -318,8 +328,7 @@ class ShimProcess implements HarnessProcess {
     const now = Date.now();
     if (now - this.#checked < 1000) return undefined;
     this.#checked = now;
-    const shimPid = readPid(this.dir, "shim.pid");
-    if (shimPid !== undefined) return alive(shimPid) || existsSync(join(this.dir, "exit")) ? undefined : "its supervisor (agent-threads-shim) went away";
+    if (readPid(this.dir, "shim.pid") !== undefined) return shimAlive(this.dir) || existsSync(join(this.dir, "exit")) ? undefined : "its supervisor (agent-threads-shim) went away";
     // No shim.pid: one still starting, or one that never started.
     const since = this.#launchedHere ? this.#launch?.at : this.#since;
     if (since !== undefined && now - since > START_TIMEOUT_MS) return "agent-threads-shim didn't start the run";
@@ -466,18 +475,96 @@ function signalGroup(pid: number, signal: NodeJS.Signals): void {
   }
 }
 
-/** Stops the run in `dir`: ends its input, then SIGTERM to its group, and SIGKILL if it hasn't exited after `grace`. */
+/** When the machine started (ms since the epoch), give or take a second. */
+const bootTime = (): number => Date.now() - uptime() * 1000;
+
+/** When a run directory's file was written, if it was since the machine started (before, its pid is stale). */
+function writtenThisBoot(dir: string, name: string): number | undefined {
+  try {
+    const at = statSync(join(dir, name)).mtimeMs;
+    return at >= bootTime() - 1000 ? at : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+/** Whether the run's shim is alive (checked cheaply: its pid is from this boot, and is a process). */
+function shimAlive(dir: string): boolean {
+  return writtenThisBoot(dir, "shim.pid") !== undefined && alive(readPid(dir, "shim.pid"));
+}
+
+/** When a process started (ms since the epoch, to the second), if it's running and `ps` says. */
+function startTime(pid: number): number | undefined {
+  try {
+    const out = execFileSync("ps", ["-o", "lstart=", "-p", String(pid)], { encoding: "utf8", env: { ...process.env, LC_ALL: "C" }, timeout: 2000, stdio: ["ignore", "pipe", "ignore"] });
+    const at = Date.parse(out.trim());
+    return Number.isNaN(at) ? undefined : at;
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * The run's process group (the program's pid), if it's still the run's and anything in it is
+ * running: never a group whose id the system has since given to another process.
+ */
+function liveGroup(dir: string): number | undefined {
+  const pid = readPid(dir, "pid");
+  const written = writtenThisBoot(dir, "pid");
+  // Written before the machine restarted: the pid means nothing now.
+  if (pid === undefined || written === undefined) return undefined;
+  if (alive(pid)) {
+    // The program, if it started before its pid was written; not a new process given the same pid.
+    const started = startTime(pid);
+    return started !== undefined && started <= written + 1000 ? pid : undefined;
+  }
+  // The program's gone, but while anything is left in its group, its id isn't given to another process.
+  try {
+    process.kill(-pid, 0);
+    return pid;
+  } catch (e) {
+    return (e as NodeJS.ErrnoException).code === "EPERM" ? pid : undefined;
+  }
+}
+
+/**
+ * Signals the run's process group, if it's still the run's; after SIGTERM (or another signal),
+ * SIGKILL to whatever is left of it after `grace`, even if the program itself has exited.
+ */
+function terminate(dir: string, grace: number, signal: NodeJS.Signals = "SIGTERM"): void {
+  const pid = liveGroup(dir);
+  if (pid === undefined) return;
+  signalGroup(pid, signal);
+  if (signal === "SIGKILL") return;
+  setTimeout(() => {
+    const left = liveGroup(dir);
+    if (left !== undefined) signalGroup(left, "SIGKILL");
+  }, grace).unref();
+}
+
+/**
+ * Stops the run in `dir`, which nothing follows: ends its input, then SIGTERM to its group and
+ * SIGKILL after `grace`. A run its shim hasn't started yet is stopped once it has; one whose shim
+ * has gone gets the `exit` the shim would have written.
+ */
 function stopDir(dir: string, grace: number): void {
-  if (existsSync(join(dir, "exit"))) return;
   try {
     writeFileSync(join(dir, "input.closed"), "");
   } catch {
-    return;
+    return; // Its directory's gone.
   }
-  const pid = readPid(dir, "pid");
-  if (pid === undefined) return;
-  signalGroup(pid, "SIGTERM");
-  setTimeout(() => {
-    if (!existsSync(join(dir, "exit"))) signalGroup(pid, "SIGKILL");
-  }, grace).unref();
+  const deadline = Date.now() + START_TIMEOUT_MS;
+  const step = (): void => {
+    const exited = existsSync(join(dir, "exit"));
+    const shim = shimAlive(dir);
+    if (readPid(dir, "pid") === undefined) {
+      // Not started yet: waited for while the shim may still start it.
+      const never = exited || (readPid(dir, "shim.pid") !== undefined && !shim) || Date.now() > deadline || !existsSync(dir);
+      if (!never) setTimeout(step, 50).unref();
+      return;
+    }
+    if (!exited && !shim) writeExit(dir, { code: null, signal: null, error: "its supervisor (agent-threads-shim) went away" });
+    terminate(dir, grace);
+  };
+  step();
 }

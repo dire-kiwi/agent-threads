@@ -22,7 +22,8 @@
 // turn); with MINI_CLAUDE_STEER=never, they never are (and the process has to be restarted); with
 // MINI_CLAUDE_STEER=hold, they're never taken in either, and an interrupt while no turn runs gets
 // an interrupted result. MINI_CLAUDE_IDLE_ERRORS=<n> sends n failed results (an API error, say)
-// before taking in late messages. With MINI_CLAUDE_FAIL_RESUME=1 (or the name of a file that
+// before taking in late messages. MINI_CLAUDE_TOOL_DELAY=<ms> waits that long between an app tool's
+// call and asking for it to be run. With MINI_CLAUDE_FAIL_RESUME=1 (or the name of a file that
 // exists), a process started with --resume fails at its first message.
 
 import { appendFileSync, existsSync } from "node:fs";
@@ -167,6 +168,8 @@ async function step(text) {
     const [name, json = "{}"] = rest;
     const id = `toolu_${++ids}`;
     out({ type: "assistant", message: { id: `msg_${process.pid}_${++msgs}`, model: "mini", content: [{ type: "tool_use", id, name: `mcp__app__${name}`, input: JSON.parse(json) }] }, parent_tool_use_id: null, session_id: session });
+    // As Claude does, a while later (so the backend has saved the call before it's asked to run it).
+    await new Promise((r) => setTimeout(r, Number(process.env.MINI_CLAUDE_TOOL_DELAY ?? 0)));
     const r = await ask({ subtype: "mcp_message", server_name: "app", message: { jsonrpc: "2.0", id: 7, method: "tools/call", params: { name, arguments: JSON.parse(json), _meta: { "claudecode/toolUseId": id } } } });
     const res = r.response.mcp_response.result;
     out({ type: "user", message: { role: "user", content: [{ type: "tool_result", tool_use_id: id, content: res.content, is_error: !!res.isError }] }, parent_tool_use_id: null, session_id: session });

@@ -3,6 +3,9 @@
 // the rules in spec/fixtures/README.md. A message is turn/start (or turn/steer while a turn runs);
 // the server's approval and question requests go through the permission policy; the app's tools are
 // dynamic tools answered over item/tool/call, or (where Codex can't take those) a loopback MCP server.
+// Codex runs aren't re-attached after a backend restart yet (see AT-15): the session has no
+// checkpoint(), reattach() or detach(), so with the shim spawner a restart stops its run and ends
+// its turn with a run.lost notice.
 
 import { mkdtempSync, realpathSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";

@@ -159,7 +159,7 @@ const sdk = new AgentThreads({
   mcpServers: { github: { command: "gh-mcp" }, docs: { url: "https://…/mcp" } },
   skills: ["./skills/support-agent"],
   permissions: async (req, ctx) => (req.kind === "read" ? "allow" : "ask"), // allow | deny | ask (asks the user)
-  spawner: shim("/usr/local/bin/agent-threads-shim"), // optional; direct by default
+  spawner: shim("/usr/local/bin/agent-threads-shim", { runsDir }), // optional; direct by default
 });
 
 const thread = await sdk.create({ harness: "claude", model: "opus", cwd, systemPrompt, metadata });
@@ -209,7 +209,7 @@ backend re-attaches; a `notice` item with code `run.reattached` (or `run.lost`, 
 couldn't pick up, whose turn it ended) tells the user. A backend saves a run's offset, with what its
 driver needs to carry on reading, in the same store write as the events it made from the output
 before it, so a restart neither loses events nor makes them twice. The Node backend has the shim
-spawner and `recover()`; its Codex driver doesn't re-attach yet, so its runs are stopped on a
+spawner and `recover()`; its Codex driver doesn't re-attach yet (AT-15), so its runs are stopped on a
 restart.
 
 ## React package

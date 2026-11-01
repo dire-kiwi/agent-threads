@@ -91,6 +91,12 @@ export interface ThreadContext {
    * called when the user responds, as for ask(). Whether it's open.
    */
   reopen(requestId: string, answered: (resolution: Resolution) => void, standing?: string): boolean;
+  /**
+   * Saves the thread's run as it is now (with a spawner whose runs outlive the backend), before
+   * the driver does something that mustn't be done twice: after a restart, it's re-attached as of
+   * this. Resolves once it's saved; rejects if the store can't save it.
+   */
+  persist(): Promise<void>;
   /** Closes a request the harness no longer wants answered. */
   cancelRequest(id: string): void;
   /** The running turn ended. */

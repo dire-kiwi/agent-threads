@@ -9,7 +9,7 @@ import { join } from "node:path";
 import { createInterface } from "node:readline";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { beforeAll, describe, expect, it } from "vitest";
-import type { Command, Snapshot, ThreadEvent } from "@dire-kiwi/agent-threads-protocol";
+import { applyEvents, initialState, type Command, type Snapshot, type ThreadEvent } from "@dire-kiwi/agent-threads-protocol";
 import { FileStore } from "../stores/file.js";
 import { readJsonl, shimPath, specDir, tempDir } from "./spec.js";
 
@@ -253,5 +253,87 @@ describe.skipIf(process.platform === "win32")("a backend restart", () => {
     const store = new FileStore(s.dirs.store);
     expect(await store.activeRuns()).toEqual([]);
     await store.close();
+  });
+
+  // With mini-claude.mjs as Claude, for what the recordings don't cover.
+  const mini = (extra: { [k: string]: string } = {}) => {
+    const log = join(tempDir(), "log.jsonl");
+    return { ...scene("claude/plain-reply", { CLAUDE_BIN: join(pkg, "src/test/mini-claude.mjs"), MINI_CLAUDE_LOG: log, ...extra }), log };
+  };
+
+  it("doesn't run an app tool again that was running when the backend died", { timeout: 60_000 }, async () => {
+    const marker = join(tempDir(), "marker");
+    const s = mini({ TOOL_MARKER: marker, TOOL_HANG: "1", MINI_CLAUDE_TOOL_DELAY: "300" });
+    const a = s.start();
+    const thread = await a.call<{ id: string }>("create", { harness: "claude", cwd: s.dirs.cwd });
+    await a.call("handle", { type: "send", thread_id: thread.id, text: "app lookup {}" } satisfies Command);
+    // It has done what it does, and hasn't returned.
+    await until(() => existsSync(marker));
+    await a.crash();
+
+    const b = s.start();
+    expect(await b.call("recover")).toEqual({ reattached: [thread.id], lost: [] });
+    await b.waitFor({ type: "thread.updated", thread: { status: "idle" } });
+    const snap = await b.call<Snapshot>("snapshot", thread.id);
+    await b.call("close", { stop: true });
+    await b.exited;
+    expect(readFileSync(marker, "utf8")).toBe("ran\n");
+    // Claude was told it may have finished.
+    const said = snap.items.filter((i) => i.type === "assistant_message").map((i) => (i.type === "assistant_message" ? i.text : ""));
+    expect(said.join("\n")).toMatch(/may or may not have finished/);
+  });
+
+  it("keeps the text streamed before it died, also when the run ends while it's down before finishing its message", { timeout: 60_000 }, async () => {
+    const s = mini();
+    const a = s.start();
+    const thread = await a.call<{ id: string }>("create", { harness: "claude", cwd: s.dirs.cwd });
+    await a.call("handle", { type: "send", thread_id: thread.id, text: "streamhang the streamed words" } satisfies Command);
+    const text = () => a.events.filter((e) => e.type === "delta").map((e) => (e.type === "delta" ? e.text : "")).join("");
+    await until(() => text() === "the streamed words ");
+    // The item, and the offset past all its deltas, are saved.
+    await sleep(200);
+    await a.crash();
+
+    const b = s.start();
+    expect(await b.call("recover")).toEqual({ reattached: [thread.id], lost: [] });
+    const snap = await b.call<Snapshot>("snapshot", thread.id);
+    expect(snap.items.find((i) => i.type === "assistant_message")).toMatchObject({ text: "the streamed words " });
+    await b.call("close");
+    await b.exited;
+
+    // The run ends while nothing follows it, without the final message: what streamed is kept.
+    const [runId] = readdirSync(s.dirs.runs);
+    writeFileSync(join(s.dirs.runs, runId!, "input.closed"), "");
+    await until(() => existsSync(join(s.dirs.runs, runId!, "exit")));
+    const c = s.start();
+    await c.call("recover");
+    await c.waitFor({ type: "turn.completed" });
+    await c.call("close");
+    await c.exited;
+    const saved = await savedEvents(s.dirs.store, thread.id);
+    const first = saved[0]!;
+    const final = applyEvents(initialState(first.type === "thread.updated" ? first.thread : ({} as never)), saved);
+    expect(final.items.find((i) => i.type === "assistant_message")).toMatchObject({ text: "the streamed words " });
+  });
+
+  it("starts a new process for the next turn after a restart if the options changed, as it would have", { timeout: 60_000 }, async () => {
+    const s = mini();
+    const a = s.start();
+    const thread = await a.call<{ id: string }>("create", { harness: "claude", model: "old", cwd: s.dirs.cwd });
+    await a.call("handle", { type: "send", thread_id: thread.id, text: "reply one" } satisfies Command);
+    await a.waitFor({ type: "turn.completed" });
+    await a.call("handle", { type: "set_options", thread_id: thread.id, model: "new" } satisfies Command);
+    await a.waitFor({ type: "thread.updated", thread: { model: "new" } });
+    await sleep(100);
+    await a.crash();
+
+    const b = s.start();
+    await b.call("recover");
+    await b.call("handle", { type: "send", thread_id: thread.id, text: "reply two" } satisfies Command);
+    await until(() => b.events.filter((e) => e.type === "turn.completed").length === 1);
+    await b.call("close", { stop: true });
+    await b.exited;
+    const argvs = readFileSync(s.log, "utf8").trim().split("\n").map((l) => JSON.parse(l)).filter((l) => l.argv).map((l) => l.argv as string[]);
+    expect(argvs.map((v) => v[v.indexOf("--model") + 1])).toEqual(["old", "new"]);
   });
 });

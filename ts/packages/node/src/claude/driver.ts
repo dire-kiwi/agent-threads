@@ -80,10 +80,17 @@ interface RunState {
   open: [string, OpenRequest][];
   sent: { ids: string[]; echo: string }[];
   pluginDir?: string;
+  /** The thread's options it was started with. */
+  launched?: Launched;
+  /** The thread's options or config have changed since, so the next turn starts a new process. */
+  stale?: boolean;
   /** When the session's timers for it go off (ms since the epoch). */
   steerAt?: number;
   stopAt?: number;
 }
+
+/** The thread's options a process is started with: a different one needs another. */
+type Launched = { model?: string; effort?: string; permission_mode?: string };
 
 /** One `claude` process, and what's needed to read it. */
 class Run {
@@ -114,6 +121,7 @@ class Run {
   sent: { ids: string[]; echo: string }[] = [];
   /** The generated plugin with the thread's skills, for this run only. */
   pluginDir: string | undefined;
+  launched: Launched | undefined;
 
   /** Left running when the backend shut down: nothing more is read or written. */
   detached = false;
@@ -156,6 +164,7 @@ class Run {
       open: [...this.open],
       sent: this.sent,
       ...(this.pluginDir ? { pluginDir: this.pluginDir } : {}),
+      ...(this.launched ? { launched: this.launched } : {}),
     };
   }
 
@@ -173,6 +182,7 @@ class Run {
     this.open = new Map(st.open);
     this.sent = st.sent.map((x) => ({ ids: [...x.ids], echo: x.echo }));
     if (st.pluginDir) this.pluginDir = st.pluginDir;
+    if (st.launched) this.launched = { ...st.launched };
   }
 
   respond(request_id: string, response: Json): void {
@@ -308,6 +318,7 @@ class ClaudeSession implements HarnessSession {
     if (!run || run.retired || offset === undefined) return undefined;
     const state: RunState = {
       ...run.state(),
+      ...(this.#stale ? { stale: true } : {}),
       ...(this.#steerAt !== undefined ? { steerAt: this.#steerAt } : {}),
       ...(this.#stopAt !== undefined ? { stopAt: this.#stopAt } : {}),
     };
@@ -329,6 +340,10 @@ class ClaudeSession implements HarnessSession {
       this.#ctx.error(e);
       return false;
     }
+    // A process started with other options than the thread's now is replaced at the next turn.
+    const t = this.#ctx.thread;
+    const l = st.launched;
+    this.#stale = !!st.stale || !l || l.model !== t.model || l.effort !== t.effort || l.permission_mode !== t.permission_mode;
     // Claude's requests that were open: the user's questions are taken up again, and the rest
     // (a policy that hadn't decided, a tool that was running) are dealt with again.
     for (const [id, open] of [...run.open]) this.#reopen(run, id, open);
@@ -475,6 +490,7 @@ class ClaudeSession implements HarnessSession {
       return;
     }
     run.proc = proc;
+    run.launched = { model: thread.model, effort: thread.effort, permission_mode: thread.permission_mode };
     ctx.setThread({ run: { id: run.id, spawner: ctx.spawner.name, started_at: new Date().toISOString() } });
     void run.control({ subtype: "initialize", ...(tools.length ? { sdkMcpServers: [APP_SERVER] } : {}) }).then((r) => this.#initialized(run, r));
   }
@@ -831,8 +847,16 @@ class ClaudeSession implements HarnessSession {
         const tool = tools.find((t) => t.name === name);
         if (!tool) return reply({ result: { content: [{ type: "text", text: `There's no tool ${name}.` }], isError: true } });
         const toolCallId = msg.params?._meta?.["claudecode/toolUseId"];
-        // Saved while it runs, so a backend that restarts meanwhile answers it (see #reopen).
+        // Saved before it runs, so a backend that restarts while it does answers it rather than run
+        // it again (see #reopen).
         run.open.set(requestId, { turn: ctx.turnId, request: req });
+        try {
+          await ctx.persist();
+        } catch {
+          run.open.delete(requestId);
+          return reply({ result: { content: [{ type: "text", text: "The app couldn't save its state, so it didn't run this tool." }], isError: true } });
+        }
+        if (!run.open.has(requestId) || run.exited || run.detached) return;
         const out = await runTool(tool, msg.params?.arguments ?? {}, {
           threadId: ctx.threadId,
           metadata: ctx.thread.metadata ?? {},

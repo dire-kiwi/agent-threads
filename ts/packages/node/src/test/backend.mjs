@@ -4,20 +4,38 @@
 // error}) and every event ({event}) to stdout, a line each.
 //
 // Environment: STORE, RUNS, CODEX_HOME_DIR (directories), SHIM (the binary), FAKE_CLI, and the fake
-// CLI's own (AGENT_THREADS_FIXTURE...). POLICY is the permission policy (allow or ask).
+// CLI's own (AGENT_THREADS_FIXTURE...). POLICY is the permission policy (allow or ask). CLAUDE_BIN
+// runs another `claude` (mini-claude.mjs) instead of the fake CLI. With TOOL_MARKER, there's an app
+// tool `lookup`, which appends a line to that file each time it runs, and then (with TOOL_HANG)
+// doesn't return.
 
+import { appendFileSync } from "node:fs";
 import { createInterface } from "node:readline";
-import { AgentThreads, FileStore, claudeCode, codex, shim } from "../../dist/index.js";
+import { AgentThreads, FileStore, claudeCode, codex, defineTool, shim } from "../../dist/index.js";
 
 const env = process.env;
 const fakeEnv = Object.fromEntries(Object.entries(env).filter(([k]) => k.startsWith("AGENT_THREADS_FIXTURE")));
 const sdk = new AgentThreads({
   store: new FileStore(env.STORE),
   harnesses: {
-    claude: claudeCode({ bin: env.FAKE_CLI, env: fakeEnv }),
+    claude: claudeCode({ bin: env.CLAUDE_BIN ?? env.FAKE_CLI, env: fakeEnv }),
     codex: codex({ bin: env.FAKE_CLI, env: fakeEnv, home: env.CODEX_HOME_DIR, login: false }),
   },
   permissions: env.POLICY ?? "allow",
+  tools: env.TOOL_MARKER
+    ? [
+        defineTool({
+          name: "lookup",
+          description: "Looks something up.",
+          input: { type: "object" },
+          run: async (_args, ctx) => {
+            appendFileSync(env.TOOL_MARKER, "ran\n");
+            if (env.TOOL_HANG) await new Promise((r) => ctx.signal.addEventListener("abort", r));
+            return "found it";
+          },
+        }),
+      ]
+    : [],
   spawner: shim(env.SHIM, { runsDir: env.RUNS, pollMs: 50 }),
   onError: (e) => process.stderr.write(`backend error: ${e?.stack ?? e}\n`),
 });

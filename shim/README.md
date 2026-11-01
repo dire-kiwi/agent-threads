@@ -23,5 +23,5 @@ cargo build --release   # target/release/agent-threads-shim
 cargo test              # runs the shim on sh scripts
 ```
 
-Backends use it through their shim spawner: `shim(path)` in the Node backend
+Backends use it through their shim spawner: `shim(path, { runsDir })` in the Node backend
 ([ts/packages/node](../ts/packages/node/README.md#processes-and-runs-that-survive-a-restart)).

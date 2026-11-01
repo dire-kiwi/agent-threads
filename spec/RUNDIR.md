@@ -16,9 +16,11 @@ agent-threads-shim <rundir> -- <program> [args...]
 ```
 
 The backend makes a new, empty directory for the run (named after the run's id, inside a
-directory of runs it keeps for one store, readable by the user only), writes `run.json` and
+directory of runs that's one store's alone, readable by the user only: the runs in it that the
+store doesn't follow are stopped and removed, so two stores mustn't share one), writes `run.json` and
 `input.jsonl` there (and `prompt`, if it has one), and runs the shim with the program's working
-directory and environment, and stdin, stdout and stderr at `/dev/null`. The shim forks and the
+directory and environment, and stdin, stdout and stderr at `/dev/null`. It gives the shim the
+directory's absolute path, since the shim starts in the program's working directory. The shim forks and the
 process the backend started exits straight away, with 0 once the fork has happened. A non-zero
 exit means the run didn't start: 2 for bad arguments (the directory doesn't exist, say), 1 if it
 couldn't fork. Then the fork:
@@ -97,8 +99,12 @@ A shim killed with SIGKILL (or a machine that restarted) leaves a run with no `e
 follows a run checks now and then (every second or so) that the process in `shim.pid` is alive
 (`kill(pid, 0)` succeeds or fails with `EPERM`); if it isn't, and there's still no `exit`, it
 writes `exit` itself, atomically and only if there isn't one, with `code` and `signal` `null` and an
-`error` saying the shim went away, and treats the run as over. A run with no `shim.pid` some
-seconds after the shim was started never started.
+`error` saying the shim went away, and treats the run as over. A `shim.pid` written before the
+machine last started (its modification time is before the boot) names no process of the run's. A
+run with no `shim.pid` some seconds after the shim was started never started.
+
+With its shim gone, nothing would stop the program, which may well still be running: the backend
+stops what's left of the run's process group, as below.
 
 ## Stopping a run
 
@@ -108,10 +114,20 @@ To stop a run, a backend first asks the harness, in the harness's own protocol o
 grace period, sends SIGTERM to the program's process group (`kill(-pid, SIGTERM)`, `pid` from
 `pid`), and SIGKILL if it still hasn't. (The Node backend's graces are its drivers'
 `stopGraceMs` and `closeGraceMs`.) A run nothing will follow any more is stopped from the second
-step. Signalling the group stops whatever the
-program started too. A backend never signals the shim: it writes `exit` once the program has gone.
+step. Signalling the group stops whatever the program started too, and the SIGKILL goes to
+whatever is left of the group after the grace even if the program itself has exited (it may have
+left children that ignore SIGTERM). A backend never signals the shim: it writes `exit` once the
+program has gone.
 
-A run with no `pid` yet is signalled as soon as `pid` appears.
+A run with no `pid` yet is signalled as soon as `pid` appears (while the shim may still start the
+program; not once its shim is gone).
+
+A backend **only signals a group that is still the run's**. The pid in `pid` may since have been
+given to another process: after the machine restarted, or once the program and everything in its
+group has gone. So it signals `-pid` only if `pid` was written since the machine last started, and
+either the process `pid` is running and started no later than `pid` was written (to the second:
+`ps -o lstart= -p <pid>`), or that process has gone but its group hasn't (the system doesn't give a
+process an id that's still a group's). Otherwise it sends nothing.
 
 ## Re-attaching
 

@@ -1,10 +1,12 @@
 // The spawners: lines out, exit after the last one, and stopping everything a process started;
 // and for the shim, reading whole lines from an offset, re-attaching, and noticing a run that's gone.
 
-import { existsSync, mkdirSync, readdirSync, readFileSync, utimesSync, writeFileSync } from "node:fs";
-import { join } from "node:path";
+import { spawn as spawnChild } from "node:child_process";
+import { existsSync, mkdirSync, readdirSync, readFileSync, rmSync, utimesSync, writeFileSync } from "node:fs";
+import { uptime } from "node:os";
+import { join, relative } from "node:path";
 import { describe, expect, it } from "vitest";
-import { shim } from "../shim.js";
+import { shim, type ShimOptions } from "../shim.js";
 import { direct, type ExitStatus, type HarnessProcess, type Spawner } from "../spawner.js";
 import { MemoryStore } from "../stores/memory.js";
 import { shimPath, tempDir } from "./spec.js";
@@ -136,8 +138,76 @@ describe.skipIf(process.platform === "win32")("shim()", () => {
     expect(await wait(p.exit)).toBe(true);
     expect(p.exit()?.error?.message).toMatch(/agent-threads-shim\) went away/);
     expect(JSON.parse(readFileSync(join(dir, "exit"), "utf8"))).toMatchObject({ code: null, error: expect.stringMatching(/went away/) });
-    p.proc.kill("SIGKILL");
-    process.kill(-Number(readFileSync(join(dir, "pid"), "utf8")), "SIGKILL");
+    // With nothing left to stop it, the program it ran is stopped.
+    const pid = Number(readFileSync(join(dir, "pid"), "utf8"));
+    expect(await wait(() => !alive(pid))).toBe(true);
+  });
+
+  it("stops what's left of the group after the program exits, with SIGKILL for what ignores SIGTERM", async () => {
+    const { run } = setup();
+    const p = run(`sh -c 'trap "" TERM; exec sleep 30' & echo $!; wait`);
+    expect(await wait(() => p.lines.length === 1)).toBe(true);
+    const stubborn = Number(p.lines[0]);
+    p.proc.kill("SIGTERM");
+    expect(await wait(p.exit)).toBe(true);
+    expect(p.exit()).toMatchObject({ signal: "SIGTERM" });
+    expect(alive(stubborn)).toBe(true);
+    expect(await wait(() => !alive(stubborn))).toBe(true);
+  });
+
+  it("stops a run nothing follows once the shim has started it, though it hadn't when it was asked to", async () => {
+    const { runsDir, spawner, run } = setup();
+    const p = run("sleep 30");
+    p.proc.detach!();
+    spawner.stop!({ id: "run_1", thread_id: "th", spawner: "shim", offset: 0, started_at: "" });
+    const dir = join(runsDir, "run_1");
+    expect(await wait(() => existsSync(join(dir, "exit")))).toBe(true);
+    expect(JSON.parse(readFileSync(join(dir, "exit"), "utf8"))).toMatchObject({ signal: 15 });
+  });
+
+  it("never signals a process that only has the run's old pid", async () => {
+    const { runsDir, spawner } = setup();
+    // An unrelated process, leading a group of its own, with the pid a dead run recorded.
+    const other = spawnChild("sleep", ["30"], { detached: true, stdio: "ignore" });
+    const dir = join(runsDir, "stale");
+    mkdirSync(dir);
+    writeFileSync(join(dir, "pid"), String(other.pid));
+    writeFileSync(join(dir, "shim.pid"), "999999999");
+    const record = { id: "stale", thread_id: "th", spawner: "shim", offset: 0, started_at: "", data: { dir } };
+    try {
+      // Recorded before that process started (the pid was given to it after the run's was gone),
+      // and before the machine last started.
+      for (const ago of [60, uptime() + 3600]) {
+        const at = new Date(Date.now() - ago * 1000);
+        utimesSync(join(dir, "pid"), at, at);
+        rmSync(join(dir, "exit"), { force: true });
+        spawner.stop!(record);
+        const p = follow((h) => spawner.attach!(record, h));
+        expect(await wait(p.exit)).toBe(true);
+        p.proc.kill("SIGKILL");
+        await new Promise((r) => setTimeout(r, 700)); // past the kill grace
+        expect(alive(other.pid!)).toBe(true);
+      }
+      // With its shim gone, it's recorded as over.
+      expect(JSON.parse(readFileSync(join(dir, "exit"), "utf8"))).toMatchObject({ error: expect.stringMatching(/went away/) });
+    } finally {
+      other.kill("SIGKILL");
+    }
+  });
+
+  it("needs a runs directory of the store's own", () => {
+    expect(() => shim(shimPath(), {} as ShimOptions)).toThrow(/runsDir/);
+  });
+
+  it("resolves the runs directory and the shim's path against the backend's working directory", async () => {
+    const runsDir = tempDir();
+    const spawner = shim(relative(process.cwd(), shimPath()), { runsDir: relative(process.cwd(), runsDir), pollMs: 20 });
+    // The thread runs elsewhere.
+    const p = follow((h) => spawner.spawn({ command: "sh", args: ["-c", "pwd"], cwd: tempDir(), threadId: "th", runId: "rel" }, h));
+    expect(await wait(p.exit)).toBe(true);
+    expect(p.exit()).toMatchObject({ code: 0 });
+    expect(p.lines).toHaveLength(1);
+    expect(existsSync(join(runsDir, "rel", "out.jsonl"))).toBe(true);
   });
 
   it("says why a run couldn't be started", async () => {
