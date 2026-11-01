@@ -29,3 +29,25 @@ pub fn read_jsonl(path: &str) -> Vec<Value> {
 pub fn temp_dir() -> PathBuf {
     tempfile::Builder::new().prefix("agent-threads-").tempdir().unwrap().keep()
 }
+
+/// agent-threads-shim, built from ../../shim if it isn't yet (or from $AGENT_THREADS_SHIM).
+pub fn shim_path() -> PathBuf {
+    if let Ok(p) = std::env::var("AGENT_THREADS_SHIM") {
+        return PathBuf::from(p);
+    }
+    let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../shim");
+    let bin = dir.join("target/debug/agent-threads-shim");
+    static BUILD: std::sync::Once = std::sync::Once::new();
+    BUILD.call_once(|| {
+        if !bin.exists() {
+            let ok = std::process::Command::new("cargo")
+                .args(["build", "--quiet", "--manifest-path"])
+                .arg(dir.join("Cargo.toml"))
+                .status()
+                .map(|s| s.success())
+                .unwrap_or(false);
+            assert!(ok, "agent-threads-shim couldn't be built");
+        }
+    });
+    bin
+}
