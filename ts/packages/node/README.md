@@ -42,6 +42,9 @@ await sdk.close(); // on shutdown: stops the harness processes (or with the shim
   the protocol's schema, which is checked before anything changes). `send`, `interrupt`, `respond`
   and `setOptions` do the same from code. After `close()`, they're all refused.
 - `get`, `list` and `delete` look threads up and remove them.
+- A tool returns text for the agent, or `{ text, isError?, structured? }`. `structured` isn't
+  passed to the agent, which only gets the text, but goes in the call's `result.structured`, for
+  the app's renderer of the tool to draw.
 - A thread's own tools, policy and so on live in memory. After a restart, give them again with
   `configure(threadId, { tools, ... })`; its stored state (items, session) comes back by itself, and
   the next message resumes the harness's session.

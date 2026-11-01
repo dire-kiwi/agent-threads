@@ -878,6 +878,7 @@ class ClaudeSession implements HarnessSession {
         // The backend shut down while it ran (and aborted it): it's left open, as saved, for the
         // backend that re-attaches to answer.
         if (run.detached) return;
+        if (typeof toolCallId === "string") ctx.toolOutput(toolCallId, out.structured);
         reply({
           result: {
             content: [{ type: "text", text: out.text }],

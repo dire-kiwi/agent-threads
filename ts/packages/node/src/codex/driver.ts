@@ -1302,6 +1302,9 @@ class CodexSession implements HarnessSession {
       metadata: ctx.thread.metadata ?? {},
       ...(toolCallId ? { toolCallId } : {}),
       signal: run.abort.signal,
+    }).then((out) => {
+      if (toolCallId && !run.detached) ctx.toolOutput(toolCallId, out.structured);
+      return out;
     });
   }
 }
