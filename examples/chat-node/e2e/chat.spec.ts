@@ -4,10 +4,11 @@
 
 import { expect, test, type Page } from "@playwright/test";
 import WebSocket from "ws";
-import { existsSync, mkdtempSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { FIXTURES, SHIM, startServer, type Server } from "./server.ts";
+import { spawnSync } from "node:child_process";
+import { FIXTURES, SHIM, runs, startServer, stopRuns, type Server } from "./server.ts";
 
 let server: Server | undefined;
 const ON_PURPOSE = "failing on purpose";
@@ -159,6 +160,44 @@ test("a supervised server and its run with a request open are stopped after a te
   expect(running.at(-1)).toMatch(/^its run /);
   throw new Error(`${ON_PURPOSE}, with the request open`);
 });
+
+test("a run is stopped with whatever its program started, though that outlives the program", async () => {
+  test.skip(!existsSync(SHIM), "agent-threads-shim isn't built (make shim)");
+  const data = mkdtempSync(join(tmpdir(), "chat-e2e-"));
+  const dir = join(data, "runs", "run_left");
+  mkdirSync(dir, { recursive: true });
+  const ready = join(data, "ready");
+  // The program starts one that ignores SIGTERM (and says its pid once it does), and goes itself
+  // on SIGTERM.
+  const child = `process.on("SIGTERM", () => {}); require("fs").writeFileSync(${JSON.stringify(ready)}, String(process.pid)); setInterval(() => {}, 1000);`;
+  const program = `require("child_process").spawn(process.execPath, ["-e", ${JSON.stringify(child)}], { stdio: "ignore" }); setInterval(() => {}, 1000);`;
+  // As a backend runs it: with its stdio at /dev/null (the shim keeps it, so a pipe would never close).
+  expect(spawnSync(SHIM, [dir, "--", process.execPath, "-e", program], { stdio: "ignore" }).status).toBe(0);
+  let started: number | undefined;
+  try {
+    await expect.poll(() => existsSync(ready)).toBe(true);
+    started = Number(readFileSync(ready, "utf8"));
+    expect(runs(data)[0]!.left()).toContain(started);
+
+    expect(await stopRuns(data)).toEqual([]);
+    // The program went on SIGTERM, and the shim with it, saying so; what it started had SIGKILL.
+    expect(existsSync(join(dir, "exit"))).toBe(true);
+    expect(runs(data)[0]!.left()).toEqual([]);
+    // Told apart from left(): gone, once it's reaped.
+    await expect.poll(() => exists(started!), { timeout: 2_000 }).toBe(false);
+  } finally {
+    if (started !== undefined && exists(started)) process.kill(started, "SIGKILL");
+  }
+});
+
+function exists(pid: number): boolean {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch {
+    return false;
+  }
+}
 
 test("the server takes WebSockets only from its own pages, and survives malformed input", async () => {
   server = await startServer({ CHAT_FAKE_CLAUDE: join(FIXTURES, "claude/plain-reply") });

@@ -6,7 +6,7 @@
 // It runs in a process group of its own, so that stopping it stops it all: the supervisor and the
 // server it runs, and whatever else they started.
 
-import { spawn, type ChildProcess } from "node:child_process";
+import { execFileSync, spawn, type ChildProcess } from "node:child_process";
 import { existsSync, mkdtempSync, readdirSync, readFileSync } from "node:fs";
 import { createServer } from "node:net";
 import { tmpdir } from "node:os";
@@ -86,7 +86,7 @@ export async function startServer(env: { [k: string]: string }, { supervised = f
     remains: async () => {
       const left = alive(-group) ? [`its process group (${group})`] : [];
       if (await fetch(server.url).then(() => true, () => false)) left.push(`${server.url}, which still answers`);
-      return [...left, ...runs(data).filter((r) => r.running()).map((r) => `its run ${r.id}`)];
+      return [...left, ...runs(data).filter((r) => r.running()).map((r) => `its run ${r.id} (${r.left().join(", ")})`)];
     },
   };
   // Not for ever: say why if it doesn't start.
@@ -113,49 +113,90 @@ function command(supervised: boolean): string[] {
 }
 
 /** The shim's runs in a data directory (see spec/RUNDIR.md), which all three servers keep in runs/. */
-function runs(data: string) {
+export function runs(data: string) {
   const dir = join(data, "runs");
   if (!existsSync(dir)) return [];
   return readdirSync(dir).map((id) => {
     const file = (name: string) => join(dir, id, name);
     const pid = (name: string) => (existsSync(file(name)) ? Number(readFileSync(file(name), "utf8")) : undefined);
-    const over = () => existsSync(file("exit"));
+    /**
+     * What's left of it: its shim, and what's in its program's process group (the program, and what
+     * it started). Not just till it has `exit`, which only says the program has gone. They're told
+     * the run's as a backend tells them (spec/RUNDIR.md): the shim leads a session of its own, whose
+     * id is its pid, and everything the run starts is in that session; so a pid or group id given
+     * to another since isn't taken for the run's.
+     */
+    const left = () => {
+      const shim = pid("shim.pid");
+      if (shim === undefined) return [];
+      const program = pid("pid");
+      return processes().filter((p) => (p.sid ?? shim) === shim && (p.pid === shim || (program !== undefined && p.pgrp === program)));
+    };
     return {
       id,
       /** The program's pid, which is its process group's too. */
       program: () => pid("pid"),
-      /** Whether its shim or anything in its program's group is still there. */
-      running: () => {
-        if (over()) return false;
-        const shim = pid("shim.pid"), program = pid("pid");
-        return (shim !== undefined && alive(shim)) || (program !== undefined && alive(-program));
-      },
+      /** The pids of its processes that are still there. */
+      left: () => left().map((p) => p.pid),
+      running: () => left().length > 0,
     };
   });
 }
 
 /**
  * Stops the runs in a data directory that are still running, as a backend does (spec/RUNDIR.md):
- * SIGTERM to the program's group, and SIGKILL if it hasn't ended 5s later. Its shim says when it
- * has. What went wrong, if anything did.
+ * SIGTERM to what's in the program's group, and SIGKILL to whatever is left of it 5s later, even
+ * once the program has gone (something it started may ignore SIGTERM). What went wrong, if anything
+ * did.
  */
-async function stopRuns(data: string): Promise<string[]> {
+export async function stopRuns(data: string): Promise<string[]> {
   const problems: string[] = [];
   await Promise.all(
     runs(data).map(async (run) => {
       if (!run.running()) return;
       // One its server was starting when it stopped may have no program yet.
       if (!(await until(() => run.program() !== undefined || !run.running(), 5_000))) return problems.push(`run ${run.id} didn't start its program`);
-      for (const sig of ["SIGTERM", "SIGKILL"] as const) {
-        // Only while it's running: once it's over, its pid may be another's.
-        if (!run.running()) return;
-        signal(-run.program()!, sig);
-        if (await until(() => !run.running(), 5_000)) return;
-      }
-      problems.push(`run ${run.id} didn't end, even with SIGKILL`);
+      // Its processes one by one, not its group: only those that are still the run's. The shim
+      // isn't signalled: it exits once the program has.
+      const shim = Number(readFileSync(join(data, "runs", run.id, "shim.pid"), "utf8"));
+      const kill = (sig: NodeJS.Signals) => run.left().forEach((p) => p !== shim && signal(p, sig));
+      kill("SIGTERM");
+      if (await until(() => !run.running(), 5_000)) return;
+      // Again each time, for any it starts meanwhile.
+      if (await until(() => (kill("SIGKILL"), !run.running()), 5_000)) return;
+      problems.push(`run ${run.id} didn't end, even with SIGKILL: ${run.left().join(", ")} left`);
     }),
   );
   return problems;
+}
+
+/**
+ * The processes that are running (not zombies), with their process group and session: from /proc
+ * on Linux; elsewhere from ps, which doesn't give sessions everywhere, so without them.
+ */
+function processes(): { pid: number; pgrp: number; sid?: number }[] {
+  if (process.platform !== "linux")
+    return execFileSync("ps", ["-A", "-o", "pid=", "-o", "pgid=", "-o", "stat="], { encoding: "utf8" })
+      .trim()
+      .split("\n")
+      .map((l) => l.trim().split(/\s+/))
+      .filter(([, , stat]) => !/^[ZX]/.test(stat ?? ""))
+      .map(([pid, pgrp]) => ({ pid: Number(pid), pgrp: Number(pgrp) }));
+  const all = [];
+  for (const name of readdirSync("/proc")) {
+    if (!/^\d+$/.test(name)) continue;
+    let stat: string;
+    try {
+      stat = readFileSync(`/proc/${name}/stat`, "utf8");
+    } catch {
+      continue; // Gone meanwhile.
+    }
+    // After the name in parentheses (which may have spaces and parentheses in it): state, ppid,
+    // pgrp, session.
+    const [state, , pgrp, sid] = stat.slice(stat.lastIndexOf(")") + 2).split(" ");
+    if (state !== "Z" && state !== "X") all.push({ pid: Number(name), pgrp: Number(pgrp), sid: Number(sid) });
+  }
+  return all;
 }
 
 /** Whether a process (or with a negative pid, a process group) is there. */
