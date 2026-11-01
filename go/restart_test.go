@@ -76,7 +76,7 @@ func runBackend() {
 	sdk := agentthreads.New(agentthreads.Options{
 		Store: store,
 		Harnesses: map[string]agentthreads.Harness{
-			"claude": agentthreads.ClaudeCode(agentthreads.ClaudeOptions{Bin: or("CLAUDE_BIN", env("FAKE_CLI")), Env: fake, StopGrace: ms("STOP_GRACE_MS"), CloseGrace: ms("CLOSE_GRACE_MS")}),
+			"claude": agentthreads.ClaudeCode(agentthreads.ClaudeOptions{Bin: or("CLAUDE_BIN", env("FAKE_CLI")), Env: fake, StopGrace: ms("STOP_GRACE_MS"), SteerGrace: ms("STEER_GRACE_MS"), CloseGrace: ms("CLOSE_GRACE_MS")}),
 			"codex":  agentthreads.Codex(agentthreads.CodexOptions{Bin: or("CODEX_BIN", env("FAKE_CLI")), Env: fake, Home: env("CODEX_HOME_DIR"), NoLogin: true, StopGrace: ms("STOP_GRACE_MS"), CloseGrace: ms("CLOSE_GRACE_MS")}),
 		},
 		Capabilities: agentthreads.Capabilities{Permissions: policy},
@@ -122,6 +122,19 @@ func runBackend() {
 			_, err = sdk.EventsSince(ctx, id, 0, 0)
 		case "recover":
 			result, err = sdk.Recover(ctx)
+		case "delete":
+			// Within ms milliseconds.
+			var id string
+			var ms int
+			json.Unmarshal(arg(0), &id)
+			json.Unmarshal(arg(1), &ms)
+			short, cancel := context.WithTimeout(ctx, time.Duration(ms)*time.Millisecond)
+			result, err = sdk.Delete(short, id)
+			cancel()
+		case "hold":
+			var id string
+			json.Unmarshal(arg(0), &id)
+			err = agentthreads.HoldThreadPastTimers(sdk, id)
 		case "close", "stop":
 			if req.Op == "stop" {
 				err = sdk.Stop(ctx)
@@ -204,6 +217,16 @@ func startBackend(t *testing.T, env []string) *backend {
 
 func (b *backend) call(op string, args ...any) json.RawMessage {
 	b.t.Helper()
+	result, err := b.try(op, args...)
+	if err != "" {
+		b.t.Fatalf("%s: %s", op, err)
+	}
+	return result
+}
+
+// try is call, for one that may fail: it returns the error.
+func (b *backend) try(op string, args ...any) (json.RawMessage, string) {
+	b.t.Helper()
 	b.mu.Lock()
 	b.next++
 	id := b.next
@@ -218,16 +241,13 @@ func (b *backend) call(op string, args ...any) json.RawMessage {
 			Error  string          `json:"error"`
 		}
 		json.Unmarshal(line, &r)
-		if r.Error != "" {
-			b.t.Fatalf("%s: %s", op, r.Error)
-		}
-		return r.Result
+		return r.Result, r.Error
 	case <-b.exited:
 		b.t.Fatalf("%s: the backend exited", op)
 	case <-time.After(20 * time.Second):
 		b.t.Fatalf("%s: no reply", op)
 	}
-	return nil
+	return nil, ""
 }
 
 func (b *backend) waitFor(pattern string) {
@@ -665,4 +685,100 @@ func TestRestartDoesntAskAgainWhatWasAnswered(t *testing.T) {
 			}
 		})
 	}
+}
+
+// A Delete whose context runs out while a run that ignores its closed input is being stopped leaves
+// the thread refusing commands; a Close then waits for that stop, rather than leaving the run going
+// for the next backend.
+func TestCloseAfterATimedOutDelete(t *testing.T) {
+	needNode(t)
+	s := miniScene(t, "CLOSE_GRACE_MS=500")
+	a := s.start()
+	id := s.create(a, "claude")
+	a.call("handle", map[string]any{"type": "send", "thread_id": id, "text": "stubborn"})
+	a.waitFor(`{"type":"turn.started"}`)
+	dir := s.runDir()
+	until(t, func() bool { _, err := os.Stat(filepath.Join(dir, "pid")); return err == nil })
+	pid := readPidFile(t, dir)
+	// It has taken in the message, and ignores its input closing from now on.
+	time.Sleep(500 * time.Millisecond)
+	if _, err := a.try("delete", id, 50); !strings.Contains(err, "deadline exceeded") {
+		t.Fatalf("delete: %q", err)
+	}
+	if _, err := a.try("handle", map[string]any{"type": "send", "thread_id": id, "text": "reply hi"}); !strings.Contains(err, "being deleted") {
+		t.Fatalf("send: %q", err)
+	}
+	a.call("close")
+	<-a.exited
+	if processAlive(pid) {
+		t.Fatal("the run's program outlived Close")
+	}
+	store, err := agentthreads.NewFileStore(s.store)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	if runs, err := store.ActiveRuns(context.Background()); err != nil || len(runs) != 0 {
+		t.Fatalf("runs left going: %+v %v", runs, err)
+	}
+}
+
+// A run left going as the backend closes keeps the deadlines of its steer and stop timers, though
+// they went off while Close's Detach was queued, and posted their functions after it.
+func TestCloseKeepsTheDeadlinesOfTimersThatWentOff(t *testing.T) {
+	needNode(t)
+	s := miniScene(t, "MINI_CLAUDE_STEER=never", "STEER_GRACE_MS=1500", "STOP_GRACE_MS=1500")
+	a := s.start()
+	id := s.create(a, "claude")
+	a.call("handle", map[string]any{"type": "send", "thread_id": id, "text": "sleep 300 one"})
+	first := a.events.waitFor(0, json.RawMessage(`{"type":"turn.started"}`), 15*time.Second)
+	if first < 0 {
+		t.Fatal("no turn")
+	}
+	// Steered, never taken in: carried over to a turn of its own, which waits for Claude to take it in.
+	a.call("handle", map[string]any{"type": "send", "thread_id": id, "text": "reply two"})
+	if a.events.waitFor(first+1, json.RawMessage(`{"type":"turn.started"}`), 15*time.Second) < 0 {
+		t.Fatalf("no carried turn; got:\n%s", show(a.events.all()))
+	}
+	a.call("handle", map[string]any{"type": "interrupt", "thread_id": id})
+	snap := snapshotOf(t, a, id)
+	if snap.Thread.Run == nil {
+		t.Fatal("no run")
+	}
+	runID := snap.Thread.Run.ID
+	pid := readPidFile(t, s.runDir())
+	a.call("hold", id)
+	a.call("close")
+	<-a.exited
+
+	store, err := agentthreads.NewFileStore(s.store)
+	if err != nil {
+		t.Fatal(err)
+	}
+	record, err := store.GetRun(context.Background(), runID)
+	store.Close()
+	if err != nil || record == nil || !record.Active() {
+		t.Fatalf("run: %+v %v", record, err)
+	}
+	var data struct {
+		State struct {
+			SteerAt *int64 `json:"steerAt"`
+			StopAt  *int64 `json:"stopAt"`
+		} `json:"state"`
+	}
+	json.Unmarshal(record.Data, &data)
+	if data.State.SteerAt == nil || data.State.StopAt == nil {
+		t.Fatalf("the deadlines are gone: %s", record.Data)
+	}
+	if !processAlive(pid) {
+		t.Fatal("the run's program went with the backend")
+	}
+
+	// The next backend carries them out: the run's stopped, and the turn ends.
+	b := s.start()
+	expectRecovered(t, b, id)
+	until(t, func() bool { return !processAlive(pid) })
+	b.waitFor(`{"type":"turn.completed"}`)
+	b.call("stop")
+	<-b.exited
 }

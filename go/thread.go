@@ -523,26 +523,37 @@ func (rt *threadRuntime) waitSaved(ctx context.Context) error {
 func (rt *threadRuntime) saveSnapshot() { rt.snapshotDue = true }
 
 // closeSession has the session close (once), and is closed when it has; nil if the thread's loop has
-// stopped, or its run was left going (Detach).
-func (rt *threadRuntime) closeSession() <-chan struct{} {
+// stopped, or its run was left going (Detach). It gives up waiting for a busy loop to take the close
+// once ctx is done (which is then still taken, and closes what it returns once it's done).
+func (rt *threadRuntime) closeSession(ctx context.Context) (<-chan struct{}, error) {
 	rt.wmu.Lock()
 	if rt.detached {
 		rt.wmu.Unlock()
-		return nil
+		return nil, nil
 	}
 	if rt.sessionDone != nil {
 		done := rt.sessionDone
 		rt.wmu.Unlock()
-		return done
+		return done, nil
 	}
 	done := make(chan struct{})
 	rt.sessionDone = done
 	rt.wmu.Unlock()
-	if !rt.loop.call(func() { rt.session.Close(func() { close(done) }) }) {
-		close(done) // Nothing's left to stop it.
-		return nil
+	if err := rt.loop.callCtx(ctx, func() { rt.session.Close(func() { close(done) }) }); err != nil {
+		if errors.Is(err, errLoopStopped) {
+			close(done) // Nothing's left to stop it.
+			return nil, nil
+		}
+		return done, err
 	}
-	return done
+	return done, nil
+}
+
+// sessionClosing says its session is closing or closed (Close or Delete), not left going.
+func (rt *threadRuntime) sessionClosing() bool {
+	rt.wmu.Lock()
+	defer rt.wmu.Unlock()
+	return rt.sessionDone != nil
 }
 
 func (rt *threadRuntime) markDetached() {

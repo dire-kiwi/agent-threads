@@ -50,7 +50,7 @@ func TestDirectWritesDontBlock(t *testing.T) {
 }
 
 // A Delete whose context runs out while the harness is still being stopped says so, and leaves the
-// thread to its goroutine, which goes on to stop the harness (SIGKILL, for one that ignores SIGTERM
+// thread (which refuses commands) to its goroutine, which goes on to stop the harness (SIGKILL, for one that ignores SIGTERM
 // and its input); deleting it again then deletes it.
 func TestATimedOutDelete(t *testing.T) {
 	dir := t.TempDir()
@@ -84,6 +84,11 @@ func TestATimedOutDelete(t *testing.T) {
 	defer cancel()
 	if ok, err := sdk.Delete(short, th.ID); ok || !errors.Is(err, context.DeadlineExceeded) {
 		t.Fatalf("got %v, %v", ok, err)
+	}
+	// Meanwhile it takes no commands.
+	var refused *agentthreads.CommandError
+	if err := sdk.Send(ctx, th.ID, "again", agentthreads.SendOptions{}); !errors.As(err, &refused) {
+		t.Fatalf("send: %v", err)
 	}
 	// Past both of the stop's deadlines (SIGTERM at 100ms, SIGKILL at 200ms), it's gone.
 	time.Sleep(500 * time.Millisecond)
