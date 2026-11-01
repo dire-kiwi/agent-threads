@@ -101,7 +101,9 @@ follows a run checks now and then (every second or so) that the process in `shim
 (`kill(pid, 0)` succeeds or fails with `EPERM`); if it isn't, and there's still no `exit`, it
 writes `exit` itself, atomically and only if there isn't one, with `code` and `signal` `null` and an
 `error` saying the shim went away, and treats the run as over. A `shim.pid` written before the
-machine last started (its modification time is before the boot) names no process of the run's. A
+machine last started (its modification time is before the boot) names no process of the run's, and
+nor does one whose process started after `shim.pid` was written (to the second: `ps -o lstart= -p
+<pid>`): that pid has gone to another process, and the shim is gone. A
 run with no `shim.pid` some seconds after the shim was started never started.
 
 With its shim gone, nothing would stop the program, which may well still be running: the backend

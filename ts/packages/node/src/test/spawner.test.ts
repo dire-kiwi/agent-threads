@@ -221,6 +221,25 @@ describe.skipIf(process.platform === "win32")("shim()", () => {
     }
   });
 
+  it("takes a shim whose pid has gone to another process for gone", async () => {
+    const { runsDir, spawner } = setup();
+    const dir = join(runsDir, "reused-shim");
+    mkdirSync(dir);
+    // The shim's pid, recorded a minute ago, is now another process's.
+    const other = spawnChild("sleep", ["30"], { detached: true, stdio: "ignore" });
+    writeFileSync(join(dir, "shim.pid"), String(other.pid));
+    const ago = new Date(Date.now() - 60_000);
+    utimesSync(join(dir, "shim.pid"), ago, ago);
+    try {
+      const p = follow((h) => spawner.attach!({ id: "reused-shim", thread_id: "th", spawner: "shim", offset: 0, started_at: "", data: { dir } }, h));
+      expect(await wait(p.exit)).toBe(true);
+      expect(p.exit()?.error?.message).toMatch(/went away/);
+      expect(alive(other.pid!)).toBe(true);
+    } finally {
+      other.kill("SIGKILL");
+    }
+  });
+
   it("needs a runs directory of the store's own", () => {
     expect(() => shim(shimPath(), {} as ShimOptions)).toThrow(/runsDir/);
   });

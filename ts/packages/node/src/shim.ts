@@ -179,6 +179,8 @@ class ShimProcess implements HarnessProcess {
   #launchedHere: boolean;
   #since = Date.now();
   #checked = 0;
+  /** The shim's pid, once it's been checked to be the run's. */
+  #shim: { pid?: number } = {};
   #over = false;
   #onDone: () => void;
 
@@ -333,7 +335,7 @@ class ShimProcess implements HarnessProcess {
     const now = Date.now();
     if (now - this.#checked < 1000) return undefined;
     this.#checked = now;
-    if (readPid(this.dir, "shim.pid") !== undefined) return shimAlive(this.dir) || existsSync(join(this.dir, "exit")) ? undefined : "its supervisor (agent-threads-shim) went away";
+    if (readPid(this.dir, "shim.pid") !== undefined) return shimAlive(this.dir, this.#shim) || existsSync(join(this.dir, "exit")) ? undefined : "its supervisor (agent-threads-shim) went away";
     // No shim.pid: one still starting, or one that never started.
     const since = this.#launchedHere ? this.#launch?.at : this.#since;
     if (since !== undefined && now - since > START_TIMEOUT_MS) return "agent-threads-shim didn't start the run";
@@ -506,9 +508,21 @@ function writtenThisBoot(dir: string, name: string): number | undefined {
   }
 }
 
-/** Whether the run's shim is alive (checked cheaply: its pid is from this boot, and is a process). */
-function shimAlive(dir: string): boolean {
-  return writtenThisBoot(dir, "shim.pid") !== undefined && alive(readPid(dir, "shim.pid"));
+/**
+ * Whether the run's shim is alive: the process in `shim.pid` (written since the machine started)
+ * is running, and started before that was written (not another process given the same pid since).
+ * `known` remembers a pid already checked, so a run followed for a while isn't checked with `ps`
+ * every time (a process with the pid that's still running is the one checked).
+ */
+function shimAlive(dir: string, known?: { pid?: number }): boolean {
+  const pid = readPid(dir, "shim.pid");
+  const written = writtenThisBoot(dir, "shim.pid");
+  if (pid === undefined || written === undefined || !alive(pid)) return false;
+  if (known?.pid === pid) return true;
+  const started = startTime(pid);
+  const ours = started !== undefined && started <= written + 1000;
+  if (ours && known) known.pid = pid;
+  return ours;
 }
 
 /** When a process started (ms since the epoch, to the second), if it's running and `ps` says. */

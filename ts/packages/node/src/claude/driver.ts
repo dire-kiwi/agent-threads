@@ -186,6 +186,8 @@ class Run {
   }
 
   respond(request_id: string, response: Json): void {
+    // Left running: what's open stays as it was saved, for the backend that re-attaches to answer.
+    if (this.detached) return;
     this.open.delete(request_id);
     this.write({ type: "control_response", response: { subtype: "success", request_id, response } });
   }
@@ -752,7 +754,7 @@ class ClaudeSession implements HarnessSession {
     const ask: typeof ctx.ask = (request, toolCallId, answered, standing) =>
       existing !== undefined && ctx.reopen(existing, answered, standing) ? existing : ctx.ask(request, toolCallId, answered, standing);
     // Whether Claude still wants this answered: not cancelled, its turn not over, its run not gone.
-    const wanted = () => run.open.has(requestId) && !run.exited && !run.retired && this.#run === run && ctx.turnId === turn;
+    const wanted = () => run.open.has(requestId) && !run.exited && !run.retired && !run.detached && this.#run === run && ctx.turnId === turn;
     const allow = (updatedInput: unknown) => wanted() && run.respond(requestId, { behavior: "allow", updatedInput });
     const deny = (message: string) => wanted() && run.respond(requestId, { behavior: "deny", message });
     const denied = () => toolUseId && ctx.updateItem(toolUseId, { status: "denied" });
@@ -853,6 +855,7 @@ class ClaudeSession implements HarnessSession {
         try {
           await ctx.persist();
         } catch {
+          if (run.detached) return;
           run.open.delete(requestId);
           return reply({ result: { content: [{ type: "text", text: "The app couldn't save its state, so it didn't run this tool." }], isError: true } });
         }
@@ -863,6 +866,9 @@ class ClaudeSession implements HarnessSession {
           ...(typeof toolCallId === "string" ? { toolCallId } : {}),
           signal: run.abort.signal,
         });
+        // The backend shut down while it ran (and aborted it): it's left open, as saved, for the
+        // backend that re-attaches to answer.
+        if (run.detached) return;
         reply({
           result: {
             content: [{ type: "text", text: out.text }],

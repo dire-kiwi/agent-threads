@@ -187,6 +187,11 @@ class Run {
   /** Notices about the thread's MCP servers were given. */
   noticedServers = false;
   mcp: LoopbackMcp | undefined;
+  /**
+   * Where Codex was told the loopback MCP server is, which it is (or, re-attached, is about to be)
+   * for as long as the process runs: what a checkpoint keeps, so a restart serves it there too.
+   */
+  mcpEndpoint: { port: number; token: string } | undefined;
   skillsDir: string | undefined;
   // What's needed to translate its output.
   streamed = new Set<string>(); // items that got deltas
@@ -218,7 +223,6 @@ class Run {
   /** What a checkpoint needs; undefined while it's starting (Codex's thread isn't known yet). */
   state(): Omit<RunState, "stale" | "stopAt"> | undefined {
     if (!this.threadId) return undefined;
-    const mcp = this.mcp && /:(\d+)\//.exec(this.mcp.url);
     return {
       v: 1,
       threadId: this.threadId,
@@ -234,7 +238,7 @@ class Run {
       hiddenSkills: this.hiddenSkills,
       noticedServers: this.noticedServers,
       ...(this.skillsDir ? { skillsDir: this.skillsDir } : {}),
-      ...(mcp && this.mcp ? { mcp: { port: Number(mcp[1]), token: this.mcp.token } } : {}),
+      ...(this.mcpEndpoint ? { mcp: this.mcpEndpoint } : {}),
       streamed: [...this.streamed],
       summaryPart: [...this.summaryPart],
       children: [...this.children],
@@ -264,6 +268,7 @@ class Run {
     this.hiddenSkills = st.hiddenSkills;
     this.noticedServers = st.noticedServers;
     if (st.skillsDir) this.skillsDir = st.skillsDir;
+    if (st.mcp) this.mcpEndpoint = { ...st.mcp };
     this.streamed = new Set(st.streamed);
     this.summaryPart = new Map(st.summaryPart);
     this.children = new Map(st.children);
@@ -762,7 +767,10 @@ class CodexSession implements HarnessSession {
     run.noticedServers = true;
     run.mcpApp = this.#mcpTools(run).length > 0;
     if (run.mcpApp) {
-      run.mcp ??= await serveTools(APP_SERVER, { tools: () => this.#mcpTools(run), call: (name, args) => this.#mcpAppTool(run, name, args) });
+      if (!run.mcp) {
+        run.mcp = await serveTools(APP_SERVER, { tools: () => this.#mcpTools(run), call: (name, args) => this.#mcpAppTool(run, name, args) });
+        run.mcpEndpoint = { port: Number(new URL(run.mcp.url).port), token: run.mcp.token };
+      }
       // The policy decides on the app's tools when they're called, so Codex needn't ask.
       servers[APP_SERVER] = {
         url: run.mcp.url,
@@ -1049,7 +1057,8 @@ class CodexSession implements HarnessSession {
     const existing = resume?.existing;
     run.open.set(id, { turn, msg: m });
     // Whether Codex still wants this answered: not resolved, its turn not over, its run not gone.
-    const wanted = () => run.open.has(id) && !run.exited && !run.retired && this.#run === run && ctx.turnId === turn;
+    // (Not once it's left running as the backend shuts down: what's open stays as it was saved.)
+    const wanted = () => run.open.has(id) && !run.exited && !run.retired && !run.detached && this.#run === run && ctx.turnId === turn;
     const answer = (result: unknown) => {
       if (!wanted()) return;
       run.open.delete(id);
@@ -1242,6 +1251,9 @@ class CodexSession implements HarnessSession {
           () => {
             if (!wanted() || run.detached) return;
             void this.#runApp(run, p.tool, p.arguments ?? {}, p.callId).then((out) => {
+              // The backend shut down while it ran (and aborted it): it's left open, as saved, for
+              // the backend that re-attaches to answer.
+              if (run.detached) return;
               reply(out.text, !out.isError);
               // Saved as answered, though no event says so: a restart doesn't answer it again.
               this.#ctx.persist().catch(() => {});
@@ -1262,7 +1274,7 @@ class CodexSession implements HarnessSession {
     const matching = run.mcpCalls.filter((c) => c.server === APP_SERVER && c.name === name && sameJson(c.args, args ?? {}));
     const it = matching.length === 1 ? ctx.item(matching[0]!.id) : undefined;
     const turn = ctx.turnId;
-    const wanted = () => !run.exited && !run.retired && this.#run === run && ctx.turnId === turn;
+    const wanted = () => !run.exited && !run.retired && !run.detached && this.#run === run && ctx.turnId === turn;
     const t = { name, kind: "app" as const, input: args ?? {}, title: name };
     return new Promise((resolve) => {
       this.#permit(run, undefined, this.#query(t, it?.id, undefined, it?.parent_id), wanted, (ok, message) => {

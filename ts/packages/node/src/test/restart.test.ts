@@ -4,6 +4,7 @@
 // events (with a notice that the run was picked up again), none lost and none twice.
 
 import { execFileSync, spawn, type ChildProcess } from "node:child_process";
+import { createServer } from "node:net";
 import { existsSync, readdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { createInterface } from "node:readline";
@@ -251,7 +252,12 @@ describe.skipIf(process.platform === "win32")("a backend restart", () => {
     };
   };
 
-  it.each(["claude", "codex"])("doesn't run an app tool again that was running when the backend died (%s)", { timeout: 60_000 }, async (harness) => {
+  it.each([
+    ["claude", "died"],
+    ["codex", "died"],
+    ["claude", "shut down"],
+    ["codex", "shut down"],
+  ])("with %s, doesn't run an app tool again that was running when the backend %s", { timeout: 60_000 }, async (harness, how) => {
     const marker = join(tempDir(), "marker");
     const s = mini({ TOOL_MARKER: marker, TOOL_HANG: "1", MINI_CLAUDE_TOOL_DELAY: "300", MINI_CODEX_TOOL_DELAY: "300" });
     const a = s.start();
@@ -259,7 +265,12 @@ describe.skipIf(process.platform === "win32")("a backend restart", () => {
     await a.call("handle", { type: "send", thread_id: thread.id, text: "app lookup {}" } satisfies Command);
     // It has done what it does, and hasn't returned.
     await until(() => existsSync(marker));
-    await a.crash();
+    if (how === "died") await a.crash();
+    else {
+      // Shutting down aborts it, which it returns on: it isn't answered, but left for the next.
+      await a.call("close");
+      await a.exited;
+    }
 
     const b = s.start();
     expect(await b.call("recover")).toEqual({ reattached: [thread.id], lost: [] });
@@ -268,7 +279,7 @@ describe.skipIf(process.platform === "win32")("a backend restart", () => {
     await b.call("close", { stop: true });
     await b.exited;
     expect(readFileSync(marker, "utf8")).toBe("ran\n");
-    // Claude was told it may have finished.
+    // The agent was told it may have finished.
     const said = snap.items.filter((i) => i.type === "assistant_message").map((i) => (i.type === "assistant_message" ? i.text : ""));
     expect(said.join("\n")).toMatch(/may or may not have finished/);
   });
@@ -374,5 +385,43 @@ describe.skipIf(process.platform === "win32")("a backend restart", () => {
     await until(() => !alive(killed.child), 5000);
     expect(existsSync(join(runsDir, "run_kill", "stopping"))).toBe(false);
     await store.close();
+  });
+
+  it("with Codex, serves the app's tools where Codex was told they are after two restarts in a row", { timeout: 60_000 }, async () => {
+    // Without dynamic tools, so the app's tools are on the loopback MCP server.
+    const marker = join(tempDir(), "marker");
+    const s = mini({ TOOL_MARKER: marker, MINI_CODEX_NO_DYNAMIC: "1" });
+    const a = s.start();
+    const thread = await a.call<{ id: string }>("create", { harness: "codex", cwd: s.dirs.cwd });
+    await a.call("handle", { type: "send", thread_id: thread.id, text: "reply hi" } satisfies Command);
+    await a.waitFor({ type: "turn.completed" });
+    await a.call("saved", thread.id);
+    await a.crash();
+
+    // The next backend can't serve them where they were (the port's taken meanwhile), and is
+    // killed before it's served them again: what's saved must still say where they are.
+    const store = new FileStore(s.dirs.store);
+    const [runId] = readdirSync(s.dirs.runs);
+    const { port } = ((await store.getRun(runId!))!.data as { state: { mcp: { port: number } } }).state.mcp;
+    await store.close();
+    const blocker = createServer();
+    await new Promise<void>((r) => blocker.listen(port, "127.0.0.1", r));
+    const b = s.start();
+    expect(await b.call("recover")).toEqual({ reattached: [thread.id], lost: [] });
+    await until(() => b.events.some((e) => e.type === "item.added" && e.item.type === "notice" && /aren't available/.test(e.item.text)));
+    await b.call("saved", thread.id);
+    await b.crash();
+    await new Promise((r) => blocker.close(r));
+
+    const c = s.start();
+    expect(await c.call("recover")).toEqual({ reattached: [thread.id], lost: [] });
+    await c.call("handle", { type: "send", thread_id: thread.id, text: "app lookup {}" } satisfies Command);
+    await c.waitFor({ type: "turn.completed" });
+    const snap = await c.call<Snapshot>("snapshot", thread.id);
+    await c.call("close", { stop: true });
+    await c.exited;
+    const said = snap.items.map((i) => (i.type === "assistant_message" ? i.text : "")).join("\n");
+    expect(said).toMatch(/app said found it/);
+    expect(readFileSync(marker, "utf8")).toBe("ran\n");
   });
 });

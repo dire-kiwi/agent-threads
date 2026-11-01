@@ -84,6 +84,9 @@ export class ThreadRuntime implements ThreadContext {
   #failure: { error: unknown } | undefined; // why the last write failed, while writes are failing
   #retry: NodeJS.Timeout | undefined;
   #backoff = 0;
+  /** Flushes started, and the last one that saved all it took (each takes everything up to its start). */
+  #flushes = 0;
+  #savedAt = 0;
   /** The run record last saved, while its run goes on (with a durable spawner). */
   #run: { record: RunRecord; json: string } | undefined;
   /** Items text has streamed into since the turn began (whose text may not be saved yet). */
@@ -147,11 +150,12 @@ export class ThreadRuntime implements ThreadContext {
    */
   async #flush(): Promise<void> {
     const store = this.#host.store;
+    const gen = ++this.#flushes;
     // Taken at the same moment as the events, so the run's offset and state are as of them.
     const events = this.#unsaved.slice();
     const { runs, run } = this.#runs();
     const threadChanged = this.#threadChanged;
-    if (!events.length && !threadChanged && !runs.length) return;
+    if (!events.length && !threadChanged && !runs.length) return void (this.#savedAt = gen);
     try {
       if (events.length || runs.length) {
         try {
@@ -178,6 +182,7 @@ export class ThreadRuntime implements ThreadContext {
       }
       this.#failure = undefined;
       this.#backoff = 0;
+      this.#savedAt = gen;
     } catch (e) {
       this.#failure = { error: e };
       this.#host.error(e);
@@ -258,15 +263,16 @@ export class ThreadRuntime implements ThreadContext {
    */
   async persist(): Promise<void> {
     if (!this.#host.spawner.durable) return;
-    // Until a write has the run as it is now: what's read while one is being written goes in the next.
-    for (let tries = 0; ; tries++) {
-      this.#scheduleFlush();
+    // Saved once a flush started after now has saved all it took, whatever has been read since.
+    const after = this.#flushes;
+    this.#scheduleFlush();
+    try {
       await this.saved();
-      // A write of only the run that failed leaves no events unsaved, so saved() doesn't say.
-      if (this.#failure) throw this.#failure.error;
-      if (!this.#runs().runs.length) return;
-      if (tries >= 3) throw new Error("the run kept changing while it was being saved");
+    } catch {
+      // Said below, if it's this write that failed.
     }
+    // A write of only the run that failed leaves no events unsaved, so saved() mightn't say.
+    if (this.#savedAt <= after) throw this.#failure?.error ?? new Error("the run couldn't be saved");
   }
 
   #retryLater(): void {
