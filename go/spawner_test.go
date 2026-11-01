@@ -3,6 +3,12 @@
 package agentthreads_test
 
 import (
+	"context"
+	"errors"
+	"os"
+	"path/filepath"
+	"strconv"
+	"strings"
 	"syscall"
 	"testing"
 	"time"
@@ -40,5 +46,54 @@ func TestDirectWritesDontBlock(t *testing.T) {
 		}
 	case <-time.After(5 * time.Second):
 		t.Fatal("it didn't exit")
+	}
+}
+
+// A Delete whose context runs out while the harness is still being stopped says so, and leaves the
+// thread to its goroutine, which goes on to stop the harness (SIGKILL, for one that ignores SIGTERM
+// and its input); deleting it again then deletes it.
+func TestATimedOutDelete(t *testing.T) {
+	dir := t.TempDir()
+	pidFile := filepath.Join(dir, "pid")
+	bin := filepath.Join(dir, "stubborn")
+	os.WriteFile(bin, []byte("#!/bin/sh\necho $$ > \"$PIDFILE\"\ntrap '' TERM\nexec sleep 1000\n"), 0o755)
+	sdk := agentthreads.New(agentthreads.Options{
+		Harnesses: map[string]agentthreads.Harness{"claude": agentthreads.ClaudeCode(agentthreads.ClaudeOptions{
+			Bin: bin, Env: map[string]string{"PIDFILE": pidFile}, CloseGrace: 100 * time.Millisecond,
+		})},
+		OnError: func(error) {},
+	})
+	defer sdk.Stop(context.Background())
+	ctx := context.Background()
+	th, err := sdk.Create(ctx, agentthreads.CreateOptions{Cwd: dir})
+	if err != nil {
+		t.Fatal(err)
+	}
+	sdk.Send(ctx, th.ID, "hi", agentthreads.SendOptions{})
+	var pid int
+	deadline := time.Now().Add(5 * time.Second)
+	for pid == 0 && time.Now().Before(deadline) {
+		data, _ := os.ReadFile(pidFile)
+		pid, _ = strconv.Atoi(strings.TrimSpace(string(data)))
+		time.Sleep(10 * time.Millisecond)
+	}
+	if pid == 0 {
+		t.Fatal("the harness didn't start")
+	}
+	short, cancel := context.WithTimeout(ctx, 20*time.Millisecond)
+	defer cancel()
+	if ok, err := sdk.Delete(short, th.ID); ok || !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("got %v, %v", ok, err)
+	}
+	// Past both of the stop's deadlines (SIGTERM at 100ms, SIGKILL at 200ms), it's gone.
+	time.Sleep(500 * time.Millisecond)
+	if err := syscall.Kill(pid, 0); err == nil {
+		t.Fatal("the harness is still running")
+	}
+	if ok, err := sdk.Delete(ctx, th.ID); !ok || err != nil {
+		t.Fatalf("got %v, %v", ok, err)
+	}
+	if got, _ := sdk.Get(ctx, th.ID); got != nil {
+		t.Fatal("still there")
 	}
 }

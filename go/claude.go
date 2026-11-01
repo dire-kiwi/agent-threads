@@ -341,18 +341,27 @@ func (r *claudeRun) finish() {
 	r.onDone = nil
 }
 
-// loopTimer is a timer whose function runs on the thread's goroutine; stop cancels it.
+// loopTimer is a timer whose function runs on the thread's goroutine; stop cancels it. Its fields are
+// the thread goroutine's.
 type loopTimer struct {
 	timer     *time.Timer
 	at        int64
 	cancelled bool
+	// paused says it won't go off here (its deadline is for the next backend), though it's pending.
+	paused bool
 }
 
 func startTimer(ctx ThreadContext, d time.Duration, fn func()) *loopTimer {
+	return startLoopTimer(ctx.Post, d, fn)
+}
+
+func startLoopTimer(post func(func()), d time.Duration, fn func()) *loopTimer {
 	t := &loopTimer{at: time.Now().Add(d).UnixMilli()}
 	t.timer = time.AfterFunc(d, func() {
-		ctx.Post(func() {
-			if !t.cancelled {
+		post(func() {
+			// Checked here, on the thread's goroutine: the timer may have gone off, and posted this,
+			// before it was stopped or paused.
+			if !t.cancelled && !t.paused {
 				t.cancelled = true
 				fn()
 			}
@@ -372,6 +381,7 @@ func (t *loopTimer) stop() {
 // going as the backend shuts down, whose next backend carries it on.
 func (t *loopTimer) pause() {
 	if t != nil {
+		t.paused = true
 		t.timer.Stop()
 	}
 }

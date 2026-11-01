@@ -118,6 +118,10 @@ type threadRuntime struct {
 	backoff  time.Duration
 	changed  chan struct{} // closed (and replaced) whenever written or failure changes
 	disposed bool
+	// sessionDone is closed once the session has closed (Close called it), and detached says its
+	// run was left going instead.
+	sessionDone chan struct{}
+	detached    bool
 }
 
 func newRuntime(sdk *AgentThreads, state protocol.Snapshot, config ThreadConfig, policy PermissionPolicy) *threadRuntime {
@@ -517,6 +521,41 @@ func (rt *threadRuntime) waitSaved(ctx context.Context) error {
 // saveSnapshot has a snapshot saved with the next batch, so loading the thread needn't fold all its
 // events.
 func (rt *threadRuntime) saveSnapshot() { rt.snapshotDue = true }
+
+// closeSession has the session close (once), and is closed when it has; nil if the thread's loop has
+// stopped, or its run was left going (Detach).
+func (rt *threadRuntime) closeSession() <-chan struct{} {
+	rt.wmu.Lock()
+	if rt.detached {
+		rt.wmu.Unlock()
+		return nil
+	}
+	if rt.sessionDone != nil {
+		done := rt.sessionDone
+		rt.wmu.Unlock()
+		return done
+	}
+	done := make(chan struct{})
+	rt.sessionDone = done
+	rt.wmu.Unlock()
+	if !rt.loop.call(func() { rt.session.Close(func() { close(done) }) }) {
+		close(done) // Nothing's left to stop it.
+		return nil
+	}
+	return done
+}
+
+func (rt *threadRuntime) markDetached() {
+	rt.wmu.Lock()
+	rt.detached = true
+	rt.wmu.Unlock()
+}
+
+func (rt *threadRuntime) detachedRun() bool {
+	rt.wmu.Lock()
+	defer rt.wmu.Unlock()
+	return rt.detached
+}
 
 // dispose stops the thread's loop, and its writes once they've failed.
 func (rt *threadRuntime) dispose() {

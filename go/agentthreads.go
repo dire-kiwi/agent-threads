@@ -326,7 +326,11 @@ func (a *AgentThreads) Delete(ctx context.Context, threadID string) (bool, error
 		return false, err
 	}
 	if rt := a.live(threadID); rt != nil {
-		a.closeSession(ctx, rt)
+		// Not deleted while its harness is still being stopped (which its goroutine does): Delete
+		// again once it has.
+		if err := a.closeSession(ctx, rt); err != nil {
+			return false, err
+		}
 		rt.dispose()
 		a.mu.Lock()
 		delete(a.threads, threadID)
@@ -338,15 +342,18 @@ func (a *AgentThreads) Delete(ctx context.Context, threadID string) (bool, error
 	return a.store.DeleteThread(ctx, threadID)
 }
 
-// closeSession stops the thread's harness process, and waits for it.
-func (a *AgentThreads) closeSession(ctx context.Context, rt *threadRuntime) {
-	done := make(chan struct{})
-	if !rt.loop.call(func() { rt.session.Close(func() { close(done) }) }) {
-		return
+// closeSession stops the thread's harness process, and waits for it (or ctx: then it goes on being
+// stopped, and a later call waits for the same stop).
+func (a *AgentThreads) closeSession(ctx context.Context, rt *threadRuntime) error {
+	done := rt.closeSession()
+	if done == nil {
+		return nil
 	}
 	select {
 	case <-done:
+		return nil
 	case <-ctx.Done():
+		return ctx.Err()
 	}
 }
 
@@ -702,6 +709,7 @@ func (a *AgentThreads) stopAll(ctx context.Context, stop bool) {
 				// Left going, saved as it is now, to be re-attached to (saveAll reports a failure).
 				if d, ok := rt.session.(DurableSession); !stop && durable && ok && d.Detach() {
 					left = true
+					rt.markDetached()
 					rt.scheduleFlush()
 					return
 				}
@@ -714,6 +722,7 @@ func (a *AgentThreads) stopAll(ctx context.Context, stop bool) {
 			if left {
 				return
 			}
+			// One that's still being stopped when ctx is done is waited for by saveAll.
 			a.closeSession(ctx, rt)
 			rt.loop.call(func() {
 				if rt.turn != nil {
@@ -732,6 +741,11 @@ func (a *AgentThreads) saveAll(ctx context.Context) error {
 		if rt.isDisposed() {
 			continue
 		}
+		// Its harness is stopped first: its goroutine is what stops it.
+		if err := a.closeSession(ctx, rt); err != nil && !rt.detachedRun() {
+			errs = append(errs, fmt.Errorf("thread %s's harness is still being stopped: %w", rt.id, err))
+			continue
+		}
 		rt.loop.call(func() { rt.saveSnapshot() })
 		if err := rt.waitSaved(ctx); err != nil {
 			errs = append(errs, err)
@@ -740,7 +754,7 @@ func (a *AgentThreads) saveAll(ctx context.Context) error {
 		rt.dispose()
 	}
 	if len(errs) > 0 {
-		return fmt.Errorf("%d thread(s) have events the store hasn't saved; Close again to retry: %w", len(errs), errors.Join(errs...))
+		return fmt.Errorf("%d thread(s) aren't closed yet (Close again to finish): %w", len(errs), errors.Join(errs...))
 	}
 	return nil
 }
