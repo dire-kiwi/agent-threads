@@ -435,7 +435,7 @@ async fn runs_app_tools_with_the_threads_id_metadata_and_call() {
         move |args, ctx| {
             *s2.lock().unwrap() = Some(ctx);
             let id = args["id"].as_str().unwrap_or("").to_string();
-            async move { format!("thing {id}") }
+            async move { agent_threads::ToolOutput::text(format!("thing {id}")).with_structured(json!({"id": id})) }
         },
     );
     let env = setup(Setup::default());
@@ -466,6 +466,8 @@ async fn runs_app_tools_with_the_threads_id_metadata_and_call() {
         ),
         (json!("lookup"), json!("app"), json!("completed"), json!("thing 7"))
     );
+    // Its structured output, which Claude doesn't pass on, is in the call's result.
+    assert_eq!(call["result"]["structured"], json!({"id": "7"}));
     let ctx = seen.lock().unwrap().clone().unwrap();
     assert_eq!(
         (ctx.thread_id, ctx.metadata["user"].clone(), ctx.tool_call_id),

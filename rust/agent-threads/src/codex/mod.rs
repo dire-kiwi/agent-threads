@@ -1932,7 +1932,7 @@ impl CodexSession {
                     None => {
                         let mut t = json!({"name": "commandExecution", "kind": "shell", "input": {"command": p["command"], "cwd": p["cwd"]}});
                         if let Some(c) = p["command"].as_str().filter(|c| !c.is_empty()) {
-                            t["command"] = json!(c);
+                            t["command"] = json!(translate::unwrap_command(c));
                         }
                         obj(t)
                     }
@@ -2053,6 +2053,7 @@ impl CodexSession {
                 .and_then(|k| serde_json::from_value(k.clone()).ok())
                 .unwrap_or(ToolKind::Other),
             input: t.get("input").cloned().unwrap_or(Value::Null),
+            command: t.get("command").and_then(Value::as_str).map(String::from),
             title: Some(
                 t.get("title")
                     .and_then(Value::as_str)
@@ -2385,12 +2386,15 @@ impl CodexSession {
                 if !s.is_wanted(ctx, &w) || s.runs.get(&run_id).is_none_or(|r| r.detached) {
                     return;
                 }
-                let fut = s.run_app(ctx, &run_id, &name, args, call_id);
+                let fut = s.run_app(ctx, &run_id, &name, args, call_id.clone());
                 ctx.spawn::<CodexSession, _>(fut, move |s, ctx, out| {
                     // The backend shut down while it ran (and cancelled it): it's left open, as
                     // saved, for the backend that re-attaches to answer.
                     if s.runs.get(&run_id).is_none_or(|r| r.detached) {
                         return;
+                    }
+                    if let Some(call) = &call_id {
+                        ctx.tool_output(call, out.structured.clone());
                     }
                     reply(s, ctx, &w, &out.text, !out.is_error);
                     // Saved as answered, though no event says so: a restart doesn't answer it again.
@@ -2449,9 +2453,14 @@ impl CodexSession {
                 let _ = reply.send(ToolOutput::error(message));
                 return;
             }
-            let fut = s.run_app(ctx, &run_id, &name, args, it_id);
-            tokio::spawn(async move {
-                let _ = reply.send(fut.await);
+            let fut = s.run_app(ctx, &run_id, &name, args, it_id.clone());
+            ctx.spawn::<CodexSession, _>(fut, move |s, ctx, out| {
+                if let Some(call) = &it_id
+                    && s.runs.get(&run_id).is_some_and(|r| !r.detached)
+                {
+                    ctx.tool_output(call, out.structured.clone());
+                }
+                let _ = reply.send(out);
             });
         });
         self.permit(

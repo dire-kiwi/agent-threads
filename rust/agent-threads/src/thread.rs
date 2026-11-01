@@ -145,6 +145,8 @@ pub struct ThreadContext {
     run: Option<(RunRecord, String)>,
     /// Items text has streamed into since the turn began (whose text may not be saved yet).
     streaming: Vec<String>,
+    /// App tools' structured output, by tool call, until the harness gives the call its result.
+    structured: HashMap<String, Value>,
     effects: VecDeque<Effect>,
     waiters: Vec<Waiter>,
     tx: mpsc::UnboundedSender<Job>,
@@ -318,9 +320,19 @@ impl ThreadContext {
     }
 
     /// Changes an item's fields (null removes one); sends nothing if nothing changes.
-    pub fn update_item(&mut self, id: &str, patch: Value) {
-        let Some(item) = self.item(id) else { return };
-        let item = serde_json::to_value(item).unwrap_or_default();
+    pub fn update_item(&mut self, id: &str, mut patch: Value) {
+        if self.item(id).is_none() {
+            return;
+        }
+        // An app tool's structured output goes with its call's result (harnesses pass on only the
+        // text).
+        if patch.get("result").is_some_and(Value::is_object)
+            && let Some(structured) = self.structured.remove(id)
+            && patch["result"].get("structured").is_none()
+        {
+            patch["result"]["structured"] = structured;
+        }
+        let item = serde_json::to_value(self.item(id)).unwrap_or_default();
         let mut changed = Map::new();
         for (k, v) in patch.as_object().into_iter().flatten() {
             if k == "id" || k == "type" {
@@ -337,6 +349,14 @@ impl ThreadContext {
         }
         if !changed.is_empty() {
             self.emit(json!({"type": "item.updated", "item_id": id, "patch": changed}));
+        }
+    }
+
+    /// An app tool returned structured output for the tool call `tool_call_id`: it goes in the
+    /// call's `result.structured` when the harness gives the call its result.
+    pub fn tool_output(&mut self, tool_call_id: &str, structured: Option<Value>) {
+        if let Some(s) = structured {
+            self.structured.insert(tool_call_id.to_string(), s);
         }
     }
 
@@ -475,6 +495,7 @@ impl ThreadContext {
             self.update_item(&id, json!({"text": text}));
         }
         self.streaming.clear();
+        self.structured.clear();
         let cut: Vec<String> = self
             .state
             .items
@@ -789,6 +810,10 @@ impl ThreadContext {
         if let Some(live) = self.live_text() {
             data.insert("live".into(), Value::Object(live));
         }
+        // App tools' structured output whose calls the harness hasn't given their result yet.
+        if !self.structured.is_empty() {
+            data.insert("structured".into(), json!(self.structured));
+        }
         let started_at = match (before, &thread.run) {
             (Some(b), _) if b.id == cp.id => b.started_at.clone(),
             (_, Some(r)) if r.id == cp.id && r.started_at.is_some() => r.started_at.clone().unwrap(),
@@ -844,6 +869,14 @@ impl ThreadContext {
             .and_then(Value::as_object)
             .cloned()
             .unwrap_or_default();
+        if let Some(s) = record
+            .data
+            .as_ref()
+            .and_then(|d| d.get("structured"))
+            .and_then(Value::as_object)
+        {
+            self.structured = s.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
+        }
         self.run = Some((record, json));
         for (id, text) in live {
             let Some(text) = text.as_str() else { continue };
@@ -919,6 +952,7 @@ impl Actor {
             backoff_ms: 0,
             run: None,
             streaming: Vec::new(),
+            structured: HashMap::new(),
             effects: VecDeque::new(),
             waiters: Vec::new(),
             tx: tx.clone(),

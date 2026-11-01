@@ -1219,6 +1219,7 @@ impl ClaudeSession {
             kind,
             input: input.clone(),
             title: Some(c.title.clone()),
+            command: t.get("command").and_then(Value::as_str).map(String::from),
             server: t.get("server").and_then(Value::as_str).map(String::from),
             reason: c.reason.clone(),
             tool_call_id: tool_use_id,
@@ -1371,7 +1372,7 @@ impl ClaudeSession {
                     let tctx = ToolContext {
                         thread_id: ctx.thread_id().to_string(),
                         metadata: ctx.thread().metadata.clone(),
-                        tool_call_id,
+                        tool_call_id: tool_call_id.clone(),
                         cancelled: run.cancel.clone(),
                     };
                     ctx.spawn::<ClaudeSession, _>(run_tool(tool, args, tctx), move |s, ctx, out| {
@@ -1379,6 +1380,9 @@ impl ClaudeSession {
                         // saved, for the backend that re-attaches to answer.
                         if s.run(&id).is_none_or(|r| r.detached) {
                             return;
+                        }
+                        if let Some(call) = &tool_call_id {
+                            ctx.tool_output(call, out.structured.clone());
                         }
                         let mut result = json!({"content": [{"type": "text", "text": out.text}]});
                         if out.is_error {

@@ -118,7 +118,10 @@ fn lookup_order(seen: Arc<Mutex<Vec<ToolContext>>>) -> Arc<dyn agent_threads::To
         move |args, ctx| {
             seen.lock().unwrap().push(ctx);
             let id = args["order_id"].as_str().unwrap_or("").to_string();
-            async move { format!("Order {id}: 3 blue widgets.") }
+            async move {
+                agent_threads::ToolOutput::text(format!("Order {id}: 3 blue widgets."))
+                    .with_structured(json!({"order_id": id}))
+            }
         },
     )
 }
@@ -379,6 +382,7 @@ async fn runs_app_tools_given_as_dynamic_tools_through_the_policy() {
         ),
         (json!("app"), json!("completed"), json!("Order 42: 3 blue widgets."))
     );
+    assert_eq!(call["result"]["structured"], json!({"order_id": "42"}));
     let ctx = seen.lock().unwrap()[0].clone();
     assert_eq!(
         (ctx.thread_id, ctx.metadata["user"].clone(), ctx.tool_call_id),
@@ -450,6 +454,7 @@ async fn serves_app_tools_on_a_loopback_mcp_server_when_codex_refuses_dynamic_to
         (json!("app"), json!("completed"), json!("Order 7: 3 blue widgets."))
     );
     assert!(call.get("server").is_none());
+    assert_eq!(call["result"]["structured"], json!({"order_id": "7"}));
     assert_eq!(
         seen.lock().unwrap()[0].tool_call_id,
         call["id"].as_str().map(String::from)
