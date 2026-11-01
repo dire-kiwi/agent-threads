@@ -48,8 +48,9 @@ class MemoryStore {
     for (const [rid, r] of this.s.runs) if (r.thread_id === id) this.s.runs.delete(rid);
     return true;
   }
-  appendEvents(id, events) {
+  appendEvents(id, events, runs = []) {
     this.#known(id);
+    for (const r of runs) if (r.thread_id !== id) throw new StoreError("invalid", `a run of ${r.thread_id}`);
     const log = this.s.events.get(id);
     let seq = log.length;
     for (const e of events) {
@@ -58,6 +59,7 @@ class MemoryStore {
       if (e.seq !== ++seq) throw new StoreError("seq", `seq ${e.seq}, not ${seq}`);
     }
     log.push(...events.map(copy));
+    for (const r of runs) this.s.runs.set(r.id, copy(r));
     return null;
   }
   readEvents(id, { after = 0, limit } = {}) {

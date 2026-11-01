@@ -23,6 +23,8 @@ reference in-memory store and runner that pass them.
 
   `offset` is how far into the run's `out.jsonl` the backend has read; `ended_at` is set once it
   has finished with the run; `data` is anything else the backend keeps about it, stored as given.
+  A backend saves a run with the events it made from the run's output (`appendEvents`' `runs`), so
+  the offset and the events can't disagree after a crash: see [../RUNDIR.md](../RUNDIR.md).
 
 A store keeps every value exactly as it was given: fields it doesn't know (a newer backend's, the
 app's `metadata`, `raw` payloads), unicode, numbers, nesting and `null`s. What's read back is equal
@@ -41,7 +43,7 @@ store's error of kind `x`, which each backend maps from its own error type.
 | `listThreads()` | All threads, oldest first by `created_at`, then by `id`. | |
 | `updateThread(thread)` | Replaces the thread with the same id (in full: fields it doesn't have any more are gone). | `not_found` |
 | `deleteThread(id)` | Deletes the thread, its events, its snapshot and its runs. `true` if there was one, `false` if not. | |
-| `appendEvents(id, events)` | Appends saved events, all of them or none. Each must be for the thread (`thread_id`), not a `delta`, and have the `seq` after the one before it (the first after `lastSeq`). An empty list does nothing. | `not_found`; `invalid` for a delta or another thread's event; `seq` for a gap or a repeat. |
+| `appendEvents(id, events, runs?)` | Appends saved events, all of them or none. Each must be for the thread (`thread_id`), not a `delta`, and have the `seq` after the one before it (the first after `lastSeq`). With `runs`, it also puts those runs (as `putRun` does) in the same atomic write: the events and the runs are all saved, or none of them. An empty list of events with no runs does nothing. | `not_found`; `invalid` for a delta, another thread's event or another thread's run; `seq` for a gap or a repeat. |
 | `readEvents(id, {after, limit?})` | The thread's events with `seq` greater than `after`, in order, at most `limit` of them. | `not_found` |
 | `lastSeq(id)` | The `seq` of the thread's last event; 0 if it has none. | `not_found` |
 | `saveSnapshot(id, snapshot)` | Keeps the snapshot, replacing the one before. | `not_found` |

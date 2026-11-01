@@ -159,7 +159,7 @@ const sdk = new AgentThreads({
   mcpServers: { github: { command: "gh-mcp" }, docs: { url: "https://…/mcp" } },
   skills: ["./skills/support-agent"],
   permissions: async (req, ctx) => (req.kind === "read" ? "allow" : "ask"), // allow | deny | ask (asks the user)
-  spawner: shim("/usr/local/bin/agent-threads-shim"), // optional; direct by default
+  spawner: shim("/usr/local/bin/agent-threads-shim", { runsDir }), // optional; direct by default
 });
 
 const thread = await sdk.create({ harness: "claude", model: "opus", cwd, systemPrompt, metadata });
@@ -203,10 +203,13 @@ shipped in this repository under `shim/`:
   Huntaway's `load_active` does.
 - It's Unix-only, like `ia-shim`. On Windows, backends fall back to `direct`.
 
-The shim and the run-directory protocol are a separate task. The thread model already has room for
-them: `Thread.run` says which process runs a thread and with which spawner, and its
-`reattached_at` is set when a restarted backend re-attaches; a `notice` item with code
-`run.reattached` (or `run.lost`, for a run that ended while the backend was down) tells the user.
+The run directory is specified in [spec/RUNDIR.md](../spec/RUNDIR.md). `Thread.run` says which
+process runs a thread and with which spawner, and its `reattached_at` is set when a restarted
+backend re-attaches; a `notice` item with code `run.reattached` (or `run.lost`, for a run it
+couldn't pick up, whose turn it ended) tells the user. A backend saves a run's offset, with what its
+driver needs to carry on reading, in the same store write as the events it made from the output
+before it, so a restart neither loses events nor makes them twice. The Node backend has the shim
+spawner and `recover()`, and both its drivers re-attach.
 
 ## React package
 

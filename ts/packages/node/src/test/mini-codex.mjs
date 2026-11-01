@@ -24,6 +24,8 @@
 //   sub <prompt>        spawns a subagent (a child thread), which replies, and waits for it
 //   sleep <ms>          waits (or until it's interrupted)
 //   slow                waits for an interrupt
+//   stubborn            ignores interrupts, and a closed stdin (saying "not stopping"), until it's
+//                       signalled
 //   warn <text>         a warning notification
 //   retry               an error that will be retried
 //   fail <text>         an error, and the turn fails
@@ -31,7 +33,8 @@
 //
 // A steered message is taken in at once (a userMessage item), and the turn says it heard it at its
 // end. MINI_CODEX_STEER=never accepts steered messages but never takes them in; =reject refuses
-// them. MINI_CODEX_NO_DYNAMIC=1 refuses
+// them. MINI_CODEX_TOOL_DELAY=<ms> waits that long between a dynamic tool's call and asking for
+// it to be run. MINI_CODEX_NO_DYNAMIC=1 refuses
 // thread/start with dynamicTools. MINI_CODEX_LOG names a file each run appends its argv and
 // CODEX_HOME, and every message it's sent, to.
 
@@ -62,6 +65,7 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 let thread = null; // { id, totals, params, dynamicTools }
 let extraRoots = [];
 let turn = null; // { id, interrupted, wake, heard }
+let stubborn = false;
 
 const sessions = home && join(home, "mini-sessions");
 function save() {
@@ -207,6 +211,8 @@ async function step(line) {
         const id = uid("call");
         const base = { type: "dynamicToolCall", id, tool, arguments: args };
         item("item/started", { ...base, status: "inProgress", contentItems: null, success: null });
+        // As Codex does, a while later (so the backend has saved the call before it's asked to run it).
+        await new Promise((r) => setTimeout(r, Number(process.env.MINI_CODEX_TOOL_DELAY ?? 0)));
         const r = await request("item/tool/call", { ...ids, callId: id, tool, arguments: args });
         item("item/completed", { ...base, status: r.result?.success ? "completed" : "failed", contentItems: r.result?.contentItems, success: r.result?.success });
         return message(`app said ${r.result?.contentItems?.[0]?.text}`);
@@ -293,6 +299,11 @@ async function step(line) {
       return wait(Number(arg));
     case "slow":
       return wait();
+    case "stubborn":
+      stubborn = true;
+      // Running with nothing else to do once its stdin's closed.
+      setInterval(() => {}, 60_000);
+      return new Promise(() => {});
     case "warn":
       return notify("warning", { threadId: thread.id, message: arg });
     case "retry":
@@ -393,7 +404,7 @@ createInterface({ input: process.stdin })
         return;
       case "turn/interrupt":
         reply({});
-        if (turn && p.turnId === turn.id) {
+        if (turn && p.turnId === turn.id && !stubborn) {
           turn.interrupted = true;
           turn.wake?.();
         }
@@ -405,4 +416,7 @@ createInterface({ input: process.stdin })
         return fail(`unknown method ${m.method}`);
     }
   })
-  .on("close", () => process.exit(0));
+  .on("close", () => {
+    if (!stubborn) process.exit(0);
+    message("not stopping");
+  });

@@ -55,10 +55,11 @@ export class MemoryStore implements Store {
     return true;
   }
 
-  async appendEvents(id: string, events: ThreadEvent[]): Promise<void> {
+  async appendEvents(id: string, events: ThreadEvent[], runs: RunRecord[] = []): Promise<void> {
     const log = this.#log(id);
-    checkEvents(id, log.length ? log[log.length - 1]!.seq : 0, events);
+    checkEvents(id, log.length ? log[log.length - 1]!.seq : 0, events, runs);
     for (const e of events) log.push(copy(e));
+    for (const r of runs) this.state.runs.set(r.id, copy(r));
   }
 
   async readEvents(id: string, { after = 0, limit }: ReadOptions = {}): Promise<ThreadEvent[]> {

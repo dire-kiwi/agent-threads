@@ -28,7 +28,7 @@ const off = sdk.subscribe((event) => ws.broadcast(event)); // every thread's eve
 ws.on("message", (cmd) => sdk.handle(JSON.parse(cmd))); // send / interrupt / respond / set_options
 await sdk.snapshot(thread.id); // for a client that just connected
 await sdk.eventsSince(thread.id, seq); // for one catching up
-await sdk.close(); // on shutdown: stops the harness processes and saves everything
+await sdk.close(); // on shutdown: stops the harness processes (or with the shim, leaves them going) and saves everything
 ```
 
 ## Threads
@@ -155,11 +155,59 @@ again to finish saving. The file store undoes a write that fails partway, so a r
 `codex` prints (`codex app-server generate-json-schema --experimental`) by `pnpm gen:codex`
 (`scripts/gen-codex.mjs`). Run it when Codex changes, and check the driver against the diff.
 
-## Processes
+## Processes, and runs that survive a restart
 
-Processes are started by a `Spawner`: `direct()` (the default) runs them as child processes, each
-in its own process group, so they end with the backend. A shim spawner, whose runs survive a
-restart, is coming.
+Processes are started by a `Spawner`. `direct()` (the default) runs them as child processes, each
+in its own process group, so they end with the backend. `shim(path)` runs them under
+[agent-threads-shim](../../../shim/README.md) (`path` is the binary), so they outlive it:
+
+```ts
+const sdk = new AgentThreads({
+  store: new FileStore("./threads"),
+  spawner: shim("/usr/local/bin/agent-threads-shim", { runsDir: "./threads-runs" }),
+});
+await sdk.recover(); // at startup, before taking commands
+```
+
+- Each run gets a directory under `runsDir`, which the backend and the shim share as
+  [spec/RUNDIR.md](../../../spec/RUNDIR.md) says: input is appended to `input.jsonl`, and the
+  backend follows `out.jsonl`, whole lines only. `runsDir` must be the store's alone (pruning stops
+  and removes the runs in it the store doesn't follow), so there's no default. It and a shim path
+  with a `/` in it are taken relative to the backend's working directory.
+- Whenever a thread's events are saved, its run's offset (how far into `out.jsonl` they go), the
+  driver's state for it, the running turn and the text streamed so far are saved with them, in the
+  same `appendEvents`. So however the backend
+  stops, after a restart it reads the output again from exactly where the saved events end: none
+  are lost, and none are made twice.
+- `recover()` re-attaches to the runs that were going when the backend stopped. A run that's still
+  going carries on, with its turn, its streamed text and its open requests as they were (a
+  permission or question the user hadn't answered can still be answered). One that ended while the
+  backend was down is read to its end, so its turn finishes as it would have. A `notice` (code
+  `run.reattached`) tells the user, and the thread's `run` gets `reattached_at`. A thread a command
+  loads before `recover()` gets to it is re-attached then.
+- `close()` leaves shim runs going, for the next start to re-attach to; `close({ stop: true })`
+  stops them.
+- Both drivers re-attach. The Claude driver saves which of Claude's control requests are open and
+  what it needs to translate the rest of the stream; the Codex driver saves its JSON-RPC client's
+  pending requests, Codex's open requests, the Codex thread and turn, and serves the app's tools
+  on the loopback MCP server again on the port and with the token Codex was told about.
+- A run that can't be re-attached to is stopped, and its turn ends with a `run.lost` notice: one
+  in a newer run-directory format, or one still starting when the backend went (Codex's handshake
+  hadn't finished). (A backend that has gone back to the direct spawner can't stop shim runs: it
+  only ends their turns.)
+- An app tool is saved as running before it runs (and isn't run if that can't be saved), so one
+  that was running when the backend stopped isn't run again (it may have done what it does): the
+  agent is told it may or may not have finished.
+- A change of options or config before the restart still starts a new process at the next turn.
+- `recover()` also prunes, now and every hour: finished runs' directories go after `keepDays`
+  (14), and a run nothing follows any more (its backend died before saving it, or while stopping
+  it) is stopped.
+- Stopping a run is the harness's interrupt, then closing its input, then SIGTERM and SIGKILL to
+  its process group (the SIGKILL to whatever is left of it, even once the harness has exited). A
+  shim that dies without saying how its run ended (SIGKILL, a reboot) is noticed: the run ends with
+  an error, and its harness is stopped. A process group is only ever signalled while it's still the
+  run's, never one whose id has gone to another process (after a reboot, say).
+- On Windows, which the shim doesn't run on, `shim()` is `direct()`.
 
 ## Tests
 
@@ -173,3 +221,7 @@ The fixture test runs each recorded session in `spec/fixtures/claude` and `spec/
 `spec/tools/fake-cli.mjs`, which checks what the driver writes to it, and compares the events with
 `expected.jsonl`. `src/test/mini-claude.mjs` and `src/test/mini-codex.mjs` are small scriptable fakes for what the
 recordings don't cover (steering past a turn's end, every kind of approval, crashes, restarts).
+The fixtures run under the shim too, and `src/test/restart.test.ts` kills a backend
+(`src/test/backend.mjs`, the built package in a process of its own) partway through a fixture's
+turn, starts another, and checks the thread finishes with exactly the fixture's events. Those
+tests build `agent-threads-shim` with cargo if it isn't built (or use `$AGENT_THREADS_SHIM`).

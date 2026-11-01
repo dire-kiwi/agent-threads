@@ -120,12 +120,13 @@ export class SqliteStore implements Store {
     });
   }
 
-  async appendEvents(id: string, events: ThreadEvent[]): Promise<void> {
+  async appendEvents(id: string, events: ThreadEvent[], runs: RunRecord[] = []): Promise<void> {
     this.#tx(() => {
       this.#known(id);
-      checkEvents(id, this.#last(id), events);
+      checkEvents(id, this.#last(id), events, runs);
       const insert = this.#q("INSERT INTO events (thread_id, seq, data) VALUES (?, ?, ?)");
       for (const e of events) insert.run(id, e.seq, JSON.stringify(e));
+      for (const r of runs) this.#putRun(r);
     });
   }
 
@@ -158,6 +159,10 @@ export class SqliteStore implements Store {
 
   async putRun(run: RunRecord): Promise<void> {
     this.#known(run.thread_id);
+    this.#putRun(run);
+  }
+
+  #putRun(run: RunRecord): void {
     this.#q(
       `INSERT INTO runs (id, thread_id, started_at, active, data) VALUES (?, ?, ?, ?, ?)
        ON CONFLICT (id) DO UPDATE SET thread_id = excluded.thread_id, started_at = excluded.started_at, active = excluded.active, data = excluded.data`,

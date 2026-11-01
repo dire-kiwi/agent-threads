@@ -13,9 +13,11 @@ import { claudeCode } from "../claude/driver.js";
 import { codex } from "../codex/driver.js";
 import type { McpServer } from "../harness.js";
 import type { PermissionPolicy } from "../permissions.js";
+import { shim } from "../shim.js";
+import { direct } from "../spawner.js";
 import { MemoryStore } from "../stores/memory.js";
 import { defineTool } from "../tools.js";
-import { readJsonl, specDir, tempDir } from "./spec.js";
+import { readJsonl, shimPath, specDir, tempDir } from "./spec.js";
 
 interface Fixture {
   thread: { harness: string; model?: string; effort?: string; permission_mode?: Thread["permission_mode"] };
@@ -48,8 +50,11 @@ const scenarios = ["claude", "codex"].flatMap((harness) => {
     .map((s) => `${harness}/${s}`);
 });
 
+// Every fixture runs with the harness as a child process, and under the shim (but not on Windows).
+const spawners = process.platform === "win32" ? ["direct"] : ["direct", "shim"];
+
 describe.each(scenarios)("%s", (scenario) => {
-  it("matches expected.jsonl", { timeout: 60_000 }, async () => {
+  it.each(spawners)("matches expected.jsonl (%s)", { timeout: 60_000 }, async (spawnerName) => {
     const fixtureDir = join(specDir, "fixtures", scenario);
     const fixture = JSON.parse(readFileSync(join(fixtureDir, "fixture.json"), "utf8")) as Fixture;
     const cwd = tempDir();
@@ -58,6 +63,7 @@ describe.each(scenarios)("%s", (scenario) => {
     const events: ThreadEvent[] = [];
     const env = { AGENT_THREADS_FIXTURE: fixtureDir, AGENT_THREADS_FIXTURE_STATE: state };
     const codexHome = tempDir();
+    const spawner = spawnerName === "shim" ? shim(shimPath(), { runsDir: tempDir() }) : direct();
 
     const make = () => {
       const sdk = new AgentThreads({
@@ -69,6 +75,7 @@ describe.each(scenarios)("%s", (scenario) => {
         tools: (fixture.tools ?? []).map((t) => defineTool({ name: t.name, description: t.description, input: t.input, run: () => t.result })),
         mcpServers: fixture.mcp_servers ?? {},
         permissions: (fixture.permissions ?? "allow") as PermissionPolicy,
+        spawner,
         onError: (e) => {
           throw e;
         },
@@ -84,7 +91,7 @@ describe.each(scenarios)("%s", (scenario) => {
     for (const [i, step] of fixture.steps.entries()) {
       const where = `step ${i + 1}: ${JSON.stringify(step)}`;
       if ("restart" in step) {
-        await sdk.close();
+        await sdk.close({ stop: true });
         sdk = make();
         from = events.length;
       } else if ("command" in step) {
@@ -107,7 +114,7 @@ describe.each(scenarios)("%s", (scenario) => {
     const snapshot = await sdk.snapshot(thread.id);
     expect(snapshot).toEqual(applyEvents(initialState(events[0]!.type === "thread.updated" ? events[0]!.thread : thread), events));
 
-    await sdk.close();
+    await sdk.close({ stop: true });
 
     // The fake CLI was sent what the recording has, in every run.
     const runs = readJsonl(`fixtures/${scenario}/session.jsonl`).filter((e) => (e as { dir?: string }).dir === "spawn").length;
