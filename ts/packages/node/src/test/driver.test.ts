@@ -388,9 +388,11 @@ describe("the Claude driver", () => {
 
   it("asks the policy, and remembers an answer given `always`", async () => {
     const seen: string[] = [];
+    const commands: (string | undefined)[] = [];
     const { sdk, events } = setup({
       permissions: (q) => {
         seen.push(q.name);
+        if (q.kind === "shell") commands.push(q.command);
         return q.kind === "read" ? "allow" : q.name === "WebFetch" ? { deny: "No web." } : "ask";
       },
     });
@@ -407,6 +409,7 @@ describe("the Claude driver", () => {
     await sdk.send(t.id, 'tool Bash {"command":"ls"}');
     const req = await until(() => events.find((e) => e.type === "request.opened"));
     expect(req.type === "request.opened" && req.request).toMatchObject({ type: "permission", name: "Bash", kind: "shell", title: "ls" });
+    expect(commands).toEqual(["ls"]);
     await sdk.handle({ type: "respond", thread_id: t.id, request_id: req.type === "request.opened" ? req.request.id : "", resolution: { outcome: "allow", always: true } });
     await settle(sdk, t.id);
 

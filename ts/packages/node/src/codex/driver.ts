@@ -43,7 +43,7 @@ import type {
   UserInput,
 } from "./protocol.js";
 import { Rpc, RpcError, type Incoming, type PendingRequest, type RequestId } from "./rpc.js";
-import { APP_SERVER, codexDone, codexPolicy, codexTool, codexUsage, isToolItem, mcpServerConfig, questions, todos } from "./translate.js";
+import { APP_SERVER, codexDone, codexPolicy, codexTool, codexUsage, isToolItem, mcpServerConfig, questions, todos, unwrapCommand } from "./translate.js";
 
 export interface CodexOptions {
   /** The `codex` binary. */
@@ -1078,7 +1078,7 @@ class CodexSession implements HarnessSession {
       case "item/commandExecution/requestApproval": {
         const q = p as CommandExecutionRequestApprovalParams;
         const it = ctx.item(q.itemId) as ToolCall | undefined;
-        const t = it ?? { name: "commandExecution", kind: "shell" as const, input: { command: q.command, cwd: q.cwd }, ...(q.command ? { command: q.command } : {}) };
+        const t = it ?? { name: "commandExecution", kind: "shell" as const, input: { command: q.command, cwd: q.cwd }, ...(q.command ? { command: unwrapCommand(q.command) } : {}) };
         return this.#permit(run, id, this.#query(t, q.itemId, q.reason, parentId), wanted, (ok) => answer({ decision: ok ? "accept" : "decline" }), existing);
       }
       case "item/fileChange/requestApproval": {
@@ -1119,6 +1119,7 @@ class CodexSession implements HarnessSession {
       kind: t.kind,
       input: t.input,
       title: t.title ?? title(t),
+      ...(t.kind === "shell" && t.command ? { command: t.command } : {}),
       ...(t.server ? { server: t.server } : {}),
       ...(reason ? { reason } : {}),
       ...(known ? { toolCallId: known } : {}),

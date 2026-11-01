@@ -214,7 +214,7 @@ describe("the Codex driver", () => {
     expect(edit).toMatchObject({ status: "denied", changes: [{ path: "/w/notes.txt", op: "update", diff: "@@ -1 +1 @@\n-a\n+b\n" }] });
     expect(texts(s.items)).toEqual(["done"]);
     expect(asked).toMatchObject([
-      { name: "commandExecution", kind: "shell", toolCallId: cmd!.id },
+      { name: "commandExecution", kind: "shell", command: "touch a.txt", toolCallId: cmd!.id },
       { name: "fileChange", kind: "edit", toolCallId: edit!.id },
     ]);
     // Codex is told accept and decline.

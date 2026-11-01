@@ -793,6 +793,7 @@ class ClaudeSession implements HarnessSession {
       kind: t.kind,
       input,
       title: title(t),
+      ...(t.kind === "shell" && t.command ? { command: t.command } : {}),
       ...(t.server ? { server: t.server } : {}),
       ...(typeof req.decision_reason === "string" && req.decision_reason ? { reason: req.decision_reason } : {}),
       ...(toolUseId ? { toolCallId: toolUseId } : {}),

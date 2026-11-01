@@ -18,11 +18,11 @@ import {
   direct,
   shim,
   type Harness,
-  type PermissionPolicy,
   type Thread,
 } from "@dire-kiwi/agent-threads-node";
 import { config, REPO, RESTART_CODE, ROOT, type HarnessInfo } from "./config.ts";
 import { lookupOrder } from "./orders.ts";
+import { permissions } from "./policy.ts";
 import { serveStatic } from "./static.ts";
 
 const cfg = config();
@@ -30,10 +30,6 @@ const workspace = join(cfg.data, "workspace"); // the agents' working directory
 mkdirSync(workspace, { recursive: true });
 
 // ---------- the backend ----------
-
-/** Allow what only reads (files, searches, the app's own lookup, loading a skill); ask the user about everything else. */
-const READ_ONLY_TOOLS = new Set(["lookup_order", "Skill"]);
-const permissions: PermissionPolicy = (q) => (q.kind === "read" || q.kind === "search" || READ_ONLY_TOOLS.has(q.name) ? "allow" : "ask");
 
 const FAKE_CLI = join(REPO, "spec/tools/fake-cli.mjs");
 

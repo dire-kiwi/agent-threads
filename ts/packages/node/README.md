@@ -42,9 +42,14 @@ await sdk.close(); // on shutdown: stops the harness processes (or with the shim
   the protocol's schema, which is checked before anything changes). `send`, `interrupt`, `respond`
   and `setOptions` do the same from code. After `close()`, they're all refused.
 - `get`, `list` and `delete` look threads up and remove them.
+
+[examples/chat-node](../../../examples/chat-node) is a whole app on this package and the React one.
 - A tool returns text for the agent, or `{ text, isError?, structured? }`. `structured` also goes
   in the call's `result.structured` (harnesses pass on only the text), for the app's renderer of
   the tool to draw.
+- The permission policy is asked about each tool call with a `PermissionQuery`: its `name`, `kind`,
+  `input`, `title`, and, for a shell command, `command` as the tool_call shows it (without Codex's
+  `bash -lc` wrapper), so a policy can tell a command that only reads.
 - A thread's own tools, policy and so on live in memory. After a restart, give them again with
   `configure(threadId, { tools, ... })`; its stored state (items, session) comes back by itself, and
   the next message resumes the harness's session.
