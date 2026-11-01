@@ -2,7 +2,12 @@
 
 agent-threads' Node backend: it runs threads on Claude Code (`claude -p`) and Codex (`codex
 app-server`), sends their events to your app and takes commands from it. It has no network layer:
-wire `subscribe()` and `handle()` to your own transport (a WebSocket, SSE, IPC...).
+wire `subscribe()` and `handle()` to your own transport (a WebSocket, SSE, IPC...), as
+[docs/transport.md](../../../docs/transport.md) shows. [examples/chat-node](../../../examples/chat-node/README.md)
+is a whole app on this package and the React one.
+
+It needs Node 24+. Nothing is published yet: build it from a checkout and link it into your app
+([how](../../../README.md#typescript-packages)).
 
 ```ts
 import { AgentThreads, FileStore, claudeCode, codex, defineTool } from "@dire-kiwi/agent-threads-node";
@@ -24,8 +29,9 @@ const sdk = new AgentThreads({
 });
 
 const thread = await sdk.create({ model: "sonnet", cwd: "/srv/work", metadata: { user: "u1" } });
-const off = sdk.subscribe((event) => ws.broadcast(event)); // every thread's events, deltas included
-ws.on("message", (cmd) => sdk.handle(JSON.parse(cmd))); // send / interrupt / respond / set_options
+// broadcast and onCommandFromClient are the app's transport: docs/transport.md has real ones.
+const off = sdk.subscribe((event) => broadcast(event)); // every thread's events, deltas included
+onCommandFromClient((command) => sdk.handle(command)); // send / interrupt / respond / set_options
 await sdk.snapshot(thread.id); // for a client that just connected
 await sdk.eventsSince(thread.id, seq); // for one catching up
 await sdk.close(); // on shutdown: stops the harness processes (or with the shim, leaves them going) and saves everything
@@ -42,17 +48,32 @@ await sdk.close(); // on shutdown: stops the harness processes (or with the shim
   the protocol's schema, which is checked before anything changes). `send`, `interrupt`, `respond`
   and `setOptions` do the same from code. After `close()`, they're all refused.
 - `get`, `list` and `delete` look threads up and remove them.
+- `snapshot(id)` is the thread's state now; `eventsSince(id, seq, limit?)` its saved events after
+  `seq`; `subscribe(fn)` calls `fn` with every thread's events as they happen, and returns how to
+  stop.
+- `recover()`, with the shim spawner, re-attaches to runs that outlived the last process; `close()`
+  stops the harnesses (or leaves shim runs going) and saves everything. See below.
+- `CommandError` is what `handle` and the rest throw for a command the client got wrong; `onError`
+  (an option) is told about errors that aren't any command's (a store that fails, a subscriber that
+  throws).
 
-[examples/chat-node](../../../examples/chat-node) is a whole app on this package and the React one.
+## Tools and permissions
+
+[docs/tools.md](../../../docs/tools.md) has the whole story, in all three backends.
+
 - A tool returns text for the agent, or `{ text, isError?, structured? }`. `structured` also goes
   in the call's `result.structured` (harnesses pass on only the text), for the app's renderer of
   the tool to draw.
 - The permission policy is asked about each tool call with a `PermissionQuery`: its `name`, `kind`,
   `input`, `title`, and, for a shell command, `command` as the tool_call shows it (without Codex's
   `bash -lc` wrapper), so a policy can tell a command that only reads.
+- MCP servers are `{ command, args?, env? }` (stdio) or `{ url, headers?, type?: "http" | "sse" }`.
+  Skills are directories with a `SKILL.md`, or `{ name, content }`.
 - A thread's own tools, policy and so on live in memory. After a restart, give them again with
   `configure(threadId, { tools, ... })`; its stored state (items, session) comes back by itself, and
   the next message resumes the harness's session.
+
+## Events and snapshots
 
 Events go to subscribers as they happen and to the store in order, those of the same tick in one
 `appendEvents` (deltas aren't saved). `eventsSince()` waits for what's been sent to be saved, and
@@ -165,7 +186,8 @@ again to finish saving. The file store undoes a write that fails partway, so a r
 
 ## Processes, and runs that survive a restart
 
-Processes are started by a `Spawner`. `direct()` (the default) runs them as child processes, each
+[docs/shim.md](../../../docs/shim.md) says when to use the shim and how recovering works; this is
+the detail. Processes are started by a `Spawner`. `direct()` (the default) runs them as child processes, each
 in its own process group, so they end with the backend. `shim(path)` runs them under
 [agent-threads-shim](../../../shim/README.md) (`path` is the binary), so they outlive it:
 

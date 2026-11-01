@@ -259,8 +259,10 @@ func (a *AgentThreads) defaultHarness() string {
 }
 
 // Configure sets a thread's own tools, MCP servers, skills, policy or system prompt (those that
-// aren't empty), which aren't stored: e.g. for a thread created before the app restarted. They
-// apply from its next turn.
+// aren't nil, and the system prompt if it isn't empty), which aren't stored: e.g. for a thread
+// created before the app restarted. The policy and the tools' code change at once, even for a
+// running turn; what the harness is told when its process starts (which tools there are, MCP
+// servers, skills, the system prompt) changes from its next turn.
 func (a *AgentThreads) Configure(ctx context.Context, threadID string, c Capabilities) error {
 	if err := a.open(); err != nil {
 		return err

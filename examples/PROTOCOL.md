@@ -1,7 +1,7 @@
 # The chat examples' wire protocol
 
-The SDK has no network layer: each example app brings its own. The chat examples (`chat-node`, and
-the Go and Rust ones to come) all use the one described here, so the React frontend in
+The SDK has no network layer: each example app brings its own. The chat examples (`chat-node`, `chat-go` and
+`chat-rust`) all use the one described here, so the React frontend in
 [chat-node/web](chat-node/web) talks to any of their servers unchanged. It's the app's protocol, not
 the SDK's: the SDK's part is only what goes inside it, the [protocol](../spec/PROTOCOL.md)'s
 `ThreadEvent`s, `Command`s, `Snapshot`s and `Thread`s, carried as they are.

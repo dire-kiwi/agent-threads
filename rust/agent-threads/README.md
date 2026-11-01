@@ -10,12 +10,20 @@ process and under `agent-threads-shim`, and the store cases in
 (`agent_threads::protocol`).
 
 It has no network layer: the app subscribes to events and hands commands in, over whatever
-transport it has. [examples/chat-rust](../../examples/chat-rust/README.md) is an axum server that does
-it over a WebSocket.
+transport it has ([docs/transport.md](../../docs/transport.md), with a Tauri example).
+[examples/chat-rust](../../examples/chat-rust/README.md) is an axum server that does it over a
+WebSocket.
+
+Nothing is published yet: depend on it with `agent-threads = { git =
+"https://github.com/dire-kiwi/agent-threads", branch = "main" }`, or a `path` into a checkout
+([how](../../README.md#rust-crate)).
 
 ```rust
-use agent_threads::*;
+use std::sync::Arc;
+
 use agent_threads::protocol::ToolKind;
+use agent_threads::*;
+use tokio::sync::broadcast::error::RecvError;
 
 let sdk = AgentThreads::new(Options {
     store: Some(Arc::new(SqliteStore::open("threads.db")?)),     // or MemoryStore, FileStore, your own
@@ -39,7 +47,15 @@ sdk.recover().await?;                                 // with the shim: re-attac
 
 let thread = sdk.create(CreateOptions { harness: Some("claude".into()), model: Some("haiku".into()), ..Default::default() }).await?;
 let mut events = sdk.subscribe();                     // tokio broadcast: every thread's events, deltas included
-tokio::spawn(async move { while let Ok(e) = events.recv().await { /* send it to the clients */ } });
+tokio::spawn(async move {
+    loop {
+        match events.recv().await {
+            Ok(e) => { /* send it to the clients */ }
+            Err(RecvError::Lagged(_)) => continue,    // missed some: clients see the gap in seq, and catch up
+            Err(RecvError::Closed) => break,
+        }
+    }
+});
 sdk.handle_json(command_from_a_client).await?;        // send / interrupt / respond / set_options
 let snapshot = sdk.snapshot(&thread.id).await?;       // for a client that just connected
 let missed = sdk.events_since(&thread.id, seq, None).await?; // for one catching up
@@ -68,11 +84,14 @@ numbered around a gap.
 
 ## Tools and permissions
 
+[docs/tools.md](../../docs/tools.md) has tools, MCP servers, skills and policies in all three
+backends.
+
 `tool(name, description, schema, |args, ctx| async move { … })` makes an app tool from a closure
 returning text, a `ToolOutput` (with `is_error` or `structured` output, which goes in the call's
 `result.structured`), or a `Result` of either; or implement the `Tool` trait. `ctx` has the thread's
-id and metadata, the tool call's id, and `cancelled`, which resolves if the harness process goes
-away first. A tool that panics returns its panic to the agent as an error.
+id and metadata, the tool call's id, and `cancelled`, a `Cancellation` whose `cancelled().await`
+resolves if the harness process goes away first (`is_cancelled()` asks without waiting). A tool that panics returns its panic to the agent as an error.
 
 `PermissionPolicy` is `allow()`, `ask()` (the default), `deny()`, `from_fn` (decided at once) or
 `from_async` (one that looks something up). A `PermissionQuery` has the tool's name, kind, input,
@@ -109,6 +128,8 @@ Both drivers' Codex and Claude messages are handled as `serde_json::Value`s; Cod
 types aren't generated for Rust (the Node backend generates them for TypeScript).
 
 ## Processes, and runs that survive a restart
+
+[docs/shim.md](../../docs/shim.md) says when to use the shim, and how recovering works.
 
 `direct()` (the default) runs each harness as a child process in its own process group. `shim(path,
 ShimOptions::new(runs_dir))` runs it under [agent-threads-shim](../../shim/README.md) and follows its

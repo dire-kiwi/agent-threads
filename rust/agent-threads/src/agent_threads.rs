@@ -357,7 +357,9 @@ impl AgentThreads {
 
     /// Sets a thread's own tools, MCP servers, skills, policy or system prompt, which aren't
     /// stored: e.g. for a thread created before the app restarted. What `update` leaves out stays as
-    /// it is. They apply from its next turn.
+    /// it is. The policy and the tools' code change at once, even for a running turn; what the
+    /// harness is told when its process starts (which tools there are, MCP servers, skills, the
+    /// system prompt) changes from its next turn.
     pub async fn configure(&self, thread_id: &str, update: impl Into<CapabilitiesUpdate>) -> Result<()> {
         self.open()?;
         let update = update.into();

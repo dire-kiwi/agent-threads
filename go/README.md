@@ -4,12 +4,19 @@
 (`claude -p`) and Codex (`codex app-server`), sends their events to your app and takes commands from
 it. It has the Node backend's model and behaviour ([ts/packages/node](../ts/packages/node/README.md)),
 and passes the same fixtures. It has no network layer: wire `Subscribe` (or `Events`) and `Handle`
-to your own transport (a WebSocket, SSE, IPC...). [examples/chat-go](../examples/chat-go) is a
-WebSocket server that chat-node's React frontend talks to.
+to your own transport (a WebSocket, SSE, IPC...), as [docs/transport.md](../docs/transport.md)
+says. [examples/chat-go](../examples/chat-go) is a WebSocket server that chat-node's React frontend
+talks to.
+
+It needs Go 1.26+, and no cgo. Nothing is published yet: `go get
+github.com/dire-kiwi/agent-threads/go@main` takes a commit as a pseudo-version (with `GOPRIVATE`
+set, the repository being private), or use a checkout with a `replace` directive
+([how](../README.md#go-module)).
 
 ```go
 import (
 	agentthreads "github.com/dire-kiwi/agent-threads/go"
+	"github.com/dire-kiwi/agent-threads/go/protocol"
 	"github.com/dire-kiwi/agent-threads/go/sqlitestore"
 )
 
@@ -63,7 +70,10 @@ sdk.Close(ctx) // on shutdown: stops the harness processes (or with the shim, le
   `EventsSince` its saved events after a `seq`, once what's been sent is saved.
 - `Get`, `List` and `Delete` look threads up and remove them. `Close` stops the harness processes
   (or with the shim leaves them going) and saves everything; `Stop` stops shim runs too.
-- **Tools** implement `Tool` (`Name`, `Description`, `InputSchema`, `Run(ctx, args, call)`), or are
+- `Recover(ctx)`, with the shim spawner, re-attaches to runs that outlived the last process
+  ([docs/shim.md](../docs/shim.md)).
+- **Tools** ([docs/tools.md](../docs/tools.md) has tools, MCP servers, skills and policies in
+  full) implement `Tool` (`Name`, `Description`, `InputSchema`, `Run(ctx, args, call)`), or are
   made with `ToolFunc` or `TypedTool`. `Run`'s `ctx` is cancelled when the thread's harness process
   goes away; `call` has the thread's id and metadata and the tool call's id. A tool's `Structured`
   output goes in the call's `result.structured`.
