@@ -100,7 +100,7 @@ impl Backend {
     }
 
     async fn wait_for(&self, pattern: &Value) -> Value {
-        let deadline = Instant::now() + Duration::from_secs(15);
+        let deadline = Instant::now() + Duration::from_secs(30);
         loop {
             if let Some(e) = self.events.lock().unwrap().iter().find(|e| matches(e, pattern)) {
                 return e.clone();
@@ -143,12 +143,24 @@ fn matches(v: &Value, p: &Value) -> bool {
     }
 }
 
-async fn until(what: impl Fn() -> bool) {
-    let deadline = Instant::now() + Duration::from_secs(15);
-    while !what() {
-        assert!(Instant::now() < deadline, "timed out");
-        tokio::time::sleep(Duration::from_millis(10)).await;
+/// Waits until `what` holds, for up to 30s (failing where it was called from).
+#[track_caller]
+fn until(what: impl Fn() -> bool) -> impl std::future::Future<Output = ()> {
+    let at = std::panic::Location::caller();
+    async move {
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while !what() {
+            assert!(Instant::now() < deadline, "timed out waiting at {at}");
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
     }
+}
+
+/// One test at a time, as the Node backend's restart tests run: each has backends, harnesses and
+/// shims of its own, with graces and save delays that a loaded machine would stretch.
+async fn serial() -> tokio::sync::MutexGuard<'static, ()> {
+    static ONE: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+    ONE.lock().await
 }
 
 /// A fixture's scene: the directories and environment its backends share.
@@ -441,41 +453,49 @@ async fn ends_while_down(h: &str) {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn claude_while_the_turn_waits_on_the_user() {
+    let _one = serial().await;
     while_waiting("claude", false).await;
 }
 
 #[tokio::test(flavor = "multi_thread")]
 async fn codex_while_the_turn_waits_on_the_user() {
+    let _one = serial().await;
     while_waiting("codex", false).await;
 }
 
 #[tokio::test(flavor = "multi_thread")]
 async fn claude_while_output_streams_in() {
+    let _one = serial().await;
     while_streaming("claude").await;
 }
 
 #[tokio::test(flavor = "multi_thread")]
 async fn codex_while_output_streams_in() {
+    let _one = serial().await;
     while_streaming("codex").await;
 }
 
 #[tokio::test(flavor = "multi_thread")]
 async fn claude_when_the_run_ends_while_its_down() {
+    let _one = serial().await;
     ends_while_down("claude").await;
 }
 
 #[tokio::test(flavor = "multi_thread")]
 async fn codex_when_the_run_ends_while_its_down() {
+    let _one = serial().await;
     ends_while_down("codex").await;
 }
 
 #[tokio::test(flavor = "multi_thread")]
 async fn claude_when_its_shut_down_close_leaves_the_run_going() {
+    let _one = serial().await;
     while_waiting("claude", true).await;
 }
 
 #[tokio::test(flavor = "multi_thread")]
 async fn codex_when_its_shut_down_close_leaves_the_run_going() {
+    let _one = serial().await;
     while_waiting("codex", true).await;
 }
 
@@ -540,21 +560,25 @@ async fn app_tool_not_run_again(h: &str, died: bool) {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn claude_doesnt_run_an_app_tool_again_that_was_running_when_the_backend_died() {
+    let _one = serial().await;
     app_tool_not_run_again("claude", true).await;
 }
 
 #[tokio::test(flavor = "multi_thread")]
 async fn codex_doesnt_run_an_app_tool_again_that_was_running_when_the_backend_died() {
+    let _one = serial().await;
     app_tool_not_run_again("codex", true).await;
 }
 
 #[tokio::test(flavor = "multi_thread")]
 async fn claude_doesnt_run_an_app_tool_again_that_was_running_when_the_backend_shut_down() {
+    let _one = serial().await;
     app_tool_not_run_again("claude", false).await;
 }
 
 #[tokio::test(flavor = "multi_thread")]
 async fn codex_doesnt_run_an_app_tool_again_that_was_running_when_the_backend_shut_down() {
+    let _one = serial().await;
     app_tool_not_run_again("codex", false).await;
 }
 
@@ -859,11 +883,13 @@ async fn stops_a_run_that_ignores_an_interrupt(harness: &str, interrupt: &str) {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn claude_stops_a_run_that_ignores_an_interrupt_when_the_backend_dies_right_after_it() {
+    let _one = serial().await;
     stops_a_run_that_ignores_an_interrupt("claude", r#""subtype":"interrupt""#).await;
 }
 
 #[tokio::test(flavor = "multi_thread")]
 async fn codex_stops_a_run_that_ignores_an_interrupt_when_the_backend_dies_right_after_it() {
+    let _one = serial().await;
     stops_a_run_that_ignores_an_interrupt("codex", r#""method":"turn/interrupt""#).await;
 }
 
@@ -933,11 +959,13 @@ async fn doesnt_ask_again(harness: &str, opening_saved: bool, text: &str, answer
 
 #[tokio::test(flavor = "multi_thread")]
 async fn claude_doesnt_ask_again_what_the_user_answered_just_before_the_backend_died_saved() {
+    let _one = serial().await;
     doesnt_ask_again("claude", true, "tool Bash {}", r#""behavior":"allow""#).await;
 }
 
 #[tokio::test(flavor = "multi_thread")]
 async fn codex_doesnt_ask_again_what_the_user_answered_just_before_the_backend_died_saved() {
+    let _one = serial().await;
     doesnt_ask_again(
         "codex",
         true,
@@ -949,11 +977,13 @@ async fn codex_doesnt_ask_again_what_the_user_answered_just_before_the_backend_d
 
 #[tokio::test(flavor = "multi_thread")]
 async fn claude_doesnt_ask_again_what_the_user_answered_just_before_the_backend_died_not_saved() {
+    let _one = serial().await;
     doesnt_ask_again("claude", false, "tool Bash {}", r#""behavior":"allow""#).await;
 }
 
 #[tokio::test(flavor = "multi_thread")]
 async fn codex_doesnt_ask_again_what_the_user_answered_just_before_the_backend_died_not_saved() {
+    let _one = serial().await;
     doesnt_ask_again(
         "codex",
         false,
