@@ -1,5 +1,6 @@
-# Builds and tests the TypeScript, Go and Rust packages, the shim and the Rust chat example, and checks that the code
-# generated from spec/schema is up to date (make check-gen), on each pull request and push to main.
+# Builds and tests the TypeScript, Go and Rust packages, the shim and the Rust chat example, and
+# checks that the code generated from spec/schema is up to date (make check-gen), on each pull
+# request and push to main.
 # It needs no secrets.
 name: CI
 

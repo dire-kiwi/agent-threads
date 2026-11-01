@@ -7,7 +7,9 @@ has no network layer: backends emit JSON events and accept JSON commands, and th
 It's early: so far there's the spec, the generated types, the `applyEvent` reducer, the
 conformance suite the backends run (recorded sessions replayed by a fake CLI, and store cases),
 the Node backend with its stores and its Claude Code and Codex drivers
-([ts/packages/node](ts/packages/node/README.md)), and `agent-threads-shim`, which keeps runs going
+([ts/packages/node](ts/packages/node/README.md)), the Rust backend
+([rust/agent-threads](rust/agent-threads/README.md), with an axum example in
+[examples/chat-rust](examples/chat-rust/README.md)), and `agent-threads-shim`, which keeps runs going
 while a backend restarts ([shim/](shim/README.md)). See [docs/design.md](docs/design.md) for the design and [spec/PROTOCOL.md](spec/PROTOCOL.md)
 for the protocol.
 
@@ -19,7 +21,7 @@ for the protocol.
 | `spec/conformance/` | The cases every store must pass ([store.md](spec/conformance/store.md)) |
 | `ts/` | pnpm workspace: `@dire-kiwi/agent-threads-protocol`, `-node`, `-react` |
 | `go/` | Go module `github.com/dire-kiwi/agent-threads/go` |
-| `rust/` | Cargo workspace with the `agent-threads` crate |
+| `rust/` | Cargo workspace with the `agent-threads` crate, the Rust backend ([README](rust/agent-threads/README.md)) |
 | `shim/` | `agent-threads-shim`, which keeps runs alive across backend restarts ([README](shim/README.md), [spec/RUNDIR.md](spec/RUNDIR.md)) |
 
 ## Building
@@ -28,7 +30,7 @@ You need Node 24+ with pnpm 10, Go 1.24+ and stable Rust (the Node tests build t
 
 ```sh
 (cd ts && pnpm install)
-make test        # build and test TS, Go and Rust, and the fixtures' tools
+make test        # build and test TS, Go and Rust (and the Rust example), and the fixtures' tools
 make gen         # regenerate the types after changing spec/schema/
 make check-gen   # fail if the generated code is out of date (CI runs it)
 ```
