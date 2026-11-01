@@ -108,8 +108,13 @@ func newApp(cfg config) (*app, error) {
 	if err := os.MkdirAll(a.workspace, 0o755); err != nil {
 		return nil, err
 	}
+	// Vite's dev server only in development: otherwise whatever else listens on its port isn't ours.
+	ports := []int{cfg.port}
+	if cfg.dev {
+		ports = append(ports, devPort)
+	}
 	for _, name := range []string{"localhost", "127.0.0.1", "[::1]"} {
-		for _, port := range []int{cfg.port, devPort} {
+		for _, port := range ports {
 			a.trusted[name+":"+strconv.Itoa(port)] = true
 		}
 	}
@@ -394,7 +399,8 @@ func (a *app) call(ctx context.Context, method string, raw json.RawMessage) (any
 	}
 	switch method {
 	case "hello":
-		return map[string]any{"harnesses": a.cfg.harnesses, "restart": a.cfg.supervised}, nil
+		// Offered only with the shim: without it, a restart loses the running turn.
+		return map[string]any{"harnesses": a.cfg.harnesses, "restart": a.cfg.supervised && a.cfg.shim != ""}, nil
 	case "list":
 		threads, err := a.sdk.List(ctx)
 		if err != nil {
@@ -429,8 +435,8 @@ func (a *app) call(ctx context.Context, method string, raw json.RawMessage) (any
 		}
 		return nil, a.sdk.HandleJSON(ctx, p.Command)
 	case "restart":
-		if !a.cfg.supervised {
-			return nil, errors.New("this server isn't run by `chat-go supervise`, so it can't restart")
+		if !a.cfg.supervised || a.cfg.shim == "" {
+			return nil, errors.New("this server can't restart: it isn't run by `chat-go supervise` with CHAT_SHIM")
 		}
 		time.AfterFunc(50*time.Millisecond, func() { a.shutdown(restartCode) })
 		return nil, nil

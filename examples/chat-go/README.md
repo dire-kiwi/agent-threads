@@ -36,8 +36,9 @@ cd ../chat-go
 go run .                              # http://127.0.0.1:3001
 ```
 
-Or with chat-node's Vite dev server, which proxies `/ws` to port 3001: `go run .` here, and
-`pnpm exec vite` in `examples/chat-node`, then open http://localhost:5173.
+Or with chat-node's Vite dev server, which proxies `/ws` to port 3001: `CHAT_DEV=1 go run .` here
+(so the server trusts pages from Vite's port), and `pnpm exec vite` in `examples/chat-node`, then
+open http://localhost:5173.
 
 The restart demo:
 
@@ -47,11 +48,13 @@ CHAT_SHIM=1 go run . supervise
 ```
 
 Ask something that needs a permission, and while the card waits, click **Restart server**: the
-server leaves its runs going, `supervise` starts it again, and `Recover` re-attaches to them.
+server leaves its runs going, `supervise` starts it again, and `Recover` re-attaches to them. The
+button is offered only with the shim, since without it a restart loses the running turn.
 
 The environment is chat-node's: `PORT`, `CHAT_DATA`, `CHAT_HARNESSES`, `CHAT_CLAUDE_MODEL`,
 `CHAT_CODEX_MODEL`, `CHAT_CODEX_EFFORT`, `CHAT_SHIM`, `CHAT_FAKE_CLAUDE`, `CHAT_FAKE_CODEX` and
-`CHAT_FAKE_STATE` (see [config.go](config.go)), plus `CHAT_WEB`, the built frontend to serve.
+`CHAT_FAKE_STATE` (see [config.go](config.go)), plus `CHAT_WEB`, the built frontend to serve, and
+`CHAT_DEV=1`, which chat-node's `pnpm dev` sets, to trust Vite's port.
 
 ## Tests
 

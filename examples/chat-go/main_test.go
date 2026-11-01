@@ -62,6 +62,7 @@ func TestTrusted(t *testing.T) {
 		{"127.0.0.1:3001", "http://localhost:3001", false},
 		{"evil.example:3001", "", false},
 		{"127.0.0.1:9999", "", false},
+		{"localhost:3002", "", false},
 	} {
 		r, _ := http.NewRequest("GET", "http://"+c.host+"/ws", nil)
 		if c.origin != "" {
@@ -269,6 +270,20 @@ func TestTheServerRefusesOtherPagesAndBadInput(t *testing.T) {
 	_, resp, err := websocket.Dial(ctx, "ws://"+host+"/ws", &websocket.DialOptions{HTTPHeader: http.Header{"Origin": {"http://evil.example"}}})
 	if err == nil || resp == nil || resp.StatusCode != http.StatusForbidden {
 		t.Fatalf("got %v %v", resp, err)
+	}
+	// Vite's port, outside development (CHAT_DEV isn't set).
+	for _, h := range []string{"localhost:5173", "127.0.0.1:5173"} {
+		conn, err := net.Dial("tcp", host)
+		if err != nil {
+			t.Fatal(err)
+		}
+		fmt.Fprintf(conn, "GET /ws HTTP/1.1\r\nHost: %s\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Version: 13\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\r\n", h)
+		status := make([]byte, 12)
+		io.ReadFull(conn, status)
+		conn.Close()
+		if !strings.HasPrefix(string(status), "HTTP/1.1 403") {
+			t.Fatalf("Host %s: got %q", h, status)
+		}
 	}
 	// Paths that don't decode.
 	for _, path := range []string{"/%E0%A4%A", "/%zz", "/%E0"} {

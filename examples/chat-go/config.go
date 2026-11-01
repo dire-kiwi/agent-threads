@@ -13,6 +13,7 @@ package main
 //	CHAT_FAKE_CLAUDE     replay a recorded session (a spec/fixtures directory) with the fake CLI
 //	CHAT_FAKE_CODEX      in place of the real one: for the tests, with no login needed
 //	CHAT_FAKE_STATE      where the fake CLIs keep their state, kept across restarts (a fresh one by default)
+//	CHAT_DEV             1 behind Vite's dev server (port 5173), whose pages are trusted too
 
 import (
 	"encoding/json"
@@ -68,6 +69,8 @@ type config struct {
 	fakeState       string
 	// supervised says the supervisor started it, and starts it again when it exits for a restart.
 	supervised bool
+	// dev says it runs behind Vite's dev server (CHAT_DEV=1), whose pages may use it too.
+	dev bool
 }
 
 func loadConfig(env func(string) string) (config, error) {
@@ -97,7 +100,7 @@ func loadConfig(env func(string) string) (config, error) {
 		"claude": {Name: "claude", Label: "Claude Code", Model: or("CHAT_CLAUDE_MODEL", "haiku"), Models: []string{"haiku", "sonnet", "opus"}},
 		"codex":  {Name: "codex", Label: "Codex", Model: or("CHAT_CODEX_MODEL", "gpt-5.6-luna"), Models: []string{"gpt-5.6-luna", "gpt-5.6"}, Effort: or("CHAT_CODEX_EFFORT", "low")},
 	}
-	c := config{fake: fake, fakeTools: true, supervised: env("CHAT_SUPERVISED") == "1"}
+	c := config{fake: fake, fakeTools: true, supervised: env("CHAT_SUPERVISED") == "1", dev: env("CHAT_DEV") == "1"}
 	for _, name := range wanted {
 		h, ok := all[name]
 		if !ok {
