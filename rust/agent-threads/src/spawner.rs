@@ -161,6 +161,9 @@ pub trait Spawner: Send + Sync {
     fn prunes(&self) -> bool {
         false
     }
+    /// Resolves once what it's doing in the background (stopping runs) is done, for a backend
+    /// that's closing.
+    async fn settle(&self) {}
 }
 
 /// Runs harness processes as children of the backend, each in its own process group.

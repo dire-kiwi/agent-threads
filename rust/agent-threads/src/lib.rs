@@ -33,7 +33,7 @@ pub use codex::{AppTools, CodexOptions, codex};
 pub use harness::{BoxFuture, Harness, HarnessSession, McpServer, Message, RunCheckpoint, Skill, ThreadConfig, TurnEnd};
 pub use permissions::{Decided, PermissionContext, PermissionDecision, PermissionPolicy, PermissionQuery};
 pub use protocol::{Command, Item, Snapshot, Thread, ThreadEvent};
-pub use shim::{ShimOptions, shim};
+pub use shim::{RUN_FORMAT, ShimOptions, shim};
 pub use spawner::{ExitStatus, HarnessProcess, ProcessEvent, Signal, SpawnOptions, Spawned, Spawner, direct};
 pub use store::{RunRecord, Store, StoreError, StoreErrorKind, StoreResult};
 pub use stores::file::FileStore;

@@ -532,6 +532,7 @@ impl AgentThreads {
                     p.abort();
                 }
                 self.stop_all(stop).await;
+                i.spawner.settle().await;
             }
         }
         self.save_all().await
