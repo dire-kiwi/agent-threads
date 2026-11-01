@@ -222,16 +222,18 @@ with placeholders bound. `spec/tools/check-events.mjs` implements this.
 
 1. **Valid.** Each of the backend's events is a valid `ThreadEvent` by the schema (required fields
    there, even when they're `false` or `""`).
-2. **Seq.** Its saved events have `seq` 1, 2, 3... with no gaps, and each `delta` has the `seq` of
-   the saved event before it.
+2. **Seq and offsets.** Its saved events have `seq` 1, 2, 3... with no gaps, and each `delta` has
+   the `seq` of the saved event before it, and as its `offset` the length of its item's text
+   before it (from the item's `item.added`, the last `item.updated` that set its `text`, and the
+   deltas since).
 3. **Normalize** both streams: leave out `raw`, `created_at`, `updated_at`, `seq` and the thread's
    `run`, and *optional* fields that are `false` or `""` (as the protocol lets a backend leave them
    out). Values the schema doesn't describe field by field (a tool's `input`, `result.structured`,
    `metadata`) stay as they are. An `item.updated`'s patch keeps all its fields, since each is an
    operation (`false` isn't "unchanged"), with their values normalized by the item's schema. Then
    drop a `thread.updated` whose thread is the same as the one before, and join consecutive deltas
-   to the same item and kind into one. (So a backend may cut deltas differently, and send a
-   `thread.updated` when only its run changes.)
+   to the same item and kind into one, with the first one's `offset`. (So a backend may cut deltas
+   differently, and send a `thread.updated` when only its run changes.)
 4. **Compare** event by event. Every field must be equal, and the backend's events may not have
    fields the expected ones don't. Numbers may differ by one part in a billion (for summed costs).
    A string `"{{name}}"` in the expected events matches any value the first time and binds it;

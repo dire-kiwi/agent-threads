@@ -71,9 +71,13 @@ export function withDeltas(events: ThreadEvent[]): ThreadEvent[] {
     const text = e.type === "item.updated" ? e.patch.text : undefined;
     if (e.type === "item.updated" && typeof text === "string" && streamed.has(e.item_id)) {
       const sofar = streamed.get(e.item_id)!;
-      if (text.startsWith(sofar))
-        for (const chunk of text.slice(sofar.length).match(/\S+\s*|\s+/g) ?? [])
-          out.push({ type: "delta", thread_id: e.thread_id, seq: e.seq - 1, item_id: e.item_id, kind: "text", text: chunk });
+      if (text.startsWith(sofar)) {
+        let offset = sofar.length;
+        for (const chunk of text.slice(sofar.length).match(/\S+\s*|\s+/g) ?? []) {
+          out.push({ type: "delta", thread_id: e.thread_id, seq: e.seq - 1, item_id: e.item_id, kind: "text", offset, text: chunk });
+          offset += chunk.length;
+        }
+      }
       streamed.delete(e.item_id);
     }
     out.push(e);

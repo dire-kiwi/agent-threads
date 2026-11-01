@@ -26,7 +26,7 @@ function asBackendWould(expected) {
   for (const e of expected.map(fill)) {
     if (e.type === "delta" && e.text.length > 1) {
       const half = Math.ceil(e.text.length / 2);
-      out.push({ ...e, text: e.text.slice(0, half) }, { ...e, text: e.text.slice(half) });
+      out.push({ ...e, text: e.text.slice(0, half) }, { ...e, offset: e.offset + half, text: e.text.slice(half) });
       continue;
     }
     if (e.type === "item.added") e.item = { ...e.item, created_at: "2026-11-01T00:00:00Z", raw: { from: "harness" } };
@@ -76,9 +76,18 @@ test("two placeholders can't be the same value", () => {
 
 test("seq numbers must have no gaps, and a delta has the last saved one", () => {
   const add = (seq) => ({ type: "item.added", thread_id: "t", seq, item: { id: "a", type: "assistant_message", text: "" } });
-  const delta = (seq) => ({ type: "delta", thread_id: "t", seq, item_id: "a", kind: "text", text: "hi" });
+  const delta = (seq) => ({ type: "delta", thread_id: "t", seq, item_id: "a", kind: "text", offset: 0, text: "hi" });
   assert.match(compare([add(1)], [add(2)]).error, /has seq 2, not 1/);
   assert.match(compare([add(1), delta(1)], [add(1), delta(2)]).error, /a delta/);
+});
+
+test("a delta's offset must be the length of its item's text before it", () => {
+  const add = { type: "item.added", thread_id: "t", seq: 1, item: { id: "a", type: "assistant_message", text: "" } };
+  const delta = (offset, text) => ({ type: "delta", thread_id: "t", seq: 1, item_id: "a", kind: "text", offset, text });
+  const expected = [add, delta(0, "hello")];
+  assert.equal(compare(expected, [add, delta(0, "hel"), delta(3, "lo")]).ok, true);
+  assert.match(compare(expected, [add, delta(0, "hel"), delta(0, "lo")]).error, /has offset 0, not 3/);
+  assert.match(compare(expected, [add, delta(1, "hello")]).error, /has offset 1, not 0/);
 });
 
 /** A fixture's expected events, and a copy as a backend would send them to change. */

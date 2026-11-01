@@ -47,6 +47,27 @@ func TestUnionVariants(t *testing.T) {
 	}
 }
 
+// An open object's values stay as they came: a large integer in a patch isn't rounded through a
+// float64, and null (which removes a field) is still there.
+func TestOpenObjectsKeepTheirValues(t *testing.T) {
+	data := `{"type":"item.updated","thread_id":"th","seq":2,"item_id":"tc1","patch":{"size":9007199254740993,"title":null}}`
+	var ev protocol.ThreadEvent
+	if err := json.Unmarshal([]byte(data), &ev); err != nil {
+		t.Fatal(err)
+	}
+	patch := ev.Value.(*protocol.ItemUpdatedEvent).Patch
+	if string(patch["size"]) != "9007199254740993" || string(patch["title"]) != "null" {
+		t.Fatalf("got %q and %q", patch["size"], patch["title"])
+	}
+	out, err := json.Marshal(ev)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Contains(out, []byte(`"size":9007199254740993`)) {
+		t.Fatalf("the integer changed: %s", out)
+	}
+}
+
 func TestRequiredListsAreNotNull(t *testing.T) {
 	out, err := json.Marshal(protocol.Snapshot{Thread: protocol.Thread{ID: "th", Harness: "claude", Status: protocol.ThreadStatusIdle}})
 	if err != nil {

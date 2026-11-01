@@ -529,7 +529,7 @@ export interface ItemUpdatedEvent {
   raw?: unknown;
 }
 /**
- * Streamed text to append to an assistant_message (kind text) or reasoning (kind reasoning) item's text. Not saved, and doesn't advance seq: its seq is that of the last saved event. An item.updated with the final text follows.
+ * Streamed text to append to an assistant_message (kind text) or reasoning (kind reasoning) item's text, at offset. Not saved, and doesn't advance seq: its seq is that of the last saved event. An item.updated with the final text follows.
  */
 export interface DeltaEvent {
   type: "delta";
@@ -537,6 +537,10 @@ export interface DeltaEvent {
   seq: number;
   item_id: string;
   kind: "text" | "reasoning";
+  /**
+   * Where text goes in the item's text: its length before this delta, in UTF-16 code units (JavaScript's string length). A client that already has the text up to offset + text's length (from a snapshot taken after the delta) skips it.
+   */
+  offset: number;
   text: string;
   /**
    * The harness's own payload, for debugging.

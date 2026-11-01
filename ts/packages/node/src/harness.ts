@@ -71,6 +71,7 @@ export interface ThreadContext {
   addItem(item: NewItem): void;
   /** Changes an item's fields (null removes one); sends nothing if nothing changes. */
   updateItem(id: string, patch: { [k: string]: unknown }): void;
+  /** Streams text onto the end of an assistant_message or reasoning item's text; sends nothing for "". */
   delta(itemId: string, kind: "text" | "reasoning", text: string): void;
   /** Changes the thread's fields (undefined removes one); sends nothing if nothing changes. */
   setThread(patch: Partial<Thread>): void;

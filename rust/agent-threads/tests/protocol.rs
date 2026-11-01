@@ -3,7 +3,7 @@
 use std::fs;
 use std::path::PathBuf;
 
-use agent_threads::protocol::{Command, Item, Notice, NoticeLevel, Snapshot, ThreadEvent};
+use agent_threads::protocol::{Command, InterruptCommand, Item, Notice, NoticeLevel, Snapshot, ThreadEvent};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 use serde_json::{Value, json};
@@ -41,7 +41,7 @@ fn unions_are_tagged_by_type() {
         "item": {"id": "n", "type": "notice", "level": "info", "text": "hi"}
     }))
     .unwrap();
-    let ThreadEvent::ItemAddedEvent(added) = event else {
+    let ThreadEvent::ItemAdded(added) = event else {
         panic!("got {event:?}")
     };
     let Item::Notice(Notice {
@@ -55,7 +55,9 @@ fn unions_are_tagged_by_type() {
     // A variant is picked by its type, not by which fields fit.
     let interrupt: Command =
         serde_json::from_value(json!({"type": "interrupt", "thread_id": "th", "text": "hi"})).unwrap();
-    assert!(matches!(interrupt, Command::InterruptCommand(_)));
+    assert!(matches!(interrupt, Command::Interrupt(_)));
+    let from = Command::from(InterruptCommand { thread_id: "th".into() });
+    assert!(matches!(from, Command::Interrupt(_)));
     assert!(serde_json::from_value::<Command>(json!({"type": "nope", "thread_id": "th"})).is_err());
     assert_eq!(
         serde_json::to_value(&interrupt).unwrap(),

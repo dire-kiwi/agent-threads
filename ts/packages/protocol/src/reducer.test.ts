@@ -68,25 +68,55 @@ describe("applyEvent", () => {
     expect(next.seq).toBe(4);
   });
 
+  /** A text delta to a1 at seq 3. */
+  const delta = (text: string, offset: number, item_id = "a1", seq = 3): ThreadEvent => ({ type: "delta", thread_id: "th", seq, item_id, kind: "text", offset, text });
+
   it("appends deltas to text without counting them", () => {
     const s = started();
-    const delta = (text: string, item_id = "a1", seq = 3): ThreadEvent => ({ type: "delta", thread_id: "th", seq, item_id, kind: "text", text });
-    const next = applyEvents(s, [delta("Hel"), delta("lo")]);
+    const next = applyEvents(s, [delta("Hel", 0), delta("lo", 3)]);
     expect(next.items[2]).toEqual({ ...reply, text: "Hello" });
     expect(next.items[0]).toBe(s.items[0]);
     expect(next.items[1]).toBe(s.items[1]);
     expect(next.seq).toBe(3);
     // Not for items it doesn't have, items without text, or from before the state's last saved event.
-    expect(applyEvent(s, delta("x", "nope"))).toBe(s);
-    expect(applyEvent(s, delta("x", "tc1"))).toBe(s);
-    expect(applyEvent(s, delta("x", "a1", 2))).toBe(s);
+    expect(applyEvent(s, delta("x", 0, "nope"))).toBe(s);
+    expect(applyEvent(s, delta("x", 0, "tc1"))).toBe(s);
+    expect(applyEvent(s, delta("x", 0, "a1", 2))).toBe(s);
     // One from after it (the state missed saved events) still applies.
-    expect(applyEvent(s, delta("x", "a1", 9)).items[2]).toEqual({ ...reply, text: "x" });
+    expect(applyEvent(s, delta("x", 0, "a1", 9)).items[2]).toEqual({ ...reply, text: "x" });
   });
 
   it("appends reasoning deltas", () => {
     const s = applyEvent(initialState(thread), { type: "item.added", thread_id: "th", seq: 1, item: { id: "r1", type: "reasoning", text: "a" } });
-    expect(applyEvent(s, { type: "delta", thread_id: "th", seq: 1, item_id: "r1", kind: "reasoning", text: "b" }).items[0]).toMatchObject({ text: "ab" });
+    expect(applyEvent(s, { type: "delta", thread_id: "th", seq: 1, item_id: "r1", kind: "reasoning", offset: 1, text: "b" }).items[0]).toMatchObject({ text: "ab" });
+  });
+
+  it("skips what of a delta the state already has", () => {
+    // A snapshot taken after "Hel" and "lo" were sent has them in, and they come again after it.
+    const s = applyEvents(started(), [delta("Hel", 0), delta("lo", 3)]);
+    expect(applyEvent(s, delta("Hel", 0))).toBe(s);
+    expect(applyEvent(s, delta("lo", 3))).toBe(s);
+    expect(applyEvent(s, delta("el", 1))).toBe(s);
+    // Part of it in already: the rest is appended.
+    expect(applyEvent(s, delta("lo, world", 3)).items[2]).toEqual({ ...reply, text: "Hello, world" });
+    expect(applyEvents(s, [delta("Hel", 0), delta("lo", 3), delta(", world", 5)]).items[2]).toEqual({ ...reply, text: "Hello, world" });
+  });
+
+  it("skips a delta past the end of the text", () => {
+    // Deltas were missed: the item's final text puts it right.
+    const s = applyEvent(started(), delta("Hel", 0));
+    expect(applyEvent(s, delta("p", 5))).toBe(s);
+  });
+
+  it("ignores a delta whose kind isn't its item's", () => {
+    const s = applyEvent(started(), { type: "item.added", thread_id: "th", seq: 4, item: { id: "r1", type: "reasoning", text: "" } });
+    expect(applyEvent(s, { type: "delta", thread_id: "th", seq: 4, item_id: "a1", kind: "reasoning", offset: 0, text: "x" })).toBe(s);
+    expect(applyEvent(s, { type: "delta", thread_id: "th", seq: 4, item_id: "r1", kind: "text", offset: 0, text: "x" })).toBe(s);
+  });
+
+  it("returns the state itself for an empty delta", () => {
+    const s = started();
+    expect(applyEvent(s, delta("", 0))).toBe(s);
   });
 
   it("opens and resolves requests", () => {
@@ -125,7 +155,7 @@ describe("applyEvent", () => {
     expect(applyEvent(s, { type: "item.added", thread_id: "th", seq: 3, item: { ...reply, text: "again" } })).toBe(s);
     expect(applyEvent(s, { type: "item.added", thread_id: "th", seq: 1, item: user })).toBe(s);
     expect(applyEvent(s, { type: "item.added", thread_id: "other", seq: 4, item: user })).toBe(s);
-    expect(applyEvent(s, { type: "delta", thread_id: "other", seq: 3, item_id: "a1", kind: "text", text: "x" })).toBe(s);
+    expect(applyEvent(s, { type: "delta", thread_id: "other", seq: 3, item_id: "a1", kind: "text", offset: 0, text: "x" })).toBe(s);
   });
 
   it("counts event types it doesn't know", () => {
@@ -141,7 +171,7 @@ describe("isGap", () => {
     expect(isGap(s, { type: "turn.started", thread_id: "th", seq: 4, turn_id: "t" })).toBe(false);
     expect(isGap(s, { type: "turn.started", thread_id: "th", seq: 3, turn_id: "t" })).toBe(false);
     expect(isGap(s, { type: "turn.started", thread_id: "th", seq: 5, turn_id: "t" })).toBe(true);
-    expect(isGap(s, { type: "delta", thread_id: "th", seq: 5, item_id: "a1", kind: "text", text: "" })).toBe(false);
+    expect(isGap(s, { type: "delta", thread_id: "th", seq: 5, item_id: "a1", kind: "text", offset: 0, text: "" })).toBe(false);
     expect(isGap(s, { type: "turn.started", thread_id: "other", seq: 9, turn_id: "t" })).toBe(false);
   });
 });
@@ -154,8 +184,8 @@ describe("spec/examples/thread", () => {
     expect(applyEvents(initialState(first.thread), events)).toEqual(readJson("examples/thread.snapshot.json"));
   });
 
-  it("folds the same with every saved event delivered twice", () => {
-    const twice = events.flatMap((e): ThreadEvent[] => (e.type === "delta" ? [e] : [e, e]));
+  it("folds the same with every event delivered twice", () => {
+    const twice = events.flatMap((e): ThreadEvent[] => [e, e]);
     expect(applyEvents(initialState(first.thread), twice)).toEqual(readJson("examples/thread.snapshot.json"));
   });
 

@@ -248,7 +248,11 @@ export class ThreadRuntime implements ThreadContext {
   }
 
   delta(itemId: string, kind: "text" | "reasoning", text: string): void {
-    if (text) this.emit({ type: "delta", item_id: itemId, kind, text });
+    if (!text) return;
+    // Where it goes: the length of the item's text so far, the deltas before it included.
+    const item = this.#state.items.findLast((i) => i.id === itemId);
+    const offset = item?.type === "assistant_message" || item?.type === "reasoning" ? item.text.length : 0;
+    this.emit({ type: "delta", item_id: itemId, kind, offset, text });
   }
 
   setThread(patch: Partial<Thread>): void {

@@ -3,8 +3,8 @@
 {"type":"turn.started","thread_id":"th_1","seq":3,"turn_id":"t1"}
 {"type":"thread.updated","thread_id":"th_1","seq":4,"thread":{"id":"th_1","harness":"claude","status":"running","model":"opus","permission_mode":"default","cwd":"/work/app","run":{"id":"run_1","spawner":"shim","started_at":"2026-11-01T00:00:01Z"},"created_at":"2026-11-01T00:00:00Z","updated_at":"2026-11-01T00:00:01Z"}}
 {"type":"item.added","thread_id":"th_1","seq":5,"item":{"id":"r1","type":"reasoning","text":"","turn_id":"t1"}}
-{"type":"delta","thread_id":"th_1","seq":5,"item_id":"r1","kind":"reasoning","text":"Let me run"}
-{"type":"delta","thread_id":"th_1","seq":5,"item_id":"r1","kind":"reasoning","text":" the tests."}
+{"type":"delta","thread_id":"th_1","seq":5,"item_id":"r1","kind":"reasoning","offset":0,"text":"Let me run"}
+{"type":"delta","thread_id":"th_1","seq":5,"item_id":"r1","kind":"reasoning","offset":10,"text":" the tests."}
 {"type":"item.updated","thread_id":"th_1","seq":6,"item_id":"r1","patch":{"text":"Let me run the tests first."}}
 {"type":"item.added","thread_id":"th_1","seq":7,"item":{"id":"tc1","type":"tool_call","name":"Bash","kind":"shell","input":{"command":"npm test"},"status":"pending","command":"npm test","turn_id":"t1"},"raw":{"type":"assistant","message":{"content":[{"type":"tool_use","id":"tc1","name":"Bash","input":{"command":"npm test"}}]}}}
 {"type":"request.opened","thread_id":"th_1","seq":8,"request":{"id":"p1","type":"permission","tool_call_id":"tc1","name":"Bash","kind":"shell","input":{"command":"npm test"},"title":"npm test","turn_id":"t1"}}
@@ -30,8 +30,8 @@
 {"type":"thread.updated","thread_id":"th_1","seq":28,"thread":{"id":"th_1","harness":"claude","status":"running","model":"opus","permission_mode":"default","cwd":"/work/app","run":{"id":"run_1","spawner":"shim","started_at":"2026-11-01T00:00:01Z","reattached_at":"2026-11-01T00:05:00Z"},"created_at":"2026-11-01T00:00:00Z","updated_at":"2026-11-01T00:05:10Z"}}
 {"type":"item.added","thread_id":"th_1","seq":29,"item":{"id":"cp1","type":"compaction","trigger":"auto","tokens_before":160000,"summary":"Fixed sum(); adding tests.","turn_id":"t1"}}
 {"type":"item.added","thread_id":"th_1","seq":30,"item":{"id":"a1","type":"assistant_message","text":"","turn_id":"t1"}}
-{"type":"delta","thread_id":"th_1","seq":30,"item_id":"a1","kind":"text","text":"Fixed "}
-{"type":"delta","thread_id":"th_1","seq":30,"item_id":"a1","kind":"text","text":"sum() "}
+{"type":"delta","thread_id":"th_1","seq":30,"item_id":"a1","kind":"text","offset":0,"text":"Fixed "}
+{"type":"delta","thread_id":"th_1","seq":30,"item_id":"a1","kind":"text","offset":6,"text":"sum() "}
 {"type":"item.updated","thread_id":"th_1","seq":31,"item_id":"a1","patch":{"text":"Fixed `sum()` to start from 0, and added a vitest test for the empty list."}}
 {"type":"item.added","thread_id":"th_1","seq":32,"item":{"id":"tr1","type":"turn_result","ok":true,"usage":{"input_tokens":5200,"output_tokens":800,"cache_read_tokens":41000,"cost_usd":0.12},"duration_ms":310000,"turn_id":"t1"}}
 {"type":"turn.completed","thread_id":"th_1","seq":33,"turn_id":"t1"}

@@ -5,7 +5,7 @@ import { fixtureEvents, fixtureNames, fixtureThread, testSource, thread } from "
 
 const added = (seq: number, item: Item): ThreadEvent => ({ type: "item.added", thread_id: "th", seq, item });
 const msg = (id: string, text = ""): Item => ({ id, type: "assistant_message", text });
-const delta = (seq: number, item_id: string, text: string): ThreadEvent => ({ type: "delta", thread_id: "th", seq, item_id, kind: "text", text });
+const delta = (seq: number, item_id: string, text: string, offset = 0): ThreadEvent => ({ type: "delta", thread_id: "th", seq, item_id, kind: "text", offset, text });
 const updated = (seq: number, item_id: string, patch: Record<string, unknown>): ThreadEvent => ({ type: "item.updated", thread_id: "th", seq, item_id, patch });
 
 /**
@@ -56,7 +56,7 @@ describe("ThreadStore", () => {
 
   it("notes what's streaming until its final text comes", () => {
     const { store, emit } = connected();
-    emit(added(1, msg("a")), delta(1, "a", "Hel"), delta(1, "a", "lo"));
+    emit(added(1, msg("a")), delta(1, "a", "Hel"), delta(1, "a", "lo", 3));
     expect(store.getState().streaming.has("a")).toBe(true);
     expect(store.getState().snapshot.items[0]).toMatchObject({ text: "Hello" });
     emit(updated(2, "a", { text: "Hello!" }));
@@ -69,9 +69,17 @@ describe("ThreadStore", () => {
     const start = applyEvents(initialState(thread), [added(1, msg("a", "Hello")), updated(2, "a", { text: "Hello!" }), { type: "turn.completed", thread_id: "th", seq: 3, turn_id: "t" }]);
     const { store, emit } = connected(start);
     const before = store.getState();
-    emit(delta(2, "a", " again"));
+    emit(delta(2, "a", " again", 5));
     expect(store.getState()).toBe(before);
     expect(store.getState().streaming.size).toBe(0);
+  });
+
+  it("skips deltas its snapshot already has", () => {
+    // The source subscribed, then took a snapshot with "Hel" in, and passes on the delta it got before.
+    const start = applyEvents(initialState(thread), [added(1, msg("a")), delta(1, "a", "Hel")]);
+    const { store, emit } = connected(start);
+    emit(delta(1, "a", "Hel"), delta(1, "a", "lo", 3));
+    expect(store.getState().snapshot.items[0]).toMatchObject({ text: "Hello" });
   });
 
   it("keeps the view when an event leaves the items and requests as they were", () => {

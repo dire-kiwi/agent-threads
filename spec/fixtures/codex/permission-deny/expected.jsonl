@@ -11,8 +11,8 @@
 {"type":"thread.updated","thread_id":"{{thread}}","seq":11,"thread":{"id":"{{thread}}","harness":"codex","status":"running","model":"gpt-5.6-luna","effort":"low","permission_mode":"default","cwd":"{{cwd}}","created_at":"2026-11-01T00:00:00Z","session_id":"01a19253-b92d-7c03-8092-a967b8ab9923"}}
 {"type":"item.updated","thread_id":"{{thread}}","seq":12,"item_id":"exec-39dff505-4b45-4045-8224-bfd23fbd8939","patch":{"status":"denied"}}
 {"type":"item.added","thread_id":"{{thread}}","seq":13,"item":{"id":"msg_0b84a4708b512b74016ae5f8c777c48191a6da41b1f175cd79","type":"assistant_message","text":"","turn_id":"{{t1}}"}}
-{"type":"delta","thread_id":"{{thread}}","seq":13,"item_id":"msg_0b84a4708b512b74016ae5f8c777c48191a6da41b1f175cd79","kind":"text","text":"not"}
-{"type":"delta","thread_id":"{{thread}}","seq":13,"item_id":"msg_0b84a4708b512b74016ae5f8c777c48191a6da41b1f175cd79","kind":"text","text":" allowed"}
+{"type":"delta","thread_id":"{{thread}}","seq":13,"item_id":"msg_0b84a4708b512b74016ae5f8c777c48191a6da41b1f175cd79","kind":"text","offset":0,"text":"not"}
+{"type":"delta","thread_id":"{{thread}}","seq":13,"item_id":"msg_0b84a4708b512b74016ae5f8c777c48191a6da41b1f175cd79","kind":"text","offset":3,"text":" allowed"}
 {"type":"item.updated","thread_id":"{{thread}}","seq":14,"item_id":"msg_0b84a4708b512b74016ae5f8c777c48191a6da41b1f175cd79","patch":{"text":"not allowed"}}
 {"type":"item.added","thread_id":"{{thread}}","seq":15,"item":{"id":"{{tr1}}","type":"turn_result","ok":true,"usage":{"input_tokens":12245,"output_tokens":70,"cache_read_tokens":11904,"cache_write_tokens":0},"duration_ms":4399,"turn_id":"{{t1}}"}}
 {"type":"turn.completed","thread_id":"{{thread}}","seq":16,"turn_id":"{{t1}}"}

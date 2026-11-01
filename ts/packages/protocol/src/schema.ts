@@ -276,6 +276,7 @@ export const schema: { readonly $defs: { readonly [name: string]: unknown } } = 
         "seq",
         "item_id",
         "kind",
+        "offset",
         "text"
       ],
       "properties": {
@@ -298,6 +299,10 @@ export const schema: { readonly $defs: { readonly [name: string]: unknown } } = 
             "text",
             "reasoning"
           ]
+        },
+        "offset": {
+          "type": "integer",
+          "minimum": 0
         },
         "text": {
           "type": "string"

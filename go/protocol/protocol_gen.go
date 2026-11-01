@@ -312,7 +312,7 @@ type ItemUpdatedEvent struct {
 	ItemID   string `json:"item_id"`
 
 	// Top-level fields of the item to set, e.g. {"status": "completed", "result": {...}}.
-	Patch map[string]any `json:"patch"`
+	Patch map[string]json.RawMessage `json:"patch"`
 
 	// The harness's own payload, for debugging.
 	Raw json.RawMessage `json:"raw,omitempty"`
@@ -322,7 +322,7 @@ func (v ItemUpdatedEvent) MarshalJSON() ([]byte, error) {
 	type plain ItemUpdatedEvent
 	p := plain(v)
 	if p.Patch == nil {
-		p.Patch = map[string]any{}
+		p.Patch = map[string]json.RawMessage{}
 	}
 	return json.Marshal(struct {
 		Type string `json:"type"`
@@ -331,8 +331,8 @@ func (v ItemUpdatedEvent) MarshalJSON() ([]byte, error) {
 }
 
 // DeltaEvent: Streamed text to append to an assistant_message (kind text) or reasoning (kind
-// reasoning) item's text. Not saved, and doesn't advance seq: its seq is that of the last saved
-// event. An item.updated with the final text follows.
+// reasoning) item's text, at offset. Not saved, and doesn't advance seq: its seq is that of the
+// last saved event. An item.updated with the final text follows.
 //
 // It's the "delta" variant of ThreadEvent.
 type DeltaEvent struct {
@@ -340,7 +340,12 @@ type DeltaEvent struct {
 	Seq      int64          `json:"seq"`
 	ItemID   string         `json:"item_id"`
 	Kind     DeltaEventKind `json:"kind"`
-	Text     string         `json:"text"`
+
+	// Where text goes in the item's text: its length before this delta, in UTF-16 code units
+	// (JavaScript's string length). A client that already has the text up to offset + text's length
+	// (from a snapshot taken after the delta) skips it.
+	Offset int64  `json:"offset"`
+	Text   string `json:"text"`
 
 	// The harness's own payload, for debugging.
 	Raw json.RawMessage `json:"raw,omitempty"`
@@ -1099,9 +1104,9 @@ type Thread struct {
 
 	// The app's own data, given when the thread was created. Backends store it and pass it to tools;
 	// they don't read it.
-	Metadata  map[string]any `json:"metadata,omitempty"`
-	CreatedAt string         `json:"created_at"`
-	UpdatedAt string         `json:"updated_at,omitempty"`
+	Metadata  map[string]json.RawMessage `json:"metadata,omitempty"`
+	CreatedAt string                     `json:"created_at"`
+	UpdatedAt string                     `json:"updated_at,omitempty"`
 }
 
 // ThreadStatus: idle: no turn is running. running: a turn is running. waiting: a turn is waiting on
