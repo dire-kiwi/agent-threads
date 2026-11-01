@@ -42,6 +42,14 @@ await sdk.close(); // on shutdown: stops the harness processes (or with the shim
   the protocol's schema, which is checked before anything changes). `send`, `interrupt`, `respond`
   and `setOptions` do the same from code. After `close()`, they're all refused.
 - `get`, `list` and `delete` look threads up and remove them.
+
+[examples/chat-node](../../../examples/chat-node) is a whole app on this package and the React one.
+- A tool returns text for the agent, or `{ text, isError?, structured? }`. `structured` also goes
+  in the call's `result.structured` (harnesses pass on only the text), for the app's renderer of
+  the tool to draw.
+- The permission policy is asked about each tool call with a `PermissionQuery`: its `name`, `kind`,
+  `input`, `title`, and, for a shell command, `command` as the tool_call shows it (without Codex's
+  `bash -lc` wrapper), so a policy can tell a command that only reads.
 - A thread's own tools, policy and so on live in memory. After a restart, give them again with
   `configure(threadId, { tools, ... })`; its stored state (items, session) comes back by itself, and
   the next message resumes the harness's session.
@@ -175,9 +183,9 @@ await sdk.recover(); // at startup, before taking commands
   and removes the runs in it the store doesn't follow), so there's no default. It and a shim path
   with a `/` in it are taken relative to the backend's working directory.
 - Whenever a thread's events are saved, its run's offset (how far into `out.jsonl` they go), the
-  driver's state for it, the running turn and the text streamed so far are saved with them, in the
-  same `appendEvents`. So however the backend
-  stops, after a restart it reads the output again from exactly where the saved events end: none
+  driver's state for it, the running turn, the text streamed so far and app tools' structured
+  output not yet given to their calls are saved with them, in the same `appendEvents`. So however
+  the backend stops, after a restart it reads the output again from exactly where the saved events end: none
   are lost, and none are made twice.
 - `recover()` re-attaches to the runs that were going when the backend stopped. A run that's still
   going carries on, with its turn, its streamed text and its open requests as they were (a

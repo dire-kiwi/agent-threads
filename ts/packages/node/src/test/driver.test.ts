@@ -388,9 +388,11 @@ describe("the Claude driver", () => {
 
   it("asks the policy, and remembers an answer given `always`", async () => {
     const seen: string[] = [];
+    const commands: (string | undefined)[] = [];
     const { sdk, events } = setup({
       permissions: (q) => {
         seen.push(q.name);
+        if (q.kind === "shell") commands.push(q.command);
         return q.kind === "read" ? "allow" : q.name === "WebFetch" ? { deny: "No web." } : "ask";
       },
     });
@@ -407,6 +409,7 @@ describe("the Claude driver", () => {
     await sdk.send(t.id, 'tool Bash {"command":"ls"}');
     const req = await until(() => events.find((e) => e.type === "request.opened"));
     expect(req.type === "request.opened" && req.request).toMatchObject({ type: "permission", name: "Bash", kind: "shell", title: "ls" });
+    expect(commands).toEqual(["ls"]);
     await sdk.handle({ type: "respond", thread_id: t.id, request_id: req.type === "request.opened" ? req.request.id : "", resolution: { outcome: "allow", always: true } });
     await settle(sdk, t.id);
 
@@ -417,7 +420,7 @@ describe("the Claude driver", () => {
     expect(texts(s.items).at(-1)).toBe('ran with {"command":"pwd"}');
   });
 
-  it("runs app tools with the thread's id, metadata and call", async () => {
+  it("runs app tools with the thread's id, metadata and call, and keeps their structured output", async () => {
     let ctx: ToolContext | undefined;
     const lookup = defineTool<{ id: string }>({
       name: "lookup",
@@ -425,7 +428,7 @@ describe("the Claude driver", () => {
       input: { type: "object", properties: { id: { type: "string" } } },
       run: (args, c) => {
         ctx = c;
-        return `thing ${args.id}`;
+        return { text: `thing ${args.id}`, structured: { id: args.id } };
       },
     });
     const { sdk, runs } = setup();
@@ -434,7 +437,7 @@ describe("the Claude driver", () => {
     const s = await settle(sdk, t.id);
     expect(texts(s.items)).toEqual(["app said thing 7"]);
     const call = s.items.find((i): i is ToolCall => i.type === "tool_call")!;
-    expect(call).toMatchObject({ name: "lookup", kind: "app", status: "completed", result: { content: "thing 7" } });
+    expect(call).toMatchObject({ name: "lookup", kind: "app", status: "completed", result: { content: "thing 7", structured: { id: "7" } } });
     expect(ctx).toMatchObject({ threadId: t.id, metadata: { user: "u1" }, toolCallId: call.id });
     const init = runs()[0]!.sent.find((m) => m.type === "control_request")!;
     expect(init).toMatchObject({ request: { subtype: "initialize", sdkMcpServers: ["app"] } });
