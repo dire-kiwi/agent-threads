@@ -2,7 +2,7 @@
 # make check-gen: fail if that changes anything, i.e. the generated code isn't up to date (CI runs it).
 # make test: build and test all three languages, the shim, and the fixtures' tools (make test-spec).
 
-GENERATED := spec/protocol.schema.json ts/packages/protocol/src/generated.ts ts/packages/protocol/src/schema.ts go/protocol/protocol_gen.go rust/agent-threads/src/protocol.rs
+GENERATED := spec/protocol.schema.json ts/packages/protocol/src/generated.ts ts/packages/protocol/src/schema.ts go/protocol/protocol_gen.go go/protocol/protocol.schema.json rust/agent-threads/src/protocol.rs
 
 .PHONY: gen gen-bundle gen-ts gen-go gen-rust check-gen test test-spec test-ts test-go test-rust test-shim shim
 
@@ -33,8 +33,10 @@ test-spec:
 test-ts: shim
 	cd ts && pnpm build && pnpm test
 
-test-go:
+# The Go backend's tests run agent-threads-shim and the fake CLI (node).
+test-go: shim
 	cd go && go vet ./... && go test ./...
+	cd examples/chat-go && go vet ./... && go test ./...
 
 test-rust:
 	cd rust && cargo test --locked && cargo clippy --locked --all-targets -- -D warnings && cargo fmt --check
