@@ -39,9 +39,11 @@ export interface Store {
   deleteThread(id: string): Promise<boolean>;
   /**
    * Appends saved events, all of them or none. Each is for the thread, isn't a delta, and has the
-   * seq after the one before it. Fails with `not_found`, `invalid` or `seq`.
+   * seq after the one before it. With `runs` (the thread's), it puts them too, in the same atomic
+   * write: a run's offset is saved with the events made from its output, so after a restart the
+   * output is read again from exactly there. Fails with `not_found`, `invalid` or `seq`.
    */
-  appendEvents(id: string, events: ThreadEvent[]): Promise<void>;
+  appendEvents(id: string, events: ThreadEvent[], runs?: RunRecord[]): Promise<void>;
   /** The thread's events after `after`, in order, at most `limit` of them. Fails with `not_found`. */
   readEvents(id: string, options?: ReadOptions): Promise<ThreadEvent[]>;
   /** The seq of the thread's last event, or 0. Fails with `not_found`. */
@@ -70,8 +72,9 @@ export class StoreError extends Error {
   }
 }
 
-/** Checks a batch of events for appendEvents to thread `id`, whose last seq is `last`. */
-export function checkEvents(id: string, last: number, events: ThreadEvent[]): void {
+/** Checks a batch of events (and runs) for appendEvents to thread `id`, whose last seq is `last`. */
+export function checkEvents(id: string, last: number, events: ThreadEvent[], runs: RunRecord[] = []): void {
+  for (const r of runs) if (r.thread_id !== id) throw new StoreError("invalid", `thread ${r.thread_id}'s run appended to ${id}`);
   let seq = last;
   for (const e of events) {
     if (e.type === "delta") throw new StoreError("invalid", "deltas aren't saved");

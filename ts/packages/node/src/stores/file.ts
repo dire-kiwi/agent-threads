@@ -13,7 +13,13 @@ import { MemoryState, MemoryStore } from "./memory.js";
 
 // A run's lines carry a revision, counted across the store, since a run moved to another thread is
 // in two files: the latest of its lines says where it is (or, if it's `run_moved`, that it's gone).
-type Line = { thread: Thread } | { events: ThreadEvent[] } | { snapshot: Snapshot } | { run: RunRecord; rev?: number } | { run_moved: string; rev?: number };
+// Events appended with runs (appendEvents' `runs`) are one line, so they're written together or not at all.
+type Line =
+  | { thread: Thread }
+  | { events: ThreadEvent[]; runs?: { run: RunRecord; rev: number }[] }
+  | { snapshot: Snapshot }
+  | { run: RunRecord; rev?: number }
+  | { run_moved: string; rev?: number };
 
 const SUFFIX = ".jsonl";
 
@@ -63,6 +69,7 @@ export class FileStore implements Store {
         } else if ("events" in line) {
           const log = state.events.get(id)!;
           for (const e of line.events) if (e.seq > (log[log.length - 1]?.seq ?? 0)) log.push(e);
+          for (const r of line.runs ?? []) mine.set(r.run.id, { run: r.run, rev: r.rev });
         } else if ("snapshot" in line) {
           state.snapshots.set(id, line.snapshot);
         } else if ("run" in line) {
@@ -169,13 +176,29 @@ export class FileStore implements Store {
     });
   }
 
-  appendEvents(id: string, events: ThreadEvent[]): Promise<void> {
+  appendEvents(id: string, events: ThreadEvent[], runs: RunRecord[] = []): Promise<void> {
     return this.#serial(async () => {
-      checkEvents(id, await this.#mem.lastSeq(id), events);
-      if (!events.length) return;
-      await this.#append([id, { events }]);
-      await this.#mem.appendEvents(id, events);
+      checkEvents(id, await this.#mem.lastSeq(id), events, runs);
+      if (!events.length && !runs.length) return;
+      const moves = runs.map((run) => this.#moved(run));
+      let rev = this.#rev;
+      const lines: [string, Line][] = [];
+      const revs: { run: RunRecord; rev: number }[] = [];
+      for (const [i, run] of runs.entries()) {
+        const from = moves[i];
+        if (from) lines.push([from, { run_moved: run.id, rev: ++rev }]);
+        revs.push({ run, rev: ++rev });
+      }
+      await this.#append(...lines, [id, { events, ...(revs.length ? { runs: revs } : {}) }]);
+      this.#rev = rev;
+      await this.#mem.appendEvents(id, events, runs);
     });
+  }
+
+  /** The thread a run was in before, if putting it in another moves it out of that one's file. */
+  #moved(run: RunRecord): string | undefined {
+    const before = this.#mem.state.runs.get(run.id);
+    return before && before.thread_id !== run.thread_id && this.#mem.state.threads.has(before.thread_id) ? before.thread_id : undefined;
   }
 
   readEvents(id: string, options?: ReadOptions): Promise<ThreadEvent[]> {
@@ -201,10 +224,9 @@ export class FileStore implements Store {
   putRun(run: RunRecord): Promise<void> {
     return this.#serial(async () => {
       this.#known(run.thread_id);
-      const before = this.#mem.state.runs.get(run.id);
-      const moved = before && before.thread_id !== run.thread_id && this.#mem.state.threads.has(before.thread_id);
+      const moved = this.#moved(run);
       const rev = this.#rev + (moved ? 2 : 1);
-      await this.#append(...(moved ? [[before.thread_id, { run_moved: run.id, rev: rev - 1 }] as [string, Line]] : []), [run.thread_id, { run, rev }]);
+      await this.#append(...(moved ? [[moved, { run_moved: run.id, rev: rev - 1 }] as [string, Line]] : []), [run.thread_id, { run, rev }]);
       this.#rev = rev;
       await this.#mem.putRun(run);
     });

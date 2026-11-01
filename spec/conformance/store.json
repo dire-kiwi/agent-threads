@@ -186,6 +186,29 @@
       ]
     },
     {
+      "name": "appends events with runs, all of them or none",
+      "steps": [
+        { "op": "createThread", "args": [{ "$": "T1" }], "result": null },
+        { "op": "createThread", "args": [{ "$": "T2" }], "result": null },
+        { "op": "appendEvents", "args": ["th_1", [{ "$": "E1" }, { "$": "E2" }], [{ "$": "R1" }]], "result": null },
+        { "op": "getRun", "args": ["run_1"], "result": { "$": "R1" } },
+        { "op": "appendEvents", "args": ["th_1", [{ "$": "E3" }], [{ "$": "R1_read" }]], "result": null },
+        { "op": "getRun", "args": ["run_1"], "result": { "$": "R1_read" } },
+        { "op": "appendEvents", "args": ["th_1", [{ "$": "E3" }], [{ "$": "R1_ended" }]], "error": "seq" },
+        { "op": "getRun", "args": ["run_1"], "result": { "$": "R1_read" } },
+        { "op": "appendEvents", "args": ["th_1", [{ "$": "E4" }], [{ "$": "R3" }, { "$": "R2" }]], "error": "invalid" },
+        { "op": "lastSeq", "args": ["th_1"], "result": 3 },
+        { "op": "getRun", "args": ["run_3"], "result": null },
+        { "op": "appendEvents", "args": ["th_nope", [], [{ "$": "R_orphan" }]], "error": "not_found" },
+        { "op": "appendEvents", "args": ["th_1", [], [{ "$": "R1_ended" }, { "$": "R3" }]], "result": null },
+        { "op": "lastSeq", "args": ["th_1"], "result": 3 },
+        { "op": "activeRuns", "args": [], "result": [{ "$": "R3" }] },
+        { "op": "appendEvents", "args": ["th_1", [{ "$": "E4" }, { "$": "E5" }]], "result": null },
+        { "op": "getRun", "args": ["run_1"], "result": { "$": "R1_ended" } },
+        { "op": "readEvents", "args": ["th_1", { "after": 0 }], "result": [{ "$": "E1" }, { "$": "E2" }, { "$": "E3" }, { "$": "E4" }, { "$": "E5" }] }
+      ]
+    },
+    {
       "name": "deletes a thread with its events, snapshot and runs",
       "steps": [
         { "op": "createThread", "args": [{ "$": "T1" }], "result": null },
@@ -220,13 +243,14 @@
         { "op": "updateThread", "args": [{ "$": "T1_running" }], "result": null },
         { "op": "saveSnapshot", "args": ["th_1", { "$": "S4" }], "result": null },
         { "op": "putRun", "args": [{ "$": "R1_read" }], "result": null },
+        { "op": "appendEvents", "args": ["th_2", [{ "$": "F2" }], [{ "$": "R2" }]], "result": null },
         { "op": "reopen", "args": [], "result": null },
         { "op": "listThreads", "args": [], "result": [{ "$": "T1_running" }, { "$": "T2" }] },
         { "op": "lastSeq", "args": ["th_1"], "result": 5 },
         { "op": "readEvents", "args": ["th_1", { "after": 0 }], "result": [{ "$": "E1" }, { "$": "E2" }, { "$": "E3" }, { "$": "E4" }, { "$": "E5" }] },
-        { "op": "readEvents", "args": ["th_2", { "after": 0 }], "result": [{ "$": "F1" }] },
+        { "op": "readEvents", "args": ["th_2", { "after": 0 }], "result": [{ "$": "F1" }, { "$": "F2" }] },
         { "op": "loadSnapshot", "args": ["th_1"], "result": { "$": "S4" } },
-        { "op": "activeRuns", "args": [], "result": [{ "$": "R1_read" }] },
+        { "op": "activeRuns", "args": [], "result": [{ "$": "R2" }, { "$": "R1_read" }] },
         { "op": "appendEvents", "args": ["th_1", [{ "$": "E1" }]], "error": "seq" },
         { "op": "deleteThread", "args": ["th_2"], "result": true },
         { "op": "reopen", "args": [], "result": null },
