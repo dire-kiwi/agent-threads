@@ -97,14 +97,27 @@ offset (with the state saved with that offset) makes nothing new.
 ## A run whose shim is gone
 
 A shim killed with SIGKILL (or a machine that restarted) leaves a run with no `exit`. A backend that
-follows a run checks now and then (every second or so) that the process in `shim.pid` is alive
-(`kill(pid, 0)` succeeds or fails with `EPERM`); if it isn't, and there's still no `exit`, it
-writes `exit` itself, atomically and only if there isn't one, with `code` and `signal` `null` and an
-`error` saying the shim went away, and treats the run as over. A `shim.pid` written before the
-machine last started (its modification time is before the boot) names no process of the run's, and
-nor does one whose process started after `shim.pid` was written (to the second: `ps -o lstart= -p
-<pid>`): that pid has gone to another process, and the shim is gone. A
-run with no `shim.pid` some seconds after the shim was started never started.
+follows a run checks now and then (every second or so) that its shim is still there; if it isn't,
+and there's still no `exit`, it writes `exit` itself, atomically and only if there isn't one, with
+`code` and `signal` `null` and an `error` saying the shim went away, and treats the run as over.
+
+The shim is there if the process in `shim.pid` is, and is the shim:
+
+- `shim.pid` was written since the machine last started (its modification time is after the boot);
+- the process is running (`kill(pid, 0)` succeeds or fails with `EPERM`);
+- it started no later than `shim.pid` was written: the first time a backend checks, the process's
+  start (from `/proc/<pid>/stat`'s `starttime` and `/proc/stat`'s `btime` on Linux, which is
+  cheap; elsewhere `ps -o lstart= -p <pid>`, to the second) must be before the file's modification
+  time (with a second to spare). The backend remembers that identity (the pid and the start) and
+  checks it each time after: a process with the pid that started at another time is another
+  process, given the pid since, and the shim is gone.
+
+When the start can't be told (no `/proc`, and `ps` isn't there, fails or times out), the backend
+doesn't take the shim for gone: a running process with the pid (written this boot) counts as the
+shim, nothing is remembered, and it tries again the next time. Nor does it signal anything on the
+strength of a start it couldn't tell (see below).
+
+A run with no `shim.pid` some seconds after the shim was started never started.
 
 With its shim gone, nothing would stop the program, which may well still be running: the backend
 stops what's left of the run's process group, as below.
@@ -130,8 +143,8 @@ given to another process: after the machine restarted, or once the program and e
 group has gone. So it signals `-pid` only if `pid` was written since the machine last started, and
 either:
 
-- the process `pid` is running and started no later than `pid` was written (to the second:
-  `ps -o lstart= -p <pid>`); or
+- the process `pid` is running and started no later than `pid` was written (its start told as
+  for the shim, above; if it can't be told, nothing is sent); or
 - that process has gone, and everything left in group `pid` is in the run's session: the shim
   leads a session of its own, whose id is its pid, so their session id is the one in `shim.pid`
   (written since the machine started too). The group's id alone says nothing here: it may have gone

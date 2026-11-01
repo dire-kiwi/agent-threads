@@ -354,7 +354,7 @@ describe.skipIf(process.platform === "win32")("a backend restart", () => {
       const script = `
         import { shim } from ${JSON.stringify(pathToFileURL(join(pkg, "dist/index.js")).href)};
         const spawner = shim(${JSON.stringify(shimPath())}, { runsDir: ${JSON.stringify(runsDir)}, killGraceMs: 1000, pollMs: 20 });
-        const proc = spawner.spawn({ command: "sh", args: ["-c", \`sh -c 'trap "" TERM; exec sleep 30' & echo $!; wait\`], threadId: "th", runId: ${JSON.stringify(runId)} }, {
+        const proc = spawner.spawn({ command: "sh", args: ["-c", \`sh -c 'trap "" TERM; echo $$; exec sleep 30' & wait\`], threadId: "th", runId: ${JSON.stringify(runId)} }, {
           line: (l) => {
             console.log(l);
             proc.kill("SIGTERM");

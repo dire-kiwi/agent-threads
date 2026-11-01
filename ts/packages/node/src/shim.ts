@@ -179,8 +179,8 @@ class ShimProcess implements HarnessProcess {
   #launchedHere: boolean;
   #since = Date.now();
   #checked = 0;
-  /** The shim's pid, once it's been checked to be the run's. */
-  #shim: { pid?: number } = {};
+  /** The shim's identity, once it's been checked to be the run's. */
+  #shim: { identity?: Identity } = {};
   #over = false;
   #onDone: () => void;
 
@@ -508,29 +508,77 @@ function writtenThisBoot(dir: string, name: string): number | undefined {
   }
 }
 
+/** A process's identity: its pid, and when it started (which a pid given to another process differs in). */
+interface Identity {
+  pid: number;
+  start: number;
+}
+
 /**
  * Whether the run's shim is alive: the process in `shim.pid` (written since the machine started)
- * is running, and started before that was written (not another process given the same pid since).
- * `known` remembers a pid already checked, so a run followed for a while isn't checked with `ps`
- * every time (a process with the pid that's still running is the one checked).
+ * is running, and is the shim, which started before `shim.pid` was written (not another process
+ * given the same pid since). `known` keeps the identity found the first time, which the process
+ * with the pid must still have each time after: if it hasn't, the shim has gone. When the start
+ * can't be told (no /proc and no `ps`, say), a running process with the pid counts as the shim,
+ * and nothing is remembered: it's checked again next time.
  */
-function shimAlive(dir: string, known?: { pid?: number }): boolean {
+function shimAlive(dir: string, known?: { identity?: Identity }): boolean {
   const pid = readPid(dir, "shim.pid");
   const written = writtenThisBoot(dir, "shim.pid");
   if (pid === undefined || written === undefined || !alive(pid)) return false;
-  if (known?.pid === pid) return true;
-  const started = startTime(pid);
-  const ours = started !== undefined && started <= written + 1000;
-  if (ours && known) known.pid = pid;
+  const start = startTime(pid);
+  if (start === undefined) return true;
+  if (known?.identity?.pid === pid) return known.identity.start === start;
+  const ours = start <= written + 1000;
+  if (ours && known) known.identity = { pid, start };
   return ours;
 }
 
-/** When a process started (ms since the epoch, to the second), if it's running and `ps` says. */
+/** For the tests: how a process's start is told, in place of /proc and `ps`. */
+export const identityForTests: { startTime?: (pid: number, real: (pid: number) => number | undefined) => number | undefined; noProc?: boolean } = {};
+
+/**
+ * When a process started (ms since the epoch), if it's running and that can be told: from /proc
+ * on Linux (cheap, and to the clock tick), or from `ps` (to the second) elsewhere.
+ */
 function startTime(pid: number): number | undefined {
+  return identityForTests.startTime ? identityForTests.startTime(pid, realStartTime) : realStartTime(pid);
+}
+
+function realStartTime(pid: number): number | undefined {
+  if (process.platform === "linux" && !identityForTests.noProc) {
+    const at = procStartTime(pid);
+    if (at !== undefined) return at;
+  }
   try {
     const out = execFileSync("ps", ["-o", "lstart=", "-p", String(pid)], { encoding: "utf8", env: { ...process.env, LC_ALL: "C" }, timeout: 2000, stdio: ["ignore", "pipe", "ignore"] });
     const at = Date.parse(out.trim());
     return Number.isNaN(at) ? undefined : at;
+  } catch {
+    return undefined;
+  }
+}
+
+/** When the machine started (/proc/stat's btime, ms since the epoch), read once. */
+let btime: number | null | undefined;
+
+/** Clock ticks a second, as /proc counts them (USER_HZ: 100 on Linux, whatever the kernel's HZ). */
+const CLOCK_TICKS = 100;
+
+/** A process's start from /proc/<pid>/stat (clock ticks after boot) and /proc/stat's btime. */
+function procStartTime(pid: number): number | undefined {
+  try {
+    if (btime === undefined) {
+      const m = /^btime (\d+)$/m.exec(readFileSync("/proc/stat", "utf8"));
+      btime = m ? Number(m[1]) * 1000 : null;
+    }
+    if (btime === null) return undefined;
+    const stat = readFileSync(`/proc/${pid}/stat`, "utf8");
+    // After the command, which is in parentheses and may have spaces or parentheses in it.
+    const fields = stat.slice(stat.lastIndexOf(")") + 2).split(" ");
+    // starttime is field 22; fields[0] here is field 3 (state).
+    const ticks = Number(fields[19]);
+    return Number.isFinite(ticks) ? btime + (ticks * 1000) / CLOCK_TICKS : undefined;
   } catch {
     return undefined;
   }

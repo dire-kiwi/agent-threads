@@ -6,7 +6,7 @@ import { existsSync, mkdirSync, readdirSync, readFileSync, rmSync, utimesSync, w
 import { uptime } from "node:os";
 import { join, relative } from "node:path";
 import { describe, expect, it } from "vitest";
-import { shim, type ShimOptions } from "../shim.js";
+import { identityForTests, shim, type ShimOptions } from "../shim.js";
 import { direct, type ExitStatus, type HarnessProcess, type Spawner } from "../spawner.js";
 import { MemoryStore } from "../stores/memory.js";
 import { shimPath, tempDir } from "./spec.js";
@@ -145,7 +145,8 @@ describe.skipIf(process.platform === "win32")("shim()", () => {
 
   it("stops what's left of the group after the program exits, with SIGKILL for what ignores SIGTERM", async () => {
     const { run } = setup();
-    const p = run(`sh -c 'trap "" TERM; exec sleep 30' & echo $!; wait`);
+    // The child says its pid once it ignores SIGTERM.
+    const p = run(`sh -c 'trap "" TERM; echo $$; exec sleep 30' & wait`);
     expect(await wait(() => p.lines.length === 1)).toBe(true);
     const stubborn = Number(p.lines[0]);
     p.proc.kill("SIGTERM");
@@ -237,6 +238,63 @@ describe.skipIf(process.platform === "win32")("shim()", () => {
       expect(alive(other.pid!)).toBe(true);
     } finally {
       other.kill("SIGKILL");
+    }
+  });
+
+  it("takes a shim whose pid goes to another process after it was checked for gone, at the next look", async () => {
+    const { runsDir, run } = setup();
+    const p = run("echo started; exec sleep 30", "reused-later");
+    const dir = join(runsDir, "reused-later");
+    expect(await wait(() => p.lines.length === 1)).toBe(true);
+    const shimPid = Number(readFileSync(join(dir, "shim.pid"), "utf8"));
+    // The shim's checked (and found to be the run's) at least once.
+    let checked = 0;
+    let reused = false;
+    identityForTests.startTime = (pid, real) => {
+      if (pid !== shimPid) return real(pid);
+      checked++;
+      // Then its pid is another process's: one that started after shim.pid was written.
+      return reused ? Date.now() : real(pid);
+    };
+    try {
+      expect(await wait(() => checked > 0)).toBe(true);
+      expect(p.exit()).toBeUndefined();
+      reused = true;
+      expect(await wait(p.exit)).toBe(true);
+      // Taken for gone, the run ended, and its program (which would have run for 30s) was stopped.
+      // (The test's shim is really still there, and records the SIGTERM over the backend's exit.)
+      const exit = p.exit()!;
+      expect(exit.error?.message.match(/went away/) ?? exit.signal).toBeTruthy();
+      expect(exit.code).toBeNull();
+    } finally {
+      identityForTests.startTime = undefined;
+      // Stopped already, with its shim gone; in case it isn't.
+      for (const pid of [-Number(readFileSync(join(dir, "pid"), "utf8")), shimPid]) {
+        try {
+          process.kill(pid, "SIGKILL");
+        } catch {
+          // Gone.
+        }
+      }
+    }
+  });
+
+  it("follows runs to their end when a process's start can't be told (no /proc, no ps)", async () => {
+    const path = process.env.PATH;
+    identityForTests.noProc = true;
+    // No ps on the PATH the backend looks in; the run itself has the usual one.
+    process.env.PATH = tempDir();
+    try {
+      const p = follow((h) =>
+        shim(shimPath(), { runsDir: tempDir(), pollMs: 20 }).spawn({ command: "/bin/sh", args: ["-c", "echo hi; sleep 2.5; echo bye"], env: { PATH: path }, threadId: "th", runId: "nops" }, h),
+      );
+      expect(await wait(p.exit, 10_000)).toBe(true);
+      expect(p.exit()).toMatchObject({ code: 0 });
+      expect(p.exit()?.error).toBeUndefined();
+      expect(p.lines).toEqual(["hi", "bye"]);
+    } finally {
+      process.env.PATH = path;
+      identityForTests.noProc = false;
     }
   });
 
