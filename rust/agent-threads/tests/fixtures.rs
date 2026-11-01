@@ -14,6 +14,7 @@ use agent_threads::{
     PermissionPolicy, Spawner, ThreadEvent, claude_code, codex, direct, tool,
 };
 use serde_json::{Value, json};
+use tokio::sync::broadcast;
 
 /// Whether a value has everything a pattern has (objects field by field, everything else exactly).
 fn matches(v: &Value, p: &Value) -> bool {
@@ -25,20 +26,36 @@ fn matches(v: &Value, p: &Value) -> bool {
 
 const WAIT: Duration = Duration::from_secs(10);
 
-async fn wait_for(events: &Mutex<Vec<ThreadEvent>>, from: usize, pattern: &Value) -> Option<usize> {
-    let deadline = Instant::now() + WAIT;
-    while Instant::now() < deadline {
-        {
-            let events = events.lock().unwrap();
-            for (i, e) in events.iter().enumerate().skip(from) {
+/// Every event the SDK has sent so far, taken from its subscription as they're asked for (so an
+/// event sent before a command is always counted before it).
+struct Events {
+    rx: broadcast::Receiver<ThreadEvent>,
+    all: Vec<ThreadEvent>,
+}
+
+impl Events {
+    fn pump(&mut self) -> &[ThreadEvent] {
+        loop {
+            match self.rx.try_recv() {
+                Ok(e) => self.all.push(e),
+                Err(broadcast::error::TryRecvError::Lagged(n)) => panic!("the test missed {n} events"),
+                Err(_) => return &self.all,
+            }
+        }
+    }
+
+    async fn wait_for(&mut self, from: usize, pattern: &Value) -> Option<usize> {
+        let deadline = Instant::now() + WAIT;
+        while Instant::now() < deadline {
+            for (i, e) in self.pump().iter().enumerate().skip(from) {
                 if matches(&serde_json::to_value(e).unwrap(), pattern) {
                     return Some(i);
                 }
             }
+            tokio::time::sleep(Duration::from_millis(5)).await;
         }
-        tokio::time::sleep(Duration::from_millis(5)).await;
+        None
     }
-    None
 }
 
 fn show(events: &[ThreadEvent]) -> String {
@@ -117,22 +134,11 @@ async fn run_fixture(scenario: &str, spawner_name: &str) {
         _ => direct(),
     };
     let errors = Arc::new(Mutex::new(Vec::new()));
-    let events: Arc<Mutex<Vec<ThreadEvent>>> = Arc::default();
 
     // The same store each time, as an app that restarts has.
     let setup = Setup { fixture: &fixture, dir: &dir, state: &state, codex_home: &codex_home, spawner, store, errors: errors.clone() };
-    let new_sdk = || {
-        let sdk = make(&setup);
-        let mut rx = sdk.subscribe();
-        let events = events.clone();
-        tokio::spawn(async move {
-            while let Ok(e) = rx.recv().await {
-                events.lock().unwrap().push(e);
-            }
-        });
-        sdk
-    };
-    let mut sdk = new_sdk();
+    let mut sdk = make(&setup);
+    let mut events = Events { rx: sdk.subscribe(), all: Vec::new() };
     let t = &fixture["thread"];
     let thread = sdk
         .create(CreateOptions {
@@ -150,8 +156,10 @@ async fn run_fixture(scenario: &str, spawner_name: &str) {
         let at = format!("{scenario} ({spawner_name}) step {}: {step}", i + 1);
         if step.get("restart").is_some() {
             sdk.close(true).await.unwrap();
-            sdk = new_sdk();
-            from = events.lock().unwrap().len();
+            events.pump();
+            sdk = make(&setup);
+            events.rx = sdk.subscribe();
+            from = events.all.len();
         } else if let Some(command) = step.get("command") {
             let mut command = command.clone();
             command["thread_id"] = json!(thread.id);
@@ -160,12 +168,12 @@ async fn run_fixture(scenario: &str, spawner_name: &str) {
                 assert_eq!(snap.requests.len(), 1, "{at}: open requests");
                 command["request_id"] = json!(snap.requests[0].id());
             }
-            from = events.lock().unwrap().len();
+            from = events.pump().len();
             sdk.handle_json(command).await.unwrap_or_else(|e| panic!("{at}: {e}"));
         } else {
-            let found = wait_for(&events, from, &step["wait"]).await;
+            let found = events.wait_for(from, &step["wait"]).await;
             let Some(found) = found else {
-                let since = events.lock().unwrap()[from..].to_vec();
+                let since = events.all[from..].to_vec();
                 panic!("{at}: no such event within {WAIT:?}. Events since the step before:\n{}", show(&since));
             };
             from = found + 1;
@@ -174,7 +182,7 @@ async fn run_fixture(scenario: &str, spawner_name: &str) {
 
     // Its snapshot is its events, folded (deltas included).
     let snapshot = sdk.snapshot(&thread.id).await.unwrap();
-    let all = events.lock().unwrap().clone();
+    let all = events.pump().to_vec();
     let first = match &all[0] {
         ThreadEvent::ThreadUpdated(e) => e.thread.clone(),
         _ => thread.clone(),
@@ -184,9 +192,7 @@ async fn run_fixture(scenario: &str, spawner_name: &str) {
     assert_eq!(serde_json::to_value(&snapshot).unwrap(), serde_json::to_value(&folded).unwrap(), "{scenario}: snapshot");
 
     sdk.close(true).await.unwrap();
-    // Let the subscriber take the last events.
-    tokio::time::sleep(Duration::from_millis(50)).await;
-    let all = events.lock().unwrap().clone();
+    let all = events.pump().to_vec();
 
     // The fake CLI was sent what the recording has, in every run.
     let runs = common::read_jsonl(&format!("fixtures/{scenario}/session.jsonl")).iter().filter(|e| e["dir"] == "spawn").count();
@@ -200,7 +206,7 @@ async fn run_fixture(scenario: &str, spawner_name: &str) {
     assert_eq!(reports, want, "{scenario} ({spawner_name}): the fake CLI's reports");
     for r in &reports {
         let report: Value = serde_json::from_str(&std::fs::read_to_string(state.join(r)).unwrap()).unwrap();
-        assert_eq!(report["ok"], json!(true), "{scenario} ({spawner_name}) {r}: {report}");
+        assert_eq!(report["ok"], json!(true), "{scenario} ({spawner_name}) {r}: {report}\nErrors: {:?}\nEvents:\n{}", errors.lock().unwrap(), show(&all));
     }
 
     let path = common::temp_dir().join("events.jsonl");

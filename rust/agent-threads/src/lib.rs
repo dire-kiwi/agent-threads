@@ -19,6 +19,7 @@ mod claude;
 mod codex;
 mod harness;
 mod ids;
+mod mcp_http;
 mod permissions;
 mod skills;
 mod shim;
@@ -28,7 +29,7 @@ mod tools;
 
 pub use agent_threads::{AgentThreads, Capabilities, CreateOptions, Error, Options, Recovered, Result, SendOptions, ThreadOptions};
 pub use claude::{ClaudeCodeOptions, claude_code};
-pub use codex::{CodexOptions, codex};
+pub use codex::{AppTools, CodexOptions, codex};
 pub use harness::{BoxFuture, Harness, HarnessSession, McpServer, Message, RunCheckpoint, Skill, ThreadConfig, TurnEnd};
 pub use permissions::{Decided, PermissionContext, PermissionDecision, PermissionPolicy, PermissionQuery};
 pub use protocol::{Command, Item, Snapshot, Thread, ThreadEvent};
