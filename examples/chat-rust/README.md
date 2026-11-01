@@ -17,8 +17,9 @@ make -C ../.. shim && CHAT_SHIM=1 cargo run -- supervise   # the restart demo
 It takes the same environment as chat-node's server (`PORT`, `CHAT_DATA`, `CHAT_HARNESSES`,
 `CHAT_CLAUDE_MODEL`, `CHAT_CODEX_MODEL`, `CHAT_CODEX_EFFORT`, `CHAT_SHIM`, `CHAT_FAKE_CLAUDE`,
 `CHAT_FAKE_CODEX`, `CHAT_FAKE_STATE`), plus `CHAT_WEB`, the built frontend (`../chat-node/web/dist`
-by default). `chat-rust supervise` runs the server and starts it again when the frontend's **Restart
-server** asks it to.
+by default), and `CHAT_DEV=1` behind Vite's dev server (its pages, on port 5173, may connect too).
+`chat-rust supervise` runs the server and starts it again when the frontend's **Restart server**
+asks it to (offered only with `CHAT_SHIM`, as a restart without it loses the running turn).
 
 The whole seam is in [src/main.rs](src/main.rs): every thread's events from `sdk.subscribe()` to
 every client, `command` requests to `sdk.handle_json`, and `snapshot` and `events_since` for clients

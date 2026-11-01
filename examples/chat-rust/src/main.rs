@@ -253,16 +253,19 @@ async fn serve(cfg: Config) -> i32 {
 /// Whether a WebSocket may connect. Listening on 127.0.0.1 isn't enough: any page the user has open
 /// can open a WebSocket to it, and the socket can read every thread, send the agent anything and
 /// allow its own permission requests. So it must come from this app's own page (its Origin is the
-/// host it connects to), on a loopback name (which a rebound DNS name isn't), at this server or
-/// Vite's dev server (whose proxy keeps the Host and Origin). Clients that aren't browsers send no
+/// host it connects to), on a loopback name (which a rebound DNS name isn't), at this server or,
+/// with CHAT_DEV, Vite's dev server (whose proxy keeps the Host and Origin). Clients that aren't browsers send no
 /// Origin. This is the example's only check: a real app authenticates its users here too.
-fn trusted(headers: &HeaderMap, port: u16) -> bool {
+fn trusted(headers: &HeaderMap, port: u16, dev: bool) -> bool {
     let Some(host) = headers.get(header::HOST).and_then(|h| h.to_str().ok()) else {
         return false;
     };
-    let ok = ["localhost", "127.0.0.1", "[::1]"]
-        .iter()
-        .any(|name| [port, DEV_PORT].iter().any(|p| host == format!("{name}:{p}")));
+    let ok = ["localhost", "127.0.0.1", "[::1]"].iter().any(|name| {
+        [Some(port), dev.then_some(DEV_PORT)]
+            .iter()
+            .flatten()
+            .any(|p| host == format!("{name}:{p}"))
+    });
     if !ok {
         return false;
     }
@@ -277,7 +280,7 @@ fn trusted(headers: &HeaderMap, port: u16) -> bool {
 }
 
 async fn ws(State(app): State<App>, headers: HeaderMap, upgrade: WebSocketUpgrade) -> Response {
-    if !trusted(&headers, app.cfg.port) {
+    if !trusted(&headers, app.cfg.port, app.cfg.dev) {
         return (StatusCode::FORBIDDEN, "Forbidden\n").into_response();
     }
     // Enough for a message with attachments.
@@ -377,7 +380,7 @@ async fn call(app: &App, method: &str, p: Value) -> Result<Value, String> {
                 .iter()
                 .map(|h| json!({"name": h.name, "label": h.label, "model": h.model, "models": h.models}))
                 .collect();
-            Ok(json!({"harnesses": harnesses, "restart": app.cfg.supervised}))
+            Ok(json!({"harnesses": harnesses, "restart": app.cfg.restart()}))
         }
         "list" => {
             let mut threads: Vec<Thread> = sdk.list().await.map_err(text)?;
@@ -420,8 +423,8 @@ async fn call(app: &App, method: &str, p: Value) -> Result<Value, String> {
             Ok(Value::Null)
         }
         "restart" => {
-            if !app.cfg.supervised {
-                return Err("this server isn't run by `chat-rust supervise`, so it can't restart".into());
+            if !app.cfg.restart() {
+                return Err("this server isn't run by `chat-rust supervise` with its runs under the shim, so it doesn't restart".into());
             }
             let shutdown = app.shutdown.clone();
             tokio::spawn(async move {

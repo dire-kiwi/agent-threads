@@ -280,3 +280,11 @@ async fn raw(port: u16, request: &str) -> String {
         .unwrap();
     String::from_utf8_lossy(&buf[..n]).to_string()
 }
+
+#[tokio::test]
+async fn trusts_vites_port_only_behind_vite() {
+    let server = start("claude/plain-reply").await;
+    let p = server.port;
+    let r = raw(p, "GET /ws HTTP/1.1\r\nHost: localhost:5173\r\nConnection: Upgrade\r\nUpgrade: websocket\r\nSec-WebSocket-Version: 13\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\r\n").await;
+    assert!(r.starts_with("HTTP/1.1 403"), "{r}");
+}

@@ -12,6 +12,8 @@
 //!   CHAT_FAKE_CODEX      in place of the real one: for the tests, with no login needed
 //!   CHAT_FAKE_STATE      where the fake CLIs keep their state, kept across restarts
 //!   CHAT_WEB             the built frontend, ../chat-node/web/dist by default
+//!   CHAT_DEV             `1` behind Vite's dev server (chat-node's `pnpm dev`), whose pages on port
+//!                        5173 may use the server too
 
 use std::path::{Path, PathBuf};
 
@@ -57,9 +59,19 @@ pub struct Config {
     pub fake_state: Option<PathBuf>,
     /// Started by `chat-rust supervise`, which starts it again when it exits for a restart.
     pub supervised: bool,
+    /// Behind Vite's dev server, whose pages (on DEV_PORT) may use the server too.
+    pub dev: bool,
 }
 
-/// Vite's dev server's port, whose pages may use the server too.
+impl Config {
+    /// Whether the frontend offers a restart: only supervised, and with the runs under the shim,
+    /// which a restart doesn't lose.
+    pub fn restart(&self) -> bool {
+        self.supervised && self.shim.is_some()
+    }
+}
+
+/// Vite's dev server's port, whose pages may use the server too with CHAT_DEV.
 pub const DEV_PORT: u16 = 5173;
 
 /// The exit code that asks `chat-rust supervise` to start the server again.
@@ -172,5 +184,6 @@ pub fn config() -> Result<Config, String> {
         fake: fake.then_some(fake_tools),
         fake_state: var("CHAT_FAKE_STATE").map(absolute),
         supervised: var("CHAT_SUPERVISED").as_deref() == Some("1"),
+        dev: var("CHAT_DEV").as_deref() == Some("1"),
     })
 }
