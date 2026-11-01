@@ -4,7 +4,7 @@
 // the server's approval and question requests go through the permission policy; the app's tools are
 // dynamic tools answered over item/tool/call, or (where Codex can't take those) a loopback MCP server.
 
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync, realpathSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve, sep } from "node:path";
 import type { Resolution, ToolCall, Usage } from "@dire-kiwi/agent-threads-protocol";
@@ -467,8 +467,10 @@ class CodexSession implements HarnessSession {
     } catch (e) {
       throw new Error(`Codex couldn't list its skills, to leave out the user's: ${e instanceof Error ? e.message : String(e)}`);
     }
-    const own = run.skillsDir ? resolve(run.skillsDir) + sep : undefined;
-    const paths = (r.data ?? []).flatMap((e) => e.skills ?? []).filter((sk) => sk.scope !== "system" && !(own && resolve(sk.path).startsWith(own)));
+    // Codex reports paths with symlinks resolved (the temporary directory often is one: /var on
+    // macOS), so the app's are told apart by their real paths.
+    const own = run.skillsDir ? canonicalPath(run.skillsDir) + sep : undefined;
+    const paths = (r.data ?? []).flatMap((e) => e.skills ?? []).filter((sk) => sk.scope !== "system" && !(own && canonicalPath(sk.path).startsWith(own)));
     return [...new Set(paths.map((sk) => sk.path))];
   }
 
@@ -1014,6 +1016,15 @@ function toolSpec(t: Tool): ToolSpec {
 /** Codex's totals as the usage they'd be if a turn had used them all. */
 function totalsAsUsage(t: Totals): Usage {
   return { input_tokens: t.inputTokens - t.cachedInputTokens, cache_read_tokens: t.cachedInputTokens, output_tokens: t.outputTokens, cache_write_tokens: t.cacheWriteInputTokens ?? 0 };
+}
+
+/** A path with its symlinks resolved, where it exists. */
+function canonicalPath(path: string): string {
+  try {
+    return realpathSync(path);
+  } catch {
+    return resolve(path);
+  }
 }
 
 /** Whether two JSON values are equal, whatever their keys' order. */

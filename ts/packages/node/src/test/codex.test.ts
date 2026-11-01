@@ -2,7 +2,7 @@
 // (mini-codex.mjs): the thread's options, CODEX_HOME, every kind of approval and question, app
 // tools on both paths, plans, searches, subagents, steering, failures, resuming and compaction.
 
-import { existsSync, lstatSync, mkdirSync, readFileSync, readlinkSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, lstatSync, mkdirSync, readFileSync, readlinkSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { afterEach, describe, expect, it } from "vitest";
@@ -529,6 +529,31 @@ describe("the Codex driver", () => {
     expect(texts(s.items)).toEqual(["skills: app-skill,builtin"]);
     expect(sent("skills/list")[0]!.params).toEqual({ cwds: [cwd], forceReload: true });
     expect(sent("thread/start")[0]!.params.config.skills).toEqual({ config: [{ path: user, enabled: false }, { path: repo, enabled: false }] });
+  });
+
+  it("keeps the app's skills on when the temporary directory is reached through a symlink", async () => {
+    // As on macOS, where /var/folders/... is /private/var/folders/...: Codex reports real paths.
+    const real = tempDir();
+    const link = join(tempDir(), "tmp-link");
+    symlinkSync(real, link);
+    const before = process.env.TMPDIR;
+    process.env.TMPDIR = link;
+    try {
+      const { sdk, sent, userHome } = setup({ skills: [{ name: "app-skill", content: "---\nname: app-skill\n---\n" }] });
+      mkdirSync(join(userHome, ".agents", "skills", "user-sentinel"), { recursive: true });
+      writeFileSync(join(userHome, ".agents", "skills", "user-sentinel", "SKILL.md"), "---\nname: user-sentinel\n---\n");
+      const t = await sdk.create({ harness: "codex", cwd: real });
+      await sdk.send(t.id, "skills");
+      const s = await settle(sdk, t.id);
+      expect(sent("skills/extraRoots/set")[0]!.params.extraRoots[0]).toMatch(new RegExp(`^${link}/`));
+      expect(texts(s.items)).toEqual(["skills: app-skill,builtin"]);
+      expect(sent("thread/start")[0]!.params.config.skills.config.map((c: { path: string }) => c.path)).toEqual([
+        join(realpathSync(userHome), ".agents", "skills", "user-sentinel", "SKILL.md"),
+      ]);
+    } finally {
+      if (before === undefined) delete process.env.TMPDIR;
+      else process.env.TMPDIR = before;
+    }
   });
 
   it("leaves the user's skills on with userConfig", async () => {

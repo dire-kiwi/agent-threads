@@ -35,7 +35,7 @@
 // thread/start with dynamicTools. MINI_CODEX_LOG names a file each run appends its argv and
 // CODEX_HOME, and every message it's sent, to.
 
-import { appendFileSync, existsSync, mkdirSync, readdirSync, readFileSync, writeFileSync } from "node:fs";
+import { appendFileSync, existsSync, mkdirSync, readdirSync, readFileSync, realpathSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { createInterface } from "node:readline";
 
@@ -73,9 +73,11 @@ function save() {
 /** The skills it finds, as Codex does: the user's, the project's, the extra roots' and a built-in one. */
 function skills(cwds) {
   const found = [];
+  // Like Codex, it reports paths with their symlinks resolved.
   const scan = (root, scope) => {
     if (!existsSync(root)) return;
-    for (const d of readdirSync(root)) if (existsSync(join(root, d, "SKILL.md"))) found.push({ name: d, path: join(root, d, "SKILL.md"), scope, enabled: true, description: d });
+    const real = realpathSync(root);
+    for (const d of readdirSync(real)) if (existsSync(join(real, d, "SKILL.md"))) found.push({ name: d, path: join(real, d, "SKILL.md"), scope, enabled: true, description: d });
   };
   if (process.env.HOME) scan(join(process.env.HOME, ".agents", "skills"), "user");
   for (const c of cwds) scan(join(c, ".agents", "skills"), "repo");
