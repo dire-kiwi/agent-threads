@@ -873,8 +873,11 @@ class CodexSession implements HarnessSession {
       return;
     }
     try {
-      if (m.id !== undefined) this.#request(run, m);
-      else this.#notification(run, m);
+      // A request read again after a restart, and answered before it (though that wasn't saved):
+      // Codex has its answer, and the user isn't asked again.
+      if (m.id !== undefined) {
+        if (!run.proc?.answered?.(m.id)) this.#request(run, m);
+      } else this.#notification(run, m);
     } catch (e) {
       this.#ctx.error(e);
     }

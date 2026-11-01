@@ -182,8 +182,8 @@ await sdk.recover(); // at startup, before taking commands
 - `recover()` re-attaches to the runs that were going when the backend stopped. A run that's still
   going carries on, with its turn, its streamed text and its open requests as they were (a
   permission or question the user hadn't answered can still be answered; one they answered just
-  before the backend went, whose answer the harness has though it wasn't saved, is closed rather
-  than asked again). One that ended while the
+  before the backend went, whose answer the harness has though it wasn't saved, isn't asked again,
+  whether or not its opening was saved). One that ended while the
   backend was down is read to its end, so its turn finishes as it would have. A `notice` (code
   `run.reattached`) tells the user, and the thread's `run` gets `reattached_at`. A thread a command
   loads before `recover()` gets to it is re-attached then.

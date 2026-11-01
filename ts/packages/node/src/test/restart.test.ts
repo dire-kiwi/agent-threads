@@ -482,18 +482,25 @@ describe.skipIf(process.platform === "win32")("a backend restart", () => {
   });
 
   it.each([
-    ["claude", "tool Bash {}", '"behavior":"allow"'],
-    ["codex", "exec ls", '"decision":"accept"'],
-  ])("with %s, doesn't ask again what the user answered just before the backend died", { timeout: 60_000 }, async (harness, text, answer) => {
-    const s = mini({ POLICY: "ask" });
+    ["claude", "saved", "tool Bash {}", '"behavior":"allow"'],
+    ["codex", "saved", "sleep 1000\nexec ls\nsleep 3000", '"decision":"accept"'],
+    ["claude", "not saved", "tool Bash {}", '"behavior":"allow"'],
+    ["codex", "not saved", "sleep 1000\nexec ls\nsleep 3000", '"decision":"accept"'],
+  ])("with %s, doesn't ask again what the user answered just before the backend died (the request %s)", { timeout: 60_000 }, async (harness, opening, text, answer) => {
+    // Claude asks a while after the tool call, and the turn runs on for a while after it's allowed
+    // (Codex's turn waits before and after the command).
+    const s = mini({ POLICY: "ask", MINI_CLAUDE_ASK_DELAY: "1000", MINI_CLAUDE_TOOL_RUN_MS: "3000" });
     // Saving takes a while, so the backend is killed after the answer is sent, and before the
-    // save that has it is done.
+    // save that has it is done: and, unless the request's opening is saved first, before that is.
     const a = s.start({ SAVE_DELAY_MS: "500" });
     const thread = await a.call<{ id: string }>("create", { harness, cwd: s.dirs.cwd });
     await a.call("handle", { type: "send", thread_id: thread.id, text } satisfies Command);
+    await a.waitFor({ type: "turn.started" });
+    // The run and its turn are saved before the request comes.
+    await a.call("saved", thread.id);
     const opened = await a.waitFor({ type: "request.opened" });
     const requestId = opened.type === "request.opened" ? opened.request.id : "";
-    await a.call("saved", thread.id);
+    if (opening === "saved") await a.call("saved", thread.id);
     const [runId] = readdirSync(s.dirs.runs);
     const input = () => readFileSync(join(s.dirs.runs, runId!, "input.jsonl"), "utf8");
     void a.call("handle", { type: "respond", thread_id: thread.id, request_id: requestId, resolution: { outcome: "allow" } } satisfies Command);
@@ -502,13 +509,19 @@ describe.skipIf(process.platform === "win32")("a backend restart", () => {
 
     const b = s.start();
     expect(await b.call("recover")).toEqual({ reattached: [thread.id], lost: [] });
-    // The request is closed as the run's picked up again, not asked again.
+    // The tool's still running: nothing's asked of the user, and the turn runs on.
+    await sleep(500);
     const snap = await b.call<Snapshot>("snapshot", thread.id);
     expect(snap.requests).toEqual([]);
-    const resolved = b.events.findIndex((e) => e.type === "request.resolved" && e.request_id === requestId);
-    const notice = b.events.findIndex((e) => e.type === "item.added" && e.item.type === "notice" && e.item.code === "run.reattached");
-    expect(resolved).toBeGreaterThanOrEqual(0);
-    expect(resolved).toBeLessThan(notice);
+    expect(snap.thread.status).toBe("running");
+    expect(b.events.some((e) => e.type === "request.opened")).toBe(false);
+    if (opening === "saved") {
+      // Closed as the run's picked up again.
+      const resolved = b.events.findIndex((e) => e.type === "request.resolved" && e.request_id === requestId);
+      const notice = b.events.findIndex((e) => e.type === "item.added" && e.item.type === "notice" && e.item.code === "run.reattached");
+      expect(resolved).toBeGreaterThanOrEqual(0);
+      expect(resolved).toBeLessThan(notice);
+    }
     await b.waitFor({ type: "turn.completed" });
     await b.call("close", { stop: true });
     await b.exited;

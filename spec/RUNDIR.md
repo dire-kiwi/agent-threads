@@ -113,8 +113,9 @@ except answers to requests it may still answer (asked of a user again, say), whi
 it does, or the request is closed otherwise. Whatever it's killed in the middle of, however many
 times, nothing that's in `input.jsonl` is written to it twice, and no request is answered twice.
 Nor is one that's answered there asked again: a request saved as open whose answer is among the
-lines after the saved offset is closed when the backend re-attaches (the user isn't asked a
-question the harness has had its answer to).
+lines after the saved offset is closed when the backend re-attaches, and one that reading the
+output again asks (one asked after the saved offset) is passed over, so the user isn't asked a
+question the harness has had its answer to.
 
 ## A run whose shim is gone
 

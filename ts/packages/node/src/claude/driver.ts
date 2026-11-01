@@ -680,6 +680,9 @@ class ClaudeSession implements HarnessSession {
         this.#user(run, m);
         break;
       case "control_request":
+        // Read again after a restart, and answered before it (though that wasn't saved): Claude
+        // has its answer, and the user isn't asked again.
+        if (run.proc?.answered?.(m.request_id)) break;
         this.#controlRequest(run, m.request_id, m.request ?? {});
         break;
       case "control_cancel_request": {
