@@ -1,0 +1,17 @@
+[package]
+name = "agent-threads-shim"
+version = "0.1.0"
+description = "Runs one harness process detached, recording its output and exit in a run directory, so it outlives the backend that started it."
+edition = "2024"
+license = "MIT"
+repository = "https://github.com/dire-kiwi/agent-threads"
+publish = false
+
+[dependencies]
+libc = "0.2"
+
+[profile.release]
+opt-level = "s"
+lto = true
+strip = true
+panic = "abort"
