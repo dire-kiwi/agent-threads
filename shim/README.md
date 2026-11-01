@@ -18,10 +18,30 @@ directory, and how a backend follows it, is in [spec/RUNDIR.md](../spec/RUNDIR.m
 
 Shims that are running aren't upgraded, so it's kept small and should rarely change.
 
+[docs/shim.md](../docs/shim.md) says when an app wants it, and how a backend recovers its runs
+after a restart.
+
+## Building and installing
+
 ```sh
 cargo build --release   # target/release/agent-threads-shim
 cargo test              # runs the shim on sh scripts
+make shim               # from the repository's root: target/debug/agent-threads-shim, which the backends' tests use
+CARGO_NET_GIT_FETCH_WITH_CLI=true cargo install --git https://github.com/dire-kiwi/agent-threads agent-threads-shim
 ```
 
-Backends use it through their shim spawner: `shim(path, { runsDir })` in the Node backend
-([ts/packages/node](../ts/packages/node/README.md#processes-and-runs-that-survive-a-restart)).
+Ship the binary with the app (it's not published anywhere yet), and give the backend its path.
+
+## Using it
+
+An app doesn't run it itself: a backend's shim spawner does, for each harness process, with a
+directory of its own for the runs:
+
+| Backend | |
+| --- | --- |
+| Node | `shim(path, { runsDir })` ([ts/packages/node](../ts/packages/node/README.md#processes-and-runs-that-survive-a-restart)) |
+| Go | `agentthreads.Shim(path, agentthreads.ShimOptions{RunsDir: dir})` ([go](../go/README.md#runs-that-survive-a-restart)) |
+| Rust | `shim(path, ShimOptions::new(runs_dir))` ([rust/agent-threads](../rust/agent-threads/README.md#processes-and-runs-that-survive-a-restart)) |
+
+Then `recover()` at startup re-attaches to the runs the last process left going. It runs on Unix
+only: on Windows the backends' shim spawner is the direct one.
