@@ -1,0 +1,21 @@
+[package]
+name = "chat-rust"
+version = "0.0.0"
+description = "A minimal chat app on agent-threads: an axum server with its own WebSocket, for the React frontend in examples/chat-node."
+edition = "2024"
+license = "MIT"
+publish = false
+
+# Not part of rust/'s workspace: an app of its own that uses the crate from the repository.
+[workspace]
+
+[dependencies]
+agent-threads = { path = "../../rust/agent-threads" }
+axum = { version = "0.8.9", features = ["ws"] }
+futures-util = { version = "0.3.31", default-features = false, features = ["sink", "std"] }
+serde_json = "1"
+tokio = { version = "1.54.1", features = ["fs", "io-std", "io-util", "macros", "net", "process", "rt-multi-thread", "signal", "sync", "time"] }
+
+[dev-dependencies]
+tempfile = "3.27.0"
+tokio-tungstenite = "0.29.0"

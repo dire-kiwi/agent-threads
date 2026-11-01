@@ -7,9 +7,11 @@ has no network layer: backends emit JSON events and accept JSON commands, and th
 It's early: so far there's the spec, the generated types, the `applyEvent` reducer, the
 conformance suite the backends run (recorded sessions replayed by a fake CLI, and store cases),
 the Node backend with its stores and its Claude Code and Codex drivers
-([ts/packages/node](ts/packages/node/README.md)), `agent-threads-shim`, which keeps runs going
-while a backend restarts ([shim/](shim/README.md)), the React package, and an example chat app
-([examples/chat-node](examples/chat-node/README.md)). See [docs/design.md](docs/design.md) for the design and [spec/PROTOCOL.md](spec/PROTOCOL.md)
+([ts/packages/node](ts/packages/node/README.md)), the Rust backend
+([rust/agent-threads](rust/agent-threads/README.md)), `agent-threads-shim`, which keeps runs going
+while a backend restarts ([shim/](shim/README.md)), the React package, and example chat apps
+([examples/chat-node](examples/chat-node/README.md), and
+[examples/chat-rust](examples/chat-rust/README.md) on the Rust backend). See [docs/design.md](docs/design.md) for the design and [spec/PROTOCOL.md](spec/PROTOCOL.md)
 for the protocol.
 
 | Path | What |
@@ -20,9 +22,9 @@ for the protocol.
 | `spec/conformance/` | The cases every store must pass ([store.md](spec/conformance/store.md)) |
 | `ts/` | pnpm workspace: `@dire-kiwi/agent-threads-protocol`, `-node`, `-react` |
 | `go/` | Go module `github.com/dire-kiwi/agent-threads/go`: the Go backend ([README](go/README.md)) |
-| `rust/` | Cargo workspace with the `agent-threads` crate |
+| `rust/` | Cargo workspace with the `agent-threads` crate, the Rust backend ([README](rust/agent-threads/README.md)) |
 | `shim/` | `agent-threads-shim`, which keeps runs alive across backend restarts ([README](shim/README.md), [spec/RUNDIR.md](spec/RUNDIR.md)) |
-| `examples/` | Example apps: [chat-node](examples/chat-node/README.md), a chat app on the Node backend and the React package over its own WebSocket ([the wire protocol](examples/PROTOCOL.md) its frontend speaks), and [chat-go](examples/chat-go/README.md), its server in Go on the Go backend |
+| `examples/` | Example apps: [chat-node](examples/chat-node/README.md), a chat app on the Node backend and the React package over its own WebSocket ([the wire protocol](examples/PROTOCOL.md) its frontend speaks), [chat-go](examples/chat-go/README.md), its server in Go on the Go backend, and [chat-rust](examples/chat-rust/README.md), in Rust on the Rust backend |
 
 ## Building
 
@@ -30,7 +32,7 @@ You need Node 24+ with pnpm 10, Go 1.26+ and stable Rust (the Node and Go tests 
 
 ```sh
 (cd ts && pnpm install)
-make test        # build and test TS, Go and Rust, and the fixtures' tools
+make test        # build and test TS, Go and Rust (and the Rust example), and the fixtures' tools
 make gen         # regenerate the types after changing spec/schema/
 make check-gen   # fail if the generated code is out of date (CI runs it)
 ```
