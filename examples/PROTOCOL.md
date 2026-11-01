@@ -91,8 +91,12 @@ command that runs it under its supervisor (`$CHAT_E2E_SERVER supervise` by defau
 | `CHAT_SHIM` | The `agent-threads-shim` binary to run the harnesses under. |
 
 It must print a line starting `chat-<name> on ` (on stdout or stderr) once it's listening, and
-again after each restart, and stop on SIGTERM. Supervised, `restart` must start it again with the
-same environment, and `hello` must say `restart: true`.
+again after each restart, and stop on SIGTERM (handling it already when it prints that line).
+Supervised, `restart` must start it again with the same environment, `hello` must say
+`restart: true`, and SIGTERM to the supervisor must stop the server too: the supervisor passes it
+on, and exits once the server has. Its runs needn't stop (they're under the shim): the tests stop
+them, from `CHAT_DATA/runs`. The tests run it in a process group of its own, and fail one that
+leaves anything in it running 15s after SIGTERM.
 
 ## The app's tool
 
