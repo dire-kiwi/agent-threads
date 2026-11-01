@@ -64,7 +64,10 @@ pub struct StoreError {
 
 impl StoreError {
     pub fn new(kind: StoreErrorKind, message: impl Into<String>) -> Self {
-        StoreError { kind, message: message.into() }
+        StoreError {
+            kind,
+            message: message.into(),
+        }
     }
 
     pub fn failed(error: impl fmt::Display) -> Self {
@@ -152,7 +155,10 @@ pub(crate) fn check_events(id: &str, last: u64, events: &[Value], runs: &[RunRec
         if got != Some(seq) {
             return Err(StoreError::new(
                 StoreErrorKind::Seq,
-                format!("event seq {}, where {seq} comes next", e.get("seq").unwrap_or(&Value::Null)),
+                format!(
+                    "event seq {}, where {seq} comes next",
+                    e.get("seq").unwrap_or(&Value::Null)
+                ),
             ));
         }
     }
@@ -166,7 +172,9 @@ pub(crate) fn str_field<'a>(v: &'a Value, name: &str) -> &'a str {
 
 /// Oldest first by `created_at` (threads), then by id.
 pub(crate) fn thread_order(a: &Value, b: &Value) -> Ordering {
-    str_field(a, "created_at").cmp(str_field(b, "created_at")).then_with(|| str_field(a, "id").cmp(str_field(b, "id")))
+    str_field(a, "created_at")
+        .cmp(str_field(b, "created_at"))
+        .then_with(|| str_field(a, "id").cmp(str_field(b, "id")))
 }
 
 /// Oldest first by `started_at` (runs), then by id.

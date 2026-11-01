@@ -13,7 +13,9 @@ pub(crate) fn write_skills(root: &Path, skills: &[Skill]) -> io::Result<PathBuf>
         match s {
             Skill::Dir(dir) => {
                 let dir = std::path::absolute(dir)?;
-                let name = dir.file_name().ok_or_else(|| io::Error::other(format!("{} isn't a skill's directory", dir.display())))?;
+                let name = dir
+                    .file_name()
+                    .ok_or_else(|| io::Error::other(format!("{} isn't a skill's directory", dir.display())))?;
                 copy_dir(&dir, &root.join(name))?;
             }
             Skill::Inline { name, content } => {

@@ -147,7 +147,10 @@ pub trait Spawner: Send + Sync {
     }
     /// Follows a run started before a restart, from the offset saved with it.
     fn attach(&self, _run: &RunRecord) -> io::Result<Spawned> {
-        Err(io::Error::new(io::ErrorKind::Unsupported, "this spawner can't re-attach to runs"))
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "this spawner can't re-attach to runs",
+        ))
     }
     /// Stops a run nothing will follow (its thread has gone on without it, or can't re-attach):
     /// ends its input and signals its process group, escalating to SIGKILL.
@@ -180,7 +183,12 @@ impl Spawner for Direct {
 
     fn spawn(&self, o: SpawnOptions) -> io::Result<Spawned> {
         let mut cmd = tokio::process::Command::new(&o.command);
-        cmd.args(&o.args).env_clear().envs(&o.env).stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped());
+        cmd.args(&o.args)
+            .env_clear()
+            .envs(&o.env)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
         if let Some(cwd) = &o.cwd {
             cmd.current_dir(cwd);
         }
@@ -213,11 +221,18 @@ impl Spawner for Direct {
             done.store(true, Ordering::SeqCst);
             let status = match status {
                 Ok(s) => exit_status(s),
-                Err(e) => ExitStatus { error: Some(e.to_string()), ..Default::default() },
+                Err(e) => ExitStatus {
+                    error: Some(e.to_string()),
+                    ..Default::default()
+                },
             };
             let _ = events.send(ProcessEvent::Exit(status));
         });
-        let proc = DirectProcess { pid, input: Mutex::new(Some(input)), closed };
+        let proc = DirectProcess {
+            pid,
+            input: Mutex::new(Some(input)),
+            closed,
+        };
         Ok((Arc::new(proc), rx))
     }
 }
@@ -226,10 +241,18 @@ pub(crate) fn exit_status(s: std::process::ExitStatus) -> ExitStatus {
     #[cfg(unix)]
     {
         use std::os::unix::process::ExitStatusExt;
-        ExitStatus { code: s.code(), signal: s.signal().map(signal_name), error: None }
+        ExitStatus {
+            code: s.code(),
+            signal: s.signal().map(signal_name),
+            error: None,
+        }
     }
     #[cfg(not(unix))]
-    ExitStatus { code: s.code(), signal: None, error: None }
+    ExitStatus {
+        code: s.code(),
+        signal: None,
+        error: None,
+    }
 }
 
 /// Sends each line of `r` (stderr ones as such) until it ends.
@@ -249,7 +272,11 @@ async fn read_lines(r: impl AsyncRead + Unpin, events: mpsc::UnboundedSender<Pro
             buf.pop();
         }
         let line = String::from_utf8_lossy(&buf).into_owned();
-        let e = if stderr { ProcessEvent::Stderr(line) } else { ProcessEvent::Line { line, end: None } };
+        let e = if stderr {
+            ProcessEvent::Stderr(line)
+        } else {
+            ProcessEvent::Line { line, end: None }
+        };
         if events.send(e).is_err() {
             return;
         }
@@ -269,7 +296,11 @@ impl HarnessProcess for DirectProcess {
 
     fn write(&self, line: &str) {
         if let Some(input) = self.input.lock().unwrap().as_ref() {
-            let _ = input.send(if line.ends_with('\n') { line.to_string() } else { format!("{line}\n") });
+            let _ = input.send(if line.ends_with('\n') {
+                line.to_string()
+            } else {
+                format!("{line}\n")
+            });
         }
     }
 

@@ -21,16 +21,20 @@ mod harness;
 mod ids;
 mod mcp_http;
 mod permissions;
-mod skills;
 mod shim;
+mod skills;
 mod spawner;
 mod thread;
 mod tools;
 
-pub use agent_threads::{AgentThreads, Capabilities, CreateOptions, Error, Options, Recovered, Result, SendOptions, ThreadOptions};
+pub use agent_threads::{
+    AgentThreads, Capabilities, CreateOptions, Error, Options, Recovered, Result, SendOptions, ThreadOptions,
+};
 pub use claude::{ClaudeCodeOptions, claude_code};
 pub use codex::{AppTools, CodexOptions, codex};
-pub use harness::{BoxFuture, Harness, HarnessSession, McpServer, Message, RunCheckpoint, Skill, ThreadConfig, TurnEnd};
+pub use harness::{
+    BoxFuture, Harness, HarnessSession, McpServer, Message, RunCheckpoint, Skill, ThreadConfig, TurnEnd,
+};
 pub use permissions::{Decided, PermissionContext, PermissionDecision, PermissionPolicy, PermissionQuery};
 pub use protocol::{Command, Item, Snapshot, Thread, ThreadEvent};
 pub use shim::{RUN_FORMAT, ShimOptions, shim};
@@ -39,5 +43,5 @@ pub use store::{RunRecord, Store, StoreError, StoreErrorKind, StoreResult};
 pub use stores::file::FileStore;
 pub use stores::memory::{MemoryState, MemoryStore};
 pub use stores::sqlite::SqliteStore;
-pub use thread::{Actor, Answered, ThreadContext, Timer, Turn};
+pub use thread::{Actor, Answered, SessionJob, ThreadContext, Timer, Turn};
 pub use tools::{Cancellation, Tool, ToolContext, ToolOutput, tool};

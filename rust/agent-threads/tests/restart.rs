@@ -50,7 +50,9 @@ impl Backend {
         tokio::spawn(async move {
             while let Ok(Some(line)) = lines.next_line().await {
                 // The test harness's own output is mixed in: only our JSON counts.
-                let Ok(msg) = serde_json::from_str::<Value>(&line) else { continue };
+                let Ok(msg) = serde_json::from_str::<Value>(&line) else {
+                    continue;
+                };
                 if let Some(e) = msg.get("event") {
                     ev.lock().unwrap().push(e.clone());
                 } else if let Some(id) = msg["reply"].as_u64()
@@ -60,7 +62,13 @@ impl Backend {
                 }
             }
         });
-        Backend { child, stdin, events, replies, next: 1 }
+        Backend {
+            child,
+            stdin,
+            events,
+            replies,
+            next: 1,
+        }
     }
 
     async fn call(&mut self, op: &str, args: Value) -> Value {
@@ -70,7 +78,10 @@ impl Backend {
         self.replies.lock().unwrap().insert(id, tx);
         let line = json!({"id": id, "op": op, "args": args}).to_string() + "\n";
         self.stdin.write_all(line.as_bytes()).await.unwrap();
-        let r = tokio::time::timeout(Duration::from_secs(30), rx).await.expect("the backend answers").unwrap();
+        let r = tokio::time::timeout(Duration::from_secs(30), rx)
+            .await
+            .expect("the backend answers")
+            .unwrap();
         assert!(r.get("error").is_none(), "{op}: {}", r["error"]);
         r["result"].clone()
     }
@@ -81,13 +92,23 @@ impl Backend {
             if let Some(e) = self.events.lock().unwrap().iter().find(|e| matches(e, pattern)) {
                 return e.clone();
             }
-            assert!(Instant::now() < deadline, "no event like {pattern}; got:\n{}", self.show());
+            assert!(
+                Instant::now() < deadline,
+                "no event like {pattern}; got:\n{}",
+                self.show()
+            );
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
     }
 
     fn show(&self) -> String {
-        self.events.lock().unwrap().iter().map(|e| e.to_string().chars().take(200).collect::<String>()).collect::<Vec<_>>().join("\n")
+        self.events
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|e| e.to_string().chars().take(200).collect::<String>())
+            .collect::<Vec<_>>()
+            .join("\n")
     }
 
     /// Kills it as a crash would: no chance to save anything or stop anything.
@@ -96,7 +117,9 @@ impl Backend {
     }
 
     async fn exited(mut self) {
-        let _ = tokio::time::timeout(Duration::from_secs(30), self.child.wait()).await.expect("the backend exits");
+        let _ = tokio::time::timeout(Duration::from_secs(30), self.child.wait())
+            .await
+            .expect("the backend exits");
     }
 }
 
@@ -126,7 +149,12 @@ struct Scene {
 }
 
 fn scene(fixture: &str, extra: &[(&str, &str)]) -> Scene {
-    let (store, runs, state, cwd) = (common::temp_dir(), common::temp_dir(), common::temp_dir(), common::temp_dir());
+    let (store, runs, state, cwd) = (
+        common::temp_dir(),
+        common::temp_dir(),
+        common::temp_dir(),
+        common::temp_dir(),
+    );
     let f = common::read_json(&format!("fixtures/{fixture}/fixture.json"));
     let s = |p: &Path| p.to_string_lossy().to_string();
     let mut env = vec![
@@ -135,7 +163,10 @@ fn scene(fixture: &str, extra: &[(&str, &str)]) -> Scene {
         ("CODEX_HOME_DIR".into(), s(&common::temp_dir())),
         ("SHIM".into(), s(&common::shim_path())),
         ("FAKE_CLI".into(), s(&common::spec_dir().join("tools/fake-cli.mjs"))),
-        ("AGENT_THREADS_FIXTURE".into(), s(&common::spec_dir().join("fixtures").join(fixture))),
+        (
+            "AGENT_THREADS_FIXTURE".into(),
+            s(&common::spec_dir().join("fixtures").join(fixture)),
+        ),
         ("AGENT_THREADS_FIXTURE_STATE".into(), s(&state)),
         ("POLICY".into(), f["permissions"].as_str().unwrap_or("allow").into()),
     ];
@@ -143,7 +174,14 @@ fn scene(fixture: &str, extra: &[(&str, &str)]) -> Scene {
         env.retain(|(x, _)| x != k);
         env.push((k.to_string(), v.to_string()));
     }
-    Scene { store, runs, state, cwd, env, fixture: f }
+    Scene {
+        store,
+        runs,
+        state,
+        cwd,
+        env,
+        fixture: f,
+    }
 }
 
 impl Scene {
@@ -168,8 +206,13 @@ async fn saved_events(store: &Path, thread: &str) -> Vec<Value> {
 /// Checks the saved events are the fixture's expected events (without deltas, which aren't saved),
 /// plus the notices that the run was picked up again, and that the fake CLI got what it should.
 fn check_thread(fixture: &str, saved: &[Value], state: &Path, reattached: usize) {
-    let is_notice = |e: &Value| e["type"] == "item.added" && e["item"]["type"] == "notice" && e["item"]["code"] == "run.reattached";
-    assert_eq!(saved.iter().filter(|e| is_notice(e)).count(), reattached, "run.reattached notices");
+    let is_notice =
+        |e: &Value| e["type"] == "item.added" && e["item"]["type"] == "notice" && e["item"]["code"] == "run.reattached";
+    assert_eq!(
+        saved.iter().filter(|e| is_notice(e)).count(),
+        reattached,
+        "run.reattached notices"
+    );
     // Without them, renumbered, the events must be exactly the fixture's.
     let rest: Vec<Value> = saved
         .iter()
@@ -182,7 +225,14 @@ fn check_thread(fixture: &str, saved: &[Value], state: &Path, reattached: usize)
         })
         .collect();
     if let Err(e) = common::compare(fixture, &rest, true) {
-        panic!("{e}\n\nSaved events:\n{}", saved.iter().map(|e| e.to_string().chars().take(300).collect::<String>()).collect::<Vec<_>>().join("\n"));
+        panic!(
+            "{e}\n\nSaved events:\n{}",
+            saved
+                .iter()
+                .map(|e| e.to_string().chars().take(300).collect::<String>())
+                .collect::<Vec<_>>()
+                .join("\n")
+        );
     }
     let reports: Vec<String> = std::fs::read_dir(state)
         .unwrap()
@@ -252,14 +302,18 @@ async fn while_waiting(h: &str, shut_down: bool) {
     }
 
     let mut b = s.start();
-    assert_eq!(b.call("recover", json!(null)).await, json!({"reattached": [id], "lost": []}));
+    assert_eq!(
+        b.call("recover", json!(null)).await,
+        json!({"reattached": [id], "lost": []})
+    );
     let snap = b.call("snapshot", json!(id)).await;
     assert_eq!(snap["thread"]["status"], "waiting");
     assert!(snap["thread"]["run"]["reattached_at"].is_string());
     assert_eq!(snap["requests"].as_array().unwrap().len(), 1);
     let respond = json!({"type": "respond", "thread_id": id, "request_id": snap["requests"][0]["id"], "resolution": {"outcome": "allow"}});
     b.call("handle", respond).await;
-    b.wait_for(&json!({"type": "thread.updated", "thread": {"status": "idle"}})).await;
+    b.wait_for(&json!({"type": "thread.updated", "thread": {"status": "idle"}}))
+        .await;
     b.call("close", json!({"stop": true})).await;
     b.exited().await;
 
@@ -277,14 +331,19 @@ async fn while_streaming(h: &str) {
     cmd["thread_id"] = json!(id);
     a.call("handle", cmd).await;
     // The first of its tool calls; more comes after it.
-    a.wait_for(&json!({"type": "item.added", "item": {"type": "tool_call"}})).await;
+    a.wait_for(&json!({"type": "item.added", "item": {"type": "tool_call"}}))
+        .await;
     tokio::time::sleep(Duration::from_millis(100)).await;
     a.crash().await;
 
     let mut b = s.start();
-    assert_eq!(b.call("recover", json!(null)).await, json!({"reattached": [id], "lost": []}));
+    assert_eq!(
+        b.call("recover", json!(null)).await,
+        json!({"reattached": [id], "lost": []})
+    );
     // The rest of the turn includes approvals the policy answers.
-    b.wait_for(&json!({"type": "thread.updated", "thread": {"status": "idle"}})).await;
+    b.wait_for(&json!({"type": "thread.updated", "thread": {"status": "idle"}}))
+        .await;
     b.call("close", json!({"stop": true})).await;
     b.exited().await;
 
@@ -302,8 +361,20 @@ async fn ends_while_down(h: &str) {
     a.call("handle", cmd).await;
     // Partway through the turn.
     let runs = s.runs.clone();
-    until(|| std::fs::read_dir(&runs).map(|mut d| d.next().is_some()).unwrap_or(false)).await;
-    let run_id = std::fs::read_dir(&s.runs).unwrap().next().unwrap().unwrap().file_name().to_string_lossy().to_string();
+    until(|| {
+        std::fs::read_dir(&runs)
+            .map(|mut d| d.next().is_some())
+            .unwrap_or(false)
+    })
+    .await;
+    let run_id = std::fs::read_dir(&s.runs)
+        .unwrap()
+        .next()
+        .unwrap()
+        .unwrap()
+        .file_name()
+        .to_string_lossy()
+        .to_string();
     let run_dir = s.runs.join(&run_id);
     let out = {
         let run_dir = run_dir.clone();
@@ -324,11 +395,20 @@ async fn ends_while_down(h: &str) {
     until(|| run_dir.join("exit").exists()).await;
 
     let mut b = s.start();
-    assert_eq!(b.call("recover", json!(null)).await, json!({"reattached": [id], "lost": []}));
-    b.wait_for(&json!({"type": "thread.updated", "thread": {"status": "idle"}})).await;
+    assert_eq!(
+        b.call("recover", json!(null)).await,
+        json!({"reattached": [id], "lost": []})
+    );
+    b.wait_for(&json!({"type": "thread.updated", "thread": {"status": "idle"}}))
+        .await;
     // The run's over, and the backend is done with it.
     let events = b.events.clone();
-    until(|| events.lock().unwrap().iter().any(|e| e["type"] == "thread.updated" && e["thread"]["status"] == "idle" && e["thread"].get("run").is_none())).await;
+    until(|| {
+        events.lock().unwrap().iter().any(|e| {
+            e["type"] == "thread.updated" && e["thread"]["status"] == "idle" && e["thread"].get("run").is_none()
+        })
+    })
+    .await;
     b.call("close", json!({"stop": false})).await;
     b.exited().await;
 
@@ -400,7 +480,11 @@ async fn app_tool_not_run_again(h: &str, died: bool) {
     let mut a = s.start();
     let thread = a.call("create", json!({"harness": h, "cwd": s.cwd})).await;
     let id = thread["id"].as_str().unwrap().to_string();
-    a.call("handle", json!({"type": "send", "thread_id": id, "text": "app lookup {}"})).await;
+    a.call(
+        "handle",
+        json!({"type": "send", "thread_id": id, "text": "app lookup {}"}),
+    )
+    .await;
     // It has done what it does, and hasn't returned.
     let m = marker.clone();
     until(move || m.exists()).await;
@@ -413,14 +497,24 @@ async fn app_tool_not_run_again(h: &str, died: bool) {
     }
 
     let mut b = s.start();
-    assert_eq!(b.call("recover", json!(null)).await, json!({"reattached": [id], "lost": []}));
-    b.wait_for(&json!({"type": "thread.updated", "thread": {"status": "idle"}})).await;
+    assert_eq!(
+        b.call("recover", json!(null)).await,
+        json!({"reattached": [id], "lost": []})
+    );
+    b.wait_for(&json!({"type": "thread.updated", "thread": {"status": "idle"}}))
+        .await;
     let snap = b.call("snapshot", json!(id)).await;
     b.call("close", json!({"stop": true})).await;
     b.exited().await;
     assert_eq!(std::fs::read_to_string(&marker).unwrap(), "ran\n");
     // The agent was told it may have finished.
-    let said: Vec<&str> = snap["items"].as_array().unwrap().iter().filter(|i| i["type"] == "assistant_message").filter_map(|i| i["text"].as_str()).collect();
+    let said: Vec<&str> = snap["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|i| i["type"] == "assistant_message")
+        .filter_map(|i| i["text"].as_str())
+        .collect();
     assert!(said.join("\n").contains("may or may not have finished"), "{said:?}");
 }
 
@@ -460,32 +554,47 @@ fn backend_process() {
 
 async fn backend() {
     let env = |k: &str| std::env::var(k).ok();
-    let fake_env: std::collections::HashMap<String, Option<String>> =
-        std::env::vars().filter(|(k, _)| k.starts_with("AGENT_THREADS_FIXTURE")).map(|(k, v)| (k, Some(v))).collect();
+    let fake_env: std::collections::HashMap<String, Option<String>> = std::env::vars()
+        .filter(|(k, _)| k.starts_with("AGENT_THREADS_FIXTURE"))
+        .map(|(k, v)| (k, Some(v)))
+        .collect();
     let store: Arc<dyn Store> = Arc::new(FileStore::open(env("STORE").unwrap()).unwrap());
     let fake = env("FAKE_CLI").unwrap();
     let mut tools = Vec::new();
     if let Some(marker) = env("TOOL_MARKER") {
         let hang = env("TOOL_HANG").is_some();
-        tools.push(tool("lookup", "Looks something up.", json!({"type": "object"}), move |_, ctx| {
-            let marker = marker.clone();
-            async move {
-                use std::io::Write;
-                let mut f = std::fs::OpenOptions::new().create(true).append(true).open(&marker).unwrap();
-                f.write_all(b"ran\n").unwrap();
-                if hang {
-                    ctx.cancelled.cancelled().await;
+        tools.push(tool(
+            "lookup",
+            "Looks something up.",
+            json!({"type": "object"}),
+            move |_, ctx| {
+                let marker = marker.clone();
+                async move {
+                    use std::io::Write;
+                    let mut f = std::fs::OpenOptions::new()
+                        .create(true)
+                        .append(true)
+                        .open(&marker)
+                        .unwrap();
+                    f.write_all(b"ran\n").unwrap();
+                    if hang {
+                        ctx.cancelled.cancelled().await;
+                    }
+                    "found it"
                 }
-                "found it"
-            }
-        }));
+            },
+        ));
     }
     let mut shim_options = ShimOptions::new(env("RUNS").unwrap());
     shim_options.poll = Duration::from_millis(50);
     let sdk = AgentThreads::new(Options {
         store: Some(store.clone()),
         harnesses: vec![
-            claude_code(ClaudeCodeOptions { bin: env("CLAUDE_BIN").unwrap_or(fake.clone()), env: fake_env.clone(), ..Default::default() }),
+            claude_code(ClaudeCodeOptions {
+                bin: env("CLAUDE_BIN").unwrap_or(fake.clone()),
+                env: fake_env.clone(),
+                ..Default::default()
+            }),
             codex(CodexOptions {
                 bin: env("CODEX_BIN").unwrap_or(fake),
                 env: fake_env,
@@ -497,7 +606,11 @@ async fn backend() {
         spawner: Some(shim(env("SHIM").unwrap(), shim_options)),
         capabilities: Capabilities {
             tools,
-            permissions: Some(if env("POLICY").as_deref() == Some("ask") { PermissionPolicy::ask() } else { PermissionPolicy::allow() }),
+            permissions: Some(if env("POLICY").as_deref() == Some("ask") {
+                PermissionPolicy::ask()
+            } else {
+                PermissionPolicy::allow()
+            }),
             ..Default::default()
         },
         on_error: Some(Arc::new(|e| eprintln!("backend error: {e}"))),
@@ -523,24 +636,49 @@ async fn backend() {
     let mut lines = BufReader::new(tokio::io::stdin()).lines();
     while let Ok(Some(line)) = lines.next_line().await {
         let msg: Value = serde_json::from_str(&line).unwrap();
-        let (id, op, args) = (msg["id"].clone(), msg["op"].as_str().unwrap().to_string(), msg["args"].clone());
+        let (id, op, args) = (
+            msg["id"].clone(),
+            msg["op"].as_str().unwrap().to_string(),
+            msg["args"].clone(),
+        );
         let result: Result<Value, String> = match op.as_str() {
             "create" => {
                 let o = CreateOptions {
                     harness: args["harness"].as_str().map(String::from),
                     model: args["model"].as_str().map(String::from),
                     effort: args["effort"].as_str().map(String::from),
-                    permission_mode: args.get("permission_mode").and_then(|m| serde_json::from_value(m.clone()).ok()),
+                    permission_mode: args
+                        .get("permission_mode")
+                        .and_then(|m| serde_json::from_value(m.clone()).ok()),
                     cwd: args["cwd"].as_str().map(PathBuf::from),
                     ..Default::default()
                 };
-                sdk.create(o).await.map(|t| serde_json::to_value(t).unwrap()).map_err(|e| e.to_string())
+                sdk.create(o)
+                    .await
+                    .map(|t| serde_json::to_value(t).unwrap())
+                    .map_err(|e| e.to_string())
             }
-            "handle" => sdk.handle_json(args).await.map(|_| Value::Null).map_err(|e| e.to_string()),
-            "snapshot" => sdk.snapshot(args.as_str().unwrap()).await.map(|s| serde_json::to_value(s).unwrap()).map_err(|e| e.to_string()),
-            "recover" => sdk.recover().await.map(|r| json!({"reattached": r.reattached, "lost": r.lost})).map_err(|e| e.to_string()),
+            "handle" => sdk
+                .handle_json(args)
+                .await
+                .map(|_| Value::Null)
+                .map_err(|e| e.to_string()),
+            "snapshot" => sdk
+                .snapshot(args.as_str().unwrap())
+                .await
+                .map(|s| serde_json::to_value(s).unwrap())
+                .map_err(|e| e.to_string()),
+            "recover" => sdk
+                .recover()
+                .await
+                .map(|r| json!({"reattached": r.reattached, "lost": r.lost}))
+                .map_err(|e| e.to_string()),
             "close" => {
-                let r = sdk.close(args["stop"].as_bool().unwrap_or(false)).await.map(|_| Value::Null).map_err(|e| e.to_string());
+                let r = sdk
+                    .close(args["stop"].as_bool().unwrap_or(false))
+                    .await
+                    .map(|_| Value::Null)
+                    .map_err(|e| e.to_string());
                 let _ = store.close().await;
                 // Let the subscriber write the last events.
                 tokio::time::sleep(Duration::from_millis(50)).await;

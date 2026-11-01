@@ -45,7 +45,11 @@ async fn call(store: &dyn Store, op: &str, args: &[Value]) -> Result<Value, Stri
         "deleteThread" => store.delete_thread(&s(0)).await.map(Value::from),
         "appendEvents" => {
             let events = args[1].as_array().unwrap().clone();
-            let runs: Vec<RunRecord> = args.get(2).and_then(Value::as_array).map(|a| a.iter().map(run).collect()).unwrap_or_default();
+            let runs: Vec<RunRecord> = args
+                .get(2)
+                .and_then(Value::as_array)
+                .map(|a| a.iter().map(run).collect())
+                .unwrap_or_default();
             store.append_events(&s(0), &events, &runs).await.map(|_| Value::Null)
         }
         "readEvents" => {
@@ -66,9 +70,10 @@ async fn call(store: &dyn Store, op: &str, args: &[Value]) -> Result<Value, Stri
 }
 
 type Opener = Box<dyn FnMut() -> Arc<dyn Store>>;
+type Kind = (&'static str, bool, Box<dyn Fn() -> Opener>);
 
 /// A way to open a store, and to open it again on the same data.
-fn kinds() -> Vec<(&'static str, bool, Box<dyn Fn() -> Opener>)> {
+fn kinds() -> Vec<Kind> {
     vec![
         (
             "MemoryStore",
@@ -145,7 +150,10 @@ async fn file_store_drops_a_half_written_last_line() {
     {
         let store = FileStore::open(&dir).unwrap();
         store.create_thread(&thread).await.unwrap();
-        store.append_events("th_1", &[e1.clone()], &[]).await.unwrap();
+        store
+            .append_events("th_1", std::slice::from_ref(&e1), &[])
+            .await
+            .unwrap();
         store.close().await.unwrap();
     }
     let file = std::fs::read_dir(&dir).unwrap().next().unwrap().unwrap().path();
@@ -156,7 +164,10 @@ async fn file_store_drops_a_half_written_last_line() {
     assert_eq!(store.read_events("th_1", 0, None).await.unwrap(), vec![e1.clone()]);
     // And it carries on from there.
     let e2 = json!({"type": "turn.completed", "thread_id": "th_1", "seq": 2, "turn_id": "t1"});
-    store.append_events("th_1", &[e2.clone()], &[]).await.unwrap();
+    store
+        .append_events("th_1", std::slice::from_ref(&e2), &[])
+        .await
+        .unwrap();
     drop(store);
     let store = FileStore::open(&dir).unwrap();
     assert_eq!(store.read_events("th_1", 0, None).await.unwrap(), vec![e1, e2]);

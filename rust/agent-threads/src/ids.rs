@@ -12,7 +12,10 @@ pub(crate) fn new_id(prefix: &str) -> String {
 
 /// Milliseconds since the epoch.
 pub(crate) fn now_ms() -> u64 {
-    SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_millis() as u64).unwrap_or(0)
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
 }
 
 /// Now, as an RFC 3339 timestamp in UTC with milliseconds, as JavaScript's toISOString() has it.
@@ -22,7 +25,9 @@ pub(crate) fn now_iso() -> String {
 
 /// An RFC 3339 timestamp's milliseconds since the epoch.
 pub(crate) fn parse_iso_ms(s: &str) -> Option<u64> {
-    chrono::DateTime::parse_from_rfc3339(s).ok().map(|t| t.timestamp_millis().max(0) as u64)
+    chrono::DateTime::parse_from_rfc3339(s)
+        .ok()
+        .map(|t| t.timestamp_millis().max(0) as u64)
 }
 
 /// A random token, URL-safe.

@@ -31,12 +31,19 @@ pub struct ToolOutput {
 
 impl ToolOutput {
     pub fn text(text: impl Into<String>) -> Self {
-        ToolOutput { text: text.into(), ..Default::default() }
+        ToolOutput {
+            text: text.into(),
+            ..Default::default()
+        }
     }
 
     /// An error, which the agent is told.
     pub fn error(text: impl Into<String>) -> Self {
-        ToolOutput { text: text.into(), is_error: true, structured: None }
+        ToolOutput {
+            text: text.into(),
+            is_error: true,
+            structured: None,
+        }
     }
 
     /// With structured output as well as the text.
@@ -116,7 +123,12 @@ where
     Fut: Future<Output = O> + Send + 'static,
     O: Into<ToolOutput> + 'static,
 {
-    Arc::new(FnTool { name: name.into(), description: description.into(), input, run })
+    Arc::new(FnTool {
+        name: name.into(),
+        description: description.into(),
+        input,
+        run,
+    })
 }
 
 /// Runs a tool; one that panics returns its panic to the agent as an error.

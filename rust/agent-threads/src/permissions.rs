@@ -94,7 +94,9 @@ impl PermissionPolicy {
 
     /// A policy that decides at once: `PermissionPolicy::from_fn(|q, _| if q.kind == ToolKind::Read
     /// { Allow } else { Ask })`.
-    pub fn from_fn(f: impl Fn(&PermissionQuery, &PermissionContext) -> PermissionDecision + Send + Sync + 'static) -> Self {
+    pub fn from_fn(
+        f: impl Fn(&PermissionQuery, &PermissionContext) -> PermissionDecision + Send + Sync + 'static,
+    ) -> Self {
         PermissionPolicy::Sync(Arc::new(f))
     }
 
@@ -123,7 +125,10 @@ pub(crate) fn decide(policy: &PermissionPolicy, query: PermissionQuery, ctx: Per
         PermissionPolicy::Sync(f) => match catch_unwind(AssertUnwindSafe(|| f(&query, &ctx))) {
             Ok(d) => Decided::Now(d),
             Err(p) => Decided::Now(failed(
-                p.downcast_ref::<String>().cloned().or_else(|| p.downcast_ref::<&str>().map(|s| s.to_string())).unwrap_or_default(),
+                p.downcast_ref::<String>()
+                    .cloned()
+                    .or_else(|| p.downcast_ref::<&str>().map(|s| s.to_string()))
+                    .unwrap_or_default(),
             )),
         },
         PermissionPolicy::Async(f) => {

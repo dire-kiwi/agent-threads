@@ -80,10 +80,19 @@ struct Setup<'a> {
 fn make(s: &Setup) -> AgentThreads {
     let (fixture, dir, state, codex_home) = (s.fixture, s.dir, s.state, s.codex_home);
     let errors = s.errors.clone();
-    let fake = common::spec_dir().join("tools/fake-cli.mjs").to_string_lossy().to_string();
+    let fake = common::spec_dir()
+        .join("tools/fake-cli.mjs")
+        .to_string_lossy()
+        .to_string();
     let env = [
-        ("AGENT_THREADS_FIXTURE".to_string(), Some(dir.to_string_lossy().to_string())),
-        ("AGENT_THREADS_FIXTURE_STATE".to_string(), Some(state.to_string_lossy().to_string())),
+        (
+            "AGENT_THREADS_FIXTURE".to_string(),
+            Some(dir.to_string_lossy().to_string()),
+        ),
+        (
+            "AGENT_THREADS_FIXTURE_STATE".to_string(),
+            Some(state.to_string_lossy().to_string()),
+        ),
     ]
     .into_iter()
     .collect::<std::collections::HashMap<_, _>>();
@@ -93,10 +102,15 @@ fn make(s: &Setup) -> AgentThreads {
         .flatten()
         .map(|t| {
             let result = t["result"].as_str().unwrap().to_string();
-            tool(t["name"].as_str().unwrap(), t["description"].as_str().unwrap(), t["input"].clone(), move |_, _| {
-                let result = result.clone();
-                async move { result }
-            })
+            tool(
+                t["name"].as_str().unwrap(),
+                t["description"].as_str().unwrap(),
+                t["input"].clone(),
+                move |_, _| {
+                    let result = result.clone();
+                    async move { result }
+                },
+            )
         })
         .collect();
     let mcp_servers = fixture["mcp_servers"]
@@ -112,11 +126,27 @@ fn make(s: &Setup) -> AgentThreads {
     AgentThreads::new(Options {
         store: Some(s.store.clone()),
         harnesses: vec![
-            claude_code(ClaudeCodeOptions { bin: fake.clone(), env: env.clone(), ..Default::default() }),
-            codex(CodexOptions { bin: fake, env, home: Some(codex_home.to_path_buf()), login: None, ..Default::default() }),
+            claude_code(ClaudeCodeOptions {
+                bin: fake.clone(),
+                env: env.clone(),
+                ..Default::default()
+            }),
+            codex(CodexOptions {
+                bin: fake,
+                env,
+                home: Some(codex_home.to_path_buf()),
+                login: None,
+                ..Default::default()
+            }),
         ],
         spawner: Some(s.spawner.clone()),
-        capabilities: Capabilities { tools, mcp_servers, skills: vec![], permissions: Some(permissions), system_prompt: None },
+        capabilities: Capabilities {
+            tools,
+            mcp_servers,
+            skills: vec![],
+            permissions: Some(permissions),
+            system_prompt: None,
+        },
         on_error: Some(Arc::new(move |e| errors.lock().unwrap().push(e.to_string()))),
         event_capacity: 1 << 16,
     })
@@ -136,16 +166,29 @@ async fn run_fixture(scenario: &str, spawner_name: &str) {
     let errors = Arc::new(Mutex::new(Vec::new()));
 
     // The same store each time, as an app that restarts has.
-    let setup = Setup { fixture: &fixture, dir: &dir, state: &state, codex_home: &codex_home, spawner, store, errors: errors.clone() };
+    let setup = Setup {
+        fixture: &fixture,
+        dir: &dir,
+        state: &state,
+        codex_home: &codex_home,
+        spawner,
+        store,
+        errors: errors.clone(),
+    };
     let mut sdk = make(&setup);
-    let mut events = Events { rx: sdk.subscribe(), all: Vec::new() };
+    let mut events = Events {
+        rx: sdk.subscribe(),
+        all: Vec::new(),
+    };
     let t = &fixture["thread"];
     let thread = sdk
         .create(CreateOptions {
             harness: t["harness"].as_str().map(String::from),
             model: t["model"].as_str().map(String::from),
             effort: t["effort"].as_str().map(String::from),
-            permission_mode: t.get("permission_mode").map(|m| serde_json::from_value(m.clone()).unwrap()),
+            permission_mode: t
+                .get("permission_mode")
+                .map(|m| serde_json::from_value(m.clone()).unwrap()),
             cwd: Some(cwd.clone()),
             ..Default::default()
         })
@@ -174,7 +217,10 @@ async fn run_fixture(scenario: &str, spawner_name: &str) {
             let found = events.wait_for(from, &step["wait"]).await;
             let Some(found) = found else {
                 let since = events.all[from..].to_vec();
-                panic!("{at}: no such event within {WAIT:?}. Events since the step before:\n{}", show(&since));
+                panic!(
+                    "{at}: no such event within {WAIT:?}. Events since the step before:\n{}",
+                    show(&since)
+                );
             };
             from = found + 1;
         }
@@ -189,13 +235,20 @@ async fn run_fixture(scenario: &str, spawner_name: &str) {
     };
     let mut folded = initial_state(first);
     apply_events(&mut folded, &all);
-    assert_eq!(serde_json::to_value(&snapshot).unwrap(), serde_json::to_value(&folded).unwrap(), "{scenario}: snapshot");
+    assert_eq!(
+        serde_json::to_value(&snapshot).unwrap(),
+        serde_json::to_value(&folded).unwrap(),
+        "{scenario}: snapshot"
+    );
 
     sdk.close(true).await.unwrap();
     let all = events.pump().to_vec();
 
     // The fake CLI was sent what the recording has, in every run.
-    let runs = common::read_jsonl(&format!("fixtures/{scenario}/session.jsonl")).iter().filter(|e| e["dir"] == "spawn").count();
+    let runs = common::read_jsonl(&format!("fixtures/{scenario}/session.jsonl"))
+        .iter()
+        .filter(|e| e["dir"] == "spawn")
+        .count();
     let mut reports: Vec<String> = std::fs::read_dir(&state)
         .unwrap()
         .filter_map(|e| e.ok()?.file_name().into_string().ok())
@@ -206,7 +259,13 @@ async fn run_fixture(scenario: &str, spawner_name: &str) {
     assert_eq!(reports, want, "{scenario} ({spawner_name}): the fake CLI's reports");
     for r in &reports {
         let report: Value = serde_json::from_str(&std::fs::read_to_string(state.join(r)).unwrap()).unwrap();
-        assert_eq!(report["ok"], json!(true), "{scenario} ({spawner_name}) {r}: {report}\nErrors: {:?}\nEvents:\n{}", errors.lock().unwrap(), show(&all));
+        assert_eq!(
+            report["ok"],
+            json!(true),
+            "{scenario} ({spawner_name}) {r}: {report}\nErrors: {:?}\nEvents:\n{}",
+            errors.lock().unwrap(),
+            show(&all)
+        );
     }
 
     let path = common::temp_dir().join("events.jsonl");
@@ -232,7 +291,11 @@ async fn run_fixture(scenario: &str, spawner_name: &str) {
 /// The spawners to run fixtures with: both, or those in $AGENT_THREADS_SPAWNERS (comma-separated).
 fn spawners() -> Vec<String> {
     let all = if cfg!(unix) { "direct,shim" } else { "direct" };
-    std::env::var("AGENT_THREADS_SPAWNERS").unwrap_or_else(|_| all.into()).split(',').map(String::from).collect()
+    std::env::var("AGENT_THREADS_SPAWNERS")
+        .unwrap_or_else(|_| all.into())
+        .split(',')
+        .map(String::from)
+        .collect()
 }
 
 macro_rules! fixtures {

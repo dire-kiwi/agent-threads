@@ -23,14 +23,16 @@ use crate::harness::{HarnessSession, Message, RunCheckpoint, ThreadConfig, TurnE
 use crate::ids::{new_id, now_iso};
 use crate::permissions::{Decided, PermissionContext, PermissionDecision, PermissionPolicy, PermissionQuery, decide};
 use crate::protocol::{
-    Attachment, DeltaEventKind, Item, Resolution, ResolutionOutcome, Snapshot, Thread, ThreadEvent, ThreadRequest, Usage,
-    UserMessage,
+    Attachment, DeltaEventKind, Item, Resolution, ResolutionOutcome, Snapshot, Thread, ThreadEvent, ThreadRequest,
+    Usage, UserMessage,
 };
 use crate::reducer::{apply_event, utf16_len};
 use crate::spawner::Spawner;
 use crate::store::{RunRecord, Store, StoreError, StoreErrorKind};
 
 pub(crate) type Job = Box<dyn FnOnce(&mut Actor) + Send>;
+/// A job for a thread's session (a `S`), as [`ThreadContext::poster`] posts it.
+pub type SessionJob<S> = Box<dyn FnOnce(&mut S, &mut ThreadContext) + Send>;
 /// What's done with the user's answer to a request.
 pub type Answered = Box<dyn FnOnce(&mut Actor, Resolution) + Send>;
 type Persisted = Box<dyn FnOnce(&mut Actor, Result<(), StoreError>) + Send>;
@@ -223,7 +225,7 @@ impl ThreadContext {
 
     /// A function that posts jobs for the session (a `S`) from another task; it says whether the
     /// thread is still there to take them.
-    pub fn poster<S: HarnessSession>(&self) -> impl Fn(Box<dyn FnOnce(&mut S, &mut ThreadContext) + Send>) -> bool + Send + Sync + 'static {
+    pub fn poster<S: HarnessSession>(&self) -> impl Fn(SessionJob<S>) -> bool + Send + Sync + 'static {
         let tx = self.tx.clone();
         move |f| tx.send(Box::new(move |a: &mut Actor| a.with_session(f))).is_ok()
     }
@@ -237,12 +239,18 @@ impl ThreadContext {
         let tx = self.tx.clone();
         tokio::spawn(async move {
             let out = fut.await;
-            let _ = tx.send(Box::new(move |a: &mut Actor| a.with_session(move |s: &mut S, c| then(s, c, out))));
+            let _ = tx.send(Box::new(move |a: &mut Actor| {
+                a.with_session(move |s: &mut S, c| then(s, c, out))
+            }));
         });
     }
 
     /// Runs `f` after `after`, unless the timer is cancelled first.
-    pub fn timer<S: HarnessSession>(&self, after: Duration, f: impl FnOnce(&mut S, &mut ThreadContext) + Send + 'static) -> Timer {
+    pub fn timer<S: HarnessSession>(
+        &self,
+        after: Duration,
+        f: impl FnOnce(&mut S, &mut ThreadContext) + Send + 'static,
+    ) -> Timer {
         let cancelled = Arc::new(AtomicBool::new(false));
         let flag = cancelled.clone();
         let tx = self.tx.clone();
@@ -259,7 +267,9 @@ impl ThreadContext {
     }
 
     /// An answer to a request (for ask() and reopen()) that runs `f` with the session.
-    pub fn answered<S: HarnessSession>(f: impl FnOnce(&mut S, &mut ThreadContext, Resolution) + Send + 'static) -> Answered {
+    pub fn answered<S: HarnessSession>(
+        f: impl FnOnce(&mut S, &mut ThreadContext, Resolution) + Send + 'static,
+    ) -> Answered {
         Box::new(move |a: &mut Actor, r| a.with_session(move |s: &mut S, c| f(s, c, r)))
     }
 
@@ -273,7 +283,9 @@ impl ThreadContext {
         let e: ThreadEvent = match serde_json::from_value(event.clone()) {
             Ok(e) => e,
             Err(err) => {
-                self.error(Error::Other(format!("agent-threads made an invalid event ({err}): {event}")));
+                self.error(Error::Other(format!(
+                    "agent-threads made an invalid event ({err}): {event}"
+                )));
                 return;
             }
         };
@@ -314,7 +326,11 @@ impl ThreadContext {
             if k == "id" || k == "type" {
                 continue;
             }
-            let differs = if v.is_null() { item.get(k).is_some() } else { item.get(k) != Some(v) };
+            let differs = if v.is_null() {
+                item.get(k).is_some()
+            } else {
+                item.get(k) != Some(v)
+            };
             if differs {
                 changed.insert(k.clone(), v.clone());
             }
@@ -334,7 +350,14 @@ impl ThreadContext {
             self.streaming.push(item_id.to_string());
         }
         // Where it goes: the length of the item's text so far, the deltas before it included.
-        let offset = self.state.items.iter().rev().find(|i| i.id() == item_id).and_then(Item::streamed_text).map_or(0, utf16_len);
+        let offset = self
+            .state
+            .items
+            .iter()
+            .rev()
+            .find(|i| i.id() == item_id)
+            .and_then(Item::streamed_text)
+            .map_or(0, utf16_len);
         self.emit(json!({"type": "delta", "item_id": item_id, "kind": kind, "offset": offset, "text": text}));
     }
 
@@ -355,7 +378,9 @@ impl ThreadContext {
 
     /// The harness took in the queued message with this id. Whether it was queued.
     pub fn took_in(&mut self, id: &str) -> bool {
-        let Some(at) = self.queue.iter().position(|q| q == id) else { return false };
+        let Some(at) = self.queue.iter().position(|q| q == id) else {
+            return false;
+        };
         self.queue.remove(at);
         self.update_item(id, json!({"queued": null}));
         if let Some(turn) = &mut self.turn {
@@ -373,7 +398,12 @@ impl ThreadContext {
             // Messages still queued from before weren't delivered: they go first, in this turn, and
             // stay queued until the harness takes them in. Such a turn is a retry for them.
             let left = self.queued();
-            let turn = Turn { id: new_id("turn"), interrupted: false, carried: !left.is_empty() as u32, progressed: false };
+            let turn = Turn {
+                id: new_id("turn"),
+                interrupted: false,
+                carried: !left.is_empty() as u32,
+                progressed: false,
+            };
             let turn_id = turn.id.clone();
             self.turn = Some(turn);
             for m in &left {
@@ -386,13 +416,21 @@ impl ThreadContext {
                 t.error = None;
             });
             let mut messages: Vec<Message> = left.iter().map(queued_message).collect();
-            messages.push(Message { id, text: message.text, attachments: message.attachments });
+            messages.push(Message {
+                id,
+                text: message.text,
+                attachments: message.attachments,
+            });
             self.effects.push_back(Effect::Start(messages));
             return;
         }
         self.add_item(user_item(&id, &message, true));
         self.queue.push(id.clone());
-        self.effects.push_back(Effect::Steer(Message { id, text: message.text, attachments: message.attachments }));
+        self.effects.push_back(Effect::Steer(Message {
+            id,
+            text: message.text,
+            attachments: message.attachments,
+        }));
     }
 
     pub(crate) fn interrupt(&mut self) {
@@ -444,7 +482,10 @@ impl ThreadContext {
             .filter_map(|it| match it {
                 Item::ToolCall(c)
                     if c.turn_id.as_deref() == Some(&turn.id)
-                        && matches!(c.status, crate::protocol::ToolStatus::Running | crate::protocol::ToolStatus::Pending) =>
+                        && matches!(
+                            c.status,
+                            crate::protocol::ToolStatus::Running | crate::protocol::ToolStatus::Pending
+                        ) =>
                 {
                     Some(c.id.clone())
                 }
@@ -465,8 +506,12 @@ impl ThreadContext {
             self.emit_resolved(&id, &cancel());
         }
         let ok = end.ok && !turn.interrupted;
-        let error = (!ok && !turn.interrupted)
-            .then(|| end.error.clone().filter(|e| !e.is_empty()).unwrap_or_else(|| "The turn failed.".into()));
+        let error = (!ok && !turn.interrupted).then(|| {
+            end.error
+                .clone()
+                .filter(|e| !e.is_empty())
+                .unwrap_or_else(|| "The turn failed.".into())
+        });
         let mut result = json!({"id": new_id("tr"), "type": "turn_result", "ok": ok});
         if turn.interrupted {
             result["interrupted"] = json!(true);
@@ -504,7 +549,11 @@ impl ThreadContext {
             || (carried > 0 && !ok && !live);
         if give_up {
             self.set_thread(|t| {
-                t.status = if error.is_some() { crate::protocol::ThreadStatus::Error } else { crate::protocol::ThreadStatus::Idle };
+                t.status = if error.is_some() {
+                    crate::protocol::ThreadStatus::Error
+                } else {
+                    crate::protocol::ThreadStatus::Idle
+                };
                 t.error = error.clone();
                 t.usage = usage.clone();
             });
@@ -518,7 +567,12 @@ impl ThreadContext {
             return;
         }
         // The next turn starts straight away, so the thread doesn't go idle in between.
-        let next = Turn { id: new_id("turn"), interrupted: false, carried: carried + 1, progressed: false };
+        let next = Turn {
+            id: new_id("turn"),
+            interrupted: false,
+            carried: carried + 1,
+            progressed: false,
+        };
         let next_id = next.id.clone();
         self.turn = Some(next);
         for m in &left {
@@ -530,7 +584,8 @@ impl ThreadContext {
             t.error = None;
             t.usage = usage;
         });
-        self.effects.push_back(Effect::CarryOver(left.iter().map(queued_message).collect()));
+        self.effects
+            .push_back(Effect::CarryOver(left.iter().map(queued_message).collect()));
     }
 
     fn undelivered(&mut self, n: usize) {
@@ -539,7 +594,9 @@ impl ThreadContext {
         } else {
             format!("{n} messages weren't delivered; they go with the next one you send.")
         };
-        self.add_item(json!({"id": new_id("n"), "type": "notice", "level": "warning", "code": "undelivered", "text": text}));
+        self.add_item(
+            json!({"id": new_id("n"), "type": "notice", "level": "warning", "code": "undelivered", "text": text}),
+        );
     }
 
     // ---------- requests ----------
@@ -548,10 +605,18 @@ impl ThreadContext {
     pub fn decide(&self, query: PermissionQuery) -> Decided {
         let key = crate::permissions::permission_key(query.kind, query.server.as_deref(), &query.name);
         if let Some(&allow) = self.always.get(&key) {
-            return Decided::Now(if allow { PermissionDecision::Allow } else { PermissionDecision::Deny(None) });
+            return Decided::Now(if allow {
+                PermissionDecision::Allow
+            } else {
+                PermissionDecision::Deny(None)
+            });
         }
         let thread = self.state.thread.clone();
-        let ctx = PermissionContext { thread_id: self.thread_id.clone(), metadata: thread.metadata.clone(), thread };
+        let ctx = PermissionContext {
+            thread_id: self.thread_id.clone(),
+            metadata: thread.metadata.clone(),
+            thread,
+        };
         decide(&self.policy, query, ctx)
     }
 
@@ -559,13 +624,21 @@ impl ThreadContext {
     /// which is set `pending`), and calls `answered` when the user responds. It isn't called when
     /// the request is cancelled because its turn ended. `standing` (the tool's permission_key) lets
     /// an answer given `always` stand for the thread.
-    pub fn ask(&mut self, mut request: Value, tool_call_id: Option<&str>, answered: Answered, standing: Option<String>) -> String {
+    pub fn ask(
+        &mut self,
+        mut request: Value,
+        tool_call_id: Option<&str>,
+        answered: Answered,
+        standing: Option<String>,
+    ) -> String {
         let id = new_id(if request["type"] == "question" { "q" } else { "perm" });
         request["id"] = json!(id);
         if let Some(turn) = &self.turn {
             request["turn_id"] = json!(turn.id);
         }
-        let call = tool_call_id.and_then(|c| self.item(c)).map(|i| (i.id().to_string(), i.parent_id().map(String::from)));
+        let call = tool_call_id
+            .and_then(|c| self.item(c))
+            .map(|i| (i.id().to_string(), i.parent_id().map(String::from)));
         if let Some((call, parent)) = &call {
             request["tool_call_id"] = json!(call);
             if let Some(p) = parent {
@@ -576,11 +649,20 @@ impl ThreadContext {
         let parsed: ThreadRequest = match serde_json::from_value(request.clone()) {
             Ok(r) => r,
             Err(e) => {
-                self.error(Error::Other(format!("agent-threads made an invalid request ({e}): {request}")));
+                self.error(Error::Other(format!(
+                    "agent-threads made an invalid request ({e}): {request}"
+                )));
                 return id;
             }
         };
-        self.requests.push((id.clone(), OpenRequest { request: parsed, answered, standing }));
+        self.requests.push((
+            id.clone(),
+            OpenRequest {
+                request: parsed,
+                answered,
+                standing,
+            },
+        ));
         self.emit(json!({"type": "request.opened", "request": request}));
         self.set_thread(|t| t.status = crate::protocol::ThreadStatus::Waiting);
         id
@@ -592,8 +674,17 @@ impl ThreadContext {
         if self.requests.iter().any(|(id, _)| id == request_id) {
             return Err(answered);
         }
-        let Some(request) = self.state.requests.iter().find(|r| r.id() == request_id).cloned() else { return Err(answered) };
-        self.requests.push((request_id.to_string(), OpenRequest { request, answered, standing }));
+        let Some(request) = self.state.requests.iter().find(|r| r.id() == request_id).cloned() else {
+            return Err(answered);
+        };
+        self.requests.push((
+            request_id.to_string(),
+            OpenRequest {
+                request,
+                answered,
+                standing,
+            },
+        ));
         Ok(())
     }
 
@@ -619,7 +710,9 @@ impl ThreadContext {
 
     /// Closes a request the harness no longer wants answered.
     pub fn cancel_request(&mut self, id: &str) {
-        let Some(at) = self.requests.iter().position(|(r, _)| r == id) else { return };
+        let Some(at) = self.requests.iter().position(|(r, _)| r == id) else {
+            return;
+        };
         self.requests.remove(at);
         self.emit_resolved(id, &cancel());
         if self.requests.is_empty() && self.turn.is_some() {
@@ -634,7 +727,10 @@ impl ThreadContext {
     /// Saves the thread's run as it is now (with a spawner whose runs outlive the backend), before
     /// the driver does something that mustn't be done twice, then runs `then` with whether it
     /// could. After a restart, the run is re-attached as of this.
-    pub fn persist<S: HarnessSession>(&mut self, then: impl FnOnce(&mut S, &mut ThreadContext, Result<(), StoreError>) + Send + 'static) {
+    pub fn persist<S: HarnessSession>(
+        &mut self,
+        then: impl FnOnce(&mut S, &mut ThreadContext, Result<(), StoreError>) + Send + 'static,
+    ) {
         let then: Persisted = Box::new(move |a: &mut Actor, r| a.with_session(move |s: &mut S, c| then(s, c, r)));
         if !self.host.spawner.durable() {
             let _ = self.tx.send(Box::new(move |a: &mut Actor| then(a, Ok(()))));
@@ -667,7 +763,10 @@ impl ThreadContext {
             && Some(&before.id) != cp.as_ref().map(|c| &c.id)
         {
             if before.ended_at.is_none() {
-                runs.push(RunRecord { ended_at: Some(now.clone()), ..before.clone() });
+                runs.push(RunRecord {
+                    ended_at: Some(now.clone()),
+                    ..before.clone()
+                });
             }
             run = None;
         }
@@ -717,7 +816,13 @@ impl ThreadContext {
     fn live_text(&self) -> Option<Map<String, Value>> {
         let mut live = Map::new();
         for id in &self.streaming {
-            let now = self.state.items.iter().rev().find(|i| i.id() == id).and_then(Item::streamed_text);
+            let now = self
+                .state
+                .items
+                .iter()
+                .rev()
+                .find(|i| i.id() == id)
+                .and_then(Item::streamed_text);
             let saved = self.item(id).and_then(Item::streamed_text);
             if let (Some(now), Some(saved)) = (now, saved)
                 && now != saved
@@ -732,7 +837,13 @@ impl ThreadContext {
     /// streamed in as of it: shown again, as deltas, before the run's output is read on.
     pub(crate) fn adopt_run(&mut self, record: RunRecord) {
         let json = serde_json::to_string(&record).unwrap_or_default();
-        let live = record.data.as_ref().and_then(|d| d.get("live")).and_then(Value::as_object).cloned().unwrap_or_default();
+        let live = record
+            .data
+            .as_ref()
+            .and_then(|d| d.get("live"))
+            .and_then(Value::as_object)
+            .cloned()
+            .unwrap_or_default();
         self.run = Some((record, json));
         for (id, text) in live {
             let Some(text) = text.as_str() else { continue };
@@ -747,20 +858,12 @@ impl ThreadContext {
         }
     }
 
-    pub(crate) fn run_record(&self) -> Option<&RunRecord> {
-        self.run.as_ref().map(|(r, _)| r)
-    }
-
     /// A saved-events waiter: resolves once everything so far is saved, or with the store's error.
     pub(crate) fn saved_waiter(&mut self) -> oneshot::Receiver<Result<(), StoreError>> {
         let (tx, rx) = oneshot::channel();
         self.waiters.push(Waiter::Saved(tx));
         self.flush_queued = true;
         rx
-    }
-
-    pub(crate) fn snapshot_mut(&mut self) -> &mut Snapshot {
-        &mut self.state
     }
 
     pub(crate) fn emit_value(&mut self, event: Value) {
@@ -873,7 +976,9 @@ impl Actor {
     /// Answers an open request; does nothing if it isn't open.
     pub(crate) fn respond(&mut self, request_id: &str, resolution: Resolution) {
         let c = &mut self.core;
-        let Some(at) = c.requests.iter().position(|(id, _)| id == request_id) else { return };
+        let Some(at) = c.requests.iter().position(|(id, _)| id == request_id) else {
+            return;
+        };
         let (_, open) = c.requests.remove(at);
         // The answers to secret questions go only to the harness: what's sent and saved hides them.
         c.emit_resolved(request_id, &redact(&open.request, &resolution));
@@ -884,7 +989,8 @@ impl Actor {
             && let Some(standing) = open.standing
             && matches!(resolution.outcome, ResolutionOutcome::Allow | ResolutionOutcome::Deny)
         {
-            c.always.insert(standing, resolution.outcome == ResolutionOutcome::Allow);
+            c.always
+                .insert(standing, resolution.outcome == ResolutionOutcome::Allow);
         }
         (open.answered)(self, resolution);
         self.drain();
@@ -899,14 +1005,17 @@ impl Actor {
             self.session.checkpoint(&self.core)
         } else {
             let t = &self.core.saved.thread;
-            t.run.as_ref().filter(|r| r.spawner.to_string() == self.core.host.spawner.name()).map(|r| RunCheckpoint {
-                id: r.id.clone(),
-                offset: 0,
-                dir: None,
-                input: None,
-                state: None,
-                ended: false,
-            })
+            t.run
+                .as_ref()
+                .filter(|r| r.spawner.to_string() == self.core.host.spawner.name())
+                .map(|r| RunCheckpoint {
+                    id: r.id.clone(),
+                    offset: 0,
+                    dir: None,
+                    input: None,
+                    state: None,
+                    ended: false,
+                })
         };
         let c = &mut self.core;
         // Taken at the same moment as the events, so the run's offset and state are as of them.
@@ -923,7 +1032,10 @@ impl Actor {
                     // store lacks.
                     Err(e) if e.kind == StoreErrorKind::Seq => {
                         let last = store.last_seq(&c.thread_id).await?;
-                        let rest: Vec<Value> = values.into_iter().filter(|v| v["seq"].as_u64().unwrap_or(0) > last).collect();
+                        let rest: Vec<Value> = values
+                            .into_iter()
+                            .filter(|v| v["seq"].as_u64().unwrap_or(0) > last)
+                            .collect();
                         if rest.len() == events.len() {
                             return Err(e);
                         }
@@ -936,7 +1048,10 @@ impl Actor {
             }
             if thread_changed {
                 c.thread_changed = false;
-                if let Err(e) = store.update_thread(&serde_json::to_value(&c.state.thread).unwrap()).await {
+                if let Err(e) = store
+                    .update_thread(&serde_json::to_value(&c.state.thread).unwrap())
+                    .await
+                {
                     c.thread_changed = true;
                     return Err(e);
                 }
@@ -967,7 +1082,15 @@ impl Actor {
         for w in std::mem::take(&mut self.core.waiters) {
             match w {
                 Waiter::Saved(tx) => {
-                    let r = if all_saved { Ok(()) } else { Err(self.core.failure.clone().unwrap_or_else(|| StoreError::failed("not saved"))) };
+                    let r = if all_saved {
+                        Ok(())
+                    } else {
+                        Err(self
+                            .core
+                            .failure
+                            .clone()
+                            .unwrap_or_else(|| StoreError::failed("not saved")))
+                    };
                     let _ = tx.send(r);
                 }
                 Waiter::Persist(then) => {
@@ -1000,7 +1123,12 @@ impl Actor {
 }
 
 fn cancel() -> Resolution {
-    Resolution { always: false, answers: Default::default(), message: None, outcome: ResolutionOutcome::Cancel }
+    Resolution {
+        always: false,
+        answers: Default::default(),
+        message: None,
+        outcome: ResolutionOutcome::Cancel,
+    }
 }
 
 /// What a secret answer is shown as.
@@ -1008,7 +1136,9 @@ pub(crate) const SECRET: &str = "[secret]";
 
 /// A resolution as it may be shown and saved: a secret question's answers replaced with SECRET.
 fn redact(request: &ThreadRequest, resolution: &Resolution) -> Resolution {
-    let ThreadRequest::Question(q) = request else { return resolution.clone() };
+    let ThreadRequest::Question(q) = request else {
+        return resolution.clone();
+    };
     let secret: HashSet<&str> = q.questions.iter().filter(|q| q.secret).map(|q| q.id.as_str()).collect();
     let mut out = resolution.clone();
     for (id, a) in out.answers.iter_mut() {
@@ -1020,7 +1150,11 @@ fn redact(request: &ThreadRequest, resolution: &Resolution) -> Resolution {
 }
 
 fn queued_message(m: &UserMessage) -> Message {
-    Message { id: m.id.clone(), text: m.text.clone(), attachments: m.attachments.clone() }
+    Message {
+        id: m.id.clone(),
+        text: m.text.clone(),
+        attachments: m.attachments.clone(),
+    }
 }
 
 fn user_item(id: &str, m: &Outgoing, steered: bool) -> Value {

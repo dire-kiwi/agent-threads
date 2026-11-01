@@ -43,8 +43,17 @@ impl FileStore {
         let dir = dir.into();
         fs::create_dir_all(&dir).map_err(StoreError::failed)?;
         let (mem, rev) = load(&dir)?;
-        let inner = Inner { dir: dir.clone(), mem, files: HashMap::new(), rev, broken: None };
-        Ok(FileStore { dir, inner: Arc::new(Mutex::new(inner)) })
+        let inner = Inner {
+            dir: dir.clone(),
+            mem,
+            files: HashMap::new(),
+            rev,
+            broken: None,
+        };
+        Ok(FileStore {
+            dir,
+            inner: Arc::new(Mutex::new(inner)),
+        })
     }
 
     pub fn dir(&self) -> &Path {
@@ -56,7 +65,10 @@ impl FileStore {
     }
 
     /// Runs a write off the async runtime's threads, after every operation before it.
-    async fn write<T: Send + 'static>(&self, op: impl FnOnce(&mut Inner) -> StoreResult<T> + Send + 'static) -> StoreResult<T> {
+    async fn write<T: Send + 'static>(
+        &self,
+        op: impl FnOnce(&mut Inner) -> StoreResult<T> + Send + 'static,
+    ) -> StoreResult<T> {
         let inner = self.inner.clone();
         tokio::task::spawn_blocking(move || op(&mut inner.lock().unwrap_or_else(|e| e.into_inner())))
             .await
@@ -104,7 +116,8 @@ fn load(dir: &Path) -> StoreResult<(State, u64)> {
         let mut id: Option<String> = None;
         let mut mine: HashMap<String, (Option<RunRecord>, u64)> = HashMap::new();
         for raw in text.split('\n').filter(|l| !l.is_empty()) {
-            let line: Value = serde_json::from_str(raw).map_err(|e| StoreError::failed(format!("{}: {e}", path.display())))?;
+            let line: Value =
+                serde_json::from_str(raw).map_err(|e| StoreError::failed(format!("{}: {e}", path.display())))?;
             let run_rev = line.get("rev").and_then(Value::as_u64).unwrap_or(0);
             if let Some(thread) = line.get("thread") {
                 let tid = str_field(thread, "id").to_string();
@@ -114,12 +127,19 @@ fn load(dir: &Path) -> StoreResult<(State, u64)> {
                 continue;
             }
             let Some(tid) = &id else {
-                return Err(StoreError::failed(format!("{} doesn't start with its thread", path.display())));
+                return Err(StoreError::failed(format!(
+                    "{} doesn't start with its thread",
+                    path.display()
+                )));
             };
             if let Some(events) = line.get("events").and_then(Value::as_array) {
                 let log = state.events.get_mut(tid).unwrap();
                 for e in events {
-                    let last = log.last().and_then(|x| x.get("seq")).and_then(Value::as_u64).unwrap_or(0);
+                    let last = log
+                        .last()
+                        .and_then(|x| x.get("seq"))
+                        .and_then(Value::as_u64)
+                        .unwrap_or(0);
                     if e.get("seq").and_then(Value::as_u64).unwrap_or(0) > last {
                         log.push(e.clone());
                     }
@@ -191,7 +211,9 @@ impl Inner {
         }
         if result.is_err() {
             for (id, size) in written.into_iter().rev() {
-                let Some((f, at)) = self.files.get_mut(&id) else { continue };
+                let Some((f, at)) = self.files.get_mut(&id) else {
+                    continue;
+                };
                 match f.set_len(size).and_then(|_| f.sync_data()) {
                     Ok(()) => *at = size,
                     Err(e) => self.broken = Some(e.to_string()),
@@ -202,7 +224,11 @@ impl Inner {
     }
 
     fn known(&self, id: &str) -> StoreResult<()> {
-        if self.mem.threads.contains_key(id) { Ok(()) } else { Err(StoreError::not_found(id)) }
+        if self.mem.threads.contains_key(id) {
+            Ok(())
+        } else {
+            Err(StoreError::not_found(id))
+        }
     }
 
     /// The thread a run was in before, if putting it in another moves it out of that one's file.

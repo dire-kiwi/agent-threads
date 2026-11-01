@@ -8,7 +8,12 @@ use crate::protocol::{DeltaEventKind, Item, Snapshot, Thread, ThreadEvent, Threa
 
 /// A thread's state before any of its events.
 pub fn initial_state(thread: Thread) -> Snapshot {
-    Snapshot { thread, items: Vec::new(), requests: Vec::new(), seq: 0 }
+    Snapshot {
+        thread,
+        items: Vec::new(),
+        requests: Vec::new(),
+        seq: 0,
+    }
 }
 
 /// Applies `event` to `state`. Events for another thread, and saved events the state already has
@@ -22,7 +27,9 @@ pub fn apply_event(state: &mut Snapshot, event: &ThreadEvent) {
         if d.seq < state.seq || d.text.is_empty() {
             return;
         }
-        let Some(item) = find_mut(&mut state.items, &d.item_id) else { return };
+        let Some(item) = find_mut(&mut state.items, &d.item_id) else {
+            return;
+        };
         let text = match (item, d.kind) {
             (Item::AssistantMessage(m), DeltaEventKind::Text) => &mut m.text,
             (Item::Reasoning(r), DeltaEventKind::Reasoning) => &mut r.text,
@@ -84,7 +91,9 @@ pub fn is_gap(state: &Snapshot, event: &ThreadEvent) -> bool {
 /// The item with the patch's fields set, and those set to null removed; `id` and `type` stay. A
 /// patch that would make it invalid leaves it as it was.
 pub(crate) fn patch_item(item: &mut Item, patch: &Map<String, Value>) {
-    let Ok(Value::Object(mut fields)) = serde_json::to_value(&*item) else { return };
+    let Ok(Value::Object(mut fields)) = serde_json::to_value(&*item) else {
+        return;
+    };
     for (k, v) in patch {
         if k == "id" || k == "type" {
             continue;

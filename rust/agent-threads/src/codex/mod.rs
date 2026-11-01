@@ -32,9 +32,12 @@ use crate::protocol::{DeltaEventKind, Item, Resolution, ResolutionOutcome, ToolK
 use crate::skills::write_skills;
 use crate::spawner::{ExitStatus, HarnessProcess, ProcessEvent, Signal, SpawnOptions};
 use crate::store::RunRecord;
-use crate::thread::{SECRET, ThreadContext, Timer};
+use crate::thread::{SECRET, SessionJob, ThreadContext, Timer};
 use crate::tools::{Cancellation, Tool, ToolContext, ToolOutput, run_tool};
-use home::{SessionState, Totals, default_codex_home, prepare_codex_home, read_session_state, user_codex_home, write_session_state};
+use home::{
+    SessionState, Totals, default_codex_home, prepare_codex_home, read_session_state, user_codex_home,
+    write_session_state,
+};
 use translate::{
     APP_SERVER, codex_done, codex_policy, codex_tool, codex_usage, is_tool_item, mcp_server_config, questions, todos,
     totals_as_usage,
@@ -250,7 +253,6 @@ enum Ready {
 
 /// One `codex app-server` process, and what's needed to read it.
 struct Run {
-    id: String,
     proc: Option<Arc<dyn HarnessProcess>>,
     offset: Option<u64>,
     spawned: bool,
@@ -308,9 +310,8 @@ struct Run {
 }
 
 impl Run {
-    fn new(id: String) -> Self {
+    fn new() -> Self {
         Run {
-            id,
             proc: None,
             offset: None,
             spawned: false,
@@ -354,7 +355,8 @@ impl Run {
     }
 
     fn write(&self, msg: &Value) {
-        if !self.exited && !self.detached
+        if !self.exited
+            && !self.detached
             && let Some(p) = &self.proc
         {
             p.write(&msg.to_string());
@@ -429,7 +431,15 @@ impl Run {
             held: self.held.iter().cloned().collect(),
             rpc: RpcState {
                 next: self.next,
-                pending: self.pending.iter().map(|p| PendingState { id: p.id, method: p.method.clone(), meta: p.meta.clone() }).collect(),
+                pending: self
+                    .pending
+                    .iter()
+                    .map(|p| PendingState {
+                        id: p.id,
+                        method: p.method.clone(),
+                        meta: p.meta.clone(),
+                    })
+                    .collect(),
             },
             launched: self.launched.clone(),
             stale: false,
@@ -485,7 +495,11 @@ fn id_string(id: &Value) -> String {
 #[derive(Clone)]
 enum Wanted {
     /// One of its requests: not resolved, its turn not over, its run not gone.
-    Request { run: String, id: Value, turn: Option<String> },
+    Request {
+        run: String,
+        id: Value,
+        turn: Option<String>,
+    },
     /// A call on the loopback MCP server: its turn not over, its run not gone.
     Run { run: String, turn: Option<String> },
 }
@@ -513,7 +527,7 @@ pub(crate) struct CodexSession {
 
 /// The app's tools on the loopback MCP server, served from the thread's task.
 struct LoopbackTools {
-    post: Box<dyn Fn(Box<dyn FnOnce(&mut CodexSession, &mut ThreadContext) + Send>) -> bool + Send + Sync>,
+    post: Box<dyn Fn(SessionJob<CodexSession>) -> bool + Send + Sync>,
     run: String,
 }
 
@@ -533,7 +547,8 @@ impl ToolServer for LoopbackTools {
         let (tx, rx) = oneshot::channel();
         let run = self.run.clone();
         (self.post)(Box::new(move |s, ctx| s.mcp_app_tool(ctx, &run, name, args, tx)));
-        rx.await.unwrap_or_else(|_| ToolOutput::error("The tool call was cancelled."))
+        rx.await
+            .unwrap_or_else(|_| ToolOutput::error("The tool call was cancelled."))
     }
 }
 
@@ -545,12 +560,27 @@ fn tool_spec(t: &dyn Tool) -> Value {
 /// The app's tools that go on the MCP server: those the session hasn't as dynamic tools, as they
 /// are now.
 fn mcp_tools(ctx: &ThreadContext, run: &Run) -> Vec<Arc<dyn Tool>> {
-    ctx.config().tools.iter().filter(|t| run.dynamic_tool(t.name()) != Some(&tool_spec(t.as_ref()))).cloned().collect()
+    ctx.config()
+        .tools
+        .iter()
+        .filter(|t| run.dynamic_tool(t.name()) != Some(&tool_spec(t.as_ref())))
+        .cloned()
+        .collect()
 }
 
 impl CodexSession {
     fn new(o: Arc<CodexOptions>) -> Self {
-        CodexSession { o, runs: HashMap::new(), current: None, last: None, stale: false, stop_timer: None, stop_at: None, tmp: None, closed: false }
+        CodexSession {
+            o,
+            runs: HashMap::new(),
+            current: None,
+            last: None,
+            stale: false,
+            stop_timer: None,
+            stop_at: None,
+            tmp: None,
+            closed: false,
+        }
     }
 
     fn run(&mut self, id: &str) -> Option<&mut Run> {
@@ -579,18 +609,33 @@ impl CodexSession {
     // ---------- JSON-RPC ----------
 
     /// Sends a request; `then` gets its answer (as a job, if the process has gone already).
-    fn request(&mut self, ctx: &ThreadContext, run: &str, method: &str, params: Value, meta: Option<Value>, then: Then) {
+    fn request(
+        &mut self,
+        ctx: &ThreadContext,
+        run: &str,
+        method: &str,
+        params: Value,
+        meta: Option<Value>,
+        then: Then,
+    ) {
         let fail = |message: String, then: Then| {
             let run = run.to_string();
             ctx.post::<CodexSession>(move |s, ctx| then(s, ctx, &run, Err(RpcError { message })));
         };
-        let Some(r) = self.runs.get_mut(run) else { return fail("the run has gone".into(), then) };
+        let Some(r) = self.runs.get_mut(run) else {
+            return fail("the run has gone".into(), then);
+        };
         if let Some(closed) = r.rpc_closed.clone() {
             return fail(closed, then);
         }
         let id = r.next;
         r.next += 1;
-        r.pending.push(Pending { id, method: method.to_string(), meta, then });
+        r.pending.push(Pending {
+            id,
+            method: method.to_string(),
+            meta,
+            then,
+        });
         r.write(&json!({"id": id, "method": method, "params": params}));
     }
 
@@ -600,10 +645,15 @@ impl CodexSession {
             return false;
         }
         let Some(r) = self.runs.get_mut(run) else { return true };
-        let Some(at) = r.pending.iter().position(|p| msg["id"].as_u64() == Some(p.id)) else { return true };
+        let Some(at) = r.pending.iter().position(|p| msg["id"].as_u64() == Some(p.id)) else {
+            return true;
+        };
         let p = r.pending.remove(at);
         let result = if msg.get("error").is_some_and(|e| !e.is_null()) {
-            let message = msg["error"]["message"].as_str().map(String::from).unwrap_or_else(|| format!("{} failed", p.method));
+            let message = msg["error"]["message"]
+                .as_str()
+                .map(String::from)
+                .unwrap_or_else(|| format!("{} failed", p.method));
             Err(RpcError { message })
         } else {
             Ok(match msg.get("result") {
@@ -618,7 +668,9 @@ impl CodexSession {
     // ---------- turns ----------
 
     fn when_ready(&mut self, ctx: &mut ThreadContext, run: &str, f: ReadyFn) {
-        let Some(r) = self.runs.get_mut(run) else { return f(self, ctx, Err("the run has gone".into())) };
+        let Some(r) = self.runs.get_mut(run) else {
+            return f(self, ctx, Err("the run has gone".into()));
+        };
         match &mut r.ready {
             Ready::Waiting(w) => w.push(f),
             Ready::Started(t) => {
@@ -638,7 +690,9 @@ impl CodexSession {
             Ok(t) => Ready::Started(t.clone()),
             Err(e) => Ready::Failed(e.clone()),
         };
-        let Ready::Waiting(waiters) = std::mem::replace(&mut r.ready, ready) else { return };
+        let Ready::Waiting(waiters) = std::mem::replace(&mut r.ready, ready) else {
+            return;
+        };
         for f in waiters {
             f(self, ctx, result.clone());
         }
@@ -646,7 +700,9 @@ impl CodexSession {
 
     /// Calls `f` with the running turn's id once it's known, or none if none is coming.
     fn with_turn(&mut self, ctx: &mut ThreadContext, run: &str, f: TurnFn) {
-        let Some(r) = self.runs.get_mut(run) else { return f(self, ctx, None) };
+        let Some(r) = self.runs.get_mut(run) else {
+            return f(self, ctx, None);
+        };
         if let Some(t) = r.turn_id.clone() {
             f(self, ctx, Some(t));
         } else if r.starting && !r.exited {
@@ -728,7 +784,10 @@ impl CodexSession {
 
     /// Messages are being sent to the process, as this input.
     fn sent(&mut self, run: &str, ids: Vec<String>, input: &[Value]) -> Sent {
-        let sent = Sent { ids, key: echo_key(&Value::Array(input.to_vec())) };
+        let sent = Sent {
+            ids,
+            key: echo_key(&Value::Array(input.to_vec())),
+        };
         if let Some(r) = self.run(run) {
             r.sent.push(sent.clone());
             r.held.extend(sent.ids.iter().cloned());
@@ -757,7 +816,14 @@ impl CodexSession {
         self.turn_ended(ctx, run);
         if ctx.turn_id().is_some() {
             let live = self.live_id().is_some();
-            ctx.end_turn(TurnEnd { ok: false, error: Some(error.to_string()), ..Default::default() }, live);
+            ctx.end_turn(
+                TurnEnd {
+                    ok: false,
+                    error: Some(error.to_string()),
+                    ..Default::default()
+                },
+                live,
+            );
         }
     }
 
@@ -775,7 +841,7 @@ impl CodexSession {
         }
         self.stale = false;
         let id = new_id("run");
-        self.runs.insert(id.clone(), Run::new(id.clone()));
+        self.runs.insert(id.clone(), Run::new());
         self.current = Some(id.clone());
         self.spawn_waiting(ctx);
         id
@@ -880,7 +946,13 @@ impl CodexSession {
         env.insert("CODEX_HOME".into(), home.to_string_lossy().into());
         let options = SpawnOptions {
             command: o.bin.clone(),
-            args: o.bin_args.iter().cloned().chain(["app-server".to_string()]).chain(o.args.iter().cloned()).collect(),
+            args: o
+                .bin_args
+                .iter()
+                .cloned()
+                .chain(["app-server".to_string()])
+                .chain(o.args.iter().cloned())
+                .collect(),
             cwd: ctx.thread().cwd.as_ref().map(PathBuf::from),
             env,
             thread_id: ctx.thread_id().to_string(),
@@ -891,7 +963,11 @@ impl CodexSession {
             Err(e) => return self.spawn_failed(ctx, id, e.to_string()),
         };
         let t = ctx.thread();
-        let launched = Launched { model: t.model.clone(), effort: t.effort.clone(), permission_mode: t.permission_mode.map(|m| m.to_string()) };
+        let launched = Launched {
+            model: t.model.clone(),
+            effort: t.effort.clone(),
+            permission_mode: t.permission_mode.map(|m| m.to_string()),
+        };
         let run = self.run(id).unwrap();
         run.proc = Some(proc);
         run.launched = Some(launched);
@@ -920,7 +996,14 @@ impl CodexSession {
     }
 
     fn spawn_failed(&mut self, ctx: &mut ThreadContext, id: &str, error: String) {
-        self.exited(ctx, id, ExitStatus { error: Some(error.clone()), ..Default::default() });
+        self.exited(
+            ctx,
+            id,
+            ExitStatus {
+                error: Some(error.clone()),
+                ..Default::default()
+            },
+        );
         self.set_ready(ctx, id, Err(error));
     }
 
@@ -973,7 +1056,11 @@ impl CodexSession {
             json!({"cwds": cwds, "forceReload": true}),
             None,
             Box::new(|s, ctx, run, r| match r {
-                Err(e) => s.start_failed(ctx, run, format!("Codex couldn't list its skills, to leave out the user's: {}", e.message)),
+                Err(e) => s.start_failed(
+                    ctx,
+                    run,
+                    format!("Codex couldn't list its skills, to leave out the user's: {}", e.message),
+                ),
                 Ok(r) => {
                     let Some(run_state) = s.run(run) else { return };
                     // Codex reports paths with symlinks resolved, so the app's are told apart by
@@ -983,7 +1070,9 @@ impl CodexSession {
                     for e in r["data"].as_array().into_iter().flatten() {
                         for sk in e["skills"].as_array().into_iter().flatten() {
                             let Some(path) = sk["path"].as_str() else { continue };
-                            if sk["scope"] == "system" || own.as_ref().is_some_and(|o| canonical(Path::new(path)).starts_with(o)) {
+                            if sk["scope"] == "system"
+                                || own.as_ref().is_some_and(|o| canonical(Path::new(path)).starts_with(o))
+                            {
                                 continue;
                             }
                             if !paths.iter().any(|p| p == path) {
@@ -1001,7 +1090,9 @@ impl CodexSession {
     /// thread/resume for a thread that has a session, or thread/start (also if Codex hasn't the
     /// session).
     fn start_thread(&mut self, ctx: &mut ThreadContext, run: &str) {
-        let Some(session) = ctx.thread().session_id.clone() else { return self.new_thread(ctx, run) };
+        let Some(session) = ctx.thread().session_id.clone() else {
+            return self.new_thread(ctx, run);
+        };
         let r = self.run(run).unwrap();
         // Codex keeps the dynamic tools the session started with, and resuming can't change them.
         let state = read_session_state(Path::new(&r.home), &session);
@@ -1039,8 +1130,11 @@ impl CodexSession {
 
     /// thread/start: a new session, with the app's tools as dynamic tools (or on the MCP server).
     fn new_thread(&mut self, ctx: &mut ThreadContext, run: &str) {
-        let dynamic: Vec<Value> =
-            if self.o.app_tools == AppTools::Mcp { Vec::new() } else { ctx.config().tools.iter().map(|t| tool_spec(t.as_ref())).collect() };
+        let dynamic: Vec<Value> = if self.o.app_tools == AppTools::Mcp {
+            Vec::new()
+        } else {
+            ctx.config().tools.iter().map(|t| tool_spec(t.as_ref())).collect()
+        };
         self.run(run).unwrap().dynamic = Some(dynamic);
         let params = match self.thread_params(ctx, run, true) {
             Ok(p) => p,
@@ -1055,7 +1149,11 @@ impl CodexSession {
             Box::new(|s, ctx, run, r| match r {
                 Ok(r) => s.new_thread_started(ctx, run, &r),
                 Err(e) => {
-                    let has_dynamic = s.runs.get(run).and_then(|r| r.dynamic.as_ref()).is_some_and(|d| !d.is_empty());
+                    let has_dynamic = s
+                        .runs
+                        .get(run)
+                        .and_then(|r| r.dynamic.as_ref())
+                        .is_some_and(|d| !d.is_empty());
                     if !has_dynamic || !mentions_dynamic_tools(&e.message) {
                         return s.start_failed(ctx, run, e.message);
                     }
@@ -1084,7 +1182,10 @@ impl CodexSession {
     fn new_thread_started(&mut self, ctx: &mut ThreadContext, run: &str, r: &Value) {
         let Some(rs) = self.run(run) else { return };
         // A new session's totals start at nothing.
-        rs.baseline = Some(Totals { cache_write_input_tokens: Some(0), ..Default::default() });
+        rs.baseline = Some(Totals {
+            cache_write_input_tokens: Some(0),
+            ..Default::default()
+        });
         if let Some(t) = r["thread"]["id"].as_str() {
             self.save_state(ctx, run, t);
         }
@@ -1111,7 +1212,14 @@ impl CodexSession {
             self.stop(ctx, run, true, true);
             if ctx.turn_id().is_some() {
                 let live = self.live_id().is_some();
-                ctx.end_turn(TurnEnd { ok: false, error: Some(format!("Codex couldn't start the thread: {error}")), ..Default::default() }, live);
+                ctx.end_turn(
+                    TurnEnd {
+                        ok: false,
+                        error: Some(format!("Codex couldn't start the thread: {error}")),
+                        ..Default::default()
+                    },
+                    live,
+                );
             }
         }
         self.set_ready(ctx, run, Err(error));
@@ -1121,7 +1229,10 @@ impl CodexSession {
     fn save_state(&self, ctx: &ThreadContext, run: &str, session: &str) {
         let Some(r) = self.runs.get(run) else { return };
         let Some(dynamic) = &r.dynamic else { return };
-        let state = SessionState { dynamic_tools: dynamic.clone(), totals: r.baseline.clone() };
+        let state = SessionState {
+            dynamic_tools: dynamic.clone(),
+            totals: r.baseline.clone(),
+        };
         if let Err(e) = write_session_state(Path::new(&r.home), session, &state) {
             ctx.error(Error::Other(format!("Codex's session state couldn't be saved: {e}")));
         }
@@ -1149,9 +1260,16 @@ impl CodexSession {
         r.mcp_app = !mcp_tools(ctx, r).is_empty();
         if r.mcp_app {
             if r.mcp.is_none() {
-                let server = Arc::new(LoopbackTools { post, run: run.to_string() });
-                let mcp = serve_tools(APP_SERVER, server, None).map_err(|e| format!("the app's tools couldn't be served: {e}"))?;
-                r.mcp_endpoint = Some(Endpoint { port: mcp.port, token: mcp.token.clone() });
+                let server = Arc::new(LoopbackTools {
+                    post,
+                    run: run.to_string(),
+                });
+                let mcp = serve_tools(APP_SERVER, server, None)
+                    .map_err(|e| format!("the app's tools couldn't be served: {e}"))?;
+                r.mcp_endpoint = Some(Endpoint {
+                    port: mcp.port,
+                    token: mcp.token.clone(),
+                });
                 r.mcp = Some(mcp);
             }
             let mcp = r.mcp.as_ref().unwrap();
@@ -1174,7 +1292,11 @@ impl CodexSession {
             cfg.insert("mcp_servers".into(), Value::Object(servers));
         }
         if !r.hidden_skills.is_empty() {
-            let skills: Vec<Value> = r.hidden_skills.iter().map(|p| json!({"path": p, "enabled": false})).collect();
+            let skills: Vec<Value> = r
+                .hidden_skills
+                .iter()
+                .map(|p| json!({"path": p, "enabled": false}))
+                .collect();
             cfg.insert("skills".into(), json!({"config": skills}));
         }
         let (approval, sandbox) = codex_policy(t.permission_mode);
@@ -1185,7 +1307,11 @@ impl CodexSession {
         if let Some(m) = &t.model {
             params["model"] = json!(m);
         }
-        let dynamic = if fresh { r.dynamic.clone().unwrap_or_default() } else { Vec::new() };
+        let dynamic = if fresh {
+            r.dynamic.clone().unwrap_or_default()
+        } else {
+            Vec::new()
+        };
         if !dynamic.is_empty() {
             let tools: Vec<Value> = dynamic
                 .into_iter()
@@ -1241,7 +1367,14 @@ impl CodexSession {
         if !retired && ctx.turn_id().is_some() {
             self.clear_stop();
             let live = self.live_id().is_some();
-            ctx.end_turn(TurnEnd { ok: false, error: Some(error), ..Default::default() }, live);
+            ctx.end_turn(
+                TurnEnd {
+                    ok: false,
+                    error: Some(error),
+                    ..Default::default()
+                },
+                live,
+            );
         }
         if let Some(run) = self.runs.get(id) {
             run.finish();
@@ -1249,7 +1382,8 @@ impl CodexSession {
         let ready_error = message;
         self.set_ready(ctx, id, Err(ready_error));
         let keep = [self.current.clone(), self.last.clone()];
-        self.runs.retain(|rid, r| !r.exited || keep.iter().any(|k| k.as_deref() == Some(rid)));
+        self.runs
+            .retain(|rid, r| !r.exited || keep.iter().any(|k| k.as_deref() == Some(rid)));
         self.spawn_waiting(ctx);
     }
 
@@ -1287,7 +1421,9 @@ impl CodexSession {
     }
 
     fn line(&mut self, ctx: &mut ThreadContext, id: &str, line: &str) {
-        let Ok(m) = serde_json::from_str::<Value>(line) else { return };
+        let Ok(m) = serde_json::from_str::<Value>(line) else {
+            return;
+        };
         if !m.is_object() {
             return;
         }
@@ -1321,15 +1457,28 @@ impl CodexSession {
 
     fn notification(&mut self, ctx: &mut ThreadContext, run: &str, m: &Value) {
         let p = &m["params"];
-        let Some(parent) = self.parent(run, &p["threadId"]) else { return };
+        let Some(parent) = self.parent(run, &p["threadId"]) else {
+            return;
+        };
         let own = parent.is_none();
-        let child = if own { None } else { p["threadId"].as_str().map(String::from) };
+        let child = if own {
+            None
+        } else {
+            p["threadId"].as_str().map(String::from)
+        };
         match m["method"].as_str().unwrap_or("") {
             method @ ("item/started" | "item/completed") => {
                 self.item(ctx, run, &p["item"], method == "item/completed", parent, child);
             }
             "item/agentMessage/delta" | "item/plan/delta" => {
-                self.delta(ctx, run, p["itemId"].as_str().unwrap_or(""), DeltaEventKind::Text, &p["delta"], parent.as_deref());
+                self.delta(
+                    ctx,
+                    run,
+                    p["itemId"].as_str().unwrap_or(""),
+                    DeltaEventKind::Text,
+                    &p["delta"],
+                    parent.as_deref(),
+                );
             }
             "item/reasoning/summaryTextDelta" => {
                 // Summary parts are joined by a blank line, as the completed item's text is.
@@ -1342,15 +1491,36 @@ impl CodexSession {
                     && index > part
                     && has_delta
                 {
-                    self.delta(ctx, run, item_id, DeltaEventKind::Reasoning, &json!("\n\n"), parent.as_deref());
+                    self.delta(
+                        ctx,
+                        run,
+                        item_id,
+                        DeltaEventKind::Reasoning,
+                        &json!("\n\n"),
+                        parent.as_deref(),
+                    );
                 }
                 if let Some(index) = index {
                     self.run(run).unwrap().summary_part.insert(item_id.to_string(), index);
                 }
-                self.delta(ctx, run, item_id, DeltaEventKind::Reasoning, &p["delta"], parent.as_deref());
+                self.delta(
+                    ctx,
+                    run,
+                    item_id,
+                    DeltaEventKind::Reasoning,
+                    &p["delta"],
+                    parent.as_deref(),
+                );
             }
             "item/reasoning/textDelta" => {
-                self.delta(ctx, run, p["itemId"].as_str().unwrap_or(""), DeltaEventKind::Reasoning, &p["delta"], parent.as_deref());
+                self.delta(
+                    ctx,
+                    run,
+                    p["itemId"].as_str().unwrap_or(""),
+                    DeltaEventKind::Reasoning,
+                    &p["delta"],
+                    parent.as_deref(),
+                );
             }
             "turn/plan/updated" => self.plan(ctx, p, parent.as_deref()),
             "turn/started" => {
@@ -1365,7 +1535,13 @@ impl CodexSession {
                 if own {
                     self.turn_completed(ctx, run, &p["turn"]);
                 } else {
-                    self.child_done(ctx, run, p["threadId"].as_str().unwrap_or(""), &p["turn"], parent.as_deref().unwrap());
+                    self.child_done(
+                        ctx,
+                        run,
+                        p["threadId"].as_str().unwrap_or(""),
+                        &p["turn"],
+                        parent.as_deref().unwrap(),
+                    );
                 }
             }
             "thread/tokenUsage/updated" => {
@@ -1390,14 +1566,17 @@ impl CodexSession {
                 }
                 if p["willRetry"].as_bool().unwrap_or(false) {
                     let text = p["error"]["message"].as_str().unwrap_or("Codex is retrying.");
-                    ctx.add_item(json!({"id": new_id("n"), "type": "notice", "level": "warning", "code": "retry", "text": text}));
+                    ctx.add_item(
+                        json!({"id": new_id("n"), "type": "notice", "level": "warning", "code": "retry", "text": text}),
+                    );
                 } else {
                     self.run(run).unwrap().error = p["error"]["message"].as_str().map(String::from);
                 }
             }
             "mcpServer/startupStatus/updated" => {
                 let name = p["name"].as_str().unwrap_or("");
-                if own && p["status"] == "failed" && (ctx.config().mcp_servers.contains_key(name) || name == APP_SERVER) {
+                if own && p["status"] == "failed" && (ctx.config().mcp_servers.contains_key(name) || name == APP_SERVER)
+                {
                     let text = match p["error"].as_str().filter(|e| !e.is_empty()) {
                         Some(e) => format!("The MCP server {name} didn't start: {e}"),
                         None => format!("The MCP server {name} didn't start."),
@@ -1420,11 +1599,25 @@ impl CodexSession {
         }
     }
 
-    fn delta(&mut self, ctx: &mut ThreadContext, run: &str, item_id: &str, kind: DeltaEventKind, text: &Value, parent: Option<&str>) {
-        let Some(text) = text.as_str().filter(|t| !t.is_empty()) else { return };
+    fn delta(
+        &mut self,
+        ctx: &mut ThreadContext,
+        run: &str,
+        item_id: &str,
+        kind: DeltaEventKind,
+        text: &Value,
+        parent: Option<&str>,
+    ) {
+        let Some(text) = text.as_str().filter(|t| !t.is_empty()) else {
+            return;
+        };
         let r = self.run(run).unwrap();
         if r.streamed.insert(item_id.to_string()) {
-            let ty = if kind == DeltaEventKind::Text { "assistant_message" } else { "reasoning" };
+            let ty = if kind == DeltaEventKind::Text {
+                "assistant_message"
+            } else {
+                "reasoning"
+            };
             let mut item = json!({"id": item_id, "type": ty, "text": ""});
             if let Some(p) = parent {
                 item["parent_id"] = json!(p);
@@ -1434,7 +1627,15 @@ impl CodexSession {
         ctx.delta(item_id, kind, text);
     }
 
-    fn item(&mut self, ctx: &mut ThreadContext, run: &str, item: &Value, done: bool, parent: Option<String>, child: Option<String>) {
+    fn item(
+        &mut self,
+        ctx: &mut ThreadContext,
+        run: &str,
+        item: &Value,
+        done: bool,
+        parent: Option<String>,
+        child: Option<String>,
+    ) {
         if !item.is_object() {
             return;
         }
@@ -1457,10 +1658,21 @@ impl CodexSession {
                 if !done {
                     return;
                 }
-                let join = |v: &Value| v.as_array().into_iter().flatten().filter_map(Value::as_str).collect::<Vec<_>>().join("\n\n");
+                let join = |v: &Value| {
+                    v.as_array()
+                        .into_iter()
+                        .flatten()
+                        .filter_map(Value::as_str)
+                        .collect::<Vec<_>>()
+                        .join("\n\n")
+                };
                 let text = if ty == "reasoning" {
                     let summary = join(&item["summary"]);
-                    if summary.is_empty() { join(&item["content"]) } else { summary }
+                    if summary.is_empty() {
+                        join(&item["content"])
+                    } else {
+                        summary
+                    }
                 } else {
                     item["text"].as_str().unwrap_or("").to_string()
                 };
@@ -1473,7 +1685,11 @@ impl CodexSession {
                 if r.streamed.contains(&item_id) {
                     ctx.update_item(&item_id, json!({"text": text}));
                 } else if !text.is_empty() {
-                    let ty = if ty == "reasoning" { "reasoning" } else { "assistant_message" };
+                    let ty = if ty == "reasoning" {
+                        "reasoning"
+                    } else {
+                        "assistant_message"
+                    };
                     ctx.add_item(under(json!({"id": item_id, "type": ty, "text": text})));
                 }
                 return;
@@ -1494,7 +1710,12 @@ impl CodexSession {
                     return;
                 }
                 let r = self.run(run).unwrap();
-                for t in item["receiverThreadIds"].as_array().into_iter().flatten().filter_map(Value::as_str) {
+                for t in item["receiverThreadIds"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .filter_map(Value::as_str)
+                {
                     r.children.insert(t.to_string(), item_id.clone());
                 }
                 if item["status"] == "failed" {
@@ -1504,7 +1725,11 @@ impl CodexSession {
             }
             "contextCompaction" => {
                 if !done && ctx.item(&item_id).is_none() {
-                    let trigger = if self.runs.get(run).is_some_and(|r| r.compacting) { "manual" } else { "auto" };
+                    let trigger = if self.runs.get(run).is_some_and(|r| r.compacting) {
+                        "manual"
+                    } else {
+                        "auto"
+                    };
                     ctx.add_item(under(json!({"id": item_id, "type": "compaction", "trigger": trigger})));
                 }
                 return;
@@ -1519,7 +1744,11 @@ impl CodexSession {
         if item["type"] == "mcpToolCall" {
             r.mcp_calls.retain(|c| c.id != item_id);
             if !done {
-                let args = if item["arguments"].is_null() { json!({}) } else { item["arguments"].clone() };
+                let args = if item["arguments"].is_null() {
+                    json!({})
+                } else {
+                    item["arguments"].clone()
+                };
                 r.mcp_calls.push(McpCall {
                     id: item_id.clone(),
                     server: item["server"].as_str().unwrap_or("").into(),
@@ -1576,7 +1805,9 @@ impl CodexSession {
 
     fn took_in(&mut self, ctx: &mut ThreadContext, run: &str, key: &str) {
         let r = self.run(run).unwrap();
-        let Some(at) = r.sent.iter().position(|s| s.key == key) else { return };
+        let Some(at) = r.sent.iter().position(|s| s.key == key) else {
+            return;
+        };
         let ids = r.sent[at].ids.clone();
         // Sent more than once (steered, then carried over), they're all taken in now.
         r.sent.retain(|s| !s.ids.iter().any(|id| ids.contains(id)));
@@ -1617,7 +1848,13 @@ impl CodexSession {
         let failed = turn["status"] == "failed";
         let end = TurnEnd {
             ok: turn["status"] == "completed",
-            error: failed.then(|| turn["error"]["message"].as_str().map(String::from).or(error).unwrap_or_else(|| "The turn failed.".into())),
+            error: failed.then(|| {
+                turn["error"]["message"]
+                    .as_str()
+                    .map(String::from)
+                    .or(error)
+                    .unwrap_or_else(|| "The turn failed.".into())
+            }),
             usage: usage.and_then(|u| serde_json::from_value(u).ok()),
             duration_ms: turn["durationMs"].as_f64().map(|d| d as u64),
         };
@@ -1634,7 +1871,11 @@ impl CodexSession {
         };
         let last = self.runs.get(run).and_then(|r| r.last_child.get(child).cloned());
         let content = if status == "failed" {
-            turn["error"]["message"].as_str().map(String::from).or(last).unwrap_or_default()
+            turn["error"]["message"]
+                .as_str()
+                .map(String::from)
+                .or(last)
+                .unwrap_or_default()
         } else {
             last.unwrap_or_default()
         };
@@ -1645,7 +1886,13 @@ impl CodexSession {
 
     /// A request of Codex's; `resume` when it's one that was open when the backend restarted: the
     /// turn it came in, and the request the user was asked with, which is taken up again.
-    fn server_request(&mut self, ctx: &mut ThreadContext, run: &str, m: Value, resume: Option<(Option<String>, Option<String>)>) {
+    fn server_request(
+        &mut self,
+        ctx: &mut ThreadContext,
+        run: &str,
+        m: Value,
+        resume: Option<(Option<String>, Option<String>)>,
+    ) {
         let id = m["id"].clone();
         let p = m["params"].clone();
         let parent = self.parent(run, &p["threadId"]).flatten();
@@ -1655,10 +1902,27 @@ impl CodexSession {
         };
         let r = self.run(run).unwrap();
         match r.open.iter_mut().find(|(x, _)| *x == id) {
-            Some(o) => o.1 = OpenRequest { turn: turn.clone(), msg: m.clone(), started: false },
-            None => r.open.push((id.clone(), OpenRequest { turn: turn.clone(), msg: m.clone(), started: false })),
+            Some(o) => {
+                o.1 = OpenRequest {
+                    turn: turn.clone(),
+                    msg: m.clone(),
+                    started: false,
+                }
+            }
+            None => r.open.push((
+                id.clone(),
+                OpenRequest {
+                    turn: turn.clone(),
+                    msg: m.clone(),
+                    started: false,
+                },
+            )),
         }
-        let wanted = Wanted::Request { run: run.to_string(), id: id.clone(), turn };
+        let wanted = Wanted::Request {
+            run: run.to_string(),
+            id: id.clone(),
+            turn,
+        };
         let decision = |ok: bool| json!({"decision": if ok { "accept" } else { "decline" }});
         match m["method"].as_str().unwrap_or("") {
             "item/commandExecution/requestApproval" => {
@@ -1676,18 +1940,40 @@ impl CodexSession {
                 let q = self.query(ctx, &t, item_id.as_deref(), p["reason"].as_str(), parent.as_deref());
                 let w = wanted.clone();
                 let done: Done = Box::new(move |s, ctx, ok, _| s.answer(ctx, &w, decision(ok)));
-                self.permit(ctx, Permit { run: run.into(), request: Some(id), query: q, wanted, existing }, done);
+                self.permit(
+                    ctx,
+                    Permit {
+                        run: run.into(),
+                        request: Some(id),
+                        query: q,
+                        wanted,
+                        existing,
+                    },
+                    done,
+                );
             }
             "item/fileChange/requestApproval" => {
                 let item_id = p["itemId"].as_str().map(String::from);
                 let t = match item_id.as_deref().and_then(|i| ctx.item(i)) {
                     Some(it) => obj(serde_json::to_value(it).unwrap()),
-                    None => obj(json!({"name": "fileChange", "kind": "edit", "input": {"grantRoot": p.get("grantRoot").cloned().unwrap_or(Value::Null)}})),
+                    None => obj(
+                        json!({"name": "fileChange", "kind": "edit", "input": {"grantRoot": p.get("grantRoot").cloned().unwrap_or(Value::Null)}}),
+                    ),
                 };
                 let q = self.query(ctx, &t, item_id.as_deref(), p["reason"].as_str(), parent.as_deref());
                 let w = wanted.clone();
                 let done: Done = Box::new(move |s, ctx, ok, _| s.answer(ctx, &w, decision(ok)));
-                self.permit(ctx, Permit { run: run.into(), request: Some(id), query: q, wanted, existing }, done);
+                self.permit(
+                    ctx,
+                    Permit {
+                        run: run.into(),
+                        request: Some(id),
+                        query: q,
+                        wanted,
+                        existing,
+                    },
+                    done,
+                );
             }
             "item/permissions/requestApproval" => {
                 let reason = p["reason"].as_str().filter(|r| !r.is_empty());
@@ -1695,14 +1981,26 @@ impl CodexSession {
                 if let Some(r) = reason {
                     input["reason"] = json!(r);
                 }
-                let t = obj(json!({"name": "permissions", "kind": "other", "input": input, "title": reason.unwrap_or("More permissions")}));
+                let t = obj(
+                    json!({"name": "permissions", "kind": "other", "input": input, "title": reason.unwrap_or("More permissions")}),
+                );
                 let q = self.query(ctx, &t, p["itemId"].as_str(), reason, parent.as_deref());
                 let (w, permissions) = (wanted.clone(), p["permissions"].clone());
                 let done: Done = Box::new(move |s, ctx, ok, _| {
                     let permissions = if ok { permissions } else { json!({}) };
                     s.answer(ctx, &w, json!({"permissions": permissions, "scope": "turn"}));
                 });
-                self.permit(ctx, Permit { run: run.into(), request: Some(id), query: q, wanted, existing }, done);
+                self.permit(
+                    ctx,
+                    Permit {
+                        run: run.into(),
+                        request: Some(id),
+                        query: q,
+                        wanted,
+                        existing,
+                    },
+                    done,
+                );
             }
             "mcpServer/elicitation/request" => self.elicitation(ctx, run, id, &p, wanted, parent, existing),
             "item/tool/requestUserInput" => self.user_input(ctx, run, id, &p, wanted, parent, existing),
@@ -1720,7 +2018,9 @@ impl CodexSession {
             Wanted::Request { run, id, turn } => (run, turn, Some(id)),
             Wanted::Run { run, turn } => (run, turn, None),
         };
-        self.runs.get(run).is_some_and(|r| id.is_none_or(|id| r.is_open(id)) && !r.exited && !r.retired && !r.detached)
+        self.runs
+            .get(run)
+            .is_some_and(|r| id.is_none_or(|id| r.is_open(id)) && !r.exited && !r.retired && !r.detached)
             && self.current.as_deref() == Some(run.as_str())
             && ctx.turn_id() == turn.as_deref()
     }
@@ -1737,13 +2037,29 @@ impl CodexSession {
     }
 
     /// A permission query about a call (the item, or what the request says about it).
-    fn query(&self, ctx: &ThreadContext, t: &Map<String, Value>, item_id: Option<&str>, reason: Option<&str>, parent: Option<&str>) -> PermissionQuery {
+    fn query(
+        &self,
+        ctx: &ThreadContext,
+        t: &Map<String, Value>,
+        item_id: Option<&str>,
+        reason: Option<&str>,
+        parent: Option<&str>,
+    ) -> PermissionQuery {
         let known = item_id.filter(|i| ctx.item(i).is_some());
         PermissionQuery {
             name: t.get("name").and_then(Value::as_str).unwrap_or("").into(),
-            kind: t.get("kind").and_then(|k| serde_json::from_value(k.clone()).ok()).unwrap_or(ToolKind::Other),
+            kind: t
+                .get("kind")
+                .and_then(|k| serde_json::from_value(k.clone()).ok())
+                .unwrap_or(ToolKind::Other),
             input: t.get("input").cloned().unwrap_or(Value::Null),
-            title: Some(t.get("title").and_then(Value::as_str).map(String::from).unwrap_or_else(|| title(t))).filter(|s| !s.is_empty()),
+            title: Some(
+                t.get("title")
+                    .and_then(Value::as_str)
+                    .map(String::from)
+                    .unwrap_or_else(|| title(t)),
+            )
+            .filter(|s| !s.is_empty()),
             server: t.get("server").and_then(Value::as_str).map(String::from),
             reason: reason.filter(|r| !r.is_empty()).map(String::from),
             tool_call_id: known.map(String::from),
@@ -1756,7 +2072,11 @@ impl CodexSession {
     /// keep their order.
     fn permit(&mut self, ctx: &mut ThreadContext, p: Permit, done: Done) {
         // The user was asked before the backend restarted: they still are.
-        let decided = if p.existing.is_some() { Decided::Now(PermissionDecision::Ask) } else { ctx.decide(p.query.clone()) };
+        let decided = if p.existing.is_some() {
+            Decided::Now(PermissionDecision::Ask)
+        } else {
+            ctx.decide(p.query.clone())
+        };
         match decided {
             Decided::Now(d) => self.apply_permit(ctx, p, done, d),
             Decided::Later(f) => ctx.spawn::<CodexSession, _>(f, move |s, ctx, d| s.apply_permit(ctx, p, done, d)),
@@ -1792,14 +2112,23 @@ impl CodexSession {
                             ctx.update_item(c, json!({"status": "running"}));
                         }
                     } else {
-                        let message = res.message.filter(|m| !m.is_empty()).unwrap_or_else(|| "The user didn't allow this.".into());
+                        let message = res
+                            .message
+                            .filter(|m| !m.is_empty())
+                            .unwrap_or_else(|| "The user didn't allow this.".into());
                         done(s, ctx, false, message);
                         if let Some(c) = &call2 {
                             ctx.update_item(c, json!({"status": "denied"}));
                         }
                     }
                 });
-                let ours = ctx.ask_again(p.existing.as_deref(), request, call.as_deref(), answered, Some(standing));
+                let ours = ctx.ask_again(
+                    p.existing.as_deref(),
+                    request,
+                    call.as_deref(),
+                    answered,
+                    Some(standing),
+                );
                 if let Some(rid) = p.request
                     && let Some(r) = self.run(&p.run)
                 {
@@ -1808,7 +2137,12 @@ impl CodexSession {
                 }
             }
             PermissionDecision::Deny(why) => {
-                done(self, ctx, false, why.unwrap_or_else(|| "The app's permission policy doesn't allow this.".into()));
+                done(
+                    self,
+                    ctx,
+                    false,
+                    why.unwrap_or_else(|| "The app's permission policy doesn't allow this.".into()),
+                );
                 if let Some(c) = &call {
                     ctx.update_item(c, json!({"status": "denied"}));
                 }
@@ -1818,7 +2152,16 @@ impl CodexSession {
 
     /// An MCP server asking: Codex asks this way whether a tool on it may be called.
     #[allow(clippy::too_many_arguments)]
-    fn elicitation(&mut self, ctx: &mut ThreadContext, run: &str, id: Value, p: &Value, wanted: Wanted, parent: Option<String>, existing: Option<String>) {
+    fn elicitation(
+        &mut self,
+        ctx: &mut ThreadContext,
+        run: &str,
+        id: Value,
+        p: &Value,
+        wanted: Wanted,
+        parent: Option<String>,
+        existing: Option<String>,
+    ) {
         let server = p["serverName"].as_str().unwrap_or("").to_string();
         let fields = p["requestedSchema"]["properties"].as_object().map_or(0, |o| o.len());
         // Only an elicitation that needs nothing filled in ("may it call this tool?") can be
@@ -1841,11 +2184,20 @@ impl CodexSession {
             Some(n) => r
                 .mcp_calls
                 .iter()
-                .filter(|c| c.server == server && c.thread == thread && &c.name == n && params.as_ref().is_none_or(|p| &c.args == p))
+                .filter(|c| {
+                    c.server == server
+                        && c.thread == thread
+                        && &c.name == n
+                        && params.as_ref().is_none_or(|p| &c.args == p)
+                })
                 .collect(),
             None => Vec::new(),
         };
-        let it = if matching.len() == 1 { ctx.item(&matching[0].id).cloned() } else { None };
+        let it = if matching.len() == 1 {
+            ctx.item(&matching[0].id).cloned()
+        } else {
+            None
+        };
         let input = params.or_else(|| match &it {
             Some(Item::ToolCall(c)) => Some(c.input.clone()),
             _ => None,
@@ -1858,14 +2210,41 @@ impl CodexSession {
         let q = self.query(ctx, &obj(t), it_id.as_deref(), None, parent.as_deref());
         let w = wanted.clone();
         let done: Done = Box::new(move |s, ctx, ok, _| {
-            s.answer(ctx, &w, if ok { json!({"action": "accept", "content": {}}) } else { json!({"action": "decline"}) })
+            s.answer(
+                ctx,
+                &w,
+                if ok {
+                    json!({"action": "accept", "content": {}})
+                } else {
+                    json!({"action": "decline"})
+                },
+            )
         });
-        self.permit(ctx, Permit { run: run.into(), request: Some(id), query: q, wanted, existing }, done);
+        self.permit(
+            ctx,
+            Permit {
+                run: run.into(),
+                request: Some(id),
+                query: q,
+                wanted,
+                existing,
+            },
+            done,
+        );
     }
 
     /// A question for the user: a request_user_input call, and a question request for it.
     #[allow(clippy::too_many_arguments)]
-    fn user_input(&mut self, ctx: &mut ThreadContext, run: &str, id: Value, p: &Value, wanted: Wanted, parent: Option<String>, existing: Option<String>) {
+    fn user_input(
+        &mut self,
+        ctx: &mut ThreadContext,
+        run: &str,
+        id: Value,
+        p: &Value,
+        wanted: Wanted,
+        parent: Option<String>,
+        existing: Option<String>,
+    ) {
         let qs = questions(&p["questions"]);
         let item_id = p["itemId"].as_str().unwrap_or("").to_string();
         if ctx.item(&item_id).is_none() {
@@ -1880,7 +2259,11 @@ impl CodexSession {
             return ctx.update_item(&item_id, json!({"status": "completed", "result": {"content": ""}}));
         }
         let order: Vec<String> = qs.iter().map(|q| js_str(&q["id"])).collect();
-        let secret: HashSet<String> = qs.iter().filter(|q| q["secret"] == true).map(|q| js_str(&q["id"])).collect();
+        let secret: HashSet<String> = qs
+            .iter()
+            .filter(|q| q["secret"] == true)
+            .map(|q| js_str(&q["id"]))
+            .collect();
         let (w, call) = (wanted.clone(), item_id.clone());
         let answered = ThreadContext::answered::<CodexSession>(move |s, ctx, res: Resolution| {
             if res.outcome != ResolutionOutcome::Answer {
@@ -1898,13 +2281,26 @@ impl CodexSession {
                 let a = &res.answers[q];
                 answers.insert(q.clone(), json!({"answers": a}));
                 // The real answer goes only to Codex; the call's result is shown and saved.
-                let shown = if secret.contains(q) && !a.is_empty() { SECRET.to_string() } else { a.join(", ") };
+                let shown = if secret.contains(q) && !a.is_empty() {
+                    SECRET.to_string()
+                } else {
+                    a.join(", ")
+                };
                 lines.push(format!("{q}: {shown}"));
             }
             s.answer(ctx, &w, json!({"answers": answers}));
-            ctx.update_item(&call, json!({"status": "completed", "result": {"content": lines.join("\n")}}));
+            ctx.update_item(
+                &call,
+                json!({"status": "completed", "result": {"content": lines.join("\n")}}),
+            );
         });
-        let ours = ctx.ask_again(existing.as_deref(), json!({"type": "question", "questions": qs}), Some(&item_id), answered, None);
+        let ours = ctx.ask_again(
+            existing.as_deref(),
+            json!({"type": "question", "questions": qs}),
+            Some(&item_id),
+            answered,
+            None,
+        );
         let r = self.run(run).unwrap();
         r.asked.retain(|(x, _)| *x != id);
         r.asked.push((id, ours));
@@ -1912,9 +2308,22 @@ impl CodexSession {
 
     /// item/tool/call: one of the app's tools, given as a dynamic tool.
     #[allow(clippy::too_many_arguments)]
-    fn dynamic_tool(&mut self, ctx: &mut ThreadContext, run: &str, id: Value, p: &Value, wanted: Wanted, parent: Option<String>, existing: Option<String>) {
+    fn dynamic_tool(
+        &mut self,
+        ctx: &mut ThreadContext,
+        run: &str,
+        id: Value,
+        p: &Value,
+        wanted: Wanted,
+        parent: Option<String>,
+        existing: Option<String>,
+    ) {
         let reply = |s: &mut CodexSession, ctx: &ThreadContext, w: &Wanted, text: &str, ok: bool| {
-            s.answer(ctx, w, json!({"contentItems": [{"type": "inputText", "text": text}], "success": ok}));
+            s.answer(
+                ctx,
+                w,
+                json!({"contentItems": [{"type": "inputText", "text": text}], "success": ok}),
+            );
         };
         let name = p["tool"].as_str().unwrap_or("").to_string();
         let r = self.runs.get(run).unwrap();
@@ -1922,7 +2331,14 @@ impl CodexSession {
         // answered with where the app's tools are now.
         let elsewhere = || {
             let names: Vec<String> = mcp_tools(ctx, r).iter().map(|t| t.name().to_string()).collect();
-            if names.is_empty() { String::new() } else { format!(" The app's other tools are on its {APP_SERVER} MCP server: {}.", names.join(", ")) }
+            if names.is_empty() {
+                String::new()
+            } else {
+                format!(
+                    " The app's other tools are on its {APP_SERVER} MCP server: {}.",
+                    names.join(", ")
+                )
+            }
         };
         let Some(tool) = ctx.config().tool(&name).cloned() else {
             let text = if r.dynamic_tool(&name).is_some() {
@@ -1936,7 +2352,11 @@ impl CodexSession {
             let text = format!("The tool {name} has changed: call it on the {APP_SERVER} MCP server instead.");
             return reply(self, ctx, &wanted, &text, false);
         }
-        let args = if p["arguments"].is_null() { json!({}) } else { p["arguments"].clone() };
+        let args = if p["arguments"].is_null() {
+            json!({})
+        } else {
+            p["arguments"].clone()
+        };
         let t = obj(json!({"name": name, "kind": "app", "input": args, "title": name}));
         let call_id = p["callId"].as_str().map(String::from);
         let q = self.query(ctx, &t, call_id.as_deref(), None, parent.as_deref());
@@ -1954,7 +2374,13 @@ impl CodexSession {
             }
             ctx.persist::<CodexSession>(move |s, ctx, saved| {
                 if saved.is_err() {
-                    return reply(s, ctx, &w, "The app couldn't save its state, so it didn't run this tool.", false);
+                    return reply(
+                        s,
+                        ctx,
+                        &w,
+                        "The app couldn't save its state, so it didn't run this tool.",
+                        false,
+                    );
                 }
                 if !s.is_wanted(ctx, &w) || s.runs.get(&run_id).is_none_or(|r| r.detached) {
                     return;
@@ -1972,20 +2398,48 @@ impl CodexSession {
                 });
             });
         });
-        self.permit(ctx, Permit { run: run.into(), request: Some(id), query: q, wanted, existing }, done);
+        self.permit(
+            ctx,
+            Permit {
+                run: run.into(),
+                request: Some(id),
+                query: q,
+                wanted,
+                existing,
+            },
+            done,
+        );
     }
 
     /// tools/call on the loopback MCP server: one of the app's tools.
-    fn mcp_app_tool(&mut self, ctx: &mut ThreadContext, run: &str, name: String, args: Value, reply: oneshot::Sender<ToolOutput>) {
+    fn mcp_app_tool(
+        &mut self,
+        ctx: &mut ThreadContext,
+        run: &str,
+        name: String,
+        args: Value,
+        reply: oneshot::Sender<ToolOutput>,
+    ) {
         let Some(r) = self.runs.get(run) else { return };
         if !mcp_tools(ctx, r).iter().any(|t| t.name() == name) {
             let _ = reply.send(ToolOutput::error(format!("There's no tool {name}.")));
             return;
         }
         // The call it is, if only one running call matches it.
-        let matching: Vec<&McpCall> = r.mcp_calls.iter().filter(|c| c.server == APP_SERVER && c.name == name && c.args == args).collect();
-        let it = if matching.len() == 1 { ctx.item(&matching[0].id).cloned() } else { None };
-        let wanted = Wanted::Run { run: run.into(), turn: ctx.turn_id().map(String::from) };
+        let matching: Vec<&McpCall> = r
+            .mcp_calls
+            .iter()
+            .filter(|c| c.server == APP_SERVER && c.name == name && c.args == args)
+            .collect();
+        let it = if matching.len() == 1 {
+            ctx.item(&matching[0].id).cloned()
+        } else {
+            None
+        };
+        let wanted = Wanted::Run {
+            run: run.into(),
+            turn: ctx.turn_id().map(String::from),
+        };
         let t = obj(json!({"name": name, "kind": "app", "input": args, "title": name}));
         let it_id = it.as_ref().map(|i| i.id().to_string());
         let q = self.query(ctx, &t, it_id.as_deref(), None, it.as_ref().and_then(|i| i.parent_id()));
@@ -2000,10 +2454,27 @@ impl CodexSession {
                 let _ = reply.send(fut.await);
             });
         });
-        self.permit(ctx, Permit { run: run.into(), request: None, query: q, wanted, existing: None }, done);
+        self.permit(
+            ctx,
+            Permit {
+                run: run.into(),
+                request: None,
+                query: q,
+                wanted,
+                existing: None,
+            },
+            done,
+        );
     }
 
-    fn run_app(&self, ctx: &ThreadContext, run: &str, name: &str, args: Value, tool_call_id: Option<String>) -> BoxFuture<ToolOutput> {
+    fn run_app(
+        &self,
+        ctx: &ThreadContext,
+        run: &str,
+        name: &str,
+        args: Value,
+        tool_call_id: Option<String>,
+    ) -> BoxFuture<ToolOutput> {
         let Some(tool) = ctx.config().tool(name).cloned() else {
             let text = format!("There's no tool {name}.");
             return Box::pin(async move { ToolOutput::error(text) });
@@ -2024,7 +2495,10 @@ impl CodexSession {
             r.take_open(&id);
             // It went with the backend, and isn't run again, since it may have done what it does.
             let text = "The app restarted while this tool was running, so it may or may not have finished.";
-            return r.respond(&id, json!({"contentItems": [{"type": "inputText", "text": text}], "success": false}));
+            return r.respond(
+                &id,
+                json!({"contentItems": [{"type": "inputText", "text": text}], "success": false}),
+            );
         }
         let existing = self.runs.get(run).and_then(|r| r.asked(&id));
         self.server_request(ctx, run, open.msg, Some((open.turn, existing)));
@@ -2089,7 +2563,9 @@ impl HarnessSession for CodexSession {
             ctx,
             &run.clone(),
             Box::new(move |s, ctx, turn| {
-                let Some(turn) = turn else { return s.refused(&run, &sent) };
+                let Some(turn) = turn else {
+                    return s.refused(&run, &sent);
+                };
                 let thread_id = s.runs.get(&run).and_then(|r| r.thread_id.clone());
                 let params = json!({"threadId": thread_id, "expectedTurnId": turn, "input": input});
                 let meta = json!({"sent": sent});
@@ -2168,7 +2644,12 @@ impl HarnessSession for CodexSession {
         if let Some(id) = self.current.clone() {
             self.stop(ctx, &id, false, false);
         }
-        let waits: Vec<watch::Receiver<bool>> = self.runs.values().filter(|r| !r.exited).map(|r| r.done.subscribe()).collect();
+        let waits: Vec<watch::Receiver<bool>> = self
+            .runs
+            .values()
+            .filter(|r| !r.exited)
+            .map(|r| r.done.subscribe())
+            .collect();
         let tmp = self.tmp.take();
         Box::pin(async move {
             for mut w in waits {
@@ -2210,20 +2691,28 @@ impl HarnessSession for CodexSession {
     }
 
     fn reattach(&mut self, ctx: &mut ThreadContext, record: &RunRecord) -> bool {
-        let Some(st) = record.data.as_ref().and_then(|d| d.get("state")).and_then(|s| serde_json::from_value::<RunState>(s.clone()).ok())
+        let Some(st) = record
+            .data
+            .as_ref()
+            .and_then(|d| d.get("state"))
+            .and_then(|s| serde_json::from_value::<RunState>(s.clone()).ok())
         else {
             return false;
         };
         if st.v != 1 || !ctx.spawner().can_attach() || self.current.is_some() {
             return false;
         }
-        let mut run = Run::new(record.id.clone());
+        let mut run = Run::new();
         run.restore(&st);
         run.spawned = true;
         run.offset = record.offset;
         // Our requests still unanswered: their answers do what they would have.
         for p in &st.rpc.pending {
-            let sent: Option<Sent> = p.meta.as_ref().and_then(|m| m.get("sent")).and_then(|s| serde_json::from_value(s.clone()).ok());
+            let sent: Option<Sent> = p
+                .meta
+                .as_ref()
+                .and_then(|m| m.get("sent"))
+                .and_then(|s| serde_json::from_value(s.clone()).ok());
             let mine = sent.filter(|s| run.sent.contains(s));
             let then: Then = match p.method.as_str() {
                 "turn/start" => match mine {
@@ -2253,12 +2742,20 @@ impl HarnessSession for CodexSession {
                 }),
                 _ => Box::new(|_, _, _, _| {}),
             };
-            run.pending.push(Pending { id: p.id, method: p.method.clone(), meta: p.meta.clone(), then });
+            run.pending.push(Pending {
+                id: p.id,
+                method: p.method.clone(),
+                meta: p.meta.clone(),
+                then,
+            });
         }
         let (proc, rx) = match ctx.spawner().attach(record) {
             Ok(p) => p,
             Err(e) => {
-                ctx.error(Error::Other(format!("Codex's run {} can't be followed: {e}", record.id)));
+                ctx.error(Error::Other(format!(
+                    "Codex's run {} can't be followed: {e}",
+                    record.id
+                )));
                 return false;
             }
         };
@@ -2269,15 +2766,25 @@ impl HarnessSession for CodexSession {
         forward_events::<CodexSession>(ctx, &id, rx, |s, ctx, id, e| s.event(ctx, id, e));
         // The app's tools on the loopback MCP server, where Codex was told they are.
         if let Some(ep) = &st.mcp {
-            let server = Arc::new(LoopbackTools { post: Box::new(ctx.poster::<CodexSession>()), run: id.clone() });
+            let server = Arc::new(LoopbackTools {
+                post: Box::new(ctx.poster::<CodexSession>()),
+                run: id.clone(),
+            });
             match serve_tools(APP_SERVER, server, Some((ep.port, ep.token.clone()))) {
                 Ok(mcp) => self.run(&id).unwrap().mcp = Some(mcp),
-                Err(e) => self.notice(ctx, &format!("The app's tools aren't available to this turn any more: {e}")),
+                Err(e) => self.notice(
+                    ctx,
+                    &format!("The app's tools aren't available to this turn any more: {e}"),
+                ),
             }
         }
         // A process started with other options than the thread's now is replaced at the next turn.
         let t = ctx.thread();
-        let now = Launched { model: t.model.clone(), effort: t.effort.clone(), permission_mode: t.permission_mode.map(|m| m.to_string()) };
+        let now = Launched {
+            model: t.model.clone(),
+            effort: t.effort.clone(),
+            permission_mode: t.permission_mode.map(|m| m.to_string()),
+        };
         self.stale = st.stale || st.launched.as_ref() != Some(&now);
         // Codex's requests that were open: the user's questions are taken up again, an app tool
         // that was running is answered (not run again), and the rest are dealt with again.
@@ -2346,7 +2853,11 @@ fn mentions_dynamic_tools(message: &str) -> bool {
     }
     m.match_indices("dynamic").any(|(at, _)| {
         let rest = &m[at + 7..];
-        rest.starts_with("tools") || rest.chars().next().is_some_and(|c| rest[c.len_utf8()..].starts_with("tools"))
+        rest.starts_with("tools")
+            || rest
+                .chars()
+                .next()
+                .is_some_and(|c| rest[c.len_utf8()..].starts_with("tools"))
     })
 }
 
@@ -2359,8 +2870,15 @@ fn canonical(path: &Path) -> PathBuf {
 /// has.
 fn echo_key(input: &Value) -> String {
     let parts: Vec<&Value> = input.as_array().map(|a| a.iter().collect()).unwrap_or_default();
-    let texts: Vec<&Value> = parts.iter().filter(|p| p["type"] == "text").map(|p| &p["text"]).collect();
-    let images = parts.iter().filter(|p| p["type"] == "image" || p["type"] == "localImage").count();
+    let texts: Vec<&Value> = parts
+        .iter()
+        .filter(|p| p["type"] == "text")
+        .map(|p| &p["text"])
+        .collect();
+    let images = parts
+        .iter()
+        .filter(|p| p["type"] == "image" || p["type"] == "localImage")
+        .count();
     json!([texts, images]).to_string()
 }
 
@@ -2376,5 +2894,9 @@ fn exit_error(status: &ExitStatus, stderr: &VecDeque<String>, during_turn: bool)
     let during = if during_turn { " during the turn" } else { "" };
     let tail = stderr.iter().cloned().collect::<Vec<_>>().join("\n");
     let tail = tail.trim();
-    if tail.is_empty() { format!("Codex {how}{during}.") } else { format!("Codex {how}{during}.\n{}", last_chars(tail, 2000)) }
+    if tail.is_empty() {
+        format!("Codex {how}{during}.")
+    } else {
+        format!("Codex {how}{during}.\n{}", last_chars(tail, 2000))
+    }
 }

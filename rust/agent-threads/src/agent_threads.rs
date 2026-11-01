@@ -174,7 +174,9 @@ impl Handle {
     /// Resolves once every event so far is saved.
     async fn saved(&self) -> Result<()> {
         let rx = self.call(|a| a.core.saved_waiter()).await?;
-        rx.await.map_err(|_| Error::Command("the thread is closed".into()))?.map_err(Error::Store)
+        rx.await
+            .map_err(|_| Error::Command("the thread is closed".into()))?
+            .map_err(Error::Store)
     }
 }
 
@@ -207,11 +209,16 @@ impl Default for AgentThreads {
 impl AgentThreads {
     pub fn new(options: Options) -> Self {
         let harnesses = if options.harnesses.is_empty() {
-            vec![crate::claude::claude_code(Default::default()), crate::codex::codex(Default::default())]
+            vec![
+                crate::claude::claude_code(Default::default()),
+                crate::codex::codex(Default::default()),
+            ]
         } else {
             options.harnesses
         };
-        let on_error = options.on_error.unwrap_or_else(|| Arc::new(|e| eprintln!("agent-threads: {e}")));
+        let on_error = options
+            .on_error
+            .unwrap_or_else(|| Arc::new(|e| eprintln!("agent-threads: {e}")));
         let (events, _) = broadcast::channel(options.event_capacity.max(16));
         AgentThreads {
             inner: Arc::new(Inner {
@@ -253,7 +260,9 @@ impl AgentThreads {
         }
         let cwd = match options.cwd {
             Some(c) => c,
-            None => std::env::current_dir().map_err(|e| Error::Command(format!("there's no working directory: {e}")))?,
+            None => {
+                std::env::current_dir().map_err(|e| Error::Command(format!("there's no working directory: {e}")))?
+            }
         };
         let mut thread = json!({
             "id": options.id.unwrap_or_else(|| new_id("th")),
@@ -263,7 +272,11 @@ impl AgentThreads {
             "cwd": cwd.to_string_lossy(),
             "created_at": now_iso(),
         });
-        for (k, v) in [("title", &options.title), ("model", &options.model), ("effort", &options.effort)] {
+        for (k, v) in [
+            ("title", &options.title),
+            ("model", &options.model),
+            ("effort", &options.effort),
+        ] {
             if let Some(v) = v.as_ref().filter(|v| !v.is_empty()) {
                 thread[k] = json!(v);
             }
@@ -276,7 +289,9 @@ impl AgentThreads {
         i.store.create_thread(&thread).await?;
         let mut threads = i.threads.lock().await;
         let (handle, mut actor, rx) = self.actor(initial_state(typed.clone()))?;
-        actor.core.emit_value(json!({"type": "thread.updated", "thread": thread}));
+        actor
+            .core
+            .emit_value(json!({"type": "thread.updated", "thread": thread}));
         self.run(&handle, actor, rx);
         threads.insert(typed.id.clone(), handle.clone());
         drop(threads);
@@ -288,7 +303,11 @@ impl AgentThreads {
     /// stored: e.g. for a thread created before the app restarted. They apply from its next turn.
     pub async fn configure(&self, thread_id: &str, capabilities: Capabilities) -> Result<()> {
         self.open()?;
-        self.inner.configs.lock().unwrap().insert(thread_id.to_string(), capabilities);
+        self.inner
+            .configs
+            .lock()
+            .unwrap()
+            .insert(thread_id.to_string(), capabilities);
         let handle = self.inner.threads.lock().await.get(thread_id).cloned();
         if let Some(h) = handle {
             let (config, policy) = (self.config(thread_id), self.policy(thread_id));
@@ -313,7 +332,12 @@ impl AgentThreads {
         {
             return Ok(Some(t));
         }
-        Ok(self.inner.store.get_thread(thread_id).await?.and_then(|t| serde_json::from_value(t).ok()))
+        Ok(self
+            .inner
+            .store
+            .get_thread(thread_id)
+            .await?
+            .and_then(|t| serde_json::from_value(t).ok()))
     }
 
     /// Every thread, oldest first.
@@ -322,7 +346,9 @@ impl AgentThreads {
         let live = self.inner.threads.lock().await.clone();
         let mut out = Vec::new();
         for t in stored {
-            let Ok(t) = serde_json::from_value::<Thread>(t) else { continue };
+            let Ok(t) = serde_json::from_value::<Thread>(t) else {
+                continue;
+            };
             match live.get(&t.id) {
                 Some(h) => out.push(h.call(|a| a.core.thread().clone()).await.unwrap_or(t)),
                 None => out.push(t),
@@ -364,7 +390,10 @@ impl AgentThreads {
         }
         let events = self.inner.store.read_events(thread_id, seq, limit).await?;
         // A newer backend's event types are left out (their seqs are still gone past).
-        Ok(events.into_iter().filter_map(|e| serde_json::from_value(e).ok()).collect())
+        Ok(events
+            .into_iter()
+            .filter_map(|e| serde_json::from_value(e).ok())
+            .collect())
     }
 
     /// Every thread's events, deltas included, from now on. A subscriber that falls more than
@@ -454,12 +483,24 @@ impl AgentThreads {
     pub async fn handle(&self, command: Command) -> Result<()> {
         match command {
             Command::Send(c) => {
-                self.send(&c.thread_id, &c.text, SendOptions { attachments: c.attachments, client_id: c.client_id }).await
+                self.send(
+                    &c.thread_id,
+                    &c.text,
+                    SendOptions {
+                        attachments: c.attachments,
+                        client_id: c.client_id,
+                    },
+                )
+                .await
             }
             Command::Interrupt(c) => self.interrupt(&c.thread_id).await,
             Command::Respond(c) => self.respond(&c.thread_id, &c.request_id, c.resolution).await,
             Command::SetOptions(c) => {
-                let o = ThreadOptions { model: c.model, effort: c.effort, permission_mode: c.permission_mode };
+                let o = ThreadOptions {
+                    model: c.model,
+                    effort: c.effort,
+                    permission_mode: c.permission_mode,
+                };
                 self.set_options(&c.thread_id, o).await
             }
         }
@@ -477,10 +518,20 @@ impl AgentThreads {
     pub async fn send(&self, thread_id: &str, text: &str, options: SendOptions) -> Result<()> {
         // Checked as the protocol's schema has it (contentEncoding: base64) before anything is
         // touched.
-        if let Some(i) = options.attachments.iter().position(|a| a.data.as_deref().is_some_and(|d| !is_base64(d))) {
-            return Err(Error::Command(format!("that isn't a valid command: attachments[{i}].data should be base64")));
+        if let Some(i) = options
+            .attachments
+            .iter()
+            .position(|a| a.data.as_deref().is_some_and(|d| !is_base64(d)))
+        {
+            return Err(Error::Command(format!(
+                "that isn't a valid command: attachments[{i}].data should be base64"
+            )));
         }
-        let message = Outgoing { text: text.to_string(), attachments: options.attachments, client_id: options.client_id };
+        let message = Outgoing {
+            text: text.to_string(),
+            attachments: options.attachments,
+            client_id: options.client_id,
+        };
         self.ready(thread_id).await?.call(move |a| a.core.send(message)).await
     }
 
@@ -492,7 +543,10 @@ impl AgentThreads {
     /// Answers an open request; does nothing if it isn't open.
     pub async fn respond(&self, thread_id: &str, request_id: &str, resolution: Resolution) -> Result<()> {
         let request_id = request_id.to_string();
-        self.ready(thread_id).await?.call(move |a| a.respond(&request_id, resolution)).await
+        self.ready(thread_id)
+            .await?
+            .call(move |a| a.respond(&request_id, resolution))
+            .await
     }
 
     /// Changes the thread's model, effort or permission mode, from its next turn.
@@ -584,8 +638,14 @@ impl AgentThreads {
 
     /// Saves every thread's events and a snapshot, then lets the thread go.
     async fn save_all(&self) -> Result<()> {
-        let handles: Vec<(String, Handle)> =
-            self.inner.threads.lock().await.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
+        let handles: Vec<(String, Handle)> = self
+            .inner
+            .threads
+            .lock()
+            .await
+            .iter()
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect();
         let mut failed = Vec::new();
         for (id, h) in handles {
             if let Err(e) = h.saved().await {
@@ -649,8 +709,12 @@ impl AgentThreads {
         }
         let mut mcp_servers = all.mcp_servers.clone();
         mcp_servers.extend(own.mcp_servers.clone());
-        let prompts: Vec<&str> =
-            [&all.system_prompt, &own.system_prompt].into_iter().flatten().map(String::as_str).filter(|s| !s.is_empty()).collect();
+        let prompts: Vec<&str> = [&all.system_prompt, &own.system_prompt]
+            .into_iter()
+            .flatten()
+            .map(String::as_str)
+            .filter(|s| !s.is_empty())
+            .collect();
         ThreadConfig {
             tools,
             mcp_servers,
@@ -660,23 +724,47 @@ impl AgentThreads {
     }
 
     fn policy(&self, thread_id: &str) -> PermissionPolicy {
-        let own = self.inner.configs.lock().unwrap().get(thread_id).and_then(|c| c.permissions.clone());
-        own.or_else(|| self.inner.capabilities.permissions.clone()).unwrap_or_default()
+        let own = self
+            .inner
+            .configs
+            .lock()
+            .unwrap()
+            .get(thread_id)
+            .and_then(|c| c.permissions.clone());
+        own.or_else(|| self.inner.capabilities.permissions.clone())
+            .unwrap_or_default()
     }
 
     fn host(&self) -> Arc<Host> {
         let i = &self.inner;
-        Arc::new(Host { store: i.store.clone(), spawner: i.spawner.clone(), events: i.events.clone(), on_error: i.on_error.clone() })
+        Arc::new(Host {
+            store: i.store.clone(),
+            spawner: i.spawner.clone(),
+            events: i.events.clone(),
+            on_error: i.on_error.clone(),
+        })
     }
 
     /// A thread's actor, not yet running.
     fn actor(&self, state: Snapshot) -> Result<(Handle, Actor, tokio::sync::mpsc::UnboundedReceiver<Job>)> {
         let id = state.thread.id.clone();
         let harness = self.harness(&state.thread.harness).ok_or_else(|| {
-            Error::Command(format!("thread {id} runs on {}, which isn't configured", state.thread.harness))
+            Error::Command(format!(
+                "thread {id} runs on {}, which isn't configured",
+                state.thread.harness
+            ))
         })?;
-        let (tx, actor, rx) = Actor::start(self.host(), state, self.config(&id), self.policy(&id), |ctx| harness.open(ctx));
-        Ok((Handle { tx, task: Arc::new(StdMutex::new(None)) }, actor, rx))
+        let (tx, actor, rx) = Actor::start(self.host(), state, self.config(&id), self.policy(&id), |ctx| {
+            harness.open(ctx)
+        });
+        Ok((
+            Handle {
+                tx,
+                task: Arc::new(StdMutex::new(None)),
+            },
+            actor,
+            rx,
+        ))
     }
 
     fn run(&self, handle: &Handle, actor: Actor, rx: tokio::sync::mpsc::UnboundedReceiver<Job>) {
@@ -691,18 +779,22 @@ impl AgentThreads {
         if let Some(h) = threads.get(thread_id) {
             return Ok(h.clone());
         }
-        let h = self.from_store(thread_id).await?;
+        let h = self.load_from_store(thread_id).await?;
         threads.insert(thread_id.to_string(), h.clone());
         Ok(h)
     }
 
-    async fn from_store(&self, thread_id: &str) -> Result<Handle> {
+    async fn load_from_store(&self, thread_id: &str) -> Result<Handle> {
         let store = &self.inner.store;
         let Some(thread) = store.get_thread(thread_id).await? else {
             return Err(Error::Command(format!("there's no thread {thread_id}")));
         };
-        let thread: Thread = serde_json::from_value(thread).map_err(|e| Error::Command(format!("thread {thread_id} can't be read: {e}")))?;
-        let snap: Option<Snapshot> = store.load_snapshot(thread_id).await?.and_then(|s| serde_json::from_value(s).ok());
+        let thread: Thread = serde_json::from_value(thread)
+            .map_err(|e| Error::Command(format!("thread {thread_id} can't be read: {e}")))?;
+        let snap: Option<Snapshot> = store
+            .load_snapshot(thread_id)
+            .await?
+            .and_then(|s| serde_json::from_value(s).ok());
         let mut state = snap.unwrap_or_else(|| initial_state(thread.clone()));
         for e in store.read_events(thread_id, state.seq, None).await? {
             match serde_json::from_value::<ThreadEvent>(e.clone()) {
@@ -733,7 +825,9 @@ impl AgentThreads {
     /// session carries on reading the run from there. Whether it did; if it couldn't, the run is
     /// stopped.
     async fn reattach(&self, actor: &mut Actor) -> bool {
-        let Some(run) = actor.core.thread().run.clone() else { return false };
+        let Some(run) = actor.core.thread().run.clone() else {
+            return false;
+        };
         if run.spawner.to_string() == "direct" {
             return false;
         }
@@ -745,9 +839,15 @@ impl AgentThreads {
                 return false;
             }
         };
-        let saved_turn: Option<Turn> =
-            record.data.as_ref().and_then(|d| d.get("turn")).and_then(|t| serde_json::from_value(t.clone()).ok());
-        if matches!(actor.core.thread().status, ThreadStatus::Running | ThreadStatus::Waiting) {
+        let saved_turn: Option<Turn> = record
+            .data
+            .as_ref()
+            .and_then(|d| d.get("turn"))
+            .and_then(|t| serde_json::from_value(t.clone()).ok());
+        if matches!(
+            actor.core.thread().status,
+            ThreadStatus::Running | ThreadStatus::Waiting
+        ) {
             let last = last_turn(actor.core.snapshot());
             actor.core.turn = Some(saved_turn.unwrap_or_else(|| Turn {
                 id: last.unwrap_or_else(|| new_id("turn")),
@@ -770,7 +870,13 @@ impl AgentThreads {
         let c = &mut actor.core;
         // Requests the session didn't take up again can't be answered.
         let open = c.open_request_ids();
-        let stale: Vec<String> = c.snapshot().requests.iter().map(|r| r.id().to_string()).filter(|id| !open.contains(id)).collect();
+        let stale: Vec<String> = c
+            .snapshot()
+            .requests
+            .iter()
+            .map(|r| r.id().to_string())
+            .filter(|id| !open.contains(id))
+            .collect();
         for id in stale {
             c.emit_resolved(&id, &cancel_resolution());
         }
@@ -790,9 +896,20 @@ impl AgentThreads {
     }
 }
 
-async fn abandon(spawner: &Arc<dyn Spawner>, store: &Arc<dyn Store>, on_error: &Arc<dyn Fn(Error) + Send + Sync>, run: RunRecord) {
+async fn abandon(
+    spawner: &Arc<dyn Spawner>,
+    store: &Arc<dyn Store>,
+    on_error: &Arc<dyn Fn(Error) + Send + Sync>,
+    run: RunRecord,
+) {
     spawner.stop_run(&run);
-    if let Err(e) = store.put_run(&RunRecord { ended_at: Some(now_iso()), ..run }).await {
+    if let Err(e) = store
+        .put_run(&RunRecord {
+            ended_at: Some(now_iso()),
+            ..run
+        })
+        .await
+    {
         on_error(Error::Store(e));
     }
 }
@@ -800,11 +917,14 @@ async fn abandon(spawner: &Arc<dyn Spawner>, store: &Arc<dyn Store>, on_error: &
 /// Whether a string is base64 (the standard alphabet, padded), as the protocol's validator has it.
 fn is_base64(s: &str) -> bool {
     let b = s.as_bytes();
-    if b.len() % 4 != 0 {
+    if !b.len().is_multiple_of(4) {
         return false;
     }
     let pad = b.iter().rev().take_while(|&&c| c == b'=').count();
-    pad <= 2 && b[..b.len() - pad].iter().all(|c| c.is_ascii_alphanumeric() || *c == b'+' || *c == b'/')
+    pad <= 2
+        && b[..b.len() - pad]
+            .iter()
+            .all(|c| c.is_ascii_alphanumeric() || *c == b'+' || *c == b'/')
 }
 
 fn cancel_resolution() -> Resolution {
@@ -820,7 +940,12 @@ fn last_turn(s: &Snapshot) -> Option<String> {
 fn recover_lost(c: &mut ThreadContext) {
     if matches!(c.thread().status, ThreadStatus::Running | ThreadStatus::Waiting) {
         let id = last_turn(c.snapshot()).unwrap_or_else(|| new_id("turn"));
-        c.turn = Some(Turn { id, interrupted: false, carried: 0, progressed: false });
+        c.turn = Some(Turn {
+            id,
+            interrupted: false,
+            carried: 0,
+            progressed: false,
+        });
         let requests: Vec<String> = c.snapshot().requests.iter().map(|r| r.id().to_string()).collect();
         for id in requests {
             c.emit_resolved(&id, &cancel_resolution());
@@ -830,7 +955,11 @@ fn recover_lost(c: &mut ThreadContext) {
             "text": "The backend stopped while this turn was running, and couldn't pick its run up again.",
         }));
         // Not carried over: loading a thread starts no process. Its queued messages go with the next.
-        let end = TurnEnd { ok: false, error: Some("The backend stopped while this turn was running.".into()), ..Default::default() };
+        let end = TurnEnd {
+            ok: false,
+            error: Some("The backend stopped while this turn was running.".into()),
+            ..Default::default()
+        };
         c.finish_turn(end, false, false);
     }
     c.set_thread(|t| t.run = None);

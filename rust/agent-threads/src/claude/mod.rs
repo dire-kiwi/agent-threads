@@ -147,7 +147,6 @@ struct RunState {
 
 /// One `claude` process, and what's needed to read it.
 struct Run {
-    id: String,
     proc: Option<Arc<dyn HarnessProcess>>,
     /// How far into its output it's been read (with a durable spawner).
     offset: Option<u64>,
@@ -184,9 +183,8 @@ struct Run {
 }
 
 impl Run {
-    fn new(id: String) -> Self {
+    fn new() -> Self {
         Run {
-            id,
             proc: None,
             offset: None,
             spawned: false,
@@ -213,7 +211,8 @@ impl Run {
     }
 
     fn write(&self, msg: &Value) {
-        if !self.exited && !self.detached
+        if !self.exited
+            && !self.detached
             && let Some(p) = &self.proc
         {
             p.write(&msg.to_string());
@@ -222,7 +221,10 @@ impl Run {
 
     /// Writes a user message (that's the items `ids`), once Claude is ready for one.
     fn send(&mut self, ids: Vec<String>, msg: Value) {
-        self.sent.push(Sent { ids, echo: echo_key(&msg["message"]["content"]) });
+        self.sent.push(Sent {
+            ids,
+            echo: echo_key(&msg["message"]["content"]),
+        });
         if self.ready {
             self.write(&msg);
         } else {
@@ -233,7 +235,10 @@ impl Run {
     fn control(&mut self, request: Value) {
         let request_id = format!("req_{}", self.next);
         self.next += 1;
-        self.pending.push((request_id.clone(), request["subtype"].as_str().unwrap_or("").to_string()));
+        self.pending.push((
+            request_id.clone(),
+            request["subtype"].as_str().unwrap_or("").to_string(),
+        ));
         self.write(&json!({"type": "control_request", "request_id": request_id, "request": request}));
     }
 
@@ -397,7 +402,13 @@ impl ClaudeSession {
                     Part::Image { media_type, data } => {
                         json!({"type": "image", "source": {"type": "base64", "media_type": media_type, "data": data}})
                     }
-                    Part::Path { path, name, media_type, written, .. } => {
+                    Part::Path {
+                        path,
+                        name,
+                        media_type,
+                        written,
+                        ..
+                    } => {
                         json!({"type": "text", "text": path_text(&path, &name, media_type.as_deref(), written)})
                     }
                 });
@@ -421,7 +432,7 @@ impl ClaudeSession {
         }
         self.stale = false;
         let id = new_id("run");
-        self.runs.insert(id.clone(), Run::new(id.clone()));
+        self.runs.insert(id.clone(), Run::new());
         self.current = Some(id.clone());
         self.spawn_waiting(ctx);
         id
@@ -521,13 +532,21 @@ impl ClaudeSession {
 
     /// Claude didn't take in steered messages after its turn: they go to a new process.
     fn requeue(&mut self, ctx: &mut ThreadContext, id: &str) {
-        if self.current.as_deref() != Some(id) || self.runs.get(id).is_none_or(|r| r.exited) || ctx.queued().is_empty() {
+        if self.current.as_deref() != Some(id) || self.runs.get(id).is_none_or(|r| r.exited) || ctx.queued().is_empty()
+        {
             return;
         }
         self.stop(ctx, id, true, true);
         let next = self.ensure(ctx, false);
-        let queued: Vec<Message> =
-            ctx.queued().into_iter().map(|m| Message { id: m.id, text: m.text, attachments: m.attachments }).collect();
+        let queued: Vec<Message> = ctx
+            .queued()
+            .into_iter()
+            .map(|m| Message {
+                id: m.id,
+                text: m.text,
+                attachments: m.attachments,
+            })
+            .collect();
         if !queued.is_empty() {
             let msg = self.user_message(&queued);
             let ids = queued.into_iter().map(|m| m.id).collect();
@@ -568,7 +587,14 @@ impl ClaudeSession {
         let (proc, rx) = match ctx.spawner().spawn(options) {
             Ok(p) => p,
             Err(e) => {
-                self.exited(ctx, id, ExitStatus { error: Some(e.to_string()), ..Default::default() });
+                self.exited(
+                    ctx,
+                    id,
+                    ExitStatus {
+                        error: Some(e.to_string()),
+                        ..Default::default()
+                    },
+                );
                 return;
             }
         };
@@ -599,10 +625,17 @@ impl ClaudeSession {
         let t = ctx.thread();
         let config = ctx.config();
         let o = self.o.clone();
-        let mut args: Vec<String> =
-            ["-p", "--output-format", "stream-json", "--verbose", "--include-partial-messages", "--input-format", "stream-json"]
-                .map(String::from)
-                .to_vec();
+        let mut args: Vec<String> = [
+            "-p",
+            "--output-format",
+            "stream-json",
+            "--verbose",
+            "--include-partial-messages",
+            "--input-format",
+            "stream-json",
+        ]
+        .map(String::from)
+        .to_vec();
         args.extend(["--replay-user-messages", "--permission-prompt-tool", "stdio"].map(String::from));
         if !o.user_settings {
             args.extend(["--setting-sources", "", "--strict-mcp-config"].map(String::from));
@@ -635,8 +668,13 @@ impl ClaudeSession {
                         }
                         v
                     }
-                    crate::harness::McpServer::Http { url, headers } | crate::harness::McpServer::Sse { url, headers } => {
-                        let kind = if matches!(s, crate::harness::McpServer::Sse { .. }) { "sse" } else { "http" };
+                    crate::harness::McpServer::Http { url, headers }
+                    | crate::harness::McpServer::Sse { url, headers } => {
+                        let kind = if matches!(s, crate::harness::McpServer::Sse { .. }) {
+                            "sse"
+                        } else {
+                            "http"
+                        };
                         let mut v = json!({"type": kind, "url": url});
                         if !headers.is_empty() {
                             v["headers"] = json!(headers);
@@ -661,7 +699,9 @@ impl ClaudeSession {
                         r.plugin_dir = Some(dir);
                     }
                 }
-                Err(e) => ctx.error(Error::Other(format!("the app's skills couldn't be written for Claude Code: {e}"))),
+                Err(e) => ctx.error(Error::Other(format!(
+                    "the app's skills couldn't be written for Claude Code: {e}"
+                ))),
             }
         }
         if let Some(p) = &config.system_prompt {
@@ -701,14 +741,22 @@ impl ClaudeSession {
             self.clear_stop();
             self.clear_steer();
             let live = self.live_id().is_some();
-            ctx.end_turn(TurnEnd { ok: false, error: Some(error), ..Default::default() }, live);
+            ctx.end_turn(
+                TurnEnd {
+                    ok: false,
+                    error: Some(error),
+                    ..Default::default()
+                },
+                live,
+            );
         }
         if let Some(run) = self.runs.get(id) {
             run.finish();
         }
         // Runs that are over and aren't the last are let go of.
         let keep = [self.current.clone(), self.last.clone()];
-        self.runs.retain(|rid, r| !r.exited || keep.iter().any(|k| k.as_deref() == Some(rid)));
+        self.runs
+            .retain(|rid, r| !r.exited || keep.iter().any(|k| k.as_deref() == Some(rid)));
         self.spawn_waiting(ctx);
     }
 
@@ -720,7 +768,8 @@ impl ClaudeSession {
         }
         if response.is_none() {
             // It refused: messages can't go in, so stop it, which ends the turn.
-            run.stderr.push_back("Claude Code refused the initialize request.".into());
+            run.stderr
+                .push_back("Claude Code refused the initialize request.".into());
             self.stop(ctx, id, false, false);
             return;
         }
@@ -767,7 +816,9 @@ impl ClaudeSession {
 
     fn line(&mut self, ctx: &mut ThreadContext, id: &str, line: &str) {
         // Not a message: Claude Code doesn't write anything else to stdout, but be safe.
-        let Ok(m) = serde_json::from_str::<Value>(line) else { return };
+        let Ok(m) = serde_json::from_str::<Value>(line) else {
+            return;
+        };
         if !m.is_object() {
             return;
         }
@@ -778,7 +829,11 @@ impl ClaudeSession {
             let request_id = r["request_id"].as_str().unwrap_or("");
             if let Some(at) = run.pending.iter().position(|(p, _)| p == request_id) {
                 let (_, subtype) = run.pending.remove(at);
-                let response = if r["subtype"] == "error" { None } else { Some(r.get("response").cloned().unwrap_or(json!({}))) };
+                let response = if r["subtype"] == "error" {
+                    None
+                } else {
+                    Some(r.get("response").cloned().unwrap_or(json!({})))
+                };
                 if subtype == "initialize" {
                     self.initialized(ctx, id, response);
                 }
@@ -838,14 +893,24 @@ impl ClaudeSession {
                     Some("thinking_delta") => (DeltaEventKind::Reasoning, ev["delta"]["thinking"].as_str()),
                     _ => return,
                 };
-                let Some(text) = text.filter(|t| !t.is_empty()) else { return };
+                let Some(text) = text.filter(|t| !t.is_empty()) else {
+                    return;
+                };
                 let msg_id = match m["api_message_id"].as_str() {
                     Some(a) => a.to_string(),
-                    None => run.msg_of_parent.get(&parent).cloned().unwrap_or_else(|| "undefined".into()),
+                    None => run
+                        .msg_of_parent
+                        .get(&parent)
+                        .cloned()
+                        .unwrap_or_else(|| "undefined".into()),
                 };
                 let key = format!("{msg_id}:{}", ev["index"]);
                 if run.streamed.insert(key.clone()) {
-                    let ty = if kind == DeltaEventKind::Text { "assistant_message" } else { "reasoning" };
+                    let ty = if kind == DeltaEventKind::Text {
+                        "assistant_message"
+                    } else {
+                        "reasoning"
+                    };
                     ctx.add_item(under(json!({"id": key, "type": ty, "text": ""})));
                 }
                 ctx.delta(&key, kind, text);
@@ -865,7 +930,9 @@ impl ClaudeSession {
                             if msg["model"] == "<synthetic>" {
                                 continue;
                             }
-                            let text = block[if ty == "text" { "text" } else { "thinking" }].as_str().unwrap_or("");
+                            let text = block[if ty == "text" { "text" } else { "thinking" }]
+                                .as_str()
+                                .unwrap_or("");
                             if run.streamed.contains(&key) {
                                 ctx.update_item(&key, json!({"text": text}));
                             } else if !text.is_empty() {
@@ -874,7 +941,8 @@ impl ClaudeSession {
                             }
                         }
                         Some("tool_use") => {
-                            let mut item = Value::Object(claude_tool(block["name"].as_str().unwrap_or(""), &block["input"]));
+                            let mut item =
+                                Value::Object(claude_tool(block["name"].as_str().unwrap_or(""), &block["input"]));
                             item["id"] = block["id"].clone();
                             item["type"] = json!("tool_call");
                             item["status"] = json!("running");
@@ -916,7 +984,12 @@ impl ClaudeSession {
                     if !r.is_empty() {
                         return r.to_string();
                     }
-                    let errors: Vec<&str> = m["errors"].as_array().into_iter().flatten().filter_map(Value::as_str).collect();
+                    let errors: Vec<&str> = m["errors"]
+                        .as_array()
+                        .into_iter()
+                        .flatten()
+                        .filter_map(Value::as_str)
+                        .collect();
                     if !errors.is_empty() {
                         return errors.join("\n");
                     }
@@ -942,7 +1015,9 @@ impl ClaudeSession {
             // Claude took in a message: if it was a steered one, it's no longer queued. Claude
             // echoes a message as it was sent: match it with the first sent like that.
             let echo = echo_key(content);
-            let Some(at) = run.sent.iter().position(|s| s.echo == echo) else { return };
+            let Some(at) = run.sent.iter().position(|s| s.echo == echo) else {
+                return;
+            };
             for mid in run.sent.remove(at).ids {
                 ctx.took_in(&mid);
             }
@@ -965,9 +1040,15 @@ impl ClaudeSession {
             if b["type"] != "tool_result" {
                 continue;
             }
-            let Some(Item::ToolCall(it)) = ctx.item(b["tool_use_id"].as_str().unwrap_or("")) else { continue };
-            let (call, kind, status, path) =
-                (it.id.clone(), it.kind, it.status, it.changes.first().map(|c| c.path.clone()));
+            let Some(Item::ToolCall(it)) = ctx.item(b["tool_use_id"].as_str().unwrap_or("")) else {
+                continue;
+            };
+            let (call, kind, status, path) = (
+                it.id.clone(),
+                it.kind,
+                it.status,
+                it.changes.first().map(|c| c.path.clone()),
+            );
             let is_error = b["is_error"].as_bool().unwrap_or(false);
             let mut patch = Map::new();
             // A denied call stays denied; its result is what the agent was told.
@@ -983,7 +1064,9 @@ impl ClaudeSession {
             }
             patch.insert("result".into(), Value::Object(slim(&result_text(&b["content"]))));
             let tur = &m["tool_use_result"];
-            if kind == ToolKind::Edit && tur.is_object() && !is_error
+            if kind == ToolKind::Edit
+                && tur.is_object()
+                && !is_error
                 && let Some(change) = edit_change(tur, path.as_deref())
             {
                 patch.insert("changes".into(), json!([change]));
@@ -1006,38 +1089,68 @@ impl ClaudeSession {
     /// Whether Claude still wants this answered: not cancelled, its turn not over, its run not
     /// gone.
     fn wanted(&self, ctx: &ThreadContext, c: &CanUse) -> bool {
-        self.runs.get(&c.run).is_some_and(|r| r.is_open(&c.request) && !r.exited && !r.retired && !r.detached)
+        self.runs
+            .get(&c.run)
+            .is_some_and(|r| r.is_open(&c.request) && !r.exited && !r.retired && !r.detached)
             && self.current.as_deref() == Some(c.run.as_str())
             && ctx.turn_id() == c.turn.as_deref()
     }
 
     fn allow(&mut self, ctx: &ThreadContext, c: &CanUse, input: Value) {
         if self.wanted(ctx, c) {
-            self.run(&c.run).unwrap().respond(&c.request, json!({"behavior": "allow", "updatedInput": input}));
+            self.run(&c.run)
+                .unwrap()
+                .respond(&c.request, json!({"behavior": "allow", "updatedInput": input}));
         }
     }
 
     fn deny(&mut self, ctx: &ThreadContext, c: &CanUse, message: &str) {
         if self.wanted(ctx, c) {
-            self.run(&c.run).unwrap().respond(&c.request, json!({"behavior": "deny", "message": message}));
+            self.run(&c.run)
+                .unwrap()
+                .respond(&c.request, json!({"behavior": "deny", "message": message}));
         }
     }
 
     /// A tool Claude wants to use: the policy decides, or the user is asked. `existing` is the
     /// request the user was asked with before the backend restarted, which is taken up again.
-    fn can_use_tool(&mut self, ctx: &mut ThreadContext, id: &str, request_id: &str, req: Value, existing: Option<String>) {
+    fn can_use_tool(
+        &mut self,
+        ctx: &mut ThreadContext,
+        id: &str,
+        request_id: &str,
+        req: Value,
+        existing: Option<String>,
+    ) {
         let tool_use_id = req["tool_use_id"].as_str().map(String::from);
-        let input = if req["input"].is_null() { json!({}) } else { req["input"].clone() };
+        let input = if req["input"].is_null() {
+            json!({})
+        } else {
+            req["input"].clone()
+        };
         let run = self.run(id).unwrap();
         let turn = match &existing {
-            Some(_) => run.open.iter().find(|(r, _)| r == request_id).and_then(|(_, o)| o.turn.clone()),
+            Some(_) => run
+                .open
+                .iter()
+                .find(|(r, _)| r == request_id)
+                .and_then(|(_, o)| o.turn.clone()),
             None => ctx.turn_id().map(String::from),
         };
-        run.set_open(request_id, OpenRequest { turn: turn.clone(), request: req.clone() });
+        run.set_open(
+            request_id,
+            OpenRequest {
+                turn: turn.clone(),
+                request: req.clone(),
+            },
+        );
         let tool_name = req["tool_name"].as_str().unwrap_or("");
         let t = claude_tool(tool_name, &input);
         let kind: ToolKind = serde_json::from_value(t["kind"].clone()).unwrap_or(ToolKind::Other);
-        let reason = req["decision_reason"].as_str().filter(|r| !r.is_empty()).map(String::from);
+        let reason = req["decision_reason"]
+            .as_str()
+            .filter(|r| !r.is_empty())
+            .map(String::from);
         let name = t["name"].as_str().unwrap_or("").to_string();
         let c = CanUse {
             run: id.to_string(),
@@ -1073,7 +1186,14 @@ impl ClaudeSession {
                         ctx.update_item(t, json!({"status": "running"}));
                     }
                 } else {
-                    s.deny(ctx, &cu, res.message.as_deref().filter(|m| !m.is_empty()).unwrap_or("The user didn't answer."));
+                    s.deny(
+                        ctx,
+                        &cu,
+                        res.message
+                            .as_deref()
+                            .filter(|m| !m.is_empty())
+                            .unwrap_or("The user didn't answer."),
+                    );
                     if let Some(t) = &cu.tool_use_id {
                         ctx.update_item(t, json!({"status": "denied"}));
                     }
@@ -1090,7 +1210,10 @@ impl ClaudeSession {
             return;
         }
 
-        let parent_id = tool_use_id.as_deref().and_then(|t| ctx.item(t)).and_then(|i| i.parent_id().map(String::from));
+        let parent_id = tool_use_id
+            .as_deref()
+            .and_then(|t| ctx.item(t))
+            .and_then(|i| i.parent_id().map(String::from));
         let query = PermissionQuery {
             name: c.name.clone(),
             kind,
@@ -1102,7 +1225,11 @@ impl ClaudeSession {
             parent_id,
         };
         // The user was asked before the backend restarted: they still are.
-        let decided = if c.existing.is_some() { Decided::Now(PermissionDecision::Ask) } else { ctx.decide(query) };
+        let decided = if c.existing.is_some() {
+            Decided::Now(PermissionDecision::Ask)
+        } else {
+            ctx.decide(query)
+        };
         match decided {
             Decided::Now(d) => self.permit(ctx, c, d),
             Decided::Later(f) => ctx.spawn::<ClaudeSession, _>(f, move |s, ctx, d| s.permit(ctx, c, d)),
@@ -1122,7 +1249,8 @@ impl ClaudeSession {
         match d {
             PermissionDecision::Allow => self.allow(ctx, &c, c.input.clone()),
             PermissionDecision::Ask => {
-                let mut request = json!({"type": "permission", "name": c.name, "kind": c.kind, "input": c.input, "title": c.title});
+                let mut request =
+                    json!({"type": "permission", "name": c.name, "kind": c.kind, "input": c.input, "title": c.title});
                 if let Some(r) = &c.reason {
                     request["reason"] = json!(r);
                 }
@@ -1134,12 +1262,24 @@ impl ClaudeSession {
                             ctx.update_item(t, json!({"status": "running"}));
                         }
                     } else {
-                        s.deny(ctx, &cu, res.message.as_deref().filter(|m| !m.is_empty()).unwrap_or("The user didn't allow this."));
+                        s.deny(
+                            ctx,
+                            &cu,
+                            res.message
+                                .as_deref()
+                                .filter(|m| !m.is_empty())
+                                .unwrap_or("The user didn't allow this."),
+                        );
                         denied(ctx, &cu);
                     }
                 });
-                let ours =
-                    ctx.ask_again(c.existing.as_deref(), request, c.tool_use_id.as_deref(), answered, Some(c.standing.clone()));
+                let ours = ctx.ask_again(
+                    c.existing.as_deref(),
+                    request,
+                    c.tool_use_id.as_deref(),
+                    answered,
+                    Some(c.standing.clone()),
+                );
                 self.run(&c.run).unwrap().asked.insert(c.request.clone(), ours);
             }
             PermissionDecision::Deny(why) => {
@@ -1156,7 +1296,10 @@ impl ClaudeSession {
         let msg_id = msg.get("id").cloned().unwrap_or(json!(0));
         let reply = |s: &mut ClaudeSession, body: Value| mcp_reply(s, id, request_id, &msg_id, body);
         if req["server_name"] != APP_SERVER {
-            let message = format!("there's no MCP server {} in process", req["server_name"].as_str().unwrap_or("undefined"));
+            let message = format!(
+                "there's no MCP server {} in process",
+                req["server_name"].as_str().unwrap_or("undefined")
+            );
             return reply(self, json!({"error": {"code": -32601, "message": message}}));
         }
         if msg.get("id").is_none() {
@@ -1183,9 +1326,14 @@ impl ClaudeSession {
                 let name = msg["params"]["name"].as_str().unwrap_or("").to_string();
                 let Some(tool) = ctx.config().tool(&name).cloned() else {
                     let text = format!("There's no tool {name}.");
-                    return reply(self, json!({"result": {"content": [{"type": "text", "text": text}], "isError": true}}));
+                    return reply(
+                        self,
+                        json!({"result": {"content": [{"type": "text", "text": text}], "isError": true}}),
+                    );
                 };
-                let tool_call_id = msg["params"]["_meta"]["claudecode/toolUseId"].as_str().map(String::from);
+                let tool_call_id = msg["params"]["_meta"]["claudecode/toolUseId"]
+                    .as_str()
+                    .map(String::from);
                 let args = match &msg["params"]["arguments"] {
                     Value::Null => json!({}),
                     a => a.clone(),
@@ -1193,7 +1341,13 @@ impl ClaudeSession {
                 // Saved before it runs, so a backend that restarts while it does answers it rather
                 // than run it again (see reopen).
                 let turn = ctx.turn_id().map(String::from);
-                self.run(id).unwrap().set_open(request_id, OpenRequest { turn, request: req.clone() });
+                self.run(id).unwrap().set_open(
+                    request_id,
+                    OpenRequest {
+                        turn,
+                        request: req.clone(),
+                    },
+                );
                 let (id, request_id) = (id.to_string(), request_id.to_string());
                 ctx.persist::<ClaudeSession>(move |s, ctx, saved| {
                     let Some(run) = s.run(&id) else { return };
@@ -1203,7 +1357,13 @@ impl ClaudeSession {
                         }
                         run.take_open(&request_id);
                         let text = "The app couldn't save its state, so it didn't run this tool.";
-                        return mcp_reply(s, &id, &request_id, &msg_id, json!({"result": {"content": [{"type": "text", "text": text}], "isError": true}}));
+                        return mcp_reply(
+                            s,
+                            &id,
+                            &request_id,
+                            &msg_id,
+                            json!({"result": {"content": [{"type": "text", "text": text}], "isError": true}}),
+                        );
                     }
                     if !run.is_open(&request_id) || run.exited || run.detached {
                         return;
@@ -1270,7 +1430,9 @@ impl HarnessSession for ClaudeSession {
         // so several would run as turns of their own after this one's result.
         if !messages.is_empty() {
             let msg = self.user_message(&messages);
-            self.run(&id).unwrap().send(messages.into_iter().map(|m| m.id).collect(), msg);
+            self.run(&id)
+                .unwrap()
+                .send(messages.into_iter().map(|m| m.id).collect(), msg);
         }
     }
 
@@ -1331,7 +1493,12 @@ impl HarnessSession for ClaudeSession {
         if let Some(id) = self.current.clone() {
             self.stop(ctx, &id, false, false);
         }
-        let waits: Vec<watch::Receiver<bool>> = self.runs.values().filter(|r| !r.exited).map(|r| r.done.subscribe()).collect();
+        let waits: Vec<watch::Receiver<bool>> = self
+            .runs
+            .values()
+            .filter(|r| !r.exited)
+            .map(|r| r.done.subscribe())
+            .collect();
         let tmp = self.tmp.take();
         Box::pin(async move {
             for mut w in waits {
@@ -1371,21 +1538,28 @@ impl HarnessSession for ClaudeSession {
     }
 
     fn reattach(&mut self, ctx: &mut ThreadContext, record: &RunRecord) -> bool {
-        let Some(st) = record.data.as_ref().and_then(|d| d.get("state")).and_then(|s| serde_json::from_value::<RunState>(s.clone()).ok())
+        let Some(st) = record
+            .data
+            .as_ref()
+            .and_then(|d| d.get("state"))
+            .and_then(|s| serde_json::from_value::<RunState>(s.clone()).ok())
         else {
             return false;
         };
         if st.v != 1 || !ctx.spawner().can_attach() || self.current.is_some() {
             return false;
         }
-        let mut run = Run::new(record.id.clone());
+        let mut run = Run::new();
         run.restore(&st);
         run.spawned = true;
         run.offset = record.offset;
         let (proc, rx) = match ctx.spawner().attach(record) {
             Ok(p) => p,
             Err(e) => {
-                ctx.error(Error::Other(format!("Claude Code's run {} can't be followed: {e}", record.id)));
+                ctx.error(Error::Other(format!(
+                    "Claude Code's run {} can't be followed: {e}",
+                    record.id
+                )));
                 return false;
             }
         };
@@ -1396,7 +1570,11 @@ impl HarnessSession for ClaudeSession {
         forward(ctx, &id, rx);
         // A process started with other options than the thread's now is replaced at the next turn.
         let t = ctx.thread();
-        let now = Launched { model: t.model.clone(), effort: t.effort.clone(), permission_mode: t.permission_mode.map(|m| m.to_string()) };
+        let now = Launched {
+            model: t.model.clone(),
+            effort: t.effort.clone(),
+            permission_mode: t.permission_mode.map(|m| m.to_string()),
+        };
         self.stale = st.stale || st.launched.as_ref() != Some(&now);
         // Claude's requests that were open: the user's questions are taken up again, and the rest
         // (a policy that hadn't decided, a tool that was running) are dealt with again.
@@ -1449,7 +1627,9 @@ pub(crate) fn forward_events<S: HarnessSession>(
     tokio::spawn(async move {
         while let Some(e) = rx.recv().await {
             let id = id.clone();
-            if !tx(Box::new(move |s: &mut S, ctx: &mut ThreadContext| handle(s, ctx, &id, e))) {
+            if !tx(Box::new(move |s: &mut S, ctx: &mut ThreadContext| {
+                handle(s, ctx, &id, e)
+            })) {
                 return;
             }
         }
@@ -1478,7 +1658,11 @@ fn echo_key(content: &Value) -> String {
         return json!([s, 0]).to_string();
     }
     let blocks: Vec<&Value> = content.as_array().map(|a| a.iter().collect()).unwrap_or_default();
-    let text: Vec<&str> = blocks.iter().filter(|b| b["type"] == "text").map(|b| b["text"].as_str().unwrap_or("")).collect();
+    let text: Vec<&str> = blocks
+        .iter()
+        .filter(|b| b["type"] == "text")
+        .map(|b| b["text"].as_str().unwrap_or(""))
+        .collect();
     let images = blocks.iter().filter(|b| b["type"] == "image").count();
     json!([text.join("\n"), images]).to_string()
 }

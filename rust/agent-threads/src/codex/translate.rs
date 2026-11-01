@@ -29,7 +29,9 @@ pub(crate) fn unwrap_command(command: &str) -> String {
         return command.to_string();
     }
     rest = &rest[word_end..];
-    let Some(r) = rest.strip_prefix(" -lc ") else { return command.to_string() };
+    let Some(r) = rest.strip_prefix(" -lc ") else {
+        return command.to_string();
+    };
     if let Some(inner) = r.strip_prefix('\'').and_then(|r| r.strip_suffix('\'')) {
         // '...' with '\'' for each quote inside.
         let mut ok = true;
@@ -79,7 +81,13 @@ fn obj(v: Value) -> Map<String, Value> {
 /// A tool item's tool_call fields (all but id, status and the item's own). `mcp_app`: app tools
 /// are on the app MCP server.
 pub(crate) fn codex_tool(item: &Value, mcp_app: bool) -> Map<String, Value> {
-    let args = || if item["arguments"].is_null() { json!({}) } else { item["arguments"].clone() };
+    let args = || {
+        if item["arguments"].is_null() {
+            json!({})
+        } else {
+            item["arguments"].clone()
+        }
+    };
     obj(match item["type"].as_str().unwrap_or("") {
         "commandExecution" => {
             let command = item["command"].as_str().unwrap_or("");
@@ -107,7 +115,9 @@ pub(crate) fn codex_tool(item: &Value, mcp_app: bool) -> Map<String, Value> {
             }
             t
         }
-        "imageView" => json!({"name": "imageView", "kind": "read", "input": {"path": item["path"]}, "path": item["path"]}),
+        "imageView" => {
+            json!({"name": "imageView", "kind": "read", "input": {"path": item["path"]}, "path": item["path"]})
+        }
         _ => json!({}),
     })
 }
@@ -115,7 +125,11 @@ pub(crate) fn codex_tool(item: &Value, mcp_app: bool) -> Map<String, Value> {
 fn web_fields(item: &Value) -> Map<String, Value> {
     let mut out = Map::new();
     let action = &item["action"];
-    let query = item["query"].as_str().filter(|q| !q.is_empty()).or_else(|| action["query"].as_str()).unwrap_or("");
+    let query = item["query"]
+        .as_str()
+        .filter(|q| !q.is_empty())
+        .or_else(|| action["query"].as_str())
+        .unwrap_or("");
     if !query.is_empty() {
         out.insert("query".into(), json!(query));
     }

@@ -54,8 +54,15 @@ const MAX_BODY: usize = 16 * 1024 * 1024;
 
 /// Starts a loopback MCP server for the tools: on a new port with a new token, or on those of one
 /// before it (for a process configured with it that outlived the backend).
-pub(crate) fn serve_tools(name: &str, server: Arc<dyn ToolServer>, again: Option<(u16, String)>) -> io::Result<LoopbackMcp> {
-    let token = again.as_ref().map(|(_, t)| t.clone()).unwrap_or_else(|| crate::ids::token(24));
+pub(crate) fn serve_tools(
+    name: &str,
+    server: Arc<dyn ToolServer>,
+    again: Option<(u16, String)>,
+) -> io::Result<LoopbackMcp> {
+    let token = again
+        .as_ref()
+        .map(|(_, t)| t.clone())
+        .unwrap_or_else(|| crate::ids::token(24));
     let listener = std::net::TcpListener::bind(("127.0.0.1", again.as_ref().map_or(0, |(p, _)| *p)))?;
     listener.set_nonblocking(true)?;
     let port = listener.local_addr()?.port();
@@ -105,11 +112,20 @@ fn same(a: &[u8], b: &[u8]) -> bool {
     a.len() == b.len() && a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
 }
 
-async fn handle(req: Request<Incoming>, server: &Arc<dyn ToolServer>, expected: &str, name: &str) -> Response<Full<Bytes>> {
+async fn handle(
+    req: Request<Incoming>,
+    server: &Arc<dyn ToolServer>,
+    expected: &str,
+    name: &str,
+) -> Response<Full<Bytes>> {
     if req.uri().path() != "/mcp" {
         return respond(StatusCode::NOT_FOUND, None);
     }
-    let auth = req.headers().get("authorization").map(|v| v.as_bytes().to_vec()).unwrap_or_default();
+    let auth = req
+        .headers()
+        .get("authorization")
+        .map(|v| v.as_bytes().to_vec())
+        .unwrap_or_default();
     if !same(&auth, expected.as_bytes()) {
         let mut r = respond(StatusCode::UNAUTHORIZED, None);
         r.headers_mut().insert("WWW-Authenticate", "Bearer".parse().unwrap());
@@ -129,7 +145,10 @@ async fn handle(req: Request<Incoming>, server: &Arc<dyn ToolServer>, expected: 
         Err(_) => return respond(StatusCode::PAYLOAD_TOO_LARGE, None),
     };
     let Ok(body) = serde_json::from_slice::<Value>(&body) else {
-        return respond(StatusCode::BAD_REQUEST, Some(json!({"jsonrpc": "2.0", "id": null, "error": {"code": -32700, "message": "parse error"}})));
+        return respond(
+            StatusCode::BAD_REQUEST,
+            Some(json!({"jsonrpc": "2.0", "id": null, "error": {"code": -32700, "message": "parse error"}})),
+        );
     };
     let batch = body.is_array();
     let messages = match body {
@@ -145,13 +164,21 @@ async fn handle(req: Request<Incoming>, server: &Arc<dyn ToolServer>, expected: 
     if replies.is_empty() {
         return respond(StatusCode::ACCEPTED, None);
     }
-    respond(StatusCode::OK, Some(if batch { Value::Array(replies) } else { replies.remove(0) }))
+    respond(
+        StatusCode::OK,
+        Some(if batch {
+            Value::Array(replies)
+        } else {
+            replies.remove(0)
+        }),
+    )
 }
 
 async fn answer(msg: &Value, server: &Arc<dyn ToolServer>, name: &str) -> Option<Value> {
     let id = msg.get("id").filter(|i| !i.is_null());
     if msg["jsonrpc"] != "2.0" || !msg["method"].is_string() {
-        return id.map(|id| json!({"jsonrpc": "2.0", "id": id, "error": {"code": -32600, "message": "invalid request"}}));
+        return id
+            .map(|id| json!({"jsonrpc": "2.0", "id": id, "error": {"code": -32600, "message": "invalid request"}}));
     }
     let id = id?; // a notification
     let reply = |body: Value| {
@@ -164,7 +191,9 @@ async fn answer(msg: &Value, server: &Arc<dyn ToolServer>, name: &str) -> Option
     Some(match msg["method"].as_str().unwrap() {
         "initialize" => {
             let version = msg["params"]["protocolVersion"].as_str().unwrap_or("2025-06-18");
-            reply(json!({"result": {"protocolVersion": version, "capabilities": {"tools": {}}, "serverInfo": {"name": name, "version": "1.0.0"}}}))
+            reply(
+                json!({"result": {"protocolVersion": version, "capabilities": {"tools": {}}, "serverInfo": {"name": name, "version": "1.0.0"}}}),
+            )
         }
         "ping" => reply(json!({"result": {}})),
         "tools/list" => reply(json!({"result": {"tools": server.tools().await}})),

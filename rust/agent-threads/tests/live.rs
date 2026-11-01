@@ -68,7 +68,9 @@ async fn turn(sdk: &AgentThreads, id: &str, text: &str) -> Value {
             }
         }
     };
-    tokio::time::timeout(std::time::Duration::from_secs(180), wait).await.expect("the turn ends");
+    tokio::time::timeout(std::time::Duration::from_secs(180), wait)
+        .await
+        .expect("the turn ends");
     serde_json::to_value(sdk.snapshot(id).await.unwrap()).unwrap()
 }
 
@@ -77,7 +79,11 @@ fn said(s: &Value) -> String {
 }
 
 fn app_call(s: &Value) -> Value {
-    common::items(s, "tool_call").into_iter().find(|i| i["kind"] == "app").cloned().unwrap_or(Value::Null)
+    common::items(s, "tool_call")
+        .into_iter()
+        .find(|i| i["kind"] == "app")
+        .cloned()
+        .unwrap_or(Value::Null)
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -88,8 +94,14 @@ async fn live_claude_replies_calls_an_app_tool_and_has_the_apps_skills() {
     // Claude's output, to see what its initialize response lists.
     let out: Arc<Mutex<Vec<String>>> = Arc::default();
     let sdk = AgentThreads::new(Options {
-        spawner: Some(Arc::new(Tee { inner: direct(), out: out.clone() })),
-        harnesses: vec![claude_code(ClaudeCodeOptions { bin: std::env::var("CLAUDE_BIN").unwrap_or("claude".into()), ..Default::default() })],
+        spawner: Some(Arc::new(Tee {
+            inner: direct(),
+            out: out.clone(),
+        })),
+        harnesses: vec![claude_code(ClaudeCodeOptions {
+            bin: std::env::var("CLAUDE_BIN").unwrap_or("claude".into()),
+            ..Default::default()
+        })],
         capabilities: Capabilities {
             tools: vec![lookup_order()],
             skills: vec![Skill::Inline {
@@ -101,8 +113,20 @@ async fn live_claude_replies_calls_an_app_tool_and_has_the_apps_skills() {
         },
         ..Default::default()
     });
-    let t = sdk.create(CreateOptions { model: Some("haiku".into()), cwd: Some(common::temp_dir()), ..Default::default() }).await.unwrap();
-    let s = turn(&sdk, &t.id, "Reply with exactly these words and nothing else: hello from agent-threads").await;
+    let t = sdk
+        .create(CreateOptions {
+            model: Some("haiku".into()),
+            cwd: Some(common::temp_dir()),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    let s = turn(
+        &sdk,
+        &t.id,
+        "Reply with exactly these words and nothing else: hello from agent-threads",
+    )
+    .await;
     // The app's skill is there, though the user's and the project's config aren't loaded.
     let init = out
         .lock()
@@ -111,16 +135,41 @@ async fn live_claude_replies_calls_an_app_tool_and_has_the_apps_skills() {
         .filter_map(|l| serde_json::from_str::<Value>(l).ok())
         .find(|m| m["type"] == "control_response" && m["response"]["response"]["commands"].is_array())
         .expect("Claude answered initialize with its commands");
-    let commands: Vec<&str> = init["response"]["response"]["commands"].as_array().unwrap().iter().filter_map(|c| c["name"].as_str()).collect();
+    let commands: Vec<&str> = init["response"]["response"]["commands"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|c| c["name"].as_str())
+        .collect();
     assert!(commands.contains(&"app:review-sentinel"), "{commands:?}");
     assert_eq!(s["thread"]["status"], "idle");
     assert!(s["thread"]["session_id"].is_string());
-    assert!(said(&s).to_lowercase().contains("hello from agent-threads"), "{}", said(&s));
+    assert!(
+        said(&s).to_lowercase().contains("hello from agent-threads"),
+        "{}",
+        said(&s)
+    );
 
-    let s = turn(&sdk, &t.id, "Look up order 42 with the lookup_order tool, then tell me in a few words what's in it.").await;
+    let s = turn(
+        &sdk,
+        &t.id,
+        "Look up order 42 with the lookup_order tool, then tell me in a few words what's in it.",
+    )
+    .await;
     assert_eq!(s["thread"]["status"], "idle");
     let call = app_call(&s);
-    assert_eq!((call["name"].clone(), call["status"].clone(), call["result"]["content"].clone()), (json!("lookup_order"), json!("completed"), json!("Order 42: 3 blue widgets.")));
+    assert_eq!(
+        (
+            call["name"].clone(),
+            call["status"].clone(),
+            call["result"]["content"].clone()
+        ),
+        (
+            json!("lookup_order"),
+            json!("completed"),
+            json!("Order 42: 3 blue widgets.")
+        )
+    );
     assert!(s["thread"]["usage"]["cost_usd"].as_f64().unwrap() > 0.0);
     sdk.close(false).await.unwrap();
 }
@@ -129,25 +178,63 @@ async fn live_codex(app_tools: AppTools) {
     if !live() {
         return;
     }
-    let o = CodexOptions { bin: std::env::var("CODEX_BIN").unwrap_or("codex".into()), home: Some(common::temp_dir()), app_tools, ..Default::default() };
+    let o = CodexOptions {
+        bin: std::env::var("CODEX_BIN").unwrap_or("codex".into()),
+        home: Some(common::temp_dir()),
+        app_tools,
+        ..Default::default()
+    };
     let sdk = AgentThreads::new(Options {
         harnesses: vec![codex(o)],
-        capabilities: Capabilities { tools: vec![lookup_order()], permissions: Some(PermissionPolicy::allow()), ..Default::default() },
+        capabilities: Capabilities {
+            tools: vec![lookup_order()],
+            permissions: Some(PermissionPolicy::allow()),
+            ..Default::default()
+        },
         ..Default::default()
     });
     let model = std::env::var("CODEX_MODEL").unwrap_or("gpt-5.6-luna".into());
-    let o = CreateOptions { harness: Some("codex".into()), model: Some(model), effort: Some("low".into()), cwd: Some(common::temp_dir()), ..Default::default() };
+    let o = CreateOptions {
+        harness: Some("codex".into()),
+        model: Some(model),
+        effort: Some("low".into()),
+        cwd: Some(common::temp_dir()),
+        ..Default::default()
+    };
     let t = sdk.create(o).await.unwrap();
-    let s = turn(&sdk, &t.id, "Reply with exactly these words and nothing else: hello from agent-threads").await;
+    let s = turn(
+        &sdk,
+        &t.id,
+        "Reply with exactly these words and nothing else: hello from agent-threads",
+    )
+    .await;
     assert_eq!(s["thread"]["status"], "idle", "{}", s["thread"]);
     assert!(s["thread"]["session_id"].is_string());
-    assert!(said(&s).to_lowercase().contains("hello from agent-threads"), "{}", said(&s));
+    assert!(
+        said(&s).to_lowercase().contains("hello from agent-threads"),
+        "{}",
+        said(&s)
+    );
 
-    let s = turn(&sdk, &t.id, "Look up order 42 with the lookup_order tool, then tell me in a few words what's in it.").await;
+    let s = turn(
+        &sdk,
+        &t.id,
+        "Look up order 42 with the lookup_order tool, then tell me in a few words what's in it.",
+    )
+    .await;
     assert_eq!(s["thread"]["status"], "idle");
     let call = app_call(&s);
-    assert_eq!((call["name"].clone(), call["status"].clone()), (json!("lookup_order"), json!("completed")), "{call}");
-    assert!(call["result"]["content"].as_str().unwrap().contains("Order 42: 3 blue widgets."));
+    assert_eq!(
+        (call["name"].clone(), call["status"].clone()),
+        (json!("lookup_order"), json!("completed")),
+        "{call}"
+    );
+    assert!(
+        call["result"]["content"]
+            .as_str()
+            .unwrap()
+            .contains("Order 42: 3 blue widgets.")
+    );
     assert!(s["thread"]["usage"]["output_tokens"].as_u64().unwrap() > 0);
     sdk.close(false).await.unwrap();
 }

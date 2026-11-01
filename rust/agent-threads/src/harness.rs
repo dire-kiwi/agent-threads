@@ -19,20 +19,37 @@ use crate::tools::Tool;
 /// An external MCP server: a command to run (stdio), or a URL (streamable HTTP, or SSE).
 #[derive(Clone, Debug, PartialEq)]
 pub enum McpServer {
-    Stdio { command: String, args: Vec<String>, env: BTreeMap<String, String> },
-    Http { url: String, headers: BTreeMap<String, String> },
-    Sse { url: String, headers: BTreeMap<String, String> },
+    Stdio {
+        command: String,
+        args: Vec<String>,
+        env: BTreeMap<String, String>,
+    },
+    Http {
+        url: String,
+        headers: BTreeMap<String, String>,
+    },
+    Sse {
+        url: String,
+        headers: BTreeMap<String, String>,
+    },
 }
 
 impl McpServer {
     /// A server to run, with its arguments.
     pub fn stdio(command: impl Into<String>, args: impl IntoIterator<Item = impl Into<String>>) -> Self {
-        McpServer::Stdio { command: command.into(), args: args.into_iter().map(Into::into).collect(), env: BTreeMap::new() }
+        McpServer::Stdio {
+            command: command.into(),
+            args: args.into_iter().map(Into::into).collect(),
+            env: BTreeMap::new(),
+        }
     }
 
     /// A streamable HTTP server.
     pub fn http(url: impl Into<String>) -> Self {
-        McpServer::Http { url: url.into(), headers: BTreeMap::new() }
+        McpServer::Http {
+            url: url.into(),
+            headers: BTreeMap::new(),
+        }
     }
 
     /// One as the Node backend's options (and the fixtures) write it: `{command, args?, env?}` or
@@ -40,20 +57,37 @@ impl McpServer {
     pub fn from_json(v: &Value) -> Option<Self> {
         let strings = |v: Option<&Value>| -> BTreeMap<String, String> {
             v.and_then(Value::as_object)
-                .map(|o| o.iter().filter_map(|(k, v)| Some((k.clone(), v.as_str()?.to_string()))).collect())
+                .map(|o| {
+                    o.iter()
+                        .filter_map(|(k, v)| Some((k.clone(), v.as_str()?.to_string())))
+                        .collect()
+                })
                 .unwrap_or_default()
         };
         if let Some(url) = v.get("url").and_then(Value::as_str) {
             let headers = strings(v.get("headers"));
             return Some(if v.get("type").and_then(Value::as_str) == Some("sse") {
-                McpServer::Sse { url: url.into(), headers }
+                McpServer::Sse {
+                    url: url.into(),
+                    headers,
+                }
             } else {
-                McpServer::Http { url: url.into(), headers }
+                McpServer::Http {
+                    url: url.into(),
+                    headers,
+                }
             });
         }
         let command = v.get("command")?.as_str()?.to_string();
-        let args = v.get("args").and_then(Value::as_array).map(|a| a.iter().filter_map(|x| x.as_str().map(String::from)).collect());
-        Some(McpServer::Stdio { command, args: args.unwrap_or_default(), env: strings(v.get("env")) })
+        let args = v
+            .get("args")
+            .and_then(Value::as_array)
+            .map(|a| a.iter().filter_map(|x| x.as_str().map(String::from)).collect());
+        Some(McpServer::Stdio {
+            command,
+            args: args.unwrap_or_default(),
+            env: strings(v.get("env")),
+        })
     }
 }
 

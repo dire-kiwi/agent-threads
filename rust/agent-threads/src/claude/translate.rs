@@ -37,7 +37,11 @@ pub(crate) fn claude_tool(name: &str, input: &Value) -> ToolFields {
     let input = if input.is_null() { json!({}) } else { input.clone() };
     let mut t = Map::new();
     let mut tool_name = name.to_string();
-    let mut kind = if name.starts_with("mcp__") { "mcp" } else { kind_of(name) };
+    let mut kind = if name.starts_with("mcp__") {
+        "mcp"
+    } else {
+        kind_of(name)
+    };
     let mut server = None;
     if let Some(rest) = name.strip_prefix("mcp__") {
         let mut parts = rest.splitn(2, "__");
@@ -103,10 +107,11 @@ pub(crate) fn claude_tool(name: &str, input: &Value) -> ToolFields {
                             None | Some(Value::Null) => String::new(),
                             Some(v) => v.to_string(),
                         };
-                        let status = match x.get("status").and_then(Value::as_str) {
-                            Some(s @ ("in_progress" | "completed")) => s,
-                            _ => "pending",
-                        };
+                        let status = x
+                            .get("status")
+                            .and_then(Value::as_str)
+                            .filter(|s| matches!(*s, "in_progress" | "completed"))
+                            .unwrap_or("pending");
                         json!({"text": text, "status": status})
                     })
                     .collect();
@@ -127,7 +132,11 @@ pub(crate) fn title(t: &ToolFields) -> String {
         return p.into();
     }
     if let Some(changes) = t.get("changes").and_then(Value::as_array).filter(|c| !c.is_empty()) {
-        return changes.iter().filter_map(|c| c["path"].as_str()).collect::<Vec<_>>().join(", ");
+        return changes
+            .iter()
+            .filter_map(|c| c["path"].as_str())
+            .collect::<Vec<_>>()
+            .join(", ");
     }
     t.get("name").and_then(Value::as_str).unwrap_or("").into()
 }
@@ -176,8 +185,21 @@ fn hunks(patch: &[Value]) -> String {
         .iter()
         .map(|h| {
             let n = |k: &str| h.get(k).map(|v| v.to_string()).unwrap_or_default();
-            let lines: Vec<&str> = h.get("lines").and_then(Value::as_array).into_iter().flatten().filter_map(Value::as_str).collect();
-            format!("@@ -{},{} +{},{} @@\n{}\n", n("oldStart"), n("oldLines"), n("newStart"), n("newLines"), lines.join("\n"))
+            let lines: Vec<&str> = h
+                .get("lines")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+                .filter_map(Value::as_str)
+                .collect();
+            format!(
+                "@@ -{},{} +{},{} @@\n{}\n",
+                n("oldStart"),
+                n("oldLines"),
+                n("newStart"),
+                n("newLines"),
+                lines.join("\n")
+            )
         })
         .collect()
 }
@@ -203,7 +225,12 @@ pub(crate) fn edit_change(result: &Value, path: Option<&str>) -> Option<Value> {
 /// `usage` is only the last model call's, and total_cost_usd is the session's so far.)
 pub(crate) fn claude_usage(result: &Value) -> Value {
     let (mut input, mut output, mut read, mut write, mut cost) = (0u64, 0u64, 0u64, 0u64, 0f64);
-    for m in result.get("model_usage_since_last_result").and_then(Value::as_object).into_iter().flat_map(|o| o.values()) {
+    for m in result
+        .get("model_usage_since_last_result")
+        .and_then(Value::as_object)
+        .into_iter()
+        .flat_map(|o| o.values())
+    {
         let n = |k: &str| m.get(k).and_then(Value::as_f64).unwrap_or(0.0) as u64;
         input += n("inputTokens");
         output += n("outputTokens");

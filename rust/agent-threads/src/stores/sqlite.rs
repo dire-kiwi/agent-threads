@@ -72,7 +72,15 @@ fn put_run(db: &Connection, run: &RunRecord) -> StoreResult<()> {
          ON CONFLICT (id) DO UPDATE SET thread_id = excluded.thread_id, started_at = excluded.started_at,
          active = excluded.active, data = excluded.data",
     )
-    .and_then(|mut s| s.execute(params![run.id, run.thread_id, run.started_at, run.is_active() as i64, data]))
+    .and_then(|mut s| {
+        s.execute(params![
+            run.id,
+            run.thread_id,
+            run.started_at,
+            run.is_active() as i64,
+            data
+        ])
+    })
     .map(|_| ())
     .map_err(failed)
 }
@@ -89,15 +97,22 @@ impl SqliteStore {
         db.execute_batch("PRAGMA journal_mode = WAL; PRAGMA synchronous = NORMAL; PRAGMA foreign_keys = ON;")
             .map_err(failed)?;
         db.execute_batch(SCHEMA).map_err(failed)?;
-        Ok(SqliteStore { db: Arc::new(Mutex::new(Some(db))) })
+        Ok(SqliteStore {
+            db: Arc::new(Mutex::new(Some(db))),
+        })
     }
 
     /// Runs `op` on the connection, off the async runtime's threads.
-    async fn run<T: Send + 'static>(&self, op: impl FnOnce(&mut Connection) -> StoreResult<T> + Send + 'static) -> StoreResult<T> {
+    async fn run<T: Send + 'static>(
+        &self,
+        op: impl FnOnce(&mut Connection) -> StoreResult<T> + Send + 'static,
+    ) -> StoreResult<T> {
         let db = self.db.clone();
         tokio::task::spawn_blocking(move || {
             let mut guard = db.lock().unwrap_or_else(|e| e.into_inner());
-            let Some(conn) = guard.as_mut() else { return Err(failed("the store is closed")) };
+            let Some(conn) = guard.as_mut() else {
+                return Err(failed("the store is closed"));
+            };
             op(conn)
         })
         .await
@@ -105,9 +120,14 @@ impl SqliteStore {
     }
 
     /// Runs `op` in a transaction that takes the write lock at once.
-    async fn tx<T: Send + 'static>(&self, op: impl FnOnce(&Transaction) -> StoreResult<T> + Send + 'static) -> StoreResult<T> {
+    async fn tx<T: Send + 'static>(
+        &self,
+        op: impl FnOnce(&Transaction) -> StoreResult<T> + Send + 'static,
+    ) -> StoreResult<T> {
         self.run(move |db| {
-            let tx = db.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate).map_err(failed)?;
+            let tx = db
+                .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+                .map_err(failed)?;
             let out = op(&tx)?;
             tx.commit().map_err(failed)?;
             Ok(out)
@@ -149,7 +169,9 @@ impl Store for SqliteStore {
 
     async fn list_threads(&self) -> StoreResult<Vec<Value>> {
         self.run(|db| {
-            let mut s = db.prepare_cached("SELECT data FROM threads ORDER BY created_at, id").map_err(failed)?;
+            let mut s = db
+                .prepare_cached("SELECT data FROM threads ORDER BY created_at, id")
+                .map_err(failed)?;
             let rows = s.query_map([], |r| r.get::<_, String>(0)).map_err(failed)?;
             rows.map(|r| parse(r.map_err(failed)?)).collect()
         })
@@ -177,7 +199,8 @@ impl Store for SqliteStore {
             // Spelled out rather than left to ON DELETE CASCADE, for a database opened without
             // foreign keys.
             for table in ["events", "snapshots", "runs"] {
-                db.execute(&format!("DELETE FROM {table} WHERE thread_id = ?"), [&id]).map_err(failed)?;
+                db.execute(&format!("DELETE FROM {table} WHERE thread_id = ?"), [&id])
+                    .map_err(failed)?;
             }
             Ok(db.execute("DELETE FROM threads WHERE id = ?", [&id]).map_err(failed)? > 0)
         })
@@ -189,9 +212,13 @@ impl Store for SqliteStore {
         self.tx(move |db| {
             known(db, &id)?;
             check_events(&id, last(db, &id)?, &events, &runs)?;
-            let mut insert = db.prepare_cached("INSERT INTO events (thread_id, seq, data) VALUES (?, ?, ?)").map_err(failed)?;
+            let mut insert = db
+                .prepare_cached("INSERT INTO events (thread_id, seq, data) VALUES (?, ?, ?)")
+                .map_err(failed)?;
             for e in &events {
-                insert.execute(params![id, e["seq"].as_i64(), e.to_string()]).map_err(failed)?;
+                insert
+                    .execute(params![id, e["seq"].as_i64(), e.to_string()])
+                    .map_err(failed)?;
             }
             for r in &runs {
                 put_run(db, r)?;
@@ -209,7 +236,9 @@ impl Store for SqliteStore {
                 .prepare_cached("SELECT data FROM events WHERE thread_id = ? AND seq > ? ORDER BY seq LIMIT ?")
                 .map_err(failed)?;
             let limit = limit.map_or(-1, |l| l.min(i64::MAX as usize) as i64);
-            let rows = s.query_map(params![id, after as i64, limit], |r| r.get::<_, String>(0)).map_err(failed)?;
+            let rows = s
+                .query_map(params![id, after as i64, limit], |r| r.get::<_, String>(0))
+                .map_err(failed)?;
             rows.map(|r| parse(r.map_err(failed)?)).collect()
         })
         .await
@@ -263,8 +292,10 @@ impl Store for SqliteStore {
     async fn get_run(&self, id: &str) -> StoreResult<Option<RunRecord>> {
         let id = id.to_string();
         self.run(move |db| {
-            let row: Option<String> =
-                db.query_row("SELECT data FROM runs WHERE id = ?", [&id], |r| r.get(0)).optional().map_err(failed)?;
+            let row: Option<String> = db
+                .query_row("SELECT data FROM runs WHERE id = ?", [&id], |r| r.get(0))
+                .optional()
+                .map_err(failed)?;
             row.map(parse).transpose()
         })
         .await
@@ -272,7 +303,9 @@ impl Store for SqliteStore {
 
     async fn active_runs(&self) -> StoreResult<Vec<RunRecord>> {
         self.run(|db| {
-            let mut s = db.prepare_cached("SELECT data FROM runs WHERE active = 1 ORDER BY started_at, id").map_err(failed)?;
+            let mut s = db
+                .prepare_cached("SELECT data FROM runs WHERE active = 1 ORDER BY started_at, id")
+                .map_err(failed)?;
             let rows = s.query_map([], |r| r.get::<_, String>(0)).map_err(failed)?;
             rows.map(|r| parse(r.map_err(failed)?)).collect()
         })

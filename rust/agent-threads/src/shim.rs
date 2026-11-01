@@ -18,7 +18,9 @@ use serde_json::{Value, json};
 use tokio::sync::mpsc;
 
 use crate::ids::{now_iso, now_ms, parse_iso_ms};
-use crate::spawner::{ExitStatus, HarnessProcess, ProcessEvent, Signal, SpawnOptions, Spawned, Spawner, direct, signal_name};
+use crate::spawner::{
+    ExitStatus, HarnessProcess, ProcessEvent, Signal, SpawnOptions, Spawned, Spawner, direct, signal_name,
+};
 use crate::store::{RunRecord, Store, StoreResult};
 
 /// The run-directory format this backend writes and reads (spec/RUNDIR.md).
@@ -68,9 +70,18 @@ pub fn shim(path: impl Into<PathBuf>, options: ShimOptions) -> Arc<dyn Spawner> 
     }
     let path = path.into();
     // Made absolute here, as the shim starts in the thread's working directory.
-    let bin = if path.components().count() > 1 && path.is_relative() { std::path::absolute(&path).unwrap_or(path) } else { path };
+    let bin = if path.components().count() > 1 && path.is_relative() {
+        std::path::absolute(&path).unwrap_or(path)
+    } else {
+        path
+    };
     let runs_dir = std::path::absolute(&options.runs_dir).unwrap_or(options.runs_dir.clone());
-    Arc::new(Shim { bin, runs_dir, o: options, live: Arc::new(Mutex::new(HashSet::new())) })
+    Arc::new(Shim {
+        bin,
+        runs_dir,
+        o: options,
+        live: Arc::new(Mutex::new(HashSet::new())),
+    })
 }
 
 struct Shim {
@@ -82,7 +93,14 @@ struct Shim {
 }
 
 impl Shim {
-    fn follow(&self, id: &str, dir: PathBuf, offset: u64, launched: bool, input: Option<u64>) -> (Arc<ShimProcess>, mpsc::UnboundedReceiver<ProcessEvent>) {
+    fn follow(
+        &self,
+        id: &str,
+        dir: PathBuf,
+        offset: u64,
+        launched: bool,
+        input: Option<u64>,
+    ) -> (Arc<ShimProcess>, mpsc::UnboundedReceiver<ProcessEvent>) {
         let (tx, rx) = mpsc::unbounded_channel();
         self.live.lock().unwrap().insert(id.to_string());
         let (live, run_id) = (self.live.clone(), id.to_string());
@@ -124,7 +142,11 @@ impl Spawner for Shim {
         // The shim forks and its first process exits at once; the run is the fork's.
         let mut cmd = tokio::process::Command::new(&self.bin);
         cmd.arg(&dir).arg("--").arg(&o.command).args(&o.args);
-        cmd.env_clear().envs(&o.env).stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null());
+        cmd.env_clear()
+            .envs(&o.env)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
         if let Some(cwd) = &o.cwd {
             cmd.current_dir(cwd);
         }
@@ -172,7 +194,10 @@ impl Spawner for Shim {
     }
 
     fn stop_run(&self, run: &RunRecord) {
-        stop_dir(&run_dir(run).unwrap_or_else(|| self.runs_dir.join(&run.id)), self.o.kill_grace);
+        stop_dir(
+            &run_dir(run).unwrap_or_else(|| self.runs_dir.join(&run.id)),
+            self.o.kill_grace,
+        );
     }
 
     fn prunes(&self) -> bool {
@@ -180,7 +205,9 @@ impl Spawner for Shim {
     }
 
     async fn prune(&self, store: &dyn Store) -> StoreResult<usize> {
-        let Ok(entries) = fs::read_dir(&self.runs_dir) else { return Ok(0) };
+        let Ok(entries) = fs::read_dir(&self.runs_dir) else {
+            return Ok(0);
+        };
         let mut removed = 0;
         let now = now_ms();
         for entry in entries.flatten() {
@@ -218,7 +245,11 @@ impl Spawner for Shim {
                 Some(r) => r.ended_at.as_deref().and_then(parse_iso_ms).unwrap_or(now),
                 None => mtime,
             };
-            let keep = if record.is_some() { self.o.keep.as_millis() as u64 } else { KEEP_UNKNOWN_MS };
+            let keep = if record.is_some() {
+                self.o.keep.as_millis() as u64
+            } else {
+                KEEP_UNKNOWN_MS
+            };
             if now.saturating_sub(since) > keep && fs::remove_dir_all(&dir).is_ok() {
                 removed += 1;
             }
@@ -229,7 +260,8 @@ impl Spawner for Shim {
     async fn settle(&self) {
         // Runs being stopped are seen through first: their groups get SIGKILL when it's due.
         loop {
-            let pending: Vec<tokio::task::JoinHandle<()>> = ESCALATING.lock().unwrap().drain().map(|(_, h)| h).collect();
+            let pending: Vec<tokio::task::JoinHandle<()>> =
+                ESCALATING.lock().unwrap().drain().map(|(_, h)| h).collect();
             if pending.is_empty() {
                 return;
             }
@@ -261,7 +293,10 @@ fn create_private_dir(dir: &Path) -> io::Result<()> {
 }
 
 fn mtime_ms(meta: &fs::Metadata) -> u64 {
-    meta.modified().ok().and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok()).map_or(0, |d| d.as_millis() as u64)
+    meta.modified()
+        .ok()
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map_or(0, |d| d.as_millis() as u64)
 }
 
 /// A line written to input.jsonl after the checkpoint a run was re-attached from, which reading
@@ -305,7 +340,14 @@ struct ShimProcess {
 }
 
 impl ShimProcess {
-    fn new(dir: PathBuf, offset: u64, launched: bool, input: Option<u64>, grace: Duration, done: Box<dyn Fn() + Send + Sync>) -> Arc<Self> {
+    fn new(
+        dir: PathBuf,
+        offset: u64,
+        launched: bool,
+        input: Option<u64>,
+        grace: Duration,
+        done: Box<dyn Fn() + Send + Sync>,
+    ) -> Arc<Self> {
         let mut st = State {
             pid: None,
             input_closed: false,
@@ -327,7 +369,11 @@ impl ShimProcess {
                     let mut at = input.min(all.len() as u64);
                     for text in String::from_utf8_lossy(&all[at as usize..]).split_inclusive('\n') {
                         if text.ends_with('\n') {
-                            st.delivered.push(Delivered { text: text.to_string(), at, answers: answering(text) });
+                            st.delivered.push(Delivered {
+                                text: text.to_string(),
+                                at,
+                                answers: answering(text),
+                            });
                         }
                         at += text.len() as u64;
                     }
@@ -340,7 +386,16 @@ impl ShimProcess {
                 escalate(&dir);
             }
         }
-        Arc::new(ShimProcess { dir, grace, launched_here: launched, since: now_ms(), offset, out_at_attach, state: Mutex::new(st), done })
+        Arc::new(ShimProcess {
+            dir,
+            grace,
+            launched_here: launched,
+            since: now_ms(),
+            offset,
+            out_at_attach,
+            state: Mutex::new(st),
+            done,
+        })
     }
 
     fn lock(&self) -> std::sync::MutexGuard<'_, State> {
@@ -370,15 +425,28 @@ impl ShimProcess {
     async fn follow(self: Arc<Self>, tx: mpsc::UnboundedSender<ProcessEvent>, poll: Duration) {
         let mut out = Tail::new(self.dir.join("out.jsonl"), self.offset, false);
         // A re-attached run's stderr starts with the end of what it wrote before.
-        let err_start = if self.launched_here { 0 } else { fs::metadata(self.dir.join("err.log")).map_or(0, |m| m.len().saturating_sub(STDERR_TAIL)) };
+        let err_start = if self.launched_here {
+            0
+        } else {
+            fs::metadata(self.dir.join("err.log")).map_or(0, |m| m.len().saturating_sub(STDERR_TAIL))
+        };
         let mut err = Tail::new(self.dir.join("err.log"), err_start, err_start > 0);
         let mut announced = self.lock().caught_up;
         let mut checked = 0u64;
         let mut identity: Option<Identity> = None;
         loop {
-            if let Some(e) = { let mut st = self.lock(); if st.over { return } st.failed.take() } {
+            if let Some(e) = {
+                let mut st = self.lock();
+                if st.over {
+                    return;
+                }
+                st.failed.take()
+            } {
                 self.lock().over = true;
-                let _ = tx.send(ProcessEvent::Exit(ExitStatus { error: Some(e), ..Default::default() }));
+                let _ = tx.send(ProcessEvent::Exit(ExitStatus {
+                    error: Some(e),
+                    ..Default::default()
+                }));
                 return;
             }
             // Looked for first, so all the output written before it is read below.
@@ -405,7 +473,11 @@ impl ShimProcess {
                 if st.pid.is_none() {
                     st.pid = read_pid(&self.dir, "pid");
                 }
-                if st.pid.is_some() { std::mem::take(&mut st.signals) } else { Vec::new() }
+                if st.pid.is_some() {
+                    std::mem::take(&mut st.signals)
+                } else {
+                    Vec::new()
+                }
             };
             for s in signals {
                 terminate(&self.dir, self.grace, s);
@@ -419,7 +491,10 @@ impl ShimProcess {
                 // Recorded as the shim would have, unless it did after all.
                 if !self.dir.exists() {
                     self.lock().over = true;
-                    let _ = tx.send(ProcessEvent::Exit(ExitStatus { error: Some(gone), ..Default::default() }));
+                    let _ = tx.send(ProcessEvent::Exit(ExitStatus {
+                        error: Some(gone),
+                        ..Default::default()
+                    }));
                     return;
                 }
                 write_exit(&self.dir, json!({"code": null, "signal": null, "error": gone}));
@@ -452,7 +527,11 @@ impl ShimProcess {
             return (!alive).then(|| "its supervisor (agent-threads-shim) went away".into());
         }
         // No shim.pid: one still starting, or one that never started.
-        let since = if self.launched_here { launch.map(|(at, _)| at) } else { Some(self.since) };
+        let since = if self.launched_here {
+            launch.map(|(at, _)| at)
+        } else {
+            Some(self.since)
+        };
         if since.is_some_and(|s| now.saturating_sub(s) > START_TIMEOUT_MS) {
             return Some("agent-threads-shim didn't start the run".into());
         }
@@ -474,7 +553,11 @@ impl HarnessProcess for ShimProcess {
         if st.over || st.input_closed {
             return;
         }
-        let text = if line.ends_with('\n') { line.to_string() } else { format!("{line}\n") };
+        let text = if line.ends_with('\n') {
+            line.to_string()
+        } else {
+            format!("{line}\n")
+        };
         // Written already, after the checkpoint this run was re-attached from: what's read again
         // since writes it again, and it isn't. The first (in order) of those it's the same as; or
         // an answer to a request that was answered already (another way, by a user asked again,
@@ -483,7 +566,10 @@ impl HarnessProcess for ShimProcess {
         if at.is_none()
             && let Some(answers) = answering(&text)
         {
-            at = st.delivered.iter().position(|d| d.answers.as_deref() == Some(answers.as_str()));
+            at = st
+                .delivered
+                .iter()
+                .position(|d| d.answers.as_deref() == Some(answers.as_str()));
         }
         if let Some(at) = at {
             st.delivered.remove(at);
@@ -544,7 +630,8 @@ impl HarnessProcess for ShimProcess {
         // Not past a line that's to be written again (and isn't): a restart before it is must know
         // it's there. (An answer's kept only while its request's open.)
         if st.caught_up {
-            st.delivered.retain(|d| d.answers.as_ref().is_some_and(|a| unanswered.contains(a)));
+            st.delivered
+                .retain(|d| d.answers.as_ref().is_some_and(|a| unanswered.contains(a)));
         }
         Some(st.delivered.first().map_or(st.input, |d| d.at))
     }
@@ -552,7 +639,8 @@ impl HarnessProcess for ShimProcess {
     fn retire(&self, unanswered: &[String]) {
         let mut st = self.lock();
         st.caught_up = true;
-        st.delivered.retain(|d| d.answers.as_ref().is_some_and(|a| unanswered.contains(a)));
+        st.delivered
+            .retain(|d| d.answers.as_ref().is_some_and(|a| unanswered.contains(a)));
     }
 
     fn dir(&self) -> Option<String> {
@@ -573,7 +661,13 @@ struct Tail {
 
 impl Tail {
     fn new(path: PathBuf, offset: u64, skip: bool) -> Self {
-        Tail { path, file: None, at: offset, pending: Vec::new(), skip }
+        Tail {
+            path,
+            file: None,
+            at: offset,
+            pending: Vec::new(),
+            skip,
+        }
     }
 
     /// The whole lines appended since the last call, each with the offset after it. Once the
@@ -595,7 +689,10 @@ impl Tail {
             out.push((String::from_utf8_lossy(line).into_owned(), self.at + start as u64));
         }
         if last && start < self.pending.len() && !self.skip {
-            out.push((String::from_utf8_lossy(&self.pending[start..]).into_owned(), self.at + self.pending.len() as u64));
+            out.push((
+                String::from_utf8_lossy(&self.pending[start..]).into_owned(),
+                self.at + self.pending.len() as u64,
+            ));
             start = self.pending.len();
         }
         self.at += start as u64;
@@ -618,7 +715,12 @@ impl Tail {
 
 /// The pid in a run directory's `pid` or `shim.pid`.
 fn read_pid(dir: &Path, name: &str) -> Option<u32> {
-    fs::read_to_string(dir.join(name)).ok()?.trim().parse().ok().filter(|&n| n > 0)
+    fs::read_to_string(dir.join(name))
+        .ok()?
+        .trim()
+        .parse()
+        .ok()
+        .filter(|&n| n > 0)
 }
 
 fn read_format(dir: &Path) -> u64 {
@@ -631,16 +733,28 @@ fn read_format(dir: &Path) -> u64 {
 
 /// A run directory's `exit`, as an ExitStatus.
 fn read_exit(dir: &Path) -> ExitStatus {
-    let e: Value = match fs::read_to_string(dir.join("exit")).map_err(|e| e.to_string()).and_then(|t| serde_json::from_str(&t).map_err(|e| e.to_string())) {
+    let e: Value = match fs::read_to_string(dir.join("exit"))
+        .map_err(|e| e.to_string())
+        .and_then(|t| serde_json::from_str(&t).map_err(|e| e.to_string()))
+    {
         Ok(v) => v,
-        Err(err) => return ExitStatus { error: Some(format!("the run's exit file can't be read: {err}")), ..Default::default() },
+        Err(err) => {
+            return ExitStatus {
+                error: Some(format!("the run's exit file can't be read: {err}")),
+                ..Default::default()
+            };
+        }
     };
     let signal = match &e["signal"] {
         Value::Number(n) => n.as_i64().map(|n| signal_name(n as i32)),
         Value::String(s) => Some(s.clone()),
         _ => None,
     };
-    ExitStatus { code: e["code"].as_i64().map(|c| c as i32), signal, error: e["error"].as_str().map(String::from) }
+    ExitStatus {
+        code: e["code"].as_i64().map(|c| c as i32),
+        signal,
+        error: e["error"].as_str().map(String::from),
+    }
 }
 
 /// Which of the harness's requests an input line answers, if it's an answer: a Claude
@@ -712,12 +826,25 @@ fn group_exists(pgid: u32) -> bool {
 /// When the machine started (ms since the epoch), read once.
 static BOOT: LazyLock<Option<u64>> = LazyLock::new(|| {
     if let Ok(stat) = fs::read_to_string("/proc/stat") {
-        return stat.lines().find_map(|l| l.strip_prefix("btime ")).and_then(|s| s.trim().parse::<u64>().ok()).map(|s| s * 1000);
+        return stat
+            .lines()
+            .find_map(|l| l.strip_prefix("btime "))
+            .and_then(|s| s.trim().parse::<u64>().ok())
+            .map(|s| s * 1000);
     }
     // { sec = 1700000000, usec = 0 } ...
-    let out = std::process::Command::new("sysctl").args(["-n", "kern.boottime"]).output().ok()?;
+    let out = std::process::Command::new("sysctl")
+        .args(["-n", "kern.boottime"])
+        .output()
+        .ok()?;
     let text = String::from_utf8_lossy(&out.stdout);
-    let sec = text.split("sec = ").nth(1)?.split(|c: char| !c.is_ascii_digit()).next()?.parse::<u64>().ok()?;
+    let sec = text
+        .split("sec = ")
+        .nth(1)?
+        .split(|c: char| !c.is_ascii_digit())
+        .next()?
+        .parse::<u64>()
+        .ok()?;
     Some(sec * 1000)
 });
 
@@ -751,7 +878,9 @@ struct ProcInfo {
 /// keeps the identity found the first time, which the process with the pid must still have each
 /// time after. When that can't be told, a running process with the pid counts as the shim.
 fn shim_alive(dir: &Path, known: Option<&mut Option<Identity>>) -> bool {
-    let (Some(pid), Some(written)) = (read_pid(dir, "shim.pid"), written_this_boot(dir, "shim.pid")) else { return false };
+    let (Some(pid), Some(written)) = (read_pid(dir, "shim.pid"), written_this_boot(dir, "shim.pid")) else {
+        return false;
+    };
     if !alive(pid) {
         return false;
     }
@@ -763,11 +892,19 @@ fn shim_alive(dir: &Path, known: Option<&mut Option<Identity>>) -> bool {
         && id.pid == pid
     {
         // /proc and ps agree on a start to within a second (ps has it to the second).
-        return if id.proc == info.proc { id.start == info.start } else { id.start.abs_diff(info.start) < 1000 };
+        return if id.proc == info.proc {
+            id.start == info.start
+        } else {
+            id.start.abs_diff(info.start) < 1000
+        };
     }
     let ours = info.start <= written + 1000;
     if ours && let Some(k) = known {
-        *k = Some(Identity { pid, start: info.start, proc: info.proc });
+        *k = Some(Identity {
+            pid,
+            start: info.start,
+            proc: info.proc,
+        });
     }
     ours
 }
@@ -781,14 +918,33 @@ fn proc_info(pid: u32) -> Option<ProcInfo> {
     let out = ps(&["-o", "stat=", "-o", "lstart=", "-p", &pid.to_string()])?;
     let out = out.trim();
     let (stat, start) = out.split_once(char::is_whitespace)?;
-    let start = chrono::NaiveDateTime::parse_from_str(&start.split_whitespace().collect::<Vec<_>>().join(" "), "%a %b %d %H:%M:%S %Y").ok()?;
-    let start = start.and_local_timezone(chrono::Local).earliest()?.timestamp_millis().max(0) as u64;
-    Some(ProcInfo { start, zombie: stat.starts_with(['Z', 'X']), proc: false })
+    let start = chrono::NaiveDateTime::parse_from_str(
+        &start.split_whitespace().collect::<Vec<_>>().join(" "),
+        "%a %b %d %H:%M:%S %Y",
+    )
+    .ok()?;
+    let start = start
+        .and_local_timezone(chrono::Local)
+        .earliest()?
+        .timestamp_millis()
+        .max(0) as u64;
+    Some(ProcInfo {
+        start,
+        zombie: stat.starts_with(['Z', 'X']),
+        proc: false,
+    })
 }
 
 /// Runs `ps` with LC_ALL=C, giving up after two seconds.
 fn ps(args: &[&str]) -> Option<String> {
-    let mut child = std::process::Command::new("ps").args(args).env("LC_ALL", "C").stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::null()).spawn().ok()?;
+    let mut child = std::process::Command::new("ps")
+        .args(args)
+        .env("LC_ALL", "C")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .ok()?;
     let deadline = std::time::Instant::now() + Duration::from_secs(2);
     loop {
         match child.try_wait() {
@@ -821,7 +977,11 @@ fn proc_stat(pid: u32) -> Option<ProcInfo> {
     // starttime is field 22; fields[0] here is field 3 (state). /proc counts in USER_HZ (100).
     let ticks: u64 = fields.get(19)?.parse().ok()?;
     let state = fields.first()?;
-    Some(ProcInfo { start: boot + ticks * 10, zombie: state == "Z" || state == "X", proc: true })
+    Some(ProcInfo {
+        start: boot + ticks * 10,
+        zombie: state == "Z" || state == "X",
+        proc: true,
+    })
 }
 
 /// The session ids of the processes in process group `pgid`, if that can be told.
@@ -896,7 +1056,11 @@ fn read_stopping(dir: &Path) -> Option<(Option<u64>, u64)> {
 fn terminate(dir: &Path, grace: Duration, signal: Signal) {
     let Some(pid) = live_group(dir) else { return };
     if signal != Signal::Kill && read_stopping(dir).is_none() {
-        write_atomic(dir, "stopping", &json!({"kill_at": now_ms() + grace.as_millis() as u64}).to_string());
+        write_atomic(
+            dir,
+            "stopping",
+            &json!({"kill_at": now_ms() + grace.as_millis() as u64}).to_string(),
+        );
     }
     signal_group(pid, signal);
     if signal != Signal::Kill {
@@ -942,17 +1106,26 @@ fn escalate(dir: &Path) {
     if escalating.get(dir).is_some_and(|h| !h.is_finished()) {
         return;
     }
-    let Ok(rt) = tokio::runtime::Handle::try_current() else { return };
+    let Ok(rt) = tokio::runtime::Handle::try_current() else {
+        return;
+    };
     let d = dir.to_path_buf();
     let handle = rt.spawn(async move {
         let mut checked = false;
         loop {
-            let Some((term_at, kill_at)) = read_stopping(&d) else { return };
+            let Some((term_at, kill_at)) = read_stopping(&d) else {
+                return;
+            };
             let pid = read_pid(&d, "pid");
             let exited = d.join("exit").exists();
             let Some(pid) = pid else {
                 let has_shim = read_pid(&d, "shim.pid").is_some();
-                let never = exited || if has_shim { !shim_alive(&d, None) } else { now_ms().saturating_sub(started_at(&d)) > START_TIMEOUT_MS };
+                let never = exited
+                    || if has_shim {
+                        !shim_alive(&d, None)
+                    } else {
+                        now_ms().saturating_sub(started_at(&d)) > START_TIMEOUT_MS
+                    };
                 if never {
                     let _ = fs::remove_file(d.join("stopping"));
                     return;
@@ -967,7 +1140,10 @@ fn escalate(dir: &Path) {
             if !checked {
                 checked = true;
                 if !exited && !shim_alive(&d, None) {
-                    write_exit(&d, json!({"code": null, "signal": null, "error": "its supervisor (agent-threads-shim) went away"}));
+                    write_exit(
+                        &d,
+                        json!({"code": null, "signal": null, "error": "its supervisor (agent-threads-shim) went away"}),
+                    );
                 }
             }
             let now = now_ms();

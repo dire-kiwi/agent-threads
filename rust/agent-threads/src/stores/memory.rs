@@ -35,7 +35,12 @@ impl State {
     }
 
     pub fn last(&self, id: &str) -> StoreResult<u64> {
-        Ok(self.log(id)?.last().and_then(|e| e.get("seq")).and_then(Value::as_u64).unwrap_or(0))
+        Ok(self
+            .log(id)?
+            .last()
+            .and_then(|e| e.get("seq"))
+            .and_then(Value::as_u64)
+            .unwrap_or(0))
     }
 
     pub fn create_thread(&mut self, thread: &Value) -> StoreResult<()> {
@@ -50,7 +55,9 @@ impl State {
 
     pub fn update_thread(&mut self, thread: &Value) -> StoreResult<()> {
         let id = str_field(thread, "id");
-        let Some(t) = self.threads.get_mut(id) else { return Err(StoreError::not_found(id)) };
+        let Some(t) = self.threads.get_mut(id) else {
+            return Err(StoreError::not_found(id));
+        };
         *t = thread.clone();
         Ok(())
     }

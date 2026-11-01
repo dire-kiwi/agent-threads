@@ -7,7 +7,10 @@ use std::path::{Path, PathBuf};
 use serde_json::Value;
 
 pub fn spec_dir() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR")).join("../../spec").canonicalize().unwrap()
+    Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../spec")
+        .canonicalize()
+        .unwrap()
 }
 
 pub fn read_json(path: &str) -> Value {
@@ -31,7 +34,10 @@ pub fn temp_dir() -> PathBuf {
     static ROOT: std::sync::LazyLock<tempfile::TempDir> = std::sync::LazyLock::new(|| {
         let base = Path::new(env!("CARGO_TARGET_TMPDIR"));
         fs::create_dir_all(base).unwrap();
-        let root = tempfile::Builder::new().prefix("agent-threads-").tempdir_in(base).unwrap();
+        let root = tempfile::Builder::new()
+            .prefix("agent-threads-")
+            .tempdir_in(base)
+            .unwrap();
         let path = root.path().to_path_buf();
         // Statics aren't dropped, so it's removed at exit.
         extern "C" fn cleanup() {
@@ -78,7 +84,11 @@ pub fn shim_path() -> PathBuf {
 /// The Node backend's scriptable stand-ins for `claude` and `codex` (mini-claude.mjs,
 /// mini-codex.mjs), for what the recorded fixtures don't cover.
 pub fn mini(name: &str) -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR")).join("../../ts/packages/node/src/test").join(format!("mini-{name}.mjs")).canonicalize().unwrap()
+    Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../ts/packages/node/src/test")
+        .join(format!("mini-{name}.mjs"))
+        .canonicalize()
+        .unwrap()
 }
 
 /// Compares events with a fixture's expected events by spec/tools/check-events.mjs's rules (the
@@ -102,11 +112,20 @@ pub fn compare(fixture: &str, events: &[Value], saved_only: bool) -> Result<(), 
          if (!r.ok) {{ console.log(r.error); process.exit(1); }}",
         format!("file://{}", spec_dir().join("tools/check-events.mjs").display())
     );
-    let out = std::process::Command::new("node").args(["--input-type=module", "-e", &script]).arg(&e).arg(&a).output().unwrap();
+    let out = std::process::Command::new("node")
+        .args(["--input-type=module", "-e", &script])
+        .arg(&e)
+        .arg(&a)
+        .output()
+        .unwrap();
     if out.status.success() {
         Ok(())
     } else {
-        Err(format!("{}{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr)))
+        Err(format!(
+            "{}{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        ))
     }
 }
 
@@ -128,7 +147,11 @@ pub async fn settle(sdk: &agent_threads::AgentThreads, id: &str) -> Value {
     until(10, || async {
         let s = serde_json::to_value(sdk.snapshot(id).await.unwrap()).unwrap();
         let status = s["thread"]["status"].as_str().unwrap_or("");
-        let queued = s["items"].as_array().unwrap().iter().any(|i| i["type"] == "user_message" && i["queued"] == true);
+        let queued = s["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|i| i["type"] == "user_message" && i["queued"] == true);
         ((status == "idle" || status == "error") && !queued).then_some(s)
     })
     .await
@@ -136,12 +159,20 @@ pub async fn settle(sdk: &agent_threads::AgentThreads, id: &str) -> Value {
 
 /// A snapshot's items of a type.
 pub fn items<'a>(s: &'a Value, ty: &str) -> Vec<&'a Value> {
-    s["items"].as_array().unwrap().iter().filter(|i| i["type"] == ty).collect()
+    s["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|i| i["type"] == ty)
+        .collect()
 }
 
 /// What the agent said, in order.
 pub fn texts(s: &Value) -> Vec<String> {
-    items(s, "assistant_message").iter().map(|i| i["text"].as_str().unwrap().to_string()).collect()
+    items(s, "assistant_message")
+        .iter()
+        .map(|i| i["text"].as_str().unwrap().to_string())
+        .collect()
 }
 
 /// What each run of mini-claude or mini-codex was started with and sent, from its log.
@@ -152,14 +183,30 @@ pub struct MiniRun {
 }
 
 pub fn mini_runs(log: &Path) -> Vec<MiniRun> {
-    let Ok(text) = fs::read_to_string(log) else { return Vec::new() };
+    let Ok(text) = fs::read_to_string(log) else {
+        return Vec::new();
+    };
     let mut out: Vec<MiniRun> = Vec::new();
     for l in text.lines().filter(|l| !l.is_empty()) {
         let v: Value = serde_json::from_str(l).unwrap();
         if let Some(argv) = v.get("argv") {
-            let argv = argv.as_array().unwrap().iter().map(|a| a.as_str().unwrap().to_string()).collect();
-            out.push(MiniRun { argv, sent: Vec::new(), notes: Vec::new() });
-        } else if v.get("jsonrpc").is_some() || v.get("method").is_some() || v.get("id").is_some() || v.get("type").is_some() || v.get("result").is_some() {
+            let argv = argv
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|a| a.as_str().unwrap().to_string())
+                .collect();
+            out.push(MiniRun {
+                argv,
+                sent: Vec::new(),
+                notes: Vec::new(),
+            });
+        } else if v.get("jsonrpc").is_some()
+            || v.get("method").is_some()
+            || v.get("id").is_some()
+            || v.get("type").is_some()
+            || v.get("result").is_some()
+        {
             out.last_mut().unwrap().sent.push(v);
         } else {
             out.last_mut().unwrap().notes.push(v);

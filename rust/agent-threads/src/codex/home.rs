@@ -22,7 +22,9 @@ pub(crate) fn default_codex_home() -> PathBuf {
 }
 
 fn home_dir() -> PathBuf {
-    std::env::var_os("HOME").map(PathBuf::from).unwrap_or_else(|| PathBuf::from("/"))
+    std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("/"))
 }
 
 /// Makes the app's CODEX_HOME, with the login (auth.json) from `login` linked in if it has none of
