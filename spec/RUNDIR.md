@@ -112,6 +112,10 @@ re-attached (and written what that writes), the rest won't be written again, and
 except answers to requests it may still answer (asked of a user again, say), which are kept until
 it does, or the request is closed otherwise. Whatever it's killed in the middle of, however many
 times, nothing that's in `input.jsonl` is written to it twice, and no request is answered twice.
+Nor is one that's answered there asked again: a request saved as open whose answer is among the
+lines after the saved offset is closed when the backend re-attaches, and one that reading the
+output again asks (one asked after the saved offset) is passed over, so the user isn't asked a
+question the harness has had its answer to.
 
 ## A run whose shim is gone
 
@@ -149,15 +153,18 @@ stops what's left of the run's process group, as below.
 ## Stopping a run
 
 To stop a run, a backend first asks the harness, in the harness's own protocol over `input.jsonl`
-(Claude's `interrupt` control request, Codex's `turn/interrupt`); then, if the turn doesn't end, writes
-`input.closed`, which a harness takes as the end of its input; then, if the run hasn't ended after a
-grace period, sends SIGTERM to the program's process group (`kill(-pid, SIGTERM)`, `pid` from
-`pid`), and SIGKILL if it still hasn't. (The Node backend's graces are its drivers'
-`stopGraceMs` and `closeGraceMs`: SIGTERM `closeGraceMs` after `input.closed`, SIGKILL twice that.) A
-run nothing will follow any more is stopped from the second step, with SIGTERM straight away. Signalling the group stops whatever the program started too, and the SIGKILL goes to
-whatever is left of the group after the grace even if the program itself has exited (it may have
-left children that ignore SIGTERM). A backend never signals the shim: it writes `exit` once the
-program has gone.
+(Claude's `interrupt` control request, Codex's `turn/interrupt`); then, if the turn doesn't end,
+writes `input.closed`, which a harness takes as the end of its input; then, if the run hasn't ended
+after a grace period, sends SIGTERM to the program's process group (`kill(-pid, SIGTERM)`, `pid`
+from `pid`), and SIGKILL if it still hasn't. (The Node backend's graces are its drivers'
+`stopGraceMs` and `closeGraceMs`: SIGTERM `closeGraceMs` after `input.closed`, SIGKILL twice that.)
+A run nothing will follow any more is stopped from the second step, with SIGTERM straight away (the
+Node backend's SIGKILL is `killGraceMs` after it). A backend saves that it has asked the harness to
+stop (the turn as interrupted, and when the next step is due) before it asks, so one that restarts
+before the turn ends carries on with the stop, though the harness ignored what it asked. Signalling
+the group stops whatever the program started too, and the SIGKILL goes to whatever is left of the
+group after the grace even if the program itself has exited (it may have left children that ignore
+SIGTERM). A backend never signals the shim: it writes `exit` once the program has gone.
 
 A run with no `pid` yet is signalled as soon as `pid` appears (while the shim may still start the
 program; not once its shim is gone).
@@ -181,13 +188,14 @@ Stopping takes a while, and the backend may stop or restart meanwhile, so it wri
 stopping a run before it writes `input.closed` (or, stopping a run without closing its input, before
 it sends SIGTERM): a `stopping` file, `{"term_at": <ms since the epoch>, "kill_at": <ms>}`, when
 SIGTERM and SIGKILL are due. Once it has sent SIGTERM, it writes `stopping` again without `term_at`
-(so it's sent once); `{"kill_at": ...}` alone is a stop that has. A stop that's asked for while one is
-under way only brings its deadlines sooner. Until the group has gone and the file is removed, a
-backend keeps the run's directory, and one that starts (or re-attaches to the run) carries on with
-it, whatever the store says about the run, and whether or not it has `exit`: at `term_at` it sends
-SIGTERM to the group, and at `kill_at` SIGKILL to whatever is left of it (each only if it's still
-the run's, as above, and the run's waited for if it has no `pid` yet), then removes `stopping`. A
-backend that shuts down meanwhile waits for that first.
+(so it's sent once), however it came to send it (before `term_at`, when the run's shim has gone,
+say: it writes that down before it sends it); `{"kill_at": ...}` alone is a stop that has. A stop
+that's asked for while one is under way only brings its deadlines sooner. Until the group has gone
+and the file is removed, a backend keeps the run's directory, and one that starts (or re-attaches to
+the run) carries on with it, whatever the store says about the run, and whether or not it has
+`exit`: at `term_at` it sends SIGTERM to the group, and at `kill_at` SIGKILL to whatever is left of
+it (each only if it's still the run's, as above, and the run's waited for if it has no `pid` yet),
+then removes `stopping`. A backend that shuts down meanwhile waits for that first.
 
 ## Re-attaching
 
