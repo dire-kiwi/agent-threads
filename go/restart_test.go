@@ -328,8 +328,10 @@ func TestRestart(t *testing.T) {
 	}
 	harnesses := map[string]harness{
 		"claude": {waits: "claude/permission-allow", streams: "claude/tool-calls", ends: "claude/subagent", pace: "0.2",
-			partway: func(_ *scene, b *backend, _ func() string) { b.waitFor(`{"type":"item.added","item":{"type":"tool_call"}}`) },
-			ended:   `"type":"result"`},
+			partway: func(_ *scene, b *backend, _ func() string) {
+				b.waitFor(`{"type":"item.added","item":{"type":"tool_call"}}`)
+			},
+			ended: `"type":"result"`},
 		"codex": {waits: "codex/permission-allow", streams: "codex/tool-calls", ends: "codex/plain-reply", pace: "0.5",
 			partway: func(s *scene, _ *backend, out func() string) {
 				until(s.t, func() bool { return strings.Contains(out(), `"method":"turn/started"`) })
