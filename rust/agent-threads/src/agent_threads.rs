@@ -177,6 +177,17 @@ pub struct Recovered {
 /// How often the shim spawner's finished runs are pruned.
 const PRUNE_EVERY: std::time::Duration = std::time::Duration::from_secs(3600);
 
+/// A deletion under way: its outcome once it's done.
+type Deletion = tokio::sync::watch::Receiver<Option<Result<bool>>>;
+
+/// Waits for a deletion's outcome.
+async fn deleted(mut d: Deletion) -> Result<bool> {
+    match d.wait_for(Option::is_some).await {
+        Ok(r) => r.clone().unwrap(),
+        Err(_) => Err(Error::Other("the deletion stopped before it finished".into())),
+    }
+}
+
 /// A live thread's task.
 #[derive(Clone)]
 struct Handle {
@@ -221,7 +232,7 @@ struct Inner {
     threads: Mutex<HashMap<String, Handle>>,
     configs: StdMutex<HashMap<String, Capabilities>>,
     /// Threads being deleted, which aren't loaded again.
-    deleting: StdMutex<std::collections::HashSet<String>>,
+    deleting: StdMutex<HashMap<String, Deletion>>,
     closed: AtomicBool,
     stopped: Mutex<bool>,
     pruner: StdMutex<Option<JoinHandle<()>>>,
@@ -334,6 +345,12 @@ impl AgentThreads {
         self.open()?;
         let update = update.into();
         {
+            // A thread being deleted keeps no configuration: checked and changed under the lock a
+            // deletion is marked under, so one can't start in between.
+            let deleting = self.inner.deleting.lock().unwrap();
+            if deleting.contains_key(thread_id) {
+                return Err(Error::Command(format!("thread {thread_id} is being deleted")));
+            }
             let mut configs = self.inner.configs.lock().unwrap();
             let own = configs.entry(thread_id.to_string()).or_default();
             if let Some(t) = update.tools {
@@ -405,31 +422,44 @@ impl AgentThreads {
     pub async fn delete(&self, thread_id: &str) -> Result<bool> {
         self.open()?;
         // Marked as being deleted under the lock loads take, so nothing loads it again meanwhile:
-        // commands for it are refused until it's gone.
-        let handle = {
+        // commands for it are refused until it's gone. The deletion runs as a task of its own, so
+        // it finishes (and the mark goes) even if the caller stops waiting for it; a delete that
+        // comes meanwhile waits for the same one, as close() does.
+        let deletion = {
             let mut threads = self.inner.threads.lock().await;
-            if !self.inner.deleting.lock().unwrap().insert(thread_id.to_string()) {
-                return Err(Error::Command(format!("thread {thread_id} is being deleted")));
+            let mut deleting = self.inner.deleting.lock().unwrap();
+            if let Some(d) = deleting.get(thread_id) {
+                d.clone()
+            } else {
+                let (tx, rx) = tokio::sync::watch::channel(None);
+                deleting.insert(thread_id.to_string(), rx.clone());
+                let handle = threads.remove(thread_id);
+                let (me, id) = (self.clone(), thread_id.to_string());
+                tokio::spawn(async move {
+                    let result = me.delete_now(&id, handle).await;
+                    me.inner.deleting.lock().unwrap().remove(&id);
+                    tx.send_replace(Some(result));
+                });
+                rx
             }
-            threads.remove(thread_id)
         };
-        let result = async {
-            if let Some(h) = handle {
-                if let Ok(close) = h.call(|a| a.session.close(&mut a.core)).await {
-                    close.await;
-                }
-                let _ = h.call(|a| a.core.dispose()).await;
-                let task = h.task.lock().unwrap().take();
-                if let Some(task) = task {
-                    let _ = task.await;
-                }
+        deleted(deletion).await
+    }
+
+    /// Stops a thread being deleted (its handle, if it was live) and deletes it from the store.
+    async fn delete_now(&self, thread_id: &str, handle: Option<Handle>) -> Result<bool> {
+        if let Some(h) = handle {
+            if let Ok(close) = h.call(|a| a.session.close(&mut a.core)).await {
+                close.await;
             }
-            self.inner.configs.lock().unwrap().remove(thread_id);
-            Ok(self.inner.store.delete_thread(thread_id).await?)
+            let _ = h.call(|a| a.core.dispose()).await;
+            let task = h.task.lock().unwrap().take();
+            if let Some(task) = task {
+                let _ = task.await;
+            }
         }
-        .await;
-        self.inner.deleting.lock().unwrap().remove(thread_id);
-        result
+        self.inner.configs.lock().unwrap().remove(thread_id);
+        Ok(self.inner.store.delete_thread(thread_id).await?)
     }
 
     /// The thread's state now, including text streamed so far.
@@ -651,6 +681,11 @@ impl AgentThreads {
                 if let Some(p) = i.pruner.lock().unwrap().take() {
                     p.abort();
                 }
+                // Deletions under way finish first.
+                let deletions: Vec<Deletion> = i.deleting.lock().unwrap().values().cloned().collect();
+                for d in deletions {
+                    let _ = deleted(d).await;
+                }
                 self.stop_all(stop).await;
                 i.spawner.settle().await;
             }
@@ -840,7 +875,7 @@ impl AgentThreads {
         if let Some(h) = threads.get(thread_id) {
             return Ok(h.clone());
         }
-        if self.inner.deleting.lock().unwrap().contains(thread_id) {
+        if self.inner.deleting.lock().unwrap().contains_key(thread_id) {
             return Err(Error::Command(format!("thread {thread_id} is being deleted")));
         }
         let h = self.load_from_store(thread_id).await?;

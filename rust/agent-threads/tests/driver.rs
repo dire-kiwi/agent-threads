@@ -1261,3 +1261,96 @@ async fn a_store_that_cant_say_whether_a_thread_has_a_run_loads_nothing() {
     let s = env.sdk.snapshot("th_1").await.unwrap();
     assert_eq!(s.thread.status, agent_threads::protocol::ThreadStatus::Error);
 }
+
+/// A thread whose turn ignores its process's input closing, so deleting it takes the close grace.
+async fn stubborn_thread(env: &Env) -> String {
+    let t = env.sdk.create(create()).await.unwrap();
+    env.sdk.send(&t.id, "stubborn", SendOptions::default()).await.unwrap();
+    until(5, || async {
+        env.sdk.snapshot(&t.id).await.unwrap().thread.session_id.map(|_| ())
+    })
+    .await;
+    t.id
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_deletion_finishes_though_its_caller_stops_waiting_and_a_retry_joins_it() {
+    let claude = ClaudeCodeOptions {
+        close_grace: Duration::from_millis(500),
+        ..Default::default()
+    };
+    let env = setup(Setup {
+        claude,
+        ..Default::default()
+    });
+    let id = stubborn_thread(&env).await;
+    let (sdk, i) = (env.sdk.clone(), id.clone());
+    let first = tokio::spawn(async move { sdk.delete(&i).await });
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    // The caller gives up mid-close.
+    first.abort();
+    assert!(first.await.unwrap_err().is_cancelled());
+    // Still being deleted: commands and configure are refused, and a retry waits for the same one.
+    assert!(matches!(env.sdk.snapshot(&id).await, Err(Error::Command(m)) if m.contains("being deleted")));
+    let configure = env.sdk.configure(&id, Capabilities::default()).await;
+    assert!(
+        matches!(&configure, Err(Error::Command(m)) if m.contains("being deleted")),
+        "{configure:?}"
+    );
+    assert!(
+        env.sdk.delete(&id).await.unwrap(),
+        "the retry joins the deletion that has the thread"
+    );
+    // Gone, with nothing left behind: no actor, no mark, no new run.
+    assert!(env.sdk.get(&id).await.unwrap().is_none());
+    assert!(matches!(env.sdk.snapshot(&id).await, Err(Error::Command(m)) if m.contains("there's no thread")));
+    assert!(!env.sdk.delete(&id).await.unwrap());
+    assert_eq!(env.runs().len(), 1);
+    env.sdk.close(true).await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn an_aborted_deletion_still_deletes_the_thread() {
+    let claude = ClaudeCodeOptions {
+        close_grace: Duration::from_millis(300),
+        ..Default::default()
+    };
+    let env = setup(Setup {
+        claude,
+        ..Default::default()
+    });
+    let id = stubborn_thread(&env).await;
+    let (sdk, i) = (env.sdk.clone(), id.clone());
+    let first = tokio::spawn(async move { sdk.delete(&i).await });
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    first.abort();
+    // Eventually gone, and not stuck "being deleted".
+    until(10, || async {
+        match env.sdk.snapshot(&id).await {
+            Err(Error::Command(m)) if m.contains("there's no thread") => Some(()),
+            _ => None,
+        }
+    })
+    .await;
+    assert!(env.sdk.store().get_thread(&id).await.unwrap().is_none());
+    env.sdk.close(true).await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn close_waits_for_a_deletion_under_way() {
+    let claude = ClaudeCodeOptions {
+        close_grace: Duration::from_millis(300),
+        ..Default::default()
+    };
+    let env = setup(Setup {
+        claude,
+        ..Default::default()
+    });
+    let id = stubborn_thread(&env).await;
+    let (sdk, i) = (env.sdk.clone(), id.clone());
+    let deleting = tokio::spawn(async move { sdk.delete(&i).await });
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    env.sdk.close(true).await.unwrap();
+    assert!(env.sdk.store().get_thread(&id).await.unwrap().is_none());
+    assert!(deleting.await.unwrap().unwrap());
+}
