@@ -217,38 +217,37 @@ async fn shim_kill_runs_leaves_nothing_running() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn shim_kill_runs_waits_for_a_run_still_being_launched() {
+async fn shim_kill_runs_stops_a_run_still_being_launched_however_long_its_launch_takes() {
     use std::os::unix::fs::PermissionsExt;
-    // A launcher that takes a while to get the shim going.
-    let bin = common::temp_dir().join("slow-shim");
+    // A launcher that stalls for longer than a run's start may take, then starts the shim.
+    let dir = common::temp_dir();
+    let (bin, launcher) = (dir.join("slow-shim"), dir.join("launcher.pid"));
     std::fs::write(
         &bin,
         format!(
-            "#!/bin/sh\nsleep 0.3\nexec '{}' \"$@\"\n",
+            "#!/bin/sh\necho $$ > '{}'\nsleep 12\nexec '{}' \"$@\"\n",
+            launcher.display(),
             common::shim_path().display()
         ),
     )
     .unwrap();
     std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
     let runs_dir = common::temp_dir();
-    let mut o = ShimOptions::new(&runs_dir);
-    o.kill_grace = Duration::from_millis(500);
     let s = ShimSetup {
-        spawner: shim(&bin, o),
+        spawner: shim(&bin, ShimOptions::new(&runs_dir)),
         runs_dir: runs_dir.clone(),
     };
     // It ignores its input closing.
     let _p = s.run("exec sleep 30", "run_1");
-    let dir = runs_dir.join("run_1");
-    assert!(!dir.join("shim.pid").exists(), "dropped before the shim has started");
+    assert!(wait(|| launcher.exists()).await);
+    let pgid: i32 = std::fs::read_to_string(&launcher).unwrap().trim().parse().unwrap();
+    let started = std::time::Instant::now();
     drop(s);
-    // It waited for the run to start, killed it, and saw it end.
-    assert!(dir.join("exit").exists());
-    let pid = |name: &str| -> i32 { std::fs::read_to_string(dir.join(name)).unwrap().trim().parse().unwrap() };
-    let (program, shim_pid) = (pid("pid"), pid("shim.pid"));
-    assert!(wait(|| !alive(program) && !alive(shim_pid)).await);
-    let exit: Value = serde_json::from_str(&std::fs::read_to_string(dir.join("exit")).unwrap()).unwrap();
-    assert_eq!(exit["signal"], 9);
+    assert!(started.elapsed() < Duration::from_secs(3), "{:?}", started.elapsed());
+    // The launcher's gone, with its sleep: nothing is left to start the run.
+    assert!(wait(|| unsafe { libc::kill(-pgid, 0) } != 0).await);
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(!runs_dir.join("run_1/shim.pid").exists());
 }
 
 #[tokio::test(flavor = "multi_thread")]

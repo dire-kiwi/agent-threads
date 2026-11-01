@@ -1291,52 +1291,135 @@ fn started_at(dir: &Path) -> u64 {
     0
 }
 
-/// Kills every run in `runs_dir`, and returns once none can start another process: SIGKILL to each
-/// run's group (if it's still the run's), waiting for a run that's still being launched to get as
-/// far as recording its program's pid, and for each shim to record how its run ended. Blocks for
-/// [`START_TIMEOUT_MS`] or so at most; a shim still there after that is killed too. For tests, so
-/// one that fails leaves no process behind; an app stops its runs with
-/// [`AgentThreads::close`](crate::AgentThreads::close).
+/// Kills every run in `runs_dir`, and returns once nothing is left that could start another of
+/// their processes. For tests, so one that fails leaves no process behind; an app stops its runs
+/// with [`AgentThreads::close`](crate::AgentThreads::close). Each time round:
+///
+/// - What names a run's directory and isn't its recorded shim (a launcher, a script that runs the
+///   shim, a shim that hasn't recorded its pid yet) is killed, with its process group: none of it
+///   has started the program, which the shim starts only after recording its own pid. (If one was
+///   the shim, recording its pid just then, what's in its session goes too.)
+/// - The program's group is killed, once its pid is recorded.
+/// - A recorded shim is left to record the program's pid and how it ended, and exit; one that's
+///   still there after five seconds is killed, with what's in its session.
 #[doc(hidden)]
 pub fn kill_runs(runs_dir: &Path) {
-    let deadline = now_ms() + START_TIMEOUT_MS + 1000;
+    let deadline = now_ms() + 5000;
     loop {
         let Ok(entries) = fs::read_dir(runs_dir) else { return };
         let dirs: Vec<PathBuf> = entries.flatten().map(|e| e.path()).filter(|d| d.is_dir()).collect();
-        let mut pending = Vec::new();
+        let procs = processes().unwrap_or_default();
+        let mut pending = false;
         for dir in dirs {
             let _ = fs::write(dir.join("input.closed"), "");
             if let Some(group) = live_group(&dir) {
                 signal_group(group, Signal::Kill);
+                pending = true;
             }
-            // The shim writes `exit` however the run ends (a program it couldn't start included).
-            let ended = dir.join("exit").exists();
-            let settled = if read_pid(&dir, "shim.pid").is_some() {
-                ended || !shim_alive(&dir, None)
-            } else {
-                // Still being launched, unless it isn't a run, or its launch has had its time.
-                ended || !dir.join("run.json").exists() || now_ms().saturating_sub(started_at(&dir)) > START_TIMEOUT_MS
-            };
-            if !settled || live_group(&dir).is_some() {
-                pending.push(dir);
+            let shim = read_pid(&dir, "shim.pid").filter(|_| shim_alive(&dir, None));
+            let abs = std::path::absolute(&dir).unwrap_or(dir.clone());
+            let launching: Vec<&Proc> = procs
+                .iter()
+                .filter(|p| Some(p.pid) != shim && p.args.iter().any(|a| Path::new(a) == abs))
+                .collect();
+            for p in &launching {
+                kill_pid_or_group(p);
+                pending = true;
             }
-        }
-        if pending.is_empty() {
-            return;
-        }
-        if now_ms() > deadline {
-            for dir in pending {
-                if let Some(pid) = read_pid(&dir, "shim.pid")
-                    && proc_info(pid).is_some()
-                    && shim_alive(&dir, None)
-                {
-                    unsafe { libc::kill(pid as i32, libc::SIGKILL) };
+            if let Some(s) = read_pid(&dir, "shim.pid")
+                && launching.iter().any(|p| p.pid == s)
+            {
+                kill_session(s);
+            }
+            if let Some(s) = shim {
+                if now_ms() > deadline {
+                    unsafe { libc::kill(s as i32, libc::SIGKILL) };
+                    kill_session(s);
+                } else {
+                    pending = true;
                 }
             }
+        }
+        // Done, or (signals that don't take, say) given up on.
+        if !pending || now_ms() > deadline + 1000 {
             return;
         }
         std::thread::sleep(Duration::from_millis(20));
     }
+}
+
+/// A process, as [`processes`] lists it.
+struct Proc {
+    pid: u32,
+    pgid: u32,
+    sid: u32,
+    args: Vec<String>,
+}
+
+/// SIGKILL to a process, and to its group if it leads one.
+fn kill_pid_or_group(p: &Proc) {
+    let target = if p.pgid == p.pid { -(p.pid as i32) } else { p.pid as i32 };
+    unsafe { libc::kill(target, libc::SIGKILL) };
+}
+
+/// SIGKILL to everything in session `sid`.
+fn kill_session(sid: u32) {
+    for p in processes().unwrap_or_default().iter().filter(|p| p.sid == sid) {
+        unsafe { libc::kill(p.pid as i32, libc::SIGKILL) };
+    }
+}
+
+/// The processes running (zombies left out), with their groups, sessions and arguments, if they
+/// can be told.
+fn processes() -> Option<Vec<Proc>> {
+    if let Ok(entries) = fs::read_dir("/proc") {
+        let mut out = Vec::new();
+        for e in entries.flatten() {
+            let name = e.file_name().to_string_lossy().to_string();
+            let Ok(pid) = name.parse::<u32>() else { continue };
+            // state is field 3, pgrp field 5 and session field 6.
+            let Some(f) = proc_fields(&name) else { continue };
+            if matches!(f.first().map(String::as_str), Some("Z" | "X")) {
+                continue;
+            }
+            let (Some(pgid), Some(sid)) = (
+                f.get(2).and_then(|g| g.parse().ok()),
+                f.get(3).and_then(|s| s.parse().ok()),
+            ) else {
+                continue;
+            };
+            let Ok(cmdline) = fs::read(format!("/proc/{name}/cmdline")) else {
+                continue;
+            };
+            let args = cmdline
+                .split(|&b| b == 0)
+                .filter(|a| !a.is_empty())
+                .map(|a| String::from_utf8_lossy(a).into_owned())
+                .collect();
+            out.push(Proc { pid, pgid, sid, args });
+        }
+        return Some(out);
+    }
+    let out = ps(&[
+        "-e", "-o", "pid=", "-o", "pgid=", "-o", "sid=", "-o", "stat=", "-o", "args=",
+    ])?;
+    Some(
+        out.lines()
+            .filter_map(|l| {
+                let mut it = l.split_whitespace();
+                let (pid, pgid, sid, stat) = (it.next()?, it.next()?, it.next()?, it.next()?);
+                if stat.starts_with(['Z', 'X']) {
+                    return None;
+                }
+                Some(Proc {
+                    pid: pid.parse().ok()?,
+                    pgid: pgid.parse().ok()?,
+                    sid: sid.parse().ok()?,
+                    args: it.map(String::from).collect(),
+                })
+            })
+            .collect(),
+    )
 }
 
 /// Stops the run in `dir`, which nothing follows: ends its input, then SIGTERM to its group and

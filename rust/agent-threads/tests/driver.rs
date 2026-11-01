@@ -1628,16 +1628,20 @@ async fn a_thread_configured_while_its_being_loaded_has_the_new_configuration() 
     });
     let s = store.clone();
     until(5, || async { (s.loads() > 0).then_some(()) }).await;
-    // Its actor is made (with the instance's policy, allow), and it isn't live yet.
-    let policy = Capabilities {
-        permissions: Some(PermissionPolicy::deny()),
-        ..Default::default()
-    };
-    tokio::time::timeout(Duration::from_secs(2), env.sdk.configure("th_1", policy))
-        .await
-        .expect("configure doesn't wait for the load")
-        .unwrap();
+    // Its actor is made (with the instance's policy, allow), and it isn't live yet: configure()
+    // waits for it, and changes it once it is.
+    let configuring = tokio::spawn({
+        let sdk = env.sdk.clone();
+        let policy = Capabilities {
+            permissions: Some(PermissionPolicy::deny()),
+            ..Default::default()
+        };
+        async move { sdk.configure("th_1", policy).await }
+    });
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert!(!configuring.is_finished(), "configure() waits for the load");
     store.open.send_replace(true);
+    configuring.await.unwrap().unwrap();
     loading.await.unwrap().unwrap();
     env.sdk
         .send("th_1", "tool Bash {}", SendOptions::default())
@@ -1646,4 +1650,101 @@ async fn a_thread_configured_while_its_being_loaded_has_the_new_configuration() 
     let s = settle(&env.sdk, "th_1").await;
     assert_eq!(items(&s, "tool_call")[0]["status"], "denied");
     env.sdk.close(true).await.unwrap();
+}
+
+/// Kills the runs in a directory when it's dropped, so a test that fails leaves nothing running.
+struct KillRuns(PathBuf);
+
+impl Drop for KillRuns {
+    fn drop(&mut self) {
+        agent_threads::kill_runs(&self.0);
+    }
+}
+
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread")]
+async fn a_thread_configured_while_its_run_is_reattached_answers_the_runs_open_requests_with_the_new_policy() {
+    let runs = KillRuns(common::temp_dir());
+    let log = common::temp_dir().join("log.jsonl");
+    let make = |store: Arc<dyn Store>, policy: PermissionPolicy| {
+        let mut claude = ClaudeCodeOptions {
+            bin: common::mini("claude").to_string_lossy().into(),
+            ..Default::default()
+        };
+        claude
+            .env
+            .insert("MINI_CLAUDE_LOG".into(), Some(log.to_string_lossy().into()));
+        AgentThreads::new(Options {
+            store: Some(store),
+            harnesses: vec![agent_threads::claude_code(claude)],
+            spawner: Some(agent_threads::shim(
+                common::shim_path(),
+                agent_threads::ShimOptions::new(&runs.0),
+            )),
+            capabilities: Capabilities {
+                permissions: Some(policy),
+                ..Default::default()
+            },
+            ..Default::default()
+        })
+    };
+    // A backend whose policy hasn't decided on Claude's request when it shuts down, leaving the run
+    // going with the request open.
+    let asked = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let a = asked.clone();
+    #[allow(unreachable_code)]
+    let undecided = PermissionPolicy::from_async(move |_, _| {
+        a.store(true, std::sync::atomic::Ordering::SeqCst);
+        std::future::pending::<PermissionDecision>()
+    });
+    let state = MemoryStore::new();
+    let first = make(Arc::new(MemoryStore::with_state(state.state.clone())), undecided);
+    let t = first.create(create()).await.unwrap();
+    first.send(&t.id, "tool Bash {}", SendOptions::default()).await.unwrap();
+    until(10, || async {
+        asked.load(std::sync::atomic::Ordering::SeqCst).then_some(())
+    })
+    .await;
+    first.close(false).await.unwrap();
+    let run_dir = std::fs::read_dir(&runs.0).unwrap().next().unwrap().unwrap().path();
+    let input = run_dir.join("input.jsonl");
+    let answers = || {
+        std::fs::read_to_string(&input)
+            .unwrap()
+            .lines()
+            .filter(|l| l.contains("control_response"))
+            .map(String::from)
+            .collect::<Vec<_>>()
+    };
+    assert!(answers().is_empty());
+
+    // The next backend allows everything, and is told to deny while it's looking the run up.
+    let store = Gated::runs(MemoryStore::with_state(state.state.clone()));
+    let second = make(store.clone(), PermissionPolicy::allow());
+    let loading = tokio::spawn({
+        let (sdk, id) = (second.clone(), t.id.clone());
+        async move { sdk.snapshot(&id).await }
+    });
+    let s = store.clone();
+    until(5, || async { (s.loads() > 0).then_some(()) }).await;
+    let configuring = tokio::spawn({
+        let (sdk, id) = (second.clone(), t.id.clone());
+        let policy = Capabilities {
+            permissions: Some(PermissionPolicy::deny()),
+            ..Default::default()
+        };
+        async move { sdk.configure(&id, policy).await }
+    });
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    store.open.send_replace(true);
+    configuring.await.unwrap().unwrap();
+    loading.await.unwrap().unwrap();
+    let said = until(10, || async {
+        let a = answers();
+        (!a.is_empty()).then_some(a)
+    })
+    .await;
+    assert_eq!(said.len(), 1, "{said:?}");
+    assert!(said[0].contains(r#""behavior":"deny""#), "{said:?}");
+    second.close(true).await.unwrap();
 }
