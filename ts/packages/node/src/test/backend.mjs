@@ -1,19 +1,22 @@
 // A backend in a process of its own, for restart.test.ts to kill: the built package (dist), with a
-// FileStore, the shim spawner and Claude Code played by the fake CLI. It takes commands on stdin,
+// FileStore, the shim spawner, and Claude Code and Codex played by the fake CLI. It takes commands on stdin,
 // one JSON object a line ({id, op, args}), and writes each reply ({reply: id, result} or {reply: id,
 // error}) and every event ({event}) to stdout, a line each.
 //
-// Environment: STORE, RUNS (directories), SHIM (the binary), FAKE_CLI, and the fake CLI's own
-// (AGENT_THREADS_FIXTURE...). POLICY is the permission policy (allow or ask).
+// Environment: STORE, RUNS, CODEX_HOME_DIR (directories), SHIM (the binary), FAKE_CLI, and the fake
+// CLI's own (AGENT_THREADS_FIXTURE...). POLICY is the permission policy (allow or ask).
 
 import { createInterface } from "node:readline";
-import { AgentThreads, FileStore, claudeCode, shim } from "../../dist/index.js";
+import { AgentThreads, FileStore, claudeCode, codex, shim } from "../../dist/index.js";
 
 const env = process.env;
 const fakeEnv = Object.fromEntries(Object.entries(env).filter(([k]) => k.startsWith("AGENT_THREADS_FIXTURE")));
 const sdk = new AgentThreads({
   store: new FileStore(env.STORE),
-  harnesses: { claude: claudeCode({ bin: env.FAKE_CLI, env: fakeEnv }) },
+  harnesses: {
+    claude: claudeCode({ bin: env.FAKE_CLI, env: fakeEnv }),
+    codex: codex({ bin: env.FAKE_CLI, env: fakeEnv, home: env.CODEX_HOME_DIR, login: false }),
+  },
   permissions: env.POLICY ?? "allow",
   spawner: shim(env.SHIM, { runsDir: env.RUNS, pollMs: 50 }),
   onError: (e) => process.stderr.write(`backend error: ${e?.stack ?? e}\n`),

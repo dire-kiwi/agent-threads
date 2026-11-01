@@ -493,6 +493,13 @@ function recoverLost(rt: ThreadRuntime): void {
     for (const r of rt.snapshot.requests) {
       rt.emit({ type: "request.resolved", request_id: r.id, resolution: { outcome: "cancel" } });
     }
+    rt.addItem({
+      id: newId("n"),
+      type: "notice",
+      level: "warning",
+      code: "run.lost",
+      text: "The backend stopped while this turn was running, and couldn't pick its run up again.",
+    });
     // Not carried over: loading a thread starts no process. Its queued messages go with the next.
     rt.endTurn({ ok: false, error: "The backend stopped while this turn was running." }, { carry: false });
   }

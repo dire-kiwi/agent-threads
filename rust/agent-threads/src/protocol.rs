@@ -352,7 +352,7 @@ pub struct ItemUpdatedEvent {
 ///Something to tell the user that isn't the agent talking: an error, a retry, hook output, a run re-attached after a restart.
 #[derive(::serde::Deserialize, ::serde::Serialize, Clone, Debug)]
 pub struct Notice {
-    ///What kind of notice it is, for apps that treat some specially. Known codes: run.reattached (a restarted backend picked up a run that was still going), run.lost (a run ended while the backend was down), retry, hook, stderr.
+    ///What kind of notice it is, for apps that treat some specially. Known codes: run.reattached (a restarted backend picked up a run that was still going), run.lost (a restarted backend couldn't pick up the run a turn was running in, so the turn ended), retry, hook, stderr.
     #[serde(skip_serializing_if = "::std::option::Option::is_none")]
     pub code: ::std::option::Option<::std::string::String>,
     #[serde(skip_serializing_if = "::std::option::Option::is_none")]

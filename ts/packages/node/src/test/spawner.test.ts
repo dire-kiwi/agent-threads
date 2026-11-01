@@ -1,7 +1,13 @@
-// The direct spawner: lines out, exit after the last one, and stopping everything a process started.
+// The spawners: lines out, exit after the last one, and stopping everything a process started;
+// and for the shim, reading whole lines from an offset, re-attaching, and noticing a run that's gone.
 
+import { existsSync, mkdirSync, readdirSync, readFileSync, utimesSync, writeFileSync } from "node:fs";
+import { join } from "node:path";
 import { describe, expect, it } from "vitest";
-import { direct, type ExitStatus } from "../spawner.js";
+import { shim } from "../shim.js";
+import { direct, type ExitStatus, type HarnessProcess, type Spawner } from "../spawner.js";
+import { MemoryStore } from "../stores/memory.js";
+import { shimPath, tempDir } from "./spec.js";
 
 function spawn(script: string) {
   const lines: string[] = [];
@@ -41,3 +47,147 @@ describe.skipIf(process.platform === "win32")("direct()", () => {
     expect(await wait(p.exit)).toBe(true);
   });
 });
+
+/** A process of the shim spawner's (or one it re-attached to), and what it has said. */
+function follow(start: (h: Parameters<Spawner["spawn"]>[1]) => HarnessProcess) {
+  const lines: string[] = [];
+  const stderr: string[] = [];
+  let exited: ExitStatus | undefined;
+  const proc = start({ line: (l) => lines.push(l), stderr: (l) => stderr.push(l), exit: (s) => (exited = s) });
+  return { proc, lines, stderr, exit: () => exited };
+}
+
+describe.skipIf(process.platform === "win32")("shim()", () => {
+  const setup = () => {
+    const runsDir = tempDir();
+    const spawner = shim(shimPath(), { runsDir, pollMs: 20, killGraceMs: 500 });
+    const run = (script: string, runId = "run_1") =>
+      follow((h) => spawner.spawn({ command: "sh", args: ["-c", script], threadId: "th", runId }, h));
+    return { runsDir, spawner, run };
+  };
+
+  it("passes whole lines through, with the offset after each, and says how it exited after the last", async () => {
+    const { runsDir, run } = setup();
+    // The last line has no newline: it counts once the run is over.
+    const p = run("read x; echo got $x; printf 'part'; sleep 0.3; printf 'ial\\nlast'; echo oops >&2; exit 3");
+    p.proc.write("hi");
+    expect(await wait(() => p.lines.length === 1)).toBe(true);
+    expect(p.lines).toEqual(["got hi"]);
+    await new Promise((r) => setTimeout(r, 150));
+    // Half a line isn't given, nor counted.
+    expect(p.lines).toEqual(["got hi"]);
+    expect(p.proc.offset).toBe("got hi\n".length);
+    expect(await wait(p.exit)).toBe(true);
+    expect(p.lines).toEqual(["got hi", "partial", "last"]);
+    expect(p.stderr).toEqual(["oops"]);
+    expect(p.exit()).toMatchObject({ code: 3, signal: null });
+    expect(p.proc.offset).toBe(readFileSync(join(runsDir, "run_1", "out.jsonl")).length);
+    expect(JSON.parse(readFileSync(join(runsDir, "run_1", "run.json"), "utf8"))).toMatchObject({ format: 1, run_id: "run_1", thread_id: "th", command: "sh" });
+  });
+
+  it("re-attaches from an offset, and leaves a run going when it detaches", async () => {
+    const { spawner, run } = setup();
+    const a = run("while read -r x; do echo \"got $x\"; done; echo bye");
+    a.proc.write("one");
+    expect(await wait(() => a.lines.length === 1)).toBe(true);
+    const offset = a.proc.offset!;
+    a.proc.write("two");
+    a.proc.detach!();
+    // What it says while nothing follows it is read by what re-attaches.
+    await new Promise((r) => setTimeout(r, 200));
+    expect(a.lines).toEqual(["got one"]);
+    const b = follow((h) => spawner.attach!({ id: "run_1", thread_id: "th", spawner: "shim", offset, started_at: "" }, h));
+    expect(await wait(() => b.lines.length === 1)).toBe(true);
+    expect(b.lines).toEqual(["got two"]);
+    b.proc.write("three");
+    b.proc.closeInput();
+    expect(await wait(b.exit)).toBe(true);
+    expect(b.lines).toEqual(["got two", "got three", "bye"]);
+    expect(b.exit()).toMatchObject({ code: 0 });
+    expect(a.exit()).toBeUndefined();
+  });
+
+  it("stops the run's whole process group", async () => {
+    const { runsDir, run } = setup();
+    const p = run("sleep 30 & echo $!; wait");
+    expect(await wait(() => p.lines.length === 1)).toBe(true);
+    const sleeper = Number(p.lines[0]);
+    p.proc.kill("SIGTERM");
+    expect(await wait(p.exit)).toBe(true);
+    expect(p.exit()).toMatchObject({ code: null, signal: "SIGTERM" });
+    expect(await wait(() => !alive(sleeper))).toBe(true);
+    expect(readdirSync(join(runsDir, "run_1"))).toContain("exit");
+  });
+
+  it("signals a run it's stopped before the shim has started it, once it has", async () => {
+    const { run } = setup();
+    const p = run("sleep 30");
+    p.proc.kill("SIGKILL");
+    expect(await wait(p.exit)).toBe(true);
+    expect(p.exit()).toMatchObject({ signal: "SIGKILL" });
+  });
+
+  it("notices a shim that went away without saying how its run ended", async () => {
+    const { runsDir, run } = setup();
+    const p = run("echo started; exec sleep 30");
+    expect(await wait(() => p.lines.length === 1)).toBe(true);
+    const dir = join(runsDir, "run_1");
+    process.kill(Number(readFileSync(join(dir, "shim.pid"), "utf8")), "SIGKILL");
+    expect(await wait(p.exit)).toBe(true);
+    expect(p.exit()?.error?.message).toMatch(/agent-threads-shim\) went away/);
+    expect(JSON.parse(readFileSync(join(dir, "exit"), "utf8"))).toMatchObject({ code: null, error: expect.stringMatching(/went away/) });
+    p.proc.kill("SIGKILL");
+    process.kill(-Number(readFileSync(join(dir, "pid"), "utf8")), "SIGKILL");
+  });
+
+  it("says why a run couldn't be started", async () => {
+    const runsDir = tempDir();
+    const p = follow((h) => shim("/nonexistent/agent-threads-shim", { runsDir }).spawn({ command: "sh", args: [], threadId: "th", runId: "r" }, h));
+    expect(await wait(p.exit)).toBe(true);
+    expect(p.exit()?.error?.message).toMatch(/couldn't be started/);
+    const q = setup().run("true");
+    expect(await wait(q.exit)).toBe(true);
+    expect(q.exit()).toMatchObject({ code: 0 });
+  });
+
+  it("prunes runs the backend finished with a while ago, and stops runs nothing follows", async () => {
+    const { runsDir, spawner, run } = setup();
+    const store = new MemoryStore();
+    await store.createThread({ id: "th", harness: "claude", status: "idle", created_at: "2026-11-01T00:00:00Z" });
+    const done = (id: string, endedDaysAgo: number | null) => {
+      const dir = join(runsDir, id);
+      mkdirSync(dir);
+      writeFileSync(join(dir, "exit"), '{"code":0,"signal":null}');
+      const ended_at = endedDaysAgo === null ? undefined : new Date(Date.now() - endedDaysAgo * 86_400_000).toISOString();
+      return store.putRun({ id, thread_id: "th", spawner: "shim", offset: 0, started_at: "2026-11-01T00:00:00Z", ...(ended_at ? { ended_at } : {}) });
+    };
+    await done("old", 20);
+    await done("recent", 1);
+    await done("active", null);
+    // No record, finished long ago (a backend that died before saving it), and one just made.
+    mkdirSync(join(runsDir, "stray"));
+    writeFileSync(join(runsDir, "stray", "exit"), "{}");
+    const hourAgo = new Date(Date.now() - 2 * 3600_000);
+    utimesSync(join(runsDir, "stray"), hourAgo, hourAgo);
+    mkdirSync(join(runsDir, "new"));
+    // Running, but the store has it as ended: its backend gave up on it.
+    const orphan = run("sleep 30", "orphan");
+    expect(await wait(() => existsSync(join(runsDir, "orphan", "pid")))).toBe(true);
+    orphan.proc.detach!();
+    await store.putRun({ id: "orphan", thread_id: "th", spawner: "shim", offset: 0, started_at: "2026-11-01T00:00:00Z", ended_at: new Date().toISOString() });
+
+    expect(await spawner.prune!(store)).toBe(2);
+    expect(readdirSync(runsDir).sort()).toEqual(["active", "new", "orphan", "recent"]);
+    expect(await wait(() => existsSync(join(runsDir, "orphan", "exit")))).toBe(true);
+    expect(JSON.parse(readFileSync(join(runsDir, "orphan", "exit"), "utf8"))).toMatchObject({ signal: 15 });
+  });
+});
+
+function alive(pid: number): boolean {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch {
+    return false;
+  }
+}

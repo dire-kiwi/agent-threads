@@ -88,6 +88,7 @@ function scene(fixture: string, extra: { [k: string]: string } = {}) {
   const env = {
     STORE: dirs.store,
     RUNS: dirs.runs,
+    CODEX_HOME_DIR: tempDir(),
     SHIM: shimPath(),
     FAKE_CLI: fakeCli,
     AGENT_THREADS_FIXTURE: join(specDir, "fixtures", fixture),
@@ -224,5 +225,33 @@ describe.skipIf(process.platform === "win32")("a backend restart", () => {
     await b.exited;
 
     checkThread("claude/permission-allow", await savedEvents(s.dirs.store, thread.id), s.dirs.state, 1);
+  });
+
+  it("with a driver that can't re-attach (Codex, for now): the run is stopped, and its turn ends", { timeout: 60_000 }, async () => {
+    const s = scene("codex/permission-allow", { POLICY: "ask" });
+    const a = s.start();
+    const thread = await a.call<{ id: string }>("create", { ...s.fixture.thread, cwd: s.dirs.cwd });
+    await a.call("handle", { ...s.fixture.steps[0].command, thread_id: thread.id });
+    await a.waitFor({ type: "request.opened" });
+    await a.crash();
+    const [runId] = readdirSync(s.dirs.runs);
+    const runDir = join(s.dirs.runs, runId!);
+    expect(existsSync(join(runDir, "exit"))).toBe(false);
+
+    const b = s.start();
+    expect(await b.call("recover")).toEqual({ reattached: [], lost: [thread.id] });
+    const snap = await b.call<Snapshot>("snapshot", thread.id);
+    expect(snap.thread).toMatchObject({ status: "error", error: expect.stringMatching(/stopped/) });
+    expect(snap.thread.run).toBeUndefined();
+    expect(snap.requests).toEqual([]);
+    expect(snap.items.filter((i) => i.type === "notice").map((i) => i.type === "notice" && i.code)).toEqual(["run.lost"]);
+    // It was sent SIGTERM (which the fake CLI exits 143 on).
+    await until(() => existsSync(join(runDir, "exit")));
+    expect(JSON.parse(readFileSync(join(runDir, "exit"), "utf8"))).toMatchObject({ code: 143 });
+    await b.call("close");
+    await b.exited;
+    const store = new FileStore(s.dirs.store);
+    expect(await store.activeRuns()).toEqual([]);
+    await store.close();
   });
 });

@@ -769,8 +769,8 @@ type Notice struct {
 	Text  string      `json:"text"`
 
 	// What kind of notice it is, for apps that treat some specially. Known codes: run.reattached (a
-	// restarted backend picked up a run that was still going), run.lost (a run ended while the backend
-	// was down), retry, hook, stderr.
+	// restarted backend picked up a run that was still going), run.lost (a restarted backend couldn't
+	// pick up the run a turn was running in, so the turn ended), retry, hook, stderr.
 	Code string `json:"code,omitempty"`
 
 	// More text, e.g. a stack trace or a hook's full output.

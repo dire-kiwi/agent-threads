@@ -152,7 +152,7 @@
         "type": { "const": "notice" },
         "level": { "type": "string", "enum": ["info", "warning", "error"] },
         "text": { "type": "string" },
-        "code": { "type": "string", "description": "What kind of notice it is, for apps that treat some specially. Known codes: run.reattached (a restarted backend picked up a run that was still going), run.lost (a run ended while the backend was down), retry, hook, stderr.", "examples": ["run.reattached", "run.lost", "retry", "hook", "stderr"] },
+        "code": { "type": "string", "description": "What kind of notice it is, for apps that treat some specially. Known codes: run.reattached (a restarted backend picked up a run that was still going), run.lost (a restarted backend couldn't pick up the run a turn was running in, so the turn ended), retry, hook, stderr.", "examples": ["run.reattached", "run.lost", "retry", "hook", "stderr"] },
         "detail": { "type": "string", "description": "More text, e.g. a stack trace or a hook's full output." },
         "parent_id": { "type": "string", "description": "The id of the subagent tool_call this item belongs to. Absent for the main conversation." },
         "turn_id": { "type": "string", "description": "The turn the item was made in." },
