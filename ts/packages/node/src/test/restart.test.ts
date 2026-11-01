@@ -424,4 +424,33 @@ describe.skipIf(process.platform === "win32")("a backend restart", () => {
     expect(said).toMatch(/app said found it/);
     expect(readFileSync(marker, "utf8")).toBe("ran\n");
   });
+
+  it("doesn't send a message again that it sent before it died, though what led it to is read again", { timeout: 60_000 }, async () => {
+    // Claude says nothing about the message for a while after it's sent, so nothing's saved after
+    // it: the checkpoint is from before Claude answered initialize, which is what sends it.
+    const s = mini({ MINI_CLAUDE_START_DELAY: "1500" });
+    const a = s.start();
+    const thread = await a.call<{ id: string }>("create", { harness: "claude", cwd: s.dirs.cwd });
+    await a.call("handle", { type: "send", thread_id: thread.id, text: "reply hello" } satisfies Command);
+    const input = () => {
+      const [runId] = readdirSync(s.dirs.runs);
+      return runId ? readFileSync(join(s.dirs.runs, runId, "input.jsonl"), "utf8") : "";
+    };
+    await until(() => input().includes("reply hello"));
+    await a.crash();
+
+    const b = s.start();
+    expect(await b.call("recover")).toEqual({ reattached: [thread.id], lost: [] });
+    await b.waitFor({ type: "turn.completed" });
+    await sleep(300);
+    const snap = await b.call<Snapshot>("snapshot", thread.id);
+    await b.call("close", { stop: true });
+    await b.exited;
+    // Sent once, and answered once.
+    expect(input().split("reply hello").length - 1).toBe(1);
+    const sent = readFileSync(s.log, "utf8").trim().split("\n").map((l) => JSON.parse(l)).filter((l) => l.type === "user");
+    expect(sent).toHaveLength(1);
+    expect(snap.items.filter((i) => i.type === "turn_result")).toHaveLength(1);
+    expect(snap.items.filter((i) => i.type === "assistant_message").map((i) => (i.type === "assistant_message" ? i.text : ""))).toEqual(["hello"]);
+  });
 });

@@ -114,6 +114,8 @@ export interface RunCheckpoint {
   offset: number;
   /** Where its files are (the shim's run directory). */
   dir?: string;
+  /** How much of its input had been written (HarnessProcess.inputOffset). */
+  input?: number;
   /** The driver's state for it, as JSON, which reattach() gets back. */
   state: unknown;
   /** It has exited, and the driver is done with it (its last checkpoint). */

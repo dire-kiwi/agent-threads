@@ -22,7 +22,8 @@
 // turn); with MINI_CLAUDE_STEER=never, they never are (and the process has to be restarted); with
 // MINI_CLAUDE_STEER=hold, they're never taken in either, and an interrupt while no turn runs gets
 // an interrupted result. MINI_CLAUDE_IDLE_ERRORS=<n> sends n failed results (an API error, say)
-// before taking in late messages. MINI_CLAUDE_TOOL_DELAY=<ms> waits that long between an app tool's
+// before taking in late messages. MINI_CLAUDE_START_DELAY=<ms> waits that long before saying
+// anything about the first message. MINI_CLAUDE_TOOL_DELAY=<ms> waits that long between an app tool's
 // call and asking for it to be run. With MINI_CLAUDE_FAIL_RESUME=1 (or the name of a file that
 // exists), a process started with --resume fails at its first message.
 
@@ -116,6 +117,8 @@ async function turn(m) {
   busy = true;
   wasInterrupted = false;
   turns++;
+  // A while before it says anything about the first message (MINI_CLAUDE_START_DELAY).
+  if (turns === 1) await sleep(Number(process.env.MINI_CLAUDE_START_DELAY ?? 0));
   out({ type: "user", message: m.message, isReplay: true, session_id: session, parent_tool_use_id: null });
   out({ type: "system", subtype: "init", session_id: session });
   for (const block of m.message.content.filter((b) => b.type === "text")) {

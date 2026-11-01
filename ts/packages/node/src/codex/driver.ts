@@ -425,7 +425,8 @@ class CodexSession implements HarnessSession {
     // While it's starting there's nothing to carry on with: a restart then stops it.
     const state: RunState | undefined = st && { ...st, ...(this.#stale ? { stale: true } : {}), ...(this.#stopAt !== undefined ? { stopAt: this.#stopAt } : {}) };
     const dir = (run.proc as { dir?: unknown }).dir;
-    return { id: run.id, offset, ...(typeof dir === "string" ? { dir } : {}), state, ...(run.exited ? { ended: true } : {}) };
+    const input = run.proc?.inputOffset;
+    return { id: run.id, offset, ...(typeof dir === "string" ? { dir } : {}), ...(input !== undefined ? { input } : {}), state, ...(run.exited ? { ended: true } : {}) };
   }
 
   reattach(record: RunRecord): boolean {

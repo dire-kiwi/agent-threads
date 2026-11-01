@@ -218,7 +218,13 @@ export class ThreadRuntime implements ThreadContext {
       offset: cp.offset,
       started_at: before?.id === cp.id ? before.started_at : thread.run?.id === cp.id && thread.run.started_at ? thread.run.started_at : now,
       ...("ended" in cp && cp.ended ? { ended_at: now } : {}),
-      data: { ...("dir" in cp && cp.dir ? { dir: cp.dir } : {}), turn: this.turn, state: cp.state, ...(live ? { live } : {}) },
+      data: {
+        ...("dir" in cp && cp.dir ? { dir: cp.dir } : {}),
+        ...("input" in cp && cp.input !== undefined ? { input: cp.input } : {}),
+        turn: this.turn,
+        state: cp.state,
+        ...(live ? { live } : {}),
+      },
     };
     // A copy, taken now: the store may write it later, after more of the run's output has changed
     // the driver's state and the turn.

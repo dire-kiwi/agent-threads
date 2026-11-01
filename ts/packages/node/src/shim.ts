@@ -60,8 +60,8 @@ export function shim(path: string, options: ShimOptions): Spawner {
   /** Runs this backend follows, which pruning leaves alone. */
   const live = new Map<string, ShimProcess>();
 
-  const follow = (id: string, dir: string, offset: number, handlers: ProcessHandlers, launched: boolean): ShimProcess => {
-    const proc = new ShimProcess(dir, offset, handlers, { poll, grace, launched, done: () => live.delete(id) });
+  const follow = (id: string, dir: string, offset: number, handlers: ProcessHandlers, launched: boolean, input?: number): ShimProcess => {
+    const proc = new ShimProcess(dir, offset, handlers, { poll, grace, launched, input, done: () => live.delete(id) });
     live.set(id, proc);
     return proc;
   };
@@ -91,7 +91,8 @@ export function shim(path: string, options: ShimOptions): Spawner {
 
     attach(run: RunRecord, handlers: ProcessHandlers): HarnessProcess {
       const dir = runDir(run) ?? join(runsDir, run.id);
-      const proc = follow(run.id, dir, run.offset ?? 0, handlers, false);
+      const input = (run.data as { input?: unknown } | undefined)?.input;
+      const proc = follow(run.id, dir, run.offset ?? 0, handlers, false, typeof input === "number" ? input : undefined);
       const format = readFormat(dir);
       if (format > RUN_FORMAT) {
         stopDir(dir, grace);
@@ -179,13 +180,30 @@ class ShimProcess implements HarnessProcess {
   #launchedHere: boolean;
   #since = Date.now();
   #checked = 0;
+  /** input.jsonl's size, as written. */
+  #input = 0;
+  /** Lines in input.jsonl after the checkpoint it was re-attached from, not yet written again. */
+  #delivered: string[] = [];
   /** The shim's identity, once it's been checked to be the run's. */
   #shim: { identity?: Identity } = {};
   #over = false;
   #onDone: () => void;
 
-  constructor(dir: string, offset: number, handlers: ProcessHandlers, o: { poll: number; grace: number; launched: boolean; done: () => void }) {
+  constructor(dir: string, offset: number, handlers: ProcessHandlers, o: { poll: number; grace: number; launched: boolean; done: () => void; input?: number }) {
     this.dir = dir;
+    if (!o.launched) {
+      // What's been written, and what of it came after the checkpoint (input: where it was then).
+      try {
+        const all = readFileSync(join(dir, "input.jsonl"));
+        this.#input = all.length;
+        if (o.input !== undefined) {
+          const after = all.subarray(Math.min(o.input, all.length)).toString("utf8");
+          this.#delivered = after.split(/(?<=\n)/).filter((l) => l.endsWith("\n"));
+        }
+      } catch {
+        // None.
+      }
+    }
     this.#offset = offset;
     this.#handlers = handlers;
     this.#poll = o.poll;
@@ -224,11 +242,22 @@ class ShimProcess implements HarnessProcess {
     return this.#offset;
   }
 
+  /** How much of input.jsonl is written (bytes): a checkpoint keeps it, as of the driver's state. */
+  get inputOffset(): number {
+    return this.#input;
+  }
+
   write(line: string): void {
     if (this.#over || this.#inputClosed) return;
+    const text = line.endsWith("\n") ? line : line + "\n";
+    // Written already, after the checkpoint this run was re-attached from: what's read again since
+    // writes it again, and it isn't.
+    const at = this.#delivered.indexOf(text);
+    if (at >= 0) return void this.#delivered.splice(at, 1);
     try {
       // One write, so the shim never relays half a line.
-      appendFileSync(join(this.dir, "input.jsonl"), line.endsWith("\n") ? line : line + "\n");
+      appendFileSync(join(this.dir, "input.jsonl"), text);
+      this.#input += Buffer.byteLength(text);
     } catch {
       // The run's gone; its exit says how.
     }
@@ -508,52 +537,81 @@ function writtenThisBoot(dir: string, name: string): number | undefined {
   }
 }
 
-/** A process's identity: its pid, and when it started (which a pid given to another process differs in). */
+/**
+ * A process's identity: its pid, when it started (which a pid given to another process differs
+ * in), and where that was read, since /proc and `ps` don't tell it alike.
+ */
 interface Identity {
   pid: number;
   start: number;
+  source: "proc" | "ps";
 }
 
 /**
  * Whether the run's shim is alive: the process in `shim.pid` (written since the machine started)
- * is running, and is the shim, which started before `shim.pid` was written (not another process
- * given the same pid since). `known` keeps the identity found the first time, which the process
- * with the pid must still have each time after: if it hasn't, the shim has gone. When the start
- * can't be told (no /proc and no `ps`, say), a running process with the pid counts as the shim,
- * and nothing is remembered: it's checked again next time.
+ * is running (not a zombie), and is the shim, which started before `shim.pid` was written (not
+ * another process given the same pid since). `known` keeps the identity found the first time,
+ * which the process with the pid must still have each time after: if it hasn't, the shim has
+ * gone. When that can't be told (no /proc and no `ps`, say, or its start is read another way
+ * than the first time), a running process with the pid counts as the shim, and it's checked again
+ * next time.
  */
 function shimAlive(dir: string, known?: { identity?: Identity }): boolean {
   const pid = readPid(dir, "shim.pid");
   const written = writtenThisBoot(dir, "shim.pid");
   if (pid === undefined || written === undefined || !alive(pid)) return false;
-  const start = startTime(pid);
-  if (start === undefined) return true;
-  if (known?.identity?.pid === pid) return known.identity.start === start;
-  const ours = start <= written + 1000;
-  if (ours && known) known.identity = { pid, start };
+  const info = procInfo(pid);
+  if (!info) return true;
+  if (info.zombie) return false;
+  const id = known?.identity;
+  if (id?.pid === pid) return id.source === info.source ? id.start === info.start : true;
+  const ours = info.start <= written + 1000;
+  if (ours && known) known.identity = { pid, start: info.start, source: info.source };
   return ours;
 }
 
-/** For the tests: how a process's start is told, in place of /proc and `ps`. */
+/** What's known of a running process: when it started, whether it has exited unreaped, and where that was read. */
+interface ProcInfo {
+  start: number;
+  zombie: boolean;
+  source: "proc" | "ps";
+}
+
+/** For the tests: how a process's start is told, in place of /proc and `ps` (or without /proc). */
 export const identityForTests: { startTime?: (pid: number, real: (pid: number) => number | undefined) => number | undefined; noProc?: boolean } = {};
 
 /**
- * When a process started (ms since the epoch), if it's running and that can be told: from /proc
- * on Linux (cheap, and to the clock tick), or from `ps` (to the second) elsewhere.
+ * A process's start (ms since the epoch) and state, if it's running and that can be told: from
+ * /proc on Linux (cheap, and to the clock tick), or from `ps` (to the second) elsewhere.
  */
-function startTime(pid: number): number | undefined {
-  return identityForTests.startTime ? identityForTests.startTime(pid, realStartTime) : realStartTime(pid);
+function procInfo(pid: number): ProcInfo | undefined {
+  const real = realProcInfo(pid);
+  if (!identityForTests.startTime) return real;
+  const start = identityForTests.startTime(pid, (p) => realProcInfo(p)?.start);
+  return start === undefined ? undefined : { zombie: false, source: "ps", ...real, start };
 }
 
-function realStartTime(pid: number): number | undefined {
+function realProcInfo(pid: number): ProcInfo | undefined {
   if (process.platform === "linux" && !identityForTests.noProc) {
-    const at = procStartTime(pid);
-    if (at !== undefined) return at;
+    const info = procStat(pid);
+    if (info) return info;
   }
   try {
-    const out = execFileSync("ps", ["-o", "lstart=", "-p", String(pid)], { encoding: "utf8", env: { ...process.env, LC_ALL: "C" }, timeout: 2000, stdio: ["ignore", "pipe", "ignore"] });
-    const at = Date.parse(out.trim());
-    return Number.isNaN(at) ? undefined : at;
+    const out = execFileSync("ps", ["-o", "stat=", "-o", "lstart=", "-p", String(pid)], { encoding: "utf8", env: { ...process.env, LC_ALL: "C" }, timeout: 2000, stdio: ["ignore", "pipe", "ignore"] });
+    const m = /^\s*(\S+)\s+(.+?)\s*$/.exec(out);
+    const at = m ? Date.parse(m[2]!) : NaN;
+    return m && !Number.isNaN(at) ? { start: at, zombie: /^[ZX]/.test(m[1]!), source: "ps" } : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+/** The fields of /proc/<pid>/stat after the command (the first is field 3, the state). */
+function procFields(pid: number | string): string[] | undefined {
+  try {
+    const stat = readFileSync(`/proc/${pid}/stat`, "utf8");
+    // After the command, which is in parentheses and may have spaces or parentheses in it.
+    return stat.slice(stat.lastIndexOf(")") + 2).split(" ");
   } catch {
     return undefined;
   }
@@ -565,27 +623,40 @@ let btime: number | null | undefined;
 /** Clock ticks a second, as /proc counts them (USER_HZ: 100 on Linux, whatever the kernel's HZ). */
 const CLOCK_TICKS = 100;
 
-/** A process's start from /proc/<pid>/stat (clock ticks after boot) and /proc/stat's btime. */
-function procStartTime(pid: number): number | undefined {
+/** A process's start and state from /proc/<pid>/stat (clock ticks after boot) and /proc/stat's btime. */
+function procStat(pid: number): ProcInfo | undefined {
   try {
     if (btime === undefined) {
       const m = /^btime (\d+)$/m.exec(readFileSync("/proc/stat", "utf8"));
       btime = m ? Number(m[1]) * 1000 : null;
     }
-    if (btime === null) return undefined;
-    const stat = readFileSync(`/proc/${pid}/stat`, "utf8");
-    // After the command, which is in parentheses and may have spaces or parentheses in it.
-    const fields = stat.slice(stat.lastIndexOf(")") + 2).split(" ");
-    // starttime is field 22; fields[0] here is field 3 (state).
-    const ticks = Number(fields[19]);
-    return Number.isFinite(ticks) ? btime + (ticks * 1000) / CLOCK_TICKS : undefined;
   } catch {
-    return undefined;
+    btime = null;
   }
+  const fields = procFields(pid);
+  if (btime === null || !fields) return undefined;
+  // starttime is field 22; fields[0] here is field 3 (state).
+  const ticks = Number(fields[19]);
+  if (!Number.isFinite(ticks)) return undefined;
+  return { start: btime + (ticks * 1000) / CLOCK_TICKS, zombie: fields[0] === "Z" || fields[0] === "X", source: "proc" };
 }
 
 /** The session ids of the processes in process group `pgid`, if `ps` can say (Linux's can). */
 function groupSessions(pgid: number): number[] | undefined {
+  if (process.platform === "linux" && !identityForTests.noProc) {
+    try {
+      const sids: number[] = [];
+      for (const name of readdirSync("/proc")) {
+        if (!/^\d+$/.test(name)) continue;
+        // pgrp is field 5 and session field 6.
+        const f = procFields(name);
+        if (f && Number(f[2]) === pgid) sids.push(Number(f[3]));
+      }
+      return sids;
+    } catch {
+      // Then ps.
+    }
+  }
   try {
     const out = execFileSync("ps", ["-e", "-o", "pgid=", "-o", "sid="], { encoding: "utf8", env: { ...process.env, LC_ALL: "C" }, timeout: 2000, stdio: ["ignore", "pipe", "ignore"] });
     const sids: number[] = [];
@@ -609,10 +680,11 @@ function liveGroup(dir: string): number | undefined {
   const written = writtenThisBoot(dir, "pid");
   // Written before the machine restarted: the pid means nothing now.
   if (pid === undefined || written === undefined) return undefined;
-  if (alive(pid)) {
+  const leader = alive(pid) ? procInfo(pid) : undefined;
+  if (alive(pid) && !leader) return undefined; // Can't tell whose it is.
+  if (leader && !leader.zombie) {
     // The program, if it started before its pid was written; not a new process given the same pid.
-    const started = startTime(pid);
-    return started !== undefined && started <= written + 1000 ? pid : undefined;
+    return leader.start <= written + 1000 ? pid : undefined;
   }
   // The program's gone. What's left in a group with its id is the run's only if it's in the run's
   // session, which the shim leads (its pid is the session's id): the id may have gone to another

@@ -39,6 +39,12 @@ export interface HarnessProcess {
    * that outlives the backend: the backend saves it with the events it made of those lines.
    */
   readonly offset?: number;
+  /**
+   * How much of its input has been written (bytes), for a process that outlives the backend: saved
+   * with the driver's state, so input written after it isn't written again when what led to it is
+   * read again after a restart.
+   */
+  readonly inputOffset?: number;
   /** Writes a line to its stdin. */
   write(line: string): void;
   /** Closes its stdin. */

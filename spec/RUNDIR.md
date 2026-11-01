@@ -94,6 +94,17 @@ the saved offset, and re-reading from there makes the rest: no event is lost, an
 twice. Output that makes no events needn't be saved straight away: reading it again from an older
 offset (with the state saved with that offset) makes nothing new.
 
+### Input written after the offset
+
+Reading the output again can make the backend write input again: what it wrote in answer to
+output it had read, but hadn't saved yet when it stopped (a message it sends once the harness has
+answered `initialize`, an answer to a request a policy allowed). `input.jsonl` is the record of
+what was written, so the backend saves with the offset how much of `input.jsonl` it had written
+(the Node backend's `input`, in bytes). After a restart, the lines after that are written already:
+until it has written each of them again, a line it would write that's the same as one of them
+(byte for byte) is taken to be that one, and isn't written again. Whatever it's killed in the middle
+of, nothing that's in `input.jsonl` is written to it twice.
+
 ## A run whose shim is gone
 
 A shim killed with SIGKILL (or a machine that restarted) leaves a run with no `exit`. A backend that
@@ -104,17 +115,20 @@ and there's still no `exit`, it writes `exit` itself, atomically and only if the
 The shim is there if the process in `shim.pid` is, and is the shim:
 
 - `shim.pid` was written since the machine last started (its modification time is after the boot);
-- the process is running (`kill(pid, 0)` succeeds or fails with `EPERM`);
+- the process is running (`kill(pid, 0)` succeeds or fails with `EPERM`) and isn't a zombie (one
+  that has exited and isn't reaped, whose state in `/proc/<pid>/stat`, or `ps -o stat=`, starts
+  with `Z` or `X`);
 - it started no later than `shim.pid` was written: the first time a backend checks, the process's
   start (from `/proc/<pid>/stat`'s `starttime` and `/proc/stat`'s `btime` on Linux, which is
   cheap; elsewhere `ps -o lstart= -p <pid>`, to the second) must be before the file's modification
-  time (with a second to spare). The backend remembers that identity (the pid and the start) and
-  checks it each time after: a process with the pid that started at another time is another
-  process, given the pid since, and the shim is gone.
+  time (with a second to spare). The backend remembers that identity (the pid, the start, and where
+  it was read) and checks it each time after: a process with the pid that started at another time
+  is another process, given the pid since, and the shim is gone.
 
-When the start can't be told (no `/proc`, and `ps` isn't there, fails or times out), the backend
-doesn't take the shim for gone: a running process with the pid (written this boot) counts as the
-shim, nothing is remembered, and it tries again the next time. Nor does it signal anything on the
+When the start can't be told (no `/proc`, and `ps` isn't there, fails or times out), or it's read
+another way than the identity was (from `ps` when it was from `/proc`, or the other way round,
+which don't agree to the millisecond), the backend doesn't take the shim for gone: a running process with the pid (written this boot) counts as the
+shim, the identity isn't changed, and it tries again the next time. Nor does it signal anything on the
 strength of a start it couldn't tell (see below).
 
 A run with no `shim.pid` some seconds after the shim was started never started.
@@ -148,7 +162,8 @@ either:
 - that process has gone, and everything left in group `pid` is in the run's session: the shim
   leads a session of its own, whose id is its pid, so their session id is the one in `shim.pid`
   (written since the machine started too). The group's id alone says nothing here: it may have gone
-  to another group whose leader has gone in turn. (On Linux, `ps -e -o pgid= -o sid=`.)
+  to another group whose leader has gone in turn. (On Linux from `/proc/<pid>/stat`'s `pgrp` and
+  `session`; elsewhere `ps -e -o pgid= -o sid=`, where `ps` has it.)
 
 If it can't tell (a `ps` that doesn't give session ids, say), it sends nothing.
 

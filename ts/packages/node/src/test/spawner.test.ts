@@ -1,7 +1,7 @@
 // The spawners: lines out, exit after the last one, and stopping everything a process started;
 // and for the shim, reading whole lines from an offset, re-attaching, and noticing a run that's gone.
 
-import { spawn as spawnChild } from "node:child_process";
+import { execFileSync, spawn as spawnChild } from "node:child_process";
 import { existsSync, mkdirSync, readdirSync, readFileSync, rmSync, utimesSync, writeFileSync } from "node:fs";
 import { uptime } from "node:os";
 import { join, relative } from "node:path";
@@ -295,6 +295,75 @@ describe.skipIf(process.platform === "win32")("shim()", () => {
     } finally {
       process.env.PATH = path;
       identityForTests.noProc = false;
+    }
+  });
+
+  it.skipIf(process.platform !== "linux").each([
+    [false, true],
+    [true, false],
+  ])("doesn't take a shim for gone when its start is read another way than when it was checked (without /proc: %s, then %s)", { timeout: 20_000 }, async (before, after) => {
+    const { run } = setup();
+    identityForTests.noProc = before;
+    const p = run("echo started; exec sleep 30", "switch");
+    try {
+      expect(await wait(() => p.lines.length === 1)).toBe(true);
+      await new Promise((r) => setTimeout(r, 1200)); // checked, and found to be the run's
+      // /proc has the start to the clock tick, and ps to the second: they don't agree.
+      identityForTests.noProc = after;
+      await new Promise((r) => setTimeout(r, 2500)); // checked again, twice
+      expect(p.exit()).toBeUndefined();
+    } finally {
+      identityForTests.noProc = false;
+      p.proc.kill("SIGKILL");
+      await wait(p.exit);
+    }
+  });
+
+  // A shim nothing reaps, after it's killed: its parent is a subreaper that doesn't wait for it.
+  const python = (() => {
+    try {
+      execFileSync("python3", ["-c", "import ctypes"], { stdio: "ignore" });
+      return process.platform === "linux";
+    } catch {
+      return false;
+    }
+  })();
+  it.skipIf(!python).each([["/proc"], ["ps"]])("takes a shim that has exited but isn't reaped for gone (from %s)", { timeout: 20_000 }, async (from) => {
+    const runsDir = tempDir();
+    const dir = join(runsDir, "zombie");
+    mkdirSync(dir);
+    const script = [
+      "import ctypes, subprocess, sys, time",
+      "ctypes.CDLL(None, use_errno=True).prctl(36, 1, 0, 0, 0)",
+      `subprocess.Popen([${JSON.stringify(shimPath())}, ${JSON.stringify(dir)}, "--", "sleep", "30"]).wait()`,
+      "time.sleep(60)",
+    ].join("\n");
+    const parent = spawnChild("python3", ["-c", script], { stdio: "ignore" });
+    identityForTests.noProc = from === "ps";
+    try {
+      expect(await wait(() => existsSync(join(dir, "pid")))).toBe(true);
+      const spawner = shim(shimPath(), { runsDir, pollMs: 20, killGraceMs: 500 });
+      const p = follow((h) => spawner.attach!({ id: "zombie", thread_id: "th", spawner: "shim", offset: 0, started_at: "", data: { dir } }, h));
+      await new Promise((r) => setTimeout(r, 1200)); // checked, and found to be the run's
+      expect(p.exit()).toBeUndefined();
+      const shimPid = Number(readFileSync(join(dir, "shim.pid"), "utf8"));
+      const program = Number(readFileSync(join(dir, "pid"), "utf8"));
+      process.kill(shimPid, "SIGKILL");
+      expect(await wait(() => readFileSync(`/proc/${shimPid}/stat`, "utf8").split(") ")[1]!.startsWith("Z"))).toBe(true);
+      expect(await wait(p.exit)).toBe(true);
+      expect(p.exit()?.error?.message).toMatch(/went away/);
+      // And the program it ran is stopped (and left unreaped too, by the same subreaper).
+      const over = () => {
+        try {
+          return /^[ZX]/.test(readFileSync(`/proc/${program}/stat`, "utf8").split(") ")[1]!);
+        } catch {
+          return true;
+        }
+      };
+      expect(await wait(over)).toBe(true);
+    } finally {
+      identityForTests.noProc = false;
+      parent.kill("SIGKILL");
     }
   });
 
