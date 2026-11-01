@@ -91,7 +91,7 @@ parts that matter (in [lib/canon.mjs](lib/canon.mjs)), and those must be equal:
 | Claude `control_request` | `subtype`; for `initialize`, the `sdkMcpServers`. |
 | Claude `control_response` | `request_id` and `subtype`; for `can_use_tool`, `behavior`, and an allow's input (its `updatedInput`, or the input it was asked about if it has none; AskUserQuestion's `answers` are in it) or a deny's `message`; for `mcp_message`, the JSON-RPC id, and the tool names (`tools/list`) or the result's text (`tools/call`). |
 | Codex arguments | The subcommand (`app-server`). |
-| Codex request | `method`, and: `initialize`'s `experimentalApi`; `thread/start` and `thread/resume`'s `model`, `approvalPolicy`, `sandbox`, enabled `features.*` config, `mcp_servers` names, `dynamicTools` names (and `threadId`); `turn/start`'s `threadId`, text and `effort`; `turn/steer`'s `threadId`, `expectedTurnId` and text; `turn/interrupt`'s `threadId` and `turnId`; `thread/compact/start`'s `threadId`; any other method's params in full. |
+| Codex request | `method`, and: `initialize`'s `experimentalApi`; `thread/start` and `thread/resume`'s `model`, `approvalPolicy`, `sandbox`, enabled `features.*` config, `mcp_servers` names, `dynamicTools` names (and `threadId`); `turn/start`'s `threadId`, text and `effort`; `turn/steer`'s `threadId`, `expectedTurnId` and text; `turn/interrupt`'s `threadId` and `turnId`; `thread/compact/start`'s `threadId`; `skills/list`'s `forceReload`; any other method's params in full. |
 | Codex notification | `method`. |
 | Codex response | The `id` it answers, and: an approval's `decision`; an elicitation's `action`; `requestUserInput`'s `answers`; `item/tool/call`'s `success` and text. |
 

@@ -6,8 +6,8 @@
 
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
-import type { Resolution, ToolCall } from "@dire-kiwi/agent-threads-protocol";
+import { join, resolve, sep } from "node:path";
+import type { Resolution, ToolCall, Usage } from "@dire-kiwi/agent-threads-protocol";
 import { messageParts } from "../attachments.js";
 import { title } from "../claude/translate.js";
 import type { Harness, HarnessSession, Message, ThreadContext } from "../harness.js";
@@ -16,8 +16,9 @@ import { serveTools, type LoopbackMcp } from "../mcp-http.js";
 import { permissionKey, type PermissionDecision, type PermissionQuery } from "../permissions.js";
 import { writeSkills } from "../skills.js";
 import type { ExitStatus, HarnessProcess } from "../spawner.js";
-import { runTool } from "../tools.js";
-import { defaultCodexHome, prepareCodexHome, userCodexHome } from "./home.js";
+import { SECRET } from "../thread.js";
+import { runTool, type Tool } from "../tools.js";
+import { defaultCodexHome, prepareCodexHome, readSessionState, userCodexHome, writeSessionState, type SessionState } from "./home.js";
 import type {
   CommandExecutionRequestApprovalParams,
   DynamicToolCallParams,
@@ -25,6 +26,7 @@ import type {
   FileChangeRequestApprovalParams,
   McpServerElicitationRequestResponse,
   PermissionsRequestApprovalParams,
+  SkillsListResponse,
   ThreadItem,
   ThreadStartParams,
   ThreadStartResponse,
@@ -114,8 +116,21 @@ class Run {
   total: TokenUsageBreakdown | null = null;
   /** The running turn's last error that won't be retried. */
   error: string | null = null;
-  /** The app's tools are on the loopback MCP server, not dynamic tools. */
+  /** The CODEX_HOME it runs with. */
+  home = "";
+  /**
+   * The dynamic tools Codex has for the session (it keeps those it was started with), by name; null
+   * if they aren't known (the session was started elsewhere).
+   */
+  dynamic: Map<string, ToolSpec> | null = null;
+  /** Some of the app's tools are on the loopback MCP server (those the session hasn't as dynamic tools). */
   mcpApp = false;
+  /** Codex's token totals for the session after its last turn, when they're known. */
+  baseline: Totals | null = null;
+  /** Skills Codex found that aren't the app's (the user's, the project's): they're turned off. */
+  hiddenSkills: string[] = [];
+  /** Notices about the thread's MCP servers were given. */
+  noticedServers = false;
   mcp: LoopbackMcp | undefined;
   skillsDir: string | undefined;
   // What's needed to translate its output.
@@ -124,7 +139,7 @@ class Run {
   children = new Map<string, string>(); // child thread -> the spawnAgent call it's for
   lastChild = new Map<string, string>(); // child thread -> its last message
   /** MCP tool calls running: for an elicitation (which only names its server) and the app's MCP tools. */
-  mcpCalls: { id: string; server: string; name: string }[] = [];
+  mcpCalls: { id: string; server: string; name: string; args: unknown; thread: string | undefined }[] = [];
   /** The server's requests not yet answered. */
   open = new Set<RequestId>();
   asked = new Map<RequestId, string>(); // the server's request -> our request
@@ -422,16 +437,9 @@ class CodexSession implements HarnessSession {
         run.skillsDir = writeSkills(join(this.#dir(), `skills-${run.id}`), skills);
         await run.rpc.request("skills/extraRoots/set", { extraRoots: [run.skillsDir] }).catch((e) => this.#notice(`Codex couldn't load the app's skills: ${e.message}`));
       }
-      run.mcpApp = o.appTools === "mcp";
-      let r: ThreadStartResponse;
-      try {
-        r = await this.#startThread(run);
-      } catch (e) {
-        // A Codex without dynamic tools gets the app's tools as an MCP server instead.
-        if (run.mcpApp || !ctx.config.tools.length || !(e instanceof RpcError) || !/dynamic.?tools|experimental/i.test(e.message)) throw e;
-        run.mcpApp = true;
-        r = await this.#startThread(run);
-      }
+      run.home = home;
+      if (!o.userConfig) run.hiddenSkills = await this.#ambientSkills(run);
+      const r = await this.#startThread(run);
       run.threadId = r.thread.id;
       if (ctx.thread.session_id !== run.threadId) ctx.setThread({ session_id: run.threadId });
       return run.threadId;
@@ -446,33 +454,91 @@ class CodexSession implements HarnessSession {
     }
   }
 
-  /** thread/start, or thread/resume for a thread that has a session (or thread/start, if that's gone). */
-  async #startThread(run: Run): Promise<ThreadStartResponse> {
-    const ctx = this.#ctx;
-    const params = await this.#threadParams(run);
-    const session = ctx.thread.session_id;
-    if (!session) return run.rpc.request<ThreadStartResponse>("thread/start", params);
+  /**
+   * The skills Codex finds that aren't the app's: the user's ($HOME/.agents/skills...), the
+   * project's and the machine's, which a separate CODEX_HOME doesn't keep it from loading. (Its own
+   * built-in ones stay.)
+   */
+  async #ambientSkills(run: Run): Promise<string[]> {
+    const cwd = this.#ctx.thread.cwd;
+    let r: SkillsListResponse;
     try {
-      return await run.rpc.request<ThreadStartResponse>("thread/resume", { threadId: session, ...params, excludeTurns: true });
+      r = await run.rpc.request<SkillsListResponse>("skills/list", { cwds: cwd ? [cwd] : [], forceReload: true });
     } catch (e) {
-      if (!(e instanceof RpcError) || !/not found|no rollout|unknown thread|does not exist/i.test(e.message)) throw e;
-      this.#notice(`Codex couldn't resume its session (${e.message}), so this is a new one: it doesn't remember the thread so far.`);
-      return run.rpc.request<ThreadStartResponse>("thread/start", params);
+      throw new Error(`Codex couldn't list its skills, to leave out the user's: ${e instanceof Error ? e.message : String(e)}`);
+    }
+    const own = run.skillsDir ? resolve(run.skillsDir) + sep : undefined;
+    const paths = (r.data ?? []).flatMap((e) => e.skills ?? []).filter((sk) => sk.scope !== "system" && !(own && resolve(sk.path).startsWith(own)));
+    return [...new Set(paths.map((sk) => sk.path))];
+  }
+
+  /** thread/resume for a thread that has a session, or thread/start (also if Codex hasn't the session). */
+  async #startThread(run: Run): Promise<ThreadStartResponse> {
+    const session = this.#ctx.thread.session_id;
+    if (session) {
+      // Codex keeps the dynamic tools the session started with, and resuming can't change them.
+      const state = readSessionState(run.home, session);
+      run.dynamic = state ? new Map(state.dynamicTools.map((t) => [t.name, t])) : null;
+      run.baseline = state?.totals ?? null;
+      try {
+        return await run.rpc.request<ThreadStartResponse>("thread/resume", { threadId: session, ...(await this.#threadParams(run, false)), excludeTurns: true });
+      } catch (e) {
+        if (!(e instanceof RpcError) || !/not found|no rollout|unknown thread|does not exist/i.test(e.message)) throw e;
+        this.#notice(`Codex couldn't resume its session (${e.message}), so this is a new one: it doesn't remember the thread so far.`);
+      }
+    }
+    return this.#newThread(run);
+  }
+
+  /** thread/start: a new session, with the app's tools as dynamic tools (or on the MCP server). */
+  async #newThread(run: Run): Promise<ThreadStartResponse> {
+    const tools = this.#ctx.config.tools;
+    run.dynamic = new Map(this.#o.appTools === "mcp" ? [] : tools.map((t) => [t.name, toolSpec(t)]));
+    let r: ThreadStartResponse;
+    try {
+      r = await run.rpc.request<ThreadStartResponse>("thread/start", await this.#threadParams(run, true));
+    } catch (e) {
+      // A Codex without dynamic tools gets the app's tools on the MCP server instead.
+      if (!run.dynamic.size || !(e instanceof RpcError) || !/dynamic.?tools|experimental/i.test(e.message)) throw e;
+      run.dynamic = new Map();
+      r = await run.rpc.request<ThreadStartResponse>("thread/start", await this.#threadParams(run, true));
+    }
+    // A new session's totals start at nothing.
+    run.baseline = { inputTokens: 0, cachedInputTokens: 0, outputTokens: 0, cacheWriteInputTokens: 0 };
+    this.#saveState(run, r.thread.id);
+    return r;
+  }
+
+  /** Records the session's dynamic tools and totals, where they're known. */
+  #saveState(run: Run, session: string): void {
+    if (!run.dynamic) return;
+    try {
+      writeSessionState(run.home, session, { dynamicTools: [...run.dynamic.values()], totals: run.baseline });
+    } catch (e) {
+      this.#ctx.error(e);
     }
   }
 
-  async #threadParams(run: Run): Promise<ThreadStartParams> {
+  /** The app's tools that go on the MCP server: those the session hasn't as dynamic tools, as they are now. */
+  #mcpTools(run: Run): Tool[] {
+    return this.#ctx.config.tools.filter((t) => !(run.dynamic?.has(t.name) && sameJson(run.dynamic.get(t.name), toolSpec(t))));
+  }
+
+  /** thread/start's (`fresh`) or thread/resume's parameters. */
+  async #threadParams(run: Run, fresh: boolean): Promise<ThreadStartParams> {
     const ctx = this.#ctx;
     const t = ctx.thread;
-    const { tools, mcpServers, systemPrompt } = ctx.config;
+    const { mcpServers, systemPrompt } = ctx.config;
     const servers: { [name: string]: unknown } = {};
     for (const [name, s] of Object.entries(mcpServers)) {
       const c = mcpServerConfig(s);
-      if ("unsupported" in c) this.#notice(`The MCP server ${name} isn't available: ${c.unsupported}.`);
-      else servers[name] = c;
+      if (!("unsupported" in c)) servers[name] = c;
+      else if (!run.noticedServers) this.#notice(`The MCP server ${name} isn't available: ${c.unsupported}.`);
     }
-    if (tools.length && run.mcpApp) {
-      run.mcp ??= await serveTools(APP_SERVER, { tools: () => ctx.config.tools, call: (name, args) => this.#mcpAppTool(run, name, args) });
+    run.noticedServers = true;
+    run.mcpApp = this.#mcpTools(run).length > 0;
+    if (run.mcpApp) {
+      run.mcp ??= await serveTools(APP_SERVER, { tools: () => this.#mcpTools(run), call: (name, args) => this.#mcpAppTool(run, name, args) });
       // The policy decides on the app's tools when they're called, so Codex needn't ask.
       servers[APP_SERVER] = {
         url: run.mcp.url,
@@ -487,15 +553,15 @@ class CodexSession implements HarnessSession {
       "features.default_mode_request_user_input": true,
       suppress_unstable_features_warning: true,
       ...(Object.keys(servers).length ? { mcp_servers: servers } : {}),
+      ...(run.hiddenSkills.length ? { skills: { config: run.hiddenSkills.map((path) => ({ path, enabled: false })) } } : {}),
     };
+    const dynamic = fresh ? [...(run.dynamic?.values() ?? [])] : [];
     return {
       ...(t.cwd ? { cwd: t.cwd } : {}),
       ...(t.model ? { model: t.model } : {}),
       ...codexPolicy(t.permission_mode),
       config,
-      ...(tools.length && !run.mcpApp
-        ? { dynamicTools: tools.map((tool) => ({ type: "function" as const, name: tool.name, description: tool.description, inputSchema: tool.input })) }
-        : {}),
+      ...(dynamic.length ? { dynamicTools: dynamic.map((d) => ({ type: "function" as const, ...d })) } : {}),
       ...(systemPrompt ? { developerInstructions: systemPrompt } : {}),
     };
   }
@@ -666,7 +732,7 @@ class CodexSession implements HarnessSession {
     const fields = codexTool(item, run.mcpApp);
     if (item.type === "mcpToolCall") {
       run.mcpCalls = run.mcpCalls.filter((c) => c.id !== item.id);
-      if (!done) run.mcpCalls.push({ id: item.id, server: item.server, name: item.tool });
+      if (!done) run.mcpCalls.push({ id: item.id, server: item.server, name: item.tool, args: item.arguments ?? {}, thread: child ?? run.threadId });
     }
     const it = ctx.item(item.id) as ToolCall | undefined;
     if (!done) {
@@ -705,13 +771,20 @@ class CodexSession implements HarnessSession {
     run.error = null;
     // The turn's requests are moot now; its open ones are cancelled with it.
     run.open.clear();
+    // Codex reports the session's totals: the turn used how far they grew. (Where the session's
+    // totals before it aren't known, the thread's usage stands in for them.)
+    const usage = run.total ? codexUsage(run.total, run.baseline ? totalsAsUsage(run.baseline) : ctx.thread.usage) : undefined;
+    if (run.total) {
+      run.baseline = run.total;
+      if (run.threadId) this.#saveState(run, run.threadId);
+    }
     if (!ctx.turnId) return;
     clearTimeout(this.#stopTimer);
     const ok = turn?.status === "completed";
     ctx.endTurn({
       ok,
       ...(turn?.status === "failed" ? { error: turn.error?.message ?? error ?? "The turn failed." } : {}),
-      ...(run.total ? { usage: codexUsage(run.total, ctx.thread.usage) } : {}),
+      ...(usage ? { usage } : {}),
       ...(typeof turn?.durationMs === "number" ? { duration_ms: turn.durationMs } : {}),
     });
   }
@@ -835,11 +908,17 @@ class CodexSession implements HarnessSession {
     if (p.mode !== "form" || fields > 0) return answer({ action: "decline" });
     // The app's own tools are decided on when they're called.
     if (server === APP_SERVER && run.mcpApp) return answer({ action: "accept", content: {} });
-    const call = run.mcpCalls.findLast((c) => c.server === server);
-    const it = call ? (this.#ctx.item(call.id) as ToolCall | undefined) : undefined;
+    // The policy is asked about the tool and arguments the elicitation names. The running call is
+    // only taken to be the one it's about if it's the only one that matches it.
     const message: string = p.message ?? "";
-    const name = it?.name ?? /tool "([^"]+)"/.exec(message)?.[1] ?? "elicitation";
-    const t = { name, kind: "mcp" as const, server, input: it?.input ?? p._meta?.tool_params ?? {}, ...(it ? {} : { title: message }) };
+    const named = /tool "([^"]+)"/.exec(message)?.[1];
+    const params: unknown = p._meta?.tool_params;
+    const thread = typeof p.threadId === "string" ? p.threadId : run.threadId;
+    const matching = named
+      ? run.mcpCalls.filter((c) => c.server === server && c.thread === thread && c.name === named && (params === undefined || sameJson(c.args, params)))
+      : [];
+    const it = matching.length === 1 ? (this.#ctx.item(matching[0]!.id) as ToolCall | undefined) : undefined;
+    const t = { name: named ?? "elicitation", kind: "mcp" as const, server, input: params ?? it?.input ?? {}, ...(it ? {} : { title: message }) };
     this.#permit(run, id, this.#query(t, it?.id, undefined, parentId), wanted, (ok) => answer(ok ? { action: "accept", content: {} } : { action: "decline" }));
   }
 
@@ -861,9 +940,11 @@ class CodexSession implements HarnessSession {
       }
       const answers: ToolRequestUserInputResponse["answers"] = {};
       const lines: string[] = [];
+      const secret = new Set(qs.filter((q) => q.secret).map((q) => q.id));
       for (const [q, a] of Object.entries(res.answers ?? {})) {
         answers[q] = { answers: a ?? [] };
-        lines.push(`${q}: ${(a ?? []).join(", ")}`);
+        // The real answer goes only to Codex; the call's result is shown and saved.
+        lines.push(`${q}: ${secret.has(q) && a?.length ? SECRET : (a ?? []).join(", ")}`);
       }
       answer({ answers });
       ctx.updateItem(p.itemId, { status: "completed", result: { content: lines.join("\n") } });
@@ -875,7 +956,15 @@ class CodexSession implements HarnessSession {
   #dynamicTool(run: Run, id: RequestId, p: DynamicToolCallParams, wanted: () => boolean, answer: (r: DynamicToolCallResponse) => void, parentId: string | undefined): void {
     const reply = (text: string, ok: boolean) => answer({ contentItems: [{ type: "inputText", text }], success: ok });
     const tool = this.#ctx.config.tools.find((t) => t.name === p.tool);
-    if (!tool) return reply(`There's no tool ${p.tool}.`, false);
+    // Codex keeps a session's dynamic tools as they were: one that has gone or changed since is
+    // answered with where the app's tools are now.
+    const elsewhere = () => {
+      const names = this.#mcpTools(run).map((t) => t.name);
+      return names.length ? ` The app's other tools are on its ${APP_SERVER} MCP server: ${names.join(", ")}.` : "";
+    };
+    if (!tool) return reply(run.dynamic?.has(p.tool) ? `The tool ${p.tool} isn't available any more.${elsewhere()}` : `There's no tool ${p.tool}.`, false);
+    const was = run.dynamic?.get(p.tool);
+    if (run.dynamic && !(was && sameJson(was, toolSpec(tool)))) return reply(`The tool ${p.tool} has changed: call it on the ${APP_SERVER} MCP server instead.`, false);
     const t = { name: p.tool, kind: "app" as const, input: p.arguments ?? {}, title: p.tool };
     this.#permit(run, id, this.#query(t, p.callId, undefined, parentId), wanted, (ok, message) => {
       if (!ok) return reply(message, false);
@@ -886,9 +975,10 @@ class CodexSession implements HarnessSession {
   /** tools/call on the loopback MCP server: one of the app's tools. */
   #mcpAppTool(run: Run, name: string, args: unknown): Promise<{ text: string; isError: boolean; structured?: unknown }> {
     const ctx = this.#ctx;
-    if (!ctx.config.tools.some((t) => t.name === name)) return Promise.resolve({ text: `There's no tool ${name}.`, isError: true });
-    const call = run.mcpCalls.find((c) => c.server === APP_SERVER && c.name === name);
-    const it = call ? ctx.item(call.id) : undefined;
+    if (!this.#mcpTools(run).some((t) => t.name === name)) return Promise.resolve({ text: `There's no tool ${name}.`, isError: true });
+    // The call it is, if only one running call matches it.
+    const matching = run.mcpCalls.filter((c) => c.server === APP_SERVER && c.name === name && sameJson(c.args, args ?? {}));
+    const it = matching.length === 1 ? ctx.item(matching[0]!.id) : undefined;
     const turn = ctx.turnId;
     const wanted = () => !run.exited && !run.retired && this.#run === run && ctx.turnId === turn;
     const t = { name, kind: "app" as const, input: args ?? {}, title: name };
@@ -911,6 +1001,35 @@ class CodexSession implements HarnessSession {
       signal: run.abort.signal,
     });
   }
+}
+
+type ToolSpec = { name: string; description: string; inputSchema: unknown };
+type Totals = NonNullable<SessionState["totals"]>;
+
+/** A tool as Codex has it as a dynamic tool. */
+function toolSpec(t: Tool): ToolSpec {
+  return { name: t.name, description: t.description, inputSchema: t.input };
+}
+
+/** Codex's totals as the usage they'd be if a turn had used them all. */
+function totalsAsUsage(t: Totals): Usage {
+  return { input_tokens: t.inputTokens - t.cachedInputTokens, cache_read_tokens: t.cachedInputTokens, output_tokens: t.outputTokens, cache_write_tokens: t.cacheWriteInputTokens ?? 0 };
+}
+
+/** Whether two JSON values are equal, whatever their keys' order. */
+function sameJson(a: unknown, b: unknown): boolean {
+  return canonical(a) === canonical(b);
+}
+
+function canonical(v: unknown): string {
+  if (Array.isArray(v)) return `[${v.map(canonical).join(",")}]`;
+  if (v && typeof v === "object") {
+    return `{${Object.keys(v)
+      .sort()
+      .map((k) => `${JSON.stringify(k)}:${canonical((v as { [k: string]: unknown })[k])}`)
+      .join(",")}}`;
+  }
+  return JSON.stringify(v ?? null);
 }
 
 /** What identifies a message in Codex's userMessage item: its text inputs and how many images it has. */

@@ -400,6 +400,7 @@ export type SessionSource =
 export type SubAgentSource =
   ("review" | "compact" | "memory_consolidation") | ThreadSpawnSubAgentSource | OtherSubAgentSource;
 export type ThreadId = string;
+export type SkillScope = "user" | "repo" | "system" | "admin";
 export type SortDirection = "asc" | "desc";
 export type ThreadHistoryMode = "legacy" | "paginated";
 export type ThreadStatus = NotLoadedThreadStatus | IdleThreadStatus | SystemErrorThreadStatus | ActiveThreadStatus;
@@ -1831,8 +1832,82 @@ export interface ThreadSpawnSubAgentSource {
 export interface OtherSubAgentSource {
   other: string;
 }
+export interface SkillDependencies {
+  tools: SkillToolDependency[];
+  [k: string]: unknown;
+}
+export interface SkillToolDependency {
+  command?: string | null;
+  description?: string | null;
+  transport?: string | null;
+  type: string;
+  url?: string | null;
+  value: string;
+  [k: string]: unknown;
+}
+export interface SkillErrorInfo {
+  message: string;
+  path: string;
+  [k: string]: unknown;
+}
+export interface SkillInterface {
+  brandColor?: string | null;
+  defaultPrompt?: string | null;
+  displayName?: string | null;
+  iconLarge?: AbsolutePathBuf | null;
+  /**
+   * Remote large icon URL from the plugin catalog.
+   */
+  iconLargeUrl?: string | null;
+  iconSmall?: AbsolutePathBuf | null;
+  /**
+   * Remote small icon URL from the plugin catalog.
+   */
+  iconSmallUrl?: string | null;
+  shortDescription?: string | null;
+  [k: string]: unknown;
+}
+export interface SkillMetadata {
+  dependencies?: SkillDependencies | null;
+  description: string;
+  enabled: boolean;
+  interface?: SkillInterface | null;
+  name: string;
+  path: LegacyAppPathString;
+  /**
+   * Owning plugin ID, matching `PluginSummary.id`, when known.
+   */
+  pluginId?: string | null;
+  scope: SkillScope;
+  /**
+   * Legacy short_description from SKILL.md. Prefer SKILL.json interface.short_description.
+   */
+  shortDescription?: string | null;
+  [k: string]: unknown;
+}
 export interface SkillsExtraRootsSetParams {
   extraRoots: AbsolutePathBuf[];
+  [k: string]: unknown;
+}
+export interface SkillsListEntry {
+  cwd: string;
+  errors: SkillErrorInfo[];
+  skills: SkillMetadata[];
+  [k: string]: unknown;
+}
+export interface SkillsListParams {
+  /**
+   * When empty, defaults to the current session working directory.
+   */
+  cwds?: string[];
+  /**
+   * When true, bypass the skills cache and re-scan skills from disk.
+   */
+  forceReload?: boolean;
+  [k: string]: unknown;
+}
+export interface SkillsListResponse {
+  data: SkillsListEntry[];
   [k: string]: unknown;
 }
 export interface Thread {

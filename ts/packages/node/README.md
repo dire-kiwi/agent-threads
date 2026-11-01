@@ -115,21 +115,34 @@ again to finish saving. The file store undoes a write that fails partway, so a r
   `item/fileChange/requestApproval`, `item/permissions/requestApproval`, and the MCP elicitations it
   approves MCP tool calls with) go to the policy, as do the app's tools. An elicitation that wants a
   form filled in is declined. `item/tool/requestUserInput` is always a `question`, shown as a
-  `request_user_input` call.
+  `request_user_input` call. An elicitation is asked about as the tool and arguments it names, and
+  is tied to a running call only if exactly one matches it (server, thread, tool and arguments).
+- **Secret answers** (to a question Codex marks `isSecret`) go only to Codex: the
+  `request.resolved` that's sent and saved, and the call's result, show `[secret]` instead. (The
+  core does this for any harness.)
 - **Items**: `commandExecution` is `shell` (with Codex's `bash -lc` wrapper taken off the shown
   command), `fileChange` `edit`, `mcpToolCall` `mcp`, `webSearch` `web`, `imageView` `read`,
   `dynamicToolCall` `app`, `spawnAgent` `subagent` (its child thread's items have it as their
   `parent_id`, and its result is the child's last message), plan updates one `todo` call per turn,
   `agentMessage` and `plan` `assistant_message`, `reasoning` `reasoning`, and `contextCompaction`
   `compaction`. Warnings and retried errors are `notice`s.
-- **Usage**: Codex reports the thread's running totals, so a turn's usage is how far they grew.
+- **Usage**: Codex reports the session's running totals, so a turn's usage is how far they grew
+  since the last turn's end. That's kept per session, so a new session starts again from nothing.
 - **App tools** are `dynamicTools` on `thread/start`, answered over `item/tool/call`. Codex marks
   those experimental: with `codex({ appTools: "mcp" })`, or when Codex refuses them, they're served
   instead by a loopback MCP server (streamable HTTP on 127.0.0.1, a random port, a random bearer
-  token), one per process, named `app`.
+  token), one per process, named `app`. Codex keeps the dynamic tools a session started with, and
+  resuming can't change them: after `configure()` changes the app's tools, those the session hasn't
+  as they are now are served on the MCP server, and a call to a dynamic tool that has gone or
+  changed gets an error saying where the app's tools are. The driver keeps what each session started
+  with (and its totals) in `<home>/agent-threads/sessions/`.
 - **MCP servers** go in `thread/start`'s config as `mcp_servers` (stdio, or streamable HTTP with
   `http_headers`; Codex has no SSE). **Skills** are written to a directory for the process and
-  given with `skills/extraRoots/set`. The system prompt is `developerInstructions`.
+  given with `skills/extraRoots/set`. Without `userConfig`, the other skills Codex finds (the
+  user's `~/.agents/skills`, the project's, the machine's: a CODEX_HOME of its own doesn't keep
+  those out) are listed with `skills/list` and turned off in the thread's config, so it has only the
+  app's and Codex's own built-in ones. (Skills added while a process runs are left out by the next.)
+  The system prompt is `developerInstructions`.
 - **Isolated config**: threads run with a `CODEX_HOME` of the app's own (`home`,
   `~/.agent-threads/codex` by default), which keeps the app's sessions (so it must outlast its
   threads) and none of the user's config, MCP servers or skills. The user's login (`auth.json` from
@@ -152,7 +165,8 @@ restart, is coming.
 
 ```sh
 pnpm test                          # stores, every fixture through the fake CLI, driver tests
-AGENT_THREADS_LIVE=1 pnpm test     # also smoke tests against the real claude and codex (a cent or so)
+AGENT_THREADS_LIVE=1 pnpm test     # also smoke tests against the real claude and codex (a cent or so),
+                                   # and the real codex against a local stand-in model (free)
 ```
 
 The fixture test runs each recorded session in `spec/fixtures/claude` and `spec/fixtures/codex` through

@@ -33,6 +33,8 @@ const ROOTS = [
   "TurnInterruptParams",
   "ThreadCompactStartParams",
   "SkillsExtraRootsSetParams",
+  "SkillsListParams",
+  "SkillsListResponse",
   "DynamicToolSpec",
   // The server's requests, and the driver's answers.
   "CommandExecutionRequestApprovalParams",

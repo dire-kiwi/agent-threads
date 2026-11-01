@@ -14,6 +14,11 @@
 //   ask                 item/tool/requestUserInput, then says the answers
 //   app <tool> <json>   an app tool: a dynamic tool (item/tool/call) if thread/start gave it, or a
 //                       call to the `app` MCP server in its config, over HTTP
+//   tools               says what tools it has: the session's dynamic tools, and the app MCP server's
+//   skills              says which skills it would use (those skills.config doesn't turn off)
+//   secret              asks a secret question (isSecret)
+//   concurrent <server> <json>  starts MCP calls ({"calls": [[tool, args]...]}) on one server, then
+//                       elicits approval for the one at "ask"
 //   plan                two turn/plan/updated notifications
 //   search <query>      a web search
 //   sub <prompt>        spawns a subagent (a child thread), which replies, and waits for it
@@ -54,14 +59,40 @@ let n = 0;
 const uid = (p) => `${p}-${process.pid}-${++n}`;
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
-let thread = null; // { id, totals, params }
+let thread = null; // { id, totals, params, dynamicTools }
+let extraRoots = [];
 let turn = null; // { id, interrupted, wake, heard }
 
 const sessions = home && join(home, "mini-sessions");
 function save() {
   if (!sessions || !thread) return;
   mkdirSync(sessions, { recursive: true });
-  writeFileSync(join(sessions, `${thread.id}.json`), JSON.stringify({ totals: thread.totals }));
+  writeFileSync(join(sessions, `${thread.id}.json`), JSON.stringify({ totals: thread.totals, dynamicTools: thread.dynamicTools }));
+}
+
+/** The skills it finds, as Codex does: the user's, the project's, the extra roots' and a built-in one. */
+function skills(cwds) {
+  const found = [];
+  const scan = (root, scope) => {
+    if (!existsSync(root)) return;
+    for (const d of readdirSync(root)) if (existsSync(join(root, d, "SKILL.md"))) found.push({ name: d, path: join(root, d, "SKILL.md"), scope, enabled: true, description: d });
+  };
+  if (process.env.HOME) scan(join(process.env.HOME, ".agents", "skills"), "user");
+  for (const c of cwds) scan(join(c, ".agents", "skills"), "repo");
+  for (const r of extraRoots) scan(r, "user");
+  found.push({ name: "builtin", path: join(home ?? "/", "skills", ".system", "builtin", "SKILL.md"), scope: "system", enabled: true, description: "built in" });
+  return found;
+}
+
+/** The app's tools on its MCP server, and a client for it. */
+function appServer() {
+  const srv = thread.params.config?.mcp_servers?.app;
+  if (!srv) return null;
+  const post = async (body) => {
+    const res = await fetch(srv.url, { method: "POST", headers: { "Content-Type": "application/json", Accept: "application/json, text/event-stream", ...srv.http_headers }, body: JSON.stringify(body) });
+    return res.status === 202 ? null : res.json();
+  };
+  return post;
 }
 
 const texts = (input) => (input ?? []).filter((i) => i.type === "text").map((i) => i.text);
@@ -170,7 +201,7 @@ async function step(line) {
     case "app": {
       const [tool, ...json] = rest;
       const args = JSON.parse(json.join(" ") || "{}");
-      if (thread.params.dynamicTools?.some((t) => t.name === tool)) {
+      if (thread.dynamicTools.some((t) => t.name === tool)) {
         const id = uid("call");
         const base = { type: "dynamicToolCall", id, tool, arguments: args };
         item("item/started", { ...base, status: "inProgress", contentItems: null, success: null });
@@ -178,15 +209,11 @@ async function step(line) {
         item("item/completed", { ...base, status: r.result?.success ? "completed" : "failed", contentItems: r.result?.contentItems, success: r.result?.success });
         return message(`app said ${r.result?.contentItems?.[0]?.text}`);
       }
-      const srv = thread.params.config?.mcp_servers?.app;
-      if (!srv) return message("there are no app tools");
+      const post = appServer();
+      if (!post) return message("there are no app tools");
       const id = uid("mcp");
       const base = { type: "mcpToolCall", id, server: "app", tool, arguments: args };
       item("item/started", { ...base, status: "inProgress" });
-      const post = async (body) => {
-        const res = await fetch(srv.url, { method: "POST", headers: { "Content-Type": "application/json", Accept: "application/json, text/event-stream", ...srv.http_headers }, body: JSON.stringify(body) });
-        return res.status === 202 ? null : res.json();
-      };
       await post({ jsonrpc: "2.0", id: 1, method: "initialize", params: { protocolVersion: "2025-06-18", capabilities: {}, clientInfo: { name: "mini-codex", version: "0" } } });
       await post({ jsonrpc: "2.0", method: "notifications/initialized" });
       const list = await post({ jsonrpc: "2.0", id: 2, method: "tools/list" });
@@ -194,6 +221,49 @@ async function step(line) {
       const r = await post({ jsonrpc: "2.0", id: 3, method: "tools/call", params: { name: tool, arguments: args } });
       item("item/completed", { ...base, status: r.result?.isError ? "failed" : "completed", result: { content: r.result?.content ?? [] } });
       return message(`app said ${r.result?.content?.[0]?.text}`);
+    }
+    case "tools": {
+      // What the model would be offered: the session's dynamic tools, and the app MCP server's.
+      const post = appServer();
+      const mcp = post ? (await post({ jsonrpc: "2.0", id: 1, method: "tools/list" })).result.tools.map((t) => t.name) : [];
+      return message(`dynamic: ${thread.dynamicTools.map((t) => t.name).join(",")}; mcp: ${mcp.join(",")}`);
+    }
+    case "skills": {
+      const off = new Set((thread.params.config?.skills?.config ?? []).filter((c) => c.enabled === false).map((c) => c.path));
+      return message(`skills: ${skills([thread.params.cwd ?? process.cwd()]).filter((sk) => !off.has(sk.path)).map((sk) => sk.name).sort().join(",")}`);
+    }
+    case "secret": {
+      const r = await request("item/tool/requestUserInput", {
+        ...ids,
+        itemId: uid("call"),
+        questions: [{ id: "password", header: "Password", question: "What's the password?", isOther: false, isSecret: true, options: null }],
+      });
+      note({ secretAnswer: r.result?.answers });
+      return message("thanks");
+    }
+    case "concurrent": {
+      // Starts calls on one server, then asks about one of them: {"calls": [[tool, args]...], "ask": i}.
+      const [server, ...json] = rest;
+      const { calls, ask } = JSON.parse(json.join(" "));
+      const started = calls.map(([tool, args]) => {
+        const it = { type: "mcpToolCall", id: uid("mcp"), server, tool, arguments: args, status: "inProgress" };
+        item("item/started", it);
+        return it;
+      });
+      const [tool, args] = calls[ask];
+      const r = await request("mcpServer/elicitation/request", {
+        ...ids,
+        serverName: server,
+        mode: "form",
+        message: `Allow the ${server} MCP server to run tool "${tool}"?`,
+        requestedSchema: { type: "object", properties: {} },
+        _meta: { codex_approval_kind: "mcp_tool_call", tool_params: args },
+      });
+      for (const [i, it] of started.entries()) {
+        const ok = i !== ask || r.result?.action === "accept";
+        item("item/completed", { ...it, status: ok ? "completed" : "failed", ...(ok ? { result: { content: [{ type: "text", text: "mcp ok" }] } } : { error: { message: "the user rejected it" } }) });
+      }
+      return message(`asked about ${tool}: ${r.result?.action}`);
     }
     case "plan":
       notify("turn/plan/updated", { ...ids, explanation: "The steps", plan: [{ step: "one", status: "inProgress" }, { step: "two", status: "pending" }] });
@@ -285,18 +355,23 @@ createInterface({ input: process.stdin })
         return reply({ codexHome: home, platformFamily: "unix", platformOs: "linux" });
       case "initialized":
         return;
+      case "skills/list":
+        return reply({ data: (p.cwds ?? []).map((cwd) => ({ cwd, skills: skills([cwd]), errors: [] })) });
       case "skills/extraRoots/set":
+        extraRoots = p.extraRoots ?? [];
         note({ skills: (p.extraRoots ?? []).flatMap((r) => readdirSync(r).map((d) => readFileSync(join(r, d, "SKILL.md"), "utf8"))) });
         return reply({});
       case "thread/start":
         if (p.dynamicTools?.length && process.env.MINI_CODEX_NO_DYNAMIC) return fail("dynamicTools isn't supported by this version");
-        thread = { id: uid("thread"), totals: { totalTokens: 0, inputTokens: 0, cachedInputTokens: 0, cacheWriteInputTokens: 0, outputTokens: 0 }, params: p };
+        thread = { id: uid("thread"), totals: { totalTokens: 0, inputTokens: 0, cachedInputTokens: 0, cacheWriteInputTokens: 0, outputTokens: 0 }, params: p, dynamicTools: p.dynamicTools ?? [] };
         save();
         return reply({ thread: { id: thread.id } });
       case "thread/resume": {
         const file = sessions && join(sessions, `${p.threadId}.json`);
         if (!file || !existsSync(file)) return fail(`no rollout found for thread id ${p.threadId}`);
-        thread = { id: p.threadId, totals: JSON.parse(readFileSync(file, "utf8")).totals, params: p };
+        // As Codex does, it keeps the dynamic tools the session started with (resuming can't change them).
+        const saved = JSON.parse(readFileSync(file, "utf8"));
+        thread = { id: p.threadId, totals: saved.totals, params: p, dynamicTools: saved.dynamicTools ?? [] };
         return reply({ thread: { id: thread.id } });
       }
       case "turn/start":

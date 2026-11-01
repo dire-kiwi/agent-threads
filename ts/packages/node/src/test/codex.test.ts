@@ -12,6 +12,7 @@ import { codex, type CodexOptions } from "../codex/driver.js";
 import { prepareCodexHome } from "../codex/home.js";
 import { serveTools } from "../mcp-http.js";
 import { MemoryStore } from "../stores/memory.js";
+import type { PermissionQuery } from "../permissions.js";
 import { defineTool, type ToolContext } from "../tools.js";
 import { tempDir } from "./spec.js";
 
@@ -31,6 +32,8 @@ interface Setup extends AgentThreadsOptions {
 function setup(options: Setup = {}) {
   const log = join(tempDir(), "log.jsonl");
   const home = tempDir();
+  // A home of its own, so the user's own skills don't show up.
+  const userHome = tempDir();
   const { codex: o, env, ...rest } = options;
   const events: ThreadEvent[] = [];
   const store = rest.store ?? new MemoryStore();
@@ -39,7 +42,7 @@ function setup(options: Setup = {}) {
       permissions: "allow",
       ...rest,
       store,
-      harnesses: { codex: codex({ bin: mini, env: { MINI_CODEX_LOG: log, ...env }, home, login: false, closeGraceMs: 1000, ...o }) },
+      harnesses: { codex: codex({ bin: mini, env: { MINI_CODEX_LOG: log, HOME: userHome, ...env }, home, login: false, closeGraceMs: 1000, ...o }) },
       onError:
         rest.onError ??
         ((e) => {
@@ -64,7 +67,7 @@ function setup(options: Setup = {}) {
   };
   /** The requests a run sent, by method. */
   const sent = (method: string, run = -1) => runs().at(run)?.sent.filter((m) => m.method === method) ?? [];
-  return { sdk: make(), make, events, runs, sent, home };
+  return { sdk: make(), make, events, runs, sent, home, userHome, store };
 }
 
 async function until<T>(what: () => T | undefined | false | Promise<T | undefined | false>, ms = 5000): Promise<T> {
@@ -152,7 +155,7 @@ describe("the Codex driver", () => {
     const run = runs()[0]!;
     expect(run.argv).toEqual(["app-server"]);
     expect(run.codexHome).toBe(home);
-    expect(run.sent.slice(0, 3).map((m) => m.method)).toEqual(["initialize", "initialized", "thread/start"]);
+    expect(run.sent.slice(0, 4).map((m) => m.method)).toEqual(["initialize", "initialized", "skills/list", "thread/start"]);
     expect(run.sent[0]!.params.capabilities).toEqual({ experimentalApi: true });
     expect(sent("thread/start")[0]!.params).toEqual({
       cwd,
@@ -510,6 +513,145 @@ describe("the Codex driver", () => {
     expect(sent("thread/resume")[0]!.params).toMatchObject({ model: "b", approvalPolicy: "never", sandbox: "danger-full-access" });
   });
 
+  it("turns off the user's and the project's skills, keeping the app's and Codex's own", async () => {
+    const skill = (root: string, name: string) => {
+      mkdirSync(join(root, ".agents", "skills", name), { recursive: true });
+      writeFileSync(join(root, ".agents", "skills", name, "SKILL.md"), `---\nname: ${name}\n---\n`);
+      return join(root, ".agents", "skills", name, "SKILL.md");
+    };
+    const { sdk, sent, userHome } = setup({ skills: [{ name: "app-skill", content: "---\nname: app-skill\n---\n" }] });
+    const cwd = tempDir();
+    const user = skill(userHome, "user-sentinel");
+    const repo = skill(cwd, "repo-sentinel");
+    const t = await sdk.create({ harness: "codex", cwd });
+    await sdk.send(t.id, "skills");
+    const s = await settle(sdk, t.id);
+    expect(texts(s.items)).toEqual(["skills: app-skill,builtin"]);
+    expect(sent("skills/list")[0]!.params).toEqual({ cwds: [cwd], forceReload: true });
+    expect(sent("thread/start")[0]!.params.config.skills).toEqual({ config: [{ path: user, enabled: false }, { path: repo, enabled: false }] });
+  });
+
+  it("leaves the user's skills on with userConfig", async () => {
+    const before = process.env.CODEX_HOME;
+    process.env.CODEX_HOME = tempDir();
+    try {
+      const { sdk, sent, userHome } = setup({ codex: { userConfig: true } });
+      mkdirSync(join(userHome, ".agents", "skills", "user-sentinel"), { recursive: true });
+      writeFileSync(join(userHome, ".agents", "skills", "user-sentinel", "SKILL.md"), "---\nname: user-sentinel\n---\n");
+      const t = await sdk.create({ harness: "codex", cwd: tempDir() });
+      await sdk.send(t.id, "skills");
+      const s = await settle(sdk, t.id);
+      expect(texts(s.items)).toEqual(["skills: builtin,user-sentinel"]);
+      expect(sent("skills/list")).toHaveLength(0);
+    } finally {
+      if (before === undefined) delete process.env.CODEX_HOME;
+      else process.env.CODEX_HOME = before;
+    }
+  });
+
+  it("keeps a secret answer out of what's sent and saved, and gives it only to Codex", async () => {
+    const { sdk, runs, store } = setup();
+    const published: ThreadEvent[] = [];
+    sdk.subscribe((e) => published.push(e));
+    const t = await sdk.create({ harness: "codex", cwd: tempDir() });
+    await sdk.send(t.id, "secret");
+    const r = await request(sdk, t.id);
+    expect(r).toMatchObject({ type: "question", questions: [{ id: "password", secret: true }] });
+    await sdk.respond(t.id, r.id, { outcome: "answer", answers: { password: ["hunter2-sentinel"] } });
+    const s = await settle(sdk, t.id);
+    expect(runs()[0]!.notes).toContainEqual({ secretAnswer: { password: { answers: ["hunter2-sentinel"] } } });
+    expect(calls(s.items)[0]).toMatchObject({ status: "completed", result: { content: "password: [secret]" } });
+    expect(published.find((e) => e.type === "request.resolved")).toMatchObject({ resolution: { outcome: "answer", answers: { password: ["[secret]"] } } });
+    await sdk.close();
+    const saved = JSON.stringify(await store.readEvents(t.id, { after: 0 }));
+    for (const where of [saved, JSON.stringify(published), JSON.stringify(s)]) expect(where).not.toContain("hunter2-sentinel");
+  });
+
+  it("asks the policy about the MCP call an elicitation names, not another one running on the server", async () => {
+    const asked: PermissionQuery[] = [];
+    const { sdk } = setup({
+      permissions: (q) => {
+        asked.push(q);
+        return q.name === "read_status" ? "allow" : { deny: "only reads" };
+      },
+    });
+    const t = await sdk.create({ harness: "codex", cwd: tempDir() });
+    // Two calls on one server, then the approval for the first: the destructive one.
+    await sdk.send(t.id, 'concurrent db {"calls": [["delete_all", {"all": true}], ["read_status", {"limit": 1}]], "ask": 0}');
+    let s = await settle(sdk, t.id);
+    const [del] = calls(s.items);
+    expect(asked[0]).toMatchObject({ name: "delete_all", kind: "mcp", server: "db", input: { all: true }, toolCallId: del!.id });
+    expect(texts(s.items)).toEqual(["asked about delete_all: decline"]);
+    expect(del).toMatchObject({ status: "denied" });
+
+    // The same tool with different arguments: the call whose arguments match.
+    await sdk.send(t.id, 'concurrent db {"calls": [["read_status", {"limit": 1}], ["read_status", {"limit": 2}]], "ask": 1}');
+    s = await settle(sdk, t.id);
+    const second = calls(s.items).filter((c) => c.name === "read_status").at(-1)!;
+    expect(asked[1]).toMatchObject({ name: "read_status", input: { limit: 2 }, toolCallId: second.id });
+
+    // Two calls it could be: it's asked about without either.
+    await sdk.send(t.id, 'concurrent db {"calls": [["delete_all", {"all": true}], ["delete_all", {"all": true}]], "ask": 1}');
+    s = await settle(sdk, t.id);
+    expect(asked[2]).toMatchObject({ name: "delete_all", input: { all: true } });
+    expect(asked[2]!.toolCallId).toBeUndefined();
+    expect(texts(s.items).at(-1)).toBe("asked about delete_all: decline");
+  });
+
+  it("gives a resumed session the app's tools as they are now, on the MCP server where its own have changed", async () => {
+    const tool = (name: string, description = `The ${name} tool.`) => defineTool({ name, description, input: { type: "object" }, run: () => `${name} ran` });
+    const { sdk, sent } = setup();
+    const t = await sdk.create({ harness: "codex", cwd: tempDir(), tools: [tool("original_tool"), tool("kept_tool")] });
+    await sdk.send(t.id, "tools");
+    let s = await settle(sdk, t.id);
+    expect(texts(s.items).at(-1)).toBe("dynamic: original_tool,kept_tool; mcp: ");
+
+    // Replaced, kept and changed: Codex keeps the dynamic tools it started with, so the new and
+    // changed ones are on the MCP server.
+    await sdk.configure(t.id, { tools: [tool("replacement_tool"), tool("kept_tool"), tool("changed_tool")] });
+    await sdk.send(t.id, "tools");
+    s = await settle(sdk, t.id);
+    expect(sent("thread/resume")[0]!.params.dynamicTools).toBeUndefined();
+    expect(texts(s.items).at(-1)).toBe("dynamic: original_tool,kept_tool; mcp: replacement_tool,changed_tool");
+    await sdk.send(t.id, "app replacement_tool {}\napp kept_tool {}\napp original_tool {}");
+    s = await settle(sdk, t.id);
+    expect(texts(s.items).slice(-3)).toEqual(["app said replacement_tool ran", "app said kept_tool ran", "app said The tool original_tool isn't available any more. The app's other tools are on its app MCP server: replacement_tool, changed_tool."]);
+
+    await sdk.configure(t.id, { tools: [tool("kept_tool", "Now different.")] });
+    await sdk.send(t.id, "tools\napp kept_tool {}");
+    s = await settle(sdk, t.id);
+    expect(texts(s.items).slice(-2)).toEqual(["dynamic: original_tool,kept_tool; mcp: kept_tool", "app said The tool kept_tool has changed: call it on the app MCP server instead."]);
+  });
+
+  it("counts usage from a new session's totals when Codex no longer has the old one", async () => {
+    const { sdk, make, home } = setup();
+    const t = await sdk.create({ harness: "codex", cwd: tempDir() });
+    await sdk.send(t.id, "reply one");
+    await settle(sdk, t.id);
+    await sdk.send(t.id, "reply two");
+    await settle(sdk, t.id);
+    await sdk.close();
+    rmSync(join(home, "mini-sessions"), { recursive: true });
+
+    let next = make();
+    await next.send(t.id, "reply three");
+    let s = await settle(next, t.id);
+    expect(notices(s.items)).toHaveLength(1);
+    const per = { input_tokens: 60, cache_read_tokens: 40, output_tokens: 10, cache_write_tokens: 0 };
+    expect(results(s.items).map((r) => r.usage)).toEqual([per, per, per]);
+
+    // And so on, across another restart (resuming the new session) and an options change.
+    await next.close();
+    next = make();
+    await next.send(t.id, "reply four");
+    await settle(next, t.id);
+    await next.setOptions(t.id, { model: "other" });
+    await next.send(t.id, "reply five");
+    s = await settle(next, t.id);
+    expect(results(s.items).map((r) => r.usage)).toEqual([per, per, per, per, per]);
+    expect(s.thread.usage).toEqual({ input_tokens: 300, cache_read_tokens: 200, output_tokens: 50, cache_write_tokens: 0 });
+  });
+
   it("gives Codex the app's skills with skills/extraRoots/set", async () => {
     const dir = join(tempDir(), "from-disk");
     mkdirSync(dir);
@@ -519,7 +661,7 @@ describe("the Codex driver", () => {
     await sdk.send(t.id, "reply ok");
     await settle(sdk, t.id);
     const run = runs()[0]!;
-    expect(run.sent.map((m) => m.method).slice(0, 4)).toEqual(["initialize", "initialized", "skills/extraRoots/set", "thread/start"]);
+    expect(run.sent.map((m) => m.method).slice(0, 5)).toEqual(["initialize", "initialized", "skills/extraRoots/set", "skills/list", "thread/start"]);
     expect(run.notes.find((n) => n.skills)!.skills.sort()).toEqual(["---\nname: from-disk\n---\nOn disk.\n", "---\nname: inline\n---\nInline.\n"]);
   });
 
