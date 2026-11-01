@@ -10,6 +10,11 @@ export interface PermissionQuery {
   kind: ToolKind;
   input: unknown;
   title?: string;
+  /**
+   * The command, for a `shell` call, as the tool_call shows it: Codex's `bash -lc` wrapper is
+   * taken off (the input has it as Codex gave it).
+   */
+  command?: string;
   /** The MCP server, for an `mcp` tool. */
   server?: string;
   /** Why the harness is asking, when it says. */

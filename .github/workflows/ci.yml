@@ -1,4 +1,4 @@
-# Builds and tests the TypeScript, Go and Rust packages and the shim, and checks that the code
+# Builds and tests the TypeScript, Go and Rust packages, the shim and the example app, and checks that the code
 # generated from spec/schema is up to date (make check-gen), on each pull request and push to main.
 # It needs no secrets.
 name: CI
@@ -90,6 +90,54 @@ jobs:
         run: pnpm install --frozen-lockfile
 
       - run: make test-ts
+
+  example:
+    name: Example app (Playwright)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 24
+
+      - run: npm install -g pnpm@$PNPM_VERSION
+
+      # For agent-threads-shim, which the restart test runs.
+      - name: Rust toolchain
+        run: rustup toolchain install stable --profile minimal && rustup default stable
+
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          workspaces: shim
+
+      - name: pnpm install
+        working-directory: ts
+        run: pnpm install --frozen-lockfile
+
+      - run: make shim
+
+      - name: Build the packages and the app
+        working-directory: ts
+        run: pnpm build
+
+      - name: Playwright's Chromium
+        working-directory: examples/chat-node
+        run: pnpm exec playwright install --with-deps chromium
+
+      - name: Smoke tests, against the fake CLI
+        working-directory: examples/chat-node
+        run: pnpm exec playwright test
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: failure()
+        with:
+          name: playwright-report
+          path: |
+            examples/chat-node/playwright-report
+            examples/chat-node/test-results
+          retention-days: 7
 
   go:
     name: Go

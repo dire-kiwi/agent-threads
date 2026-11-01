@@ -108,7 +108,7 @@ const lookupOrder = (seen: ToolContext[] = []) =>
     input: { type: "object", properties: { order_id: { type: "string" } }, required: ["order_id"] },
     run: ({ order_id }, ctx) => {
       seen.push(ctx);
-      return `Order ${order_id}: 3 blue widgets.`;
+      return { text: `Order ${order_id}: 3 blue widgets.`, structured: { order_id } };
     },
   });
 
@@ -214,7 +214,7 @@ describe("the Codex driver", () => {
     expect(edit).toMatchObject({ status: "denied", changes: [{ path: "/w/notes.txt", op: "update", diff: "@@ -1 +1 @@\n-a\n+b\n" }] });
     expect(texts(s.items)).toEqual(["done"]);
     expect(asked).toMatchObject([
-      { name: "commandExecution", kind: "shell", toolCallId: cmd!.id },
+      { name: "commandExecution", kind: "shell", command: "touch a.txt", toolCallId: cmd!.id },
       { name: "fileChange", kind: "edit", toolCallId: edit!.id },
     ]);
     // Codex is told accept and decline.
@@ -290,7 +290,7 @@ describe("the Codex driver", () => {
     expect(texts(s.items)).toEqual(['answers {"color":{"answers":["Blue"]}}']);
   });
 
-  it("runs app tools given as dynamic tools, through the policy", async () => {
+  it("runs app tools given as dynamic tools, through the policy, and keeps their structured output", async () => {
     const seen: ToolContext[] = [];
     const asked: unknown[] = [];
     const { sdk } = setup({
@@ -307,7 +307,7 @@ describe("the Codex driver", () => {
     await sdk.respond(t.id, r.id, { outcome: "allow" });
     const s = await settle(sdk, t.id);
     const call = calls(s.items)[0]!;
-    expect(call).toMatchObject({ name: "lookup_order", kind: "app", status: "completed", result: { content: "Order 42: 3 blue widgets." } });
+    expect(call).toMatchObject({ name: "lookup_order", kind: "app", status: "completed", result: { content: "Order 42: 3 blue widgets.", structured: { order_id: "42" } } });
     expect(seen).toMatchObject([{ threadId: t.id, metadata: { user: "u1" }, toolCallId: call.id }]);
     expect(texts(s.items)).toEqual(["app said Order 42: 3 blue widgets."]);
   });
@@ -325,7 +325,7 @@ describe("the Codex driver", () => {
     expect(app).toMatchObject({ url: expect.stringMatching(/^http:\/\/127\.0\.0\.1:\d+\/mcp$/), http_headers: { Authorization: expect.stringMatching(/^Bearer .{20,}/) }, default_tools_approval_mode: "approve" });
     expect(runs()[0]!.notes).toContainEqual({ mcpTools: ["lookup_order"] });
     const call = calls(s.items)[0]!;
-    expect(call).toMatchObject({ name: "lookup_order", kind: "app", status: "completed", result: { content: "Order 7: 3 blue widgets." } });
+    expect(call).toMatchObject({ name: "lookup_order", kind: "app", status: "completed", result: { content: "Order 7: 3 blue widgets.", structured: { order_id: "7" } } });
     expect(call.server).toBeUndefined();
     expect(seen[0]).toMatchObject({ toolCallId: call.id });
     expect(texts(s.items)).toEqual(["app said Order 7: 3 blue widgets."]);

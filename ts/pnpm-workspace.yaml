@@ -1,2 +1,4 @@
 packages:
   - packages/*
+  # The example apps, which use the packages from here.
+  - ../examples/*

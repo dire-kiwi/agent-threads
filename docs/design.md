@@ -83,7 +83,7 @@ hand. The wire format is specified in [spec/PROTOCOL.md](../spec/PROTOCOL.md) an
 | `go/` | Go module `github.com/dire-kiwi/agent-threads/go`, the Go backend ([go/README.md](../go/README.md)); generated types in `go/protocol`, SQLite in `go/sqlitestore`. |
 | `rust/` | Cargo workspace with the `agent-threads` crate (generated types in `agent_threads::protocol`) and its `codegen`. |
 | `shim/` | `agent-threads-shim` (see below). |
-| `examples/` | A minimal chat app per backend, each with its own WebSocket transport, to show the "bring your own network" seam (`examples/chat-go`: the Go server). |
+| `examples/` | A minimal chat app per backend, each with its own WebSocket transport, to show the "bring your own network" seam: `chat-node`, and `chat-go`, a Go server for chat-node's React frontend, which every example's server shares ([examples/PROTOCOL.md](../examples/PROTOCOL.md)). |
 
 `make gen` regenerates the types from `spec/schema/`, and CI fails if they're out of date.
 

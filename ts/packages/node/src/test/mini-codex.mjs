@@ -34,7 +34,8 @@
 // A steered message is taken in at once (a userMessage item), and the turn says it heard it at its
 // end. MINI_CODEX_STEER=never accepts steered messages but never takes them in; =reject refuses
 // them. MINI_CODEX_TOOL_DELAY=<ms> waits that long between a dynamic tool's call and asking for
-// it to be run. MINI_CODEX_NO_DYNAMIC=1 refuses
+// it to be run, and MINI_CODEX_RESULT_DELAY=<ms> between its answer and the item's completion.
+// MINI_CODEX_NO_DYNAMIC=1 refuses
 // thread/start with dynamicTools. MINI_CODEX_LOG names a file each run appends its argv and
 // CODEX_HOME, and every message it's sent, to.
 
@@ -214,6 +215,7 @@ async function step(line) {
         // As Codex does, a while later (so the backend has saved the call before it's asked to run it).
         await new Promise((r) => setTimeout(r, Number(process.env.MINI_CODEX_TOOL_DELAY ?? 0)));
         const r = await request("item/tool/call", { ...ids, callId: id, tool, arguments: args });
+        await new Promise((r) => setTimeout(r, Number(process.env.MINI_CODEX_RESULT_DELAY ?? 0)));
         item("item/completed", { ...base, status: r.result?.success ? "completed" : "failed", contentItems: r.result?.contentItems, success: r.result?.success });
         return message(`app said ${r.result?.contentItems?.[0]?.text}`);
       }

@@ -456,6 +456,8 @@ export class AgentThreads {
     // Requests the session didn't take up again can't be answered.
     const open = new Set(rt.openRequests.map((r) => r.id));
     for (const r of rt.snapshot.requests) if (!open.has(r.id)) rt.emit({ type: "request.resolved", request_id: r.id, resolution: { outcome: "cancel" } });
+    // With none left (one answered before the restart is closed, say), the turn runs on.
+    if (rt.turn && !open.size && rt.thread.status === "waiting") rt.setThread({ status: "running" });
     rt.setThread({ run: { ...run, reattached_at: new Date().toISOString() } });
     if (rt.turn) {
       rt.addItem({

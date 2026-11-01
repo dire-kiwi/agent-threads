@@ -91,6 +91,8 @@ export class ThreadRuntime implements ThreadContext {
   #run: { record: RunRecord; json: string } | undefined;
   /** Items text has streamed into since the turn began (whose text may not be saved yet). */
   #streaming = new Set<string>();
+  /** App tools' structured output, by tool call, until the harness gives the call its result. */
+  #structured = new Map<string, unknown>();
 
   constructor(host: RuntimeHost, state: Snapshot, config: ThreadConfig, policy: PermissionPolicy) {
     this.#host = host;
@@ -224,6 +226,8 @@ export class ThreadRuntime implements ThreadContext {
         turn: this.turn,
         state: cp.state,
         ...(live ? { live } : {}),
+        // App tools' structured output whose calls the harness hasn't given their result yet.
+        ...(this.#structured.size ? { structured: Object.fromEntries(this.#structured) } : {}),
       },
     };
     // A copy, taken now: the store may write it later, after more of the run's output has changed
@@ -250,11 +254,14 @@ export class ThreadRuntime implements ThreadContext {
 
   /**
    * The run record saved last, for a backend that re-attached to it, with the text that had
-   * streamed in as of it: shown again, as deltas, before the run's output is read on.
+   * streamed in as of it (shown again, as deltas, before the run's output is read on) and the app
+   * tools' structured output still waiting for their calls' results.
    */
   adoptRun(record: RunRecord): void {
     this.#run = { record, json: JSON.stringify(record) };
-    const live = (record.data as { live?: { [id: string]: string } } | undefined)?.live ?? {};
+    const data = record.data as { live?: { [id: string]: string }; structured?: { [id: string]: unknown } } | undefined;
+    this.#structured = new Map(Object.entries(data?.structured ?? {}));
+    const live = data?.live ?? {};
     for (const [id, text] of Object.entries(live)) {
       const item = this.item(id);
       if (!item || (item.type !== "assistant_message" && item.type !== "reasoning") || !text.startsWith(item.text)) continue;
@@ -344,12 +351,21 @@ export class ThreadRuntime implements ThreadContext {
   updateItem(id: string, patch: { [k: string]: unknown }): void {
     const item = this.item(id) as unknown as Record<string, unknown> | undefined;
     if (!item) return;
+    const result = patch.result as { [k: string]: unknown } | null | undefined;
+    if (result && this.#structured.has(id)) {
+      if (result.structured === undefined) patch = { ...patch, result: { ...result, structured: this.#structured.get(id) } };
+      this.#structured.delete(id);
+    }
     const changed: { [k: string]: unknown } = {};
     for (const [k, v] of Object.entries(patch)) {
       if (v === undefined || k === "id" || k === "type") continue;
       if (v === null ? k in item : JSON.stringify(item[k]) !== JSON.stringify(v)) changed[k] = v;
     }
     if (Object.keys(changed).length) this.emit({ type: "item.updated", item_id: id, patch: changed });
+  }
+
+  toolOutput(toolCallId: string, structured: unknown): void {
+    if (structured !== undefined) this.#structured.set(toolCallId, structured);
   }
 
   delta(itemId: string, kind: "text" | "reasoning", text: string): void {
@@ -433,6 +449,7 @@ export class ThreadRuntime implements ThreadContext {
       if (saved && "text" in saved && saved.text !== it.text) this.updateItem(it.id, { text: it.text });
     }
     this.#streaming.clear();
+    this.#structured.clear();
     for (const it of this.#state.items) {
       if (it.type === "tool_call" && it.turn_id === turn.id && (it.status === "running" || it.status === "pending")) {
         this.updateItem(it.id, { status: "cancelled" });

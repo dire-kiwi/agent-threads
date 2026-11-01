@@ -65,6 +65,12 @@ export interface HarnessProcess {
    */
   stop?(grace: number, now?: boolean): void;
   /**
+   * Whether an answer to its request `id` was written to its input already, after the checkpoint
+   * it was re-attached from (and before the backend restarted): the harness has it, so the request
+   * isn't asked again.
+   */
+  answered?(id: string | number): boolean;
+  /**
    * Stops following it and leaves it running, for a backend that's shutting down and will
    * re-attach (a process that outlives the backend only). No handler is called after this.
    */

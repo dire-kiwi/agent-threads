@@ -42,6 +42,14 @@ await sdk.close(); // on shutdown: stops the harness processes (or with the shim
   the protocol's schema, which is checked before anything changes). `send`, `interrupt`, `respond`
   and `setOptions` do the same from code. After `close()`, they're all refused.
 - `get`, `list` and `delete` look threads up and remove them.
+
+[examples/chat-node](../../../examples/chat-node) is a whole app on this package and the React one.
+- A tool returns text for the agent, or `{ text, isError?, structured? }`. `structured` also goes
+  in the call's `result.structured` (harnesses pass on only the text), for the app's renderer of
+  the tool to draw.
+- The permission policy is asked about each tool call with a `PermissionQuery`: its `name`, `kind`,
+  `input`, `title`, and, for a shell command, `command` as the tool_call shows it (without Codex's
+  `bash -lc` wrapper), so a policy can tell a command that only reads.
 - A thread's own tools, policy and so on live in memory. After a restart, give them again with
   `configure(threadId, { tools, ... })`; its stored state (items, session) comes back by itself, and
   the next message resumes the harness's session.
@@ -175,13 +183,15 @@ await sdk.recover(); // at startup, before taking commands
   and removes the runs in it the store doesn't follow), so there's no default. It and a shim path
   with a `/` in it are taken relative to the backend's working directory.
 - Whenever a thread's events are saved, its run's offset (how far into `out.jsonl` they go), the
-  driver's state for it, the running turn and the text streamed so far are saved with them, in the
-  same `appendEvents`. So however the backend
-  stops, after a restart it reads the output again from exactly where the saved events end: none
+  driver's state for it, the running turn, the text streamed so far and app tools' structured
+  output not yet given to their calls are saved with them, in the same `appendEvents`. So however
+  the backend stops, after a restart it reads the output again from exactly where the saved events end: none
   are lost, and none are made twice.
 - `recover()` re-attaches to the runs that were going when the backend stopped. A run that's still
   going carries on, with its turn, its streamed text and its open requests as they were (a
-  permission or question the user hadn't answered can still be answered). One that ended while the
+  permission or question the user hadn't answered can still be answered; one they answered just
+  before the backend went, whose answer the harness has though it wasn't saved, isn't asked again,
+  whether or not its opening was saved). One that ended while the
   backend was down is read to its end, so its turn finishes as it would have. A `notice` (code
   `run.reattached`) tells the user, and the thread's `run` gets `reattached_at`. A thread a command
   loads before `recover()` gets to it is re-attached then.
@@ -203,7 +213,14 @@ await sdk.recover(); // at startup, before taking commands
   (14), and a run nothing follows any more (its backend died before saving it, or while stopping
   it) is stopped.
 - Stopping a run is the harness's interrupt, then closing its input, then SIGTERM and SIGKILL to
-  its process group (the SIGKILL to whatever is left of it, even once the harness has exited). A
+  its process group (the SIGKILL to whatever is left of it, even once the harness has exited). The
+  drivers' `stopGraceMs` is how long an interrupted turn has to end before its input is closed,
+  and their `closeGraceMs` how long after that SIGTERM comes, with SIGKILL twice that.
+  `shim()`'s `killGraceMs` (10s) is only for the runs the spawner stops itself, from SIGTERM
+  straight away: one nothing follows any more, one in a newer format, and one whose shim has gone.
+  An interrupt is saved (the turn as interrupted, and when the run is stopped if it doesn't end)
+  before the harness is sent it, so a backend that dies straight after still stops a harness that
+  ignores it. A
   shim that dies without saying how its run ended (SIGKILL, a reboot) is noticed: the run ends with
   an error, and its harness is stopped. A process group is only ever signalled while it's still the
   run's, never one whose id has gone to another process (after a reboot, say).
