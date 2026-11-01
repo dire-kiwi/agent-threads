@@ -30,6 +30,10 @@ impl ShimOptions {
     }
 }
 
+/// Nothing to kill: runs don't outlive the backend here.
+#[doc(hidden)]
+pub fn kill_runs(_runs_dir: &std::path::Path) {}
+
 /// [`direct`]: the shim doesn't run here.
 pub fn shim(_path: impl Into<PathBuf>, _options: ShimOptions) -> Arc<dyn Spawner> {
     direct()

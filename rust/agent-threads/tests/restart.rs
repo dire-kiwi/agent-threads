@@ -209,6 +209,14 @@ fn scene(fixture: &str, extra: &[(&str, &str)]) -> Scene {
     }
 }
 
+impl Drop for Scene {
+    /// Kills the runs its backends left (which outlive them), so a test that fails leaves nothing
+    /// running.
+    fn drop(&mut self) {
+        agent_threads::kill_runs(&self.runs);
+    }
+}
+
 impl Scene {
     fn start(&self) -> Backend {
         Backend::start(&self.env)

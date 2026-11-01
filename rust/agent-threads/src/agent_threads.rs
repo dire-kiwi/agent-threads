@@ -199,6 +199,28 @@ async fn deleted(mut d: Deletion) -> Result<bool> {
     }
 }
 
+/// A thread being loaded: the outcome once it is.
+type Loading = tokio::sync::watch::Receiver<Option<Result<Handle>>>;
+
+/// Waits for a load's outcome.
+async fn loaded(mut l: Loading) -> Result<Handle> {
+    match l.wait_for(Option::is_some).await {
+        Ok(r) => r.clone().unwrap(),
+        Err(_) => Err(Error::Other("the load stopped before it finished".into())),
+    }
+}
+
+/// The live threads, and those being loaded. Its lock is never held across an await, so a slow
+/// load or close doesn't hold up commands for other threads.
+#[derive(Default)]
+struct Threads {
+    live: HashMap<String, Handle>,
+    /// Threads being loaded, which are live once they are (a thread is published only once its
+    /// load, re-attach or recovery has finished). A load that comes meanwhile waits for the same
+    /// one, as do a deletion and close().
+    loading: HashMap<String, Loading>,
+}
+
 /// A live thread's task.
 #[derive(Clone)]
 struct Handle {
@@ -240,7 +262,7 @@ struct Inner {
     capabilities: Capabilities,
     on_error: Arc<dyn Fn(Error) + Send + Sync>,
     events: broadcast::Sender<ThreadEvent>,
-    threads: Mutex<HashMap<String, Handle>>,
+    threads: StdMutex<Threads>,
     configs: StdMutex<HashMap<String, Capabilities>>,
     /// Threads being deleted, which aren't loaded again.
     deleting: StdMutex<HashMap<String, Deletion>>,
@@ -282,7 +304,7 @@ impl AgentThreads {
                 capabilities: options.capabilities,
                 on_error,
                 events,
-                threads: Mutex::new(HashMap::new()),
+                threads: StdMutex::new(Threads::default()),
                 configs: StdMutex::new(HashMap::new()),
                 deleting: StdMutex::new(Default::default()),
                 closed: AtomicBool::new(false),
@@ -343,14 +365,19 @@ impl AgentThreads {
         let typed: Thread = serde_json::from_value(thread.clone()).map_err(|e| Error::Command(e.to_string()))?;
         i.configs.lock().unwrap().insert(typed.id.clone(), options.capabilities);
         i.store.create_thread(&thread).await?;
-        let mut threads = i.threads.lock().await;
-        let (handle, mut actor, rx) = self.actor(initial_state(typed.clone()))?;
-        actor
-            .core
-            .emit_value(json!({"type": "thread.updated", "thread": thread}));
-        self.run(&handle, actor, rx);
-        threads.insert(typed.id.clone(), handle.clone());
-        drop(threads);
+        let handle = {
+            let mut threads = i.threads.lock().unwrap();
+            // Checked again under the lock close() collects the threads under, so a close() that
+            // started meanwhile either sees this one or refuses it here.
+            self.open()?;
+            let (handle, mut actor, rx) = self.actor(initial_state(typed.clone()))?;
+            actor
+                .core
+                .emit_value(json!({"type": "thread.updated", "thread": thread}));
+            self.run(&handle, actor, rx);
+            threads.live.insert(typed.id.clone(), handle.clone());
+            handle
+        };
         handle.saved().await?;
         Ok(typed)
     }
@@ -388,7 +415,22 @@ impl AgentThreads {
                 own.system_prompt = Some(p).filter(|p| !p.is_empty());
             }
         }
-        let handle = self.inner.threads.lock().await.get(thread_id).cloned();
+        // A thread being loaded is waited for, and then changed as a live one is: this doesn't
+        // return before the change is in effect. (What its load did before then had the change if
+        // it came before the load re-attached the thread's run: see reattach().) One that isn't
+        // loaded, or whose load fails, gets it when it's next loaded.
+        let (live, loading) = {
+            let threads = self.inner.threads.lock().unwrap();
+            (
+                threads.live.get(thread_id).cloned(),
+                threads.loading.get(thread_id).cloned(),
+            )
+        };
+        let handle = match (live, loading) {
+            (Some(h), _) => Some(h),
+            (None, Some(l)) => loaded(l).await.ok(),
+            (None, None) => None,
+        };
         if let Some(h) = handle {
             let (config, policy) = (self.config(thread_id), self.policy(thread_id));
             h.call(move |a| {
@@ -406,7 +448,7 @@ impl AgentThreads {
 
     /// The thread, or none.
     pub async fn get(&self, thread_id: &str) -> Result<Option<Thread>> {
-        let handle = self.inner.threads.lock().await.get(thread_id).cloned();
+        let handle = self.live(thread_id);
         if let Some(h) = handle
             && let Ok(t) = h.call(|a| a.core.thread().clone()).await
         {
@@ -423,7 +465,7 @@ impl AgentThreads {
     /// Every thread, oldest first.
     pub async fn list(&self) -> Result<Vec<Thread>> {
         let stored = self.inner.store.list_threads().await?;
-        let live = self.inner.threads.lock().await.clone();
+        let live = self.inner.threads.lock().unwrap().live.clone();
         let mut out = Vec::new();
         for t in stored {
             let Ok(t) = serde_json::from_value::<Thread>(t) else {
@@ -441,11 +483,12 @@ impl AgentThreads {
     pub async fn delete(&self, thread_id: &str) -> Result<bool> {
         self.open()?;
         // Marked as being deleted under the lock loads take, so nothing loads it again meanwhile:
-        // commands for it are refused until it's gone. The deletion runs as a task of its own, so
-        // it finishes (and the mark goes) even if the caller stops waiting for it; a delete that
+        // commands for it are refused until it's gone. A load already under way is waited for (it
+        // sees the mark, and stops the thread it loaded). The deletion runs as a task of its own,
+        // so it finishes (and the mark goes) even if the caller stops waiting for it; a delete that
         // comes meanwhile waits for the same one, as close() does.
         let deletion = {
-            let mut threads = self.inner.threads.lock().await;
+            let mut threads = self.inner.threads.lock().unwrap();
             let mut deleting = self.inner.deleting.lock().unwrap();
             if let Some(d) = deleting.get(thread_id) {
                 d.clone()
@@ -455,7 +498,8 @@ impl AgentThreads {
                 self.open()?;
                 let (tx, rx) = tokio::sync::watch::channel(None);
                 deleting.insert(thread_id.to_string(), rx.clone());
-                let handle = threads.remove(thread_id);
+                let handle = threads.live.remove(thread_id);
+                let loading = threads.loading.get(thread_id).cloned();
                 let (me, id) = (self.clone(), thread_id.to_string());
                 tokio::spawn(async move {
                     // However it ends (a panic in delete_now included), the mark goes and those
@@ -471,6 +515,9 @@ impl AgentThreads {
                             ));
                         }))
                     };
+                    if let Some(l) = loading {
+                        let _ = loaded(l).await;
+                    }
                     let r = me.delete_now(&id, handle).await;
                     *result.lock().unwrap() = Some(r);
                 });
@@ -483,14 +530,7 @@ impl AgentThreads {
     /// Stops a thread being deleted (its handle, if it was live) and deletes it from the store.
     async fn delete_now(&self, thread_id: &str, handle: Option<Handle>) -> Result<bool> {
         if let Some(h) = handle {
-            if let Ok(close) = h.call(|a| a.session.close(&mut a.core)).await {
-                close.await;
-            }
-            let _ = h.call(|a| a.core.dispose()).await;
-            let task = h.task.lock().unwrap().take();
-            if let Some(task) = task {
-                let _ = task.await;
-            }
+            discard(h).await;
         }
         self.inner.configs.lock().unwrap().remove(thread_id);
         Ok(self.inner.store.delete_thread(thread_id).await?)
@@ -498,13 +538,12 @@ impl AgentThreads {
 
     /// The thread's state now, including text streamed so far.
     pub async fn snapshot(&self, thread_id: &str) -> Result<Snapshot> {
-        self.open()?;
-        self.load(thread_id).await?.call(|a| a.core.snapshot().clone()).await
+        self.ready(thread_id).await?.call(|a| a.core.snapshot().clone()).await
     }
 
     /// The thread's saved events after `seq` (at most `limit`), for a client catching up.
     pub async fn events_since(&self, thread_id: &str, seq: u64, limit: Option<usize>) -> Result<Vec<ThreadEvent>> {
-        let handle = self.inner.threads.lock().await.get(thread_id).cloned();
+        let handle = self.live(thread_id);
         match handle {
             Some(h) => h.saved().await?,
             None => {
@@ -733,16 +772,21 @@ impl AgentThreads {
         self.save_all().await
     }
 
-    /// Waits for the deletions under way, then stops every thread's harness, and settles the
-    /// spawner.
+    /// Waits for the deletions and loads under way, then stops every thread's harness, and settles
+    /// the spawner.
     async fn shut_down(&self, stop: bool) {
         let i = &self.inner;
-        // A delete() that started before `closed` was set has marked its thread by the time the
-        // threads lock is free (it rechecks `closed` under it), so none is missed.
-        let deletions: Vec<Deletion> = {
-            let _threads = i.threads.lock().await;
-            i.deleting.lock().unwrap().values().cloned().collect()
+        // A delete(), load() or create() that started before `closed` was set has marked, started
+        // or published its thread by the time the threads lock is free (each rechecks `closed`
+        // under it), so none is missed: a load is published when it's done, for stop_all to stop.
+        let (deletions, loads): (Vec<Deletion>, Vec<Loading>) = {
+            let threads = i.threads.lock().unwrap();
+            let deletions = i.deleting.lock().unwrap().values().cloned().collect();
+            (deletions, threads.loading.values().cloned().collect())
         };
+        for l in loads {
+            let _ = loaded(l).await;
+        }
         for d in deletions {
             let _ = deleted(d).await;
         }
@@ -752,7 +796,7 @@ impl AgentThreads {
 
     /// Stops every thread's harness.
     async fn stop_all(&self, stop: bool) {
-        let handles: Vec<Handle> = self.inner.threads.lock().await.values().cloned().collect();
+        let handles: Vec<Handle> = self.inner.threads.lock().unwrap().live.values().cloned().collect();
         let durable = self.inner.spawner.durable();
         let mut tasks = Vec::new();
         for h in handles {
@@ -796,7 +840,8 @@ impl AgentThreads {
             .inner
             .threads
             .lock()
-            .await
+            .unwrap()
+            .live
             .iter()
             .map(|(k, v)| (k.clone(), v.clone()))
             .collect();
@@ -807,7 +852,7 @@ impl AgentThreads {
                 // Its task has ended: a close() that saved and disposed of it was cut short before
                 // it let go of the handle.
                 Err(Error::Command(_)) if h.tx.is_closed() => {
-                    self.inner.threads.lock().await.remove(&id);
+                    self.inner.threads.lock().unwrap().live.remove(&id);
                     continue;
                 }
                 Err(e) => {
@@ -825,7 +870,7 @@ impl AgentThreads {
             if let Some(task) = task {
                 let _ = task.await;
             }
-            self.inner.threads.lock().await.remove(&id);
+            self.inner.threads.lock().unwrap().live.remove(&id);
         }
         if failed.is_empty() {
             Ok(())
@@ -936,18 +981,84 @@ impl AgentThreads {
         *handle.task.lock().unwrap() = Some(tokio::spawn(actor.run(rx)));
     }
 
-    /// The live thread, loaded from the store if it isn't yet.
+    /// The live thread, if it is.
+    fn live(&self, thread_id: &str) -> Option<Handle> {
+        self.inner.threads.lock().unwrap().live.get(thread_id).cloned()
+    }
+
+    /// The live thread, loaded from the store if it isn't yet. Only the thread's own load is waited
+    /// for: other threads' commands go on meanwhile.
     async fn load(&self, thread_id: &str) -> Result<Handle> {
-        let mut threads = self.inner.threads.lock().await;
-        if let Some(h) = threads.get(thread_id) {
-            return Ok(h.clone());
-        }
-        if self.inner.deleting.lock().unwrap().contains_key(thread_id) {
-            return Err(Error::Command(format!("thread {thread_id} is being deleted")));
-        }
-        let h = self.load_from_store(thread_id).await?;
-        threads.insert(thread_id.to_string(), h.clone());
-        Ok(h)
+        let loading = {
+            let mut threads = self.inner.threads.lock().unwrap();
+            if let Some(h) = threads.live.get(thread_id) {
+                return Ok(h.clone());
+            }
+            // Refused at once, rather than after a load under way, which comes to nothing.
+            if self.inner.deleting.lock().unwrap().contains_key(thread_id) {
+                return Err(Error::Command(format!("thread {thread_id} is being deleted")));
+            }
+            match threads.loading.get(thread_id) {
+                Some(l) => l.clone(),
+                None => {
+                    // Checked again under the lock close() collects loads under, so a close() that
+                    // started meanwhile either waits for this one or refuses it here.
+                    self.open()?;
+                    let (tx, rx) = tokio::sync::watch::channel(None);
+                    threads.loading.insert(thread_id.to_string(), rx.clone());
+                    // A task of its own, so the load finishes (and is published or let go) even if
+                    // the caller stops waiting for it.
+                    let (me, id) = (self.clone(), thread_id.to_string());
+                    tokio::spawn(async move { me.load_task(&id, tx).await });
+                    rx
+                }
+            }
+        };
+        loaded(loading).await
+    }
+
+    /// Loads a thread, then publishes it, or stops it if it's being deleted meanwhile.
+    async fn load_task(&self, thread_id: &str, tx: tokio::sync::watch::Sender<Option<Result<Handle>>>) {
+        // However it ends (a panic included), the load is let go of and those waiting are told.
+        let result: Arc<StdMutex<Option<Result<Handle>>>> = Arc::default();
+        let _done = {
+            let (me, id, result, ours) = (self.clone(), thread_id.to_string(), result.clone(), tx.subscribe());
+            Finally(Some(move || {
+                {
+                    // Unless it's been published, and another load started since.
+                    let mut threads = me.inner.threads.lock().unwrap();
+                    if threads.loading.get(&id).is_some_and(|l| l.same_channel(&ours)) {
+                        threads.loading.remove(&id);
+                    }
+                }
+                let r = result.lock().unwrap().take();
+                tx.send_replace(Some(
+                    r.unwrap_or_else(|| Err(Error::Other(format!("loading thread {id} failed")))),
+                ));
+            }))
+        };
+        let r = match self.load_from_store(thread_id).await {
+            Ok(h) => {
+                let published = {
+                    let mut threads = self.inner.threads.lock().unwrap();
+                    let deleting = self.inner.deleting.lock().unwrap().contains_key(thread_id);
+                    if !deleting {
+                        threads.live.insert(thread_id.to_string(), h.clone());
+                        threads.loading.remove(thread_id);
+                    }
+                    !deleting
+                };
+                if published {
+                    Ok(h)
+                } else {
+                    // The deletion waits for this before it deletes the thread from the store.
+                    discard(h).await;
+                    Err(Error::Command(format!("thread {thread_id} is being deleted")))
+                }
+            }
+            Err(e) => Err(e),
+        };
+        *result.lock().unwrap() = Some(r);
     }
 
     async fn load_from_store(&self, thread_id: &str) -> Result<Handle> {
@@ -1022,6 +1133,12 @@ impl AgentThreads {
             }));
         }
         actor.core.adopt_run(record.clone());
+        // The configuration and policy as they are now, not as they were when the actor was made
+        // (before looking the run up): re-attaching may answer the run's open requests at once. A
+        // configure() that comes after this waits for the load, and then changes the thread.
+        let id = actor.core.thread().id.clone();
+        actor.core.config = self.config(&id);
+        actor.core.policy = self.policy(&id);
         let spawner = &self.inner.spawner;
         let ok = spawner.can_attach() && record.spawner == spawner.name() && {
             let (s, c) = (&mut actor.session, &mut actor.core);
@@ -1062,6 +1179,18 @@ impl AgentThreads {
             }));
         }
         Ok(true)
+    }
+}
+
+/// Stops a thread's harness and lets the thread go, once whatever it has is saved.
+async fn discard(h: Handle) {
+    if let Ok(close) = h.call(|a| a.session.close(&mut a.core)).await {
+        close.await;
+    }
+    let _ = h.call(|a| a.core.dispose()).await;
+    let task = h.task.lock().unwrap().take();
+    if let Some(task) = task {
+        let _ = task.await;
     }
 }
 

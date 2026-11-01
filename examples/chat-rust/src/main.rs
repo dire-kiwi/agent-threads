@@ -471,8 +471,12 @@ async fn files(State(app): State<App>, req: Request) -> Response {
         "json" | "map" => "application/json",
         _ => "application/octet-stream",
     };
-    // Vite's assets have their hash in their names; index.html must be fetched fresh.
-    let cache = if file.components().any(|c| c.as_os_str() == "assets") {
+    // Vite's assets have their hash in their names; index.html must be fetched fresh. Only the path
+    // inside the root counts: an `assets` directory above it doesn't.
+    let asset = file
+        .strip_prefix(root)
+        .is_ok_and(|p| p.components().any(|c| c.as_os_str() == "assets"));
+    let cache = if asset {
         "public, max-age=31536000, immutable"
     } else {
         "no-cache"

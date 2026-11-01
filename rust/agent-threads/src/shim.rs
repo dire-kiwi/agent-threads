@@ -38,7 +38,9 @@ pub struct ShimOptions {
     /// How long a run that's stopped has to exit after SIGTERM before it's sent SIGKILL. 10s by
     /// default.
     pub kill_grace: Duration,
-    /// How often a run's output is read. 50ms by default.
+    /// How often a run's directory is read when nothing says it changed. On Linux it's watched
+    /// (inotify), which wakes the backend when the run writes, so this is only a fallback: 200ms by
+    /// default. Elsewhere it's how often a run's output is read: 50ms by default.
     pub poll: Duration,
 }
 
@@ -48,7 +50,7 @@ impl ShimOptions {
             runs_dir: runs_dir.into(),
             keep: Duration::from_secs(14 * 86_400),
             kill_grace: Duration::from_secs(10),
-            poll: Duration::from_millis(50),
+            poll: Duration::from_millis(if cfg!(target_os = "linux") { 200 } else { 50 }),
         }
     }
 }
@@ -433,6 +435,8 @@ impl ShimProcess {
         let mut announced = self.lock().caught_up;
         let mut checked = 0u64;
         let mut identity: Option<Identity> = None;
+        // Watched from before the first read, so nothing written after it goes unnoticed.
+        let watch = DirWatch::new(&self.dir);
         loop {
             if let Some(e) = {
                 let mut st = self.lock();
@@ -502,7 +506,14 @@ impl ShimProcess {
                 terminate(&self.dir, self.grace, Signal::Term);
                 continue;
             }
-            tokio::time::sleep(poll).await;
+            // Until the run writes something, or (as the watch can't see everything: whether the
+            // shim is still there, say) for the poll at most.
+            match &watch {
+                Some(w) => {
+                    let _ = tokio::time::timeout(poll, w.changed()).await;
+                }
+                None => tokio::time::sleep(poll).await,
+            }
         }
     }
 
@@ -649,6 +660,79 @@ impl HarnessProcess for ShimProcess {
     fn dir(&self) -> Option<String> {
         Some(self.dir.to_string_lossy().into())
     }
+}
+
+/// A run directory, watched with inotify: what the run writes to it (output, its pid, its exit)
+/// wakes whoever's following it.
+#[cfg(target_os = "linux")]
+struct DirWatch(tokio::io::unix::AsyncFd<std::os::fd::OwnedFd>);
+
+#[cfg(target_os = "linux")]
+impl DirWatch {
+    /// None if the directory can't be watched (it's followed by polling alone).
+    fn new(dir: &Path) -> Option<Self> {
+        use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+        use std::os::unix::ffi::OsStrExt;
+        let path = std::ffi::CString::new(dir.as_os_str().as_bytes()).ok()?;
+        let fd = unsafe { libc::inotify_init1(libc::IN_NONBLOCK | libc::IN_CLOEXEC) };
+        if fd < 0 {
+            return None;
+        }
+        let fd = unsafe { OwnedFd::from_raw_fd(fd) };
+        let mask = libc::IN_MODIFY
+            | libc::IN_CLOSE_WRITE
+            | libc::IN_CREATE
+            | libc::IN_MOVED_TO
+            | libc::IN_DELETE_SELF
+            | libc::IN_MOVE_SELF;
+        if unsafe { libc::inotify_add_watch(fd.as_raw_fd(), path.as_ptr(), mask) } < 0 {
+            return None;
+        }
+        // Safety: the fd is ours alone, and is closed only when the AsyncFd is dropped.
+        unsafe { tokio::io::unix::AsyncFd::register(fd) }.ok().map(DirWatch)
+    }
+
+    /// Resolves once something in the directory has changed since the last call. Which change is
+    /// left to the caller to find out: it reads the directory again.
+    async fn changed(&self) {
+        use std::os::fd::AsRawFd;
+        loop {
+            let Ok(mut ready) = self.0.readable().await else {
+                // Can't be waited on: the caller's poll goes on alone.
+                return std::future::pending().await;
+            };
+            let mut any = false;
+            let mut buf = [0u8; 4096];
+            loop {
+                let n = unsafe { libc::read(self.0.as_raw_fd(), buf.as_mut_ptr().cast(), buf.len()) };
+                if n > 0 {
+                    any = true;
+                    continue;
+                }
+                if n < 0 && io::Error::last_os_error().kind() == io::ErrorKind::Interrupted {
+                    continue;
+                }
+                break;
+            }
+            ready.clear_ready();
+            if any {
+                return;
+            }
+        }
+    }
+}
+
+/// Where there's no inotify, runs are followed by polling alone.
+#[cfg(not(target_os = "linux"))]
+struct DirWatch;
+
+#[cfg(not(target_os = "linux"))]
+impl DirWatch {
+    fn new(_dir: &Path) -> Option<Self> {
+        None
+    }
+
+    async fn changed(&self) {}
 }
 
 /// Reads a file's whole lines as they're appended, from an offset.
@@ -1205,6 +1289,137 @@ fn started_at(dir: &Path) -> u64 {
         }
     }
     0
+}
+
+/// Kills every run in `runs_dir`, and returns once nothing is left that could start another of
+/// their processes. For tests, so one that fails leaves no process behind; an app stops its runs
+/// with [`AgentThreads::close`](crate::AgentThreads::close). Each time round:
+///
+/// - What names a run's directory and isn't its recorded shim (a launcher, a script that runs the
+///   shim, a shim that hasn't recorded its pid yet) is killed, with its process group: none of it
+///   has started the program, which the shim starts only after recording its own pid. (If one was
+///   the shim, recording its pid just then, what's in its session goes too.)
+/// - The program's group is killed, once its pid is recorded.
+/// - A recorded shim is left to record the program's pid and how it ended, and exit; one that's
+///   still there after five seconds is killed, with what's in its session.
+#[doc(hidden)]
+pub fn kill_runs(runs_dir: &Path) {
+    let deadline = now_ms() + 5000;
+    loop {
+        let Ok(entries) = fs::read_dir(runs_dir) else { return };
+        let dirs: Vec<PathBuf> = entries.flatten().map(|e| e.path()).filter(|d| d.is_dir()).collect();
+        let procs = processes().unwrap_or_default();
+        let mut pending = false;
+        for dir in dirs {
+            let _ = fs::write(dir.join("input.closed"), "");
+            if let Some(group) = live_group(&dir) {
+                signal_group(group, Signal::Kill);
+                pending = true;
+            }
+            let shim = read_pid(&dir, "shim.pid").filter(|_| shim_alive(&dir, None));
+            let abs = std::path::absolute(&dir).unwrap_or(dir.clone());
+            let launching: Vec<&Proc> = procs
+                .iter()
+                .filter(|p| Some(p.pid) != shim && p.args.iter().any(|a| Path::new(a) == abs))
+                .collect();
+            for p in &launching {
+                kill_pid_or_group(p);
+                pending = true;
+            }
+            if let Some(s) = read_pid(&dir, "shim.pid")
+                && launching.iter().any(|p| p.pid == s)
+            {
+                kill_session(s);
+            }
+            if let Some(s) = shim {
+                if now_ms() > deadline {
+                    unsafe { libc::kill(s as i32, libc::SIGKILL) };
+                    kill_session(s);
+                } else {
+                    pending = true;
+                }
+            }
+        }
+        // Done, or (signals that don't take, say) given up on.
+        if !pending || now_ms() > deadline + 1000 {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+/// A process, as [`processes`] lists it.
+struct Proc {
+    pid: u32,
+    pgid: u32,
+    sid: u32,
+    args: Vec<String>,
+}
+
+/// SIGKILL to a process, and to its group if it leads one.
+fn kill_pid_or_group(p: &Proc) {
+    let target = if p.pgid == p.pid { -(p.pid as i32) } else { p.pid as i32 };
+    unsafe { libc::kill(target, libc::SIGKILL) };
+}
+
+/// SIGKILL to everything in session `sid`.
+fn kill_session(sid: u32) {
+    for p in processes().unwrap_or_default().iter().filter(|p| p.sid == sid) {
+        unsafe { libc::kill(p.pid as i32, libc::SIGKILL) };
+    }
+}
+
+/// The processes running (zombies left out), with their groups, sessions and arguments, if they
+/// can be told.
+fn processes() -> Option<Vec<Proc>> {
+    if let Ok(entries) = fs::read_dir("/proc") {
+        let mut out = Vec::new();
+        for e in entries.flatten() {
+            let name = e.file_name().to_string_lossy().to_string();
+            let Ok(pid) = name.parse::<u32>() else { continue };
+            // state is field 3, pgrp field 5 and session field 6.
+            let Some(f) = proc_fields(&name) else { continue };
+            if matches!(f.first().map(String::as_str), Some("Z" | "X")) {
+                continue;
+            }
+            let (Some(pgid), Some(sid)) = (
+                f.get(2).and_then(|g| g.parse().ok()),
+                f.get(3).and_then(|s| s.parse().ok()),
+            ) else {
+                continue;
+            };
+            let Ok(cmdline) = fs::read(format!("/proc/{name}/cmdline")) else {
+                continue;
+            };
+            let args = cmdline
+                .split(|&b| b == 0)
+                .filter(|a| !a.is_empty())
+                .map(|a| String::from_utf8_lossy(a).into_owned())
+                .collect();
+            out.push(Proc { pid, pgid, sid, args });
+        }
+        return Some(out);
+    }
+    let out = ps(&[
+        "-e", "-o", "pid=", "-o", "pgid=", "-o", "sid=", "-o", "stat=", "-o", "args=",
+    ])?;
+    Some(
+        out.lines()
+            .filter_map(|l| {
+                let mut it = l.split_whitespace();
+                let (pid, pgid, sid, stat) = (it.next()?, it.next()?, it.next()?, it.next()?);
+                if stat.starts_with(['Z', 'X']) {
+                    return None;
+                }
+                Some(Proc {
+                    pid: pid.parse().ok()?,
+                    pgid: pgid.parse().ok()?,
+                    sid: sid.parse().ok()?,
+                    args: it.map(String::from).collect(),
+                })
+            })
+            .collect(),
+    )
 }
 
 /// Stops the run in `dir`, which nothing follows: ends its input, then SIGTERM to its group and
