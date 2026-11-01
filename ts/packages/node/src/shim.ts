@@ -114,7 +114,6 @@ export function shim(path: string, options: ShimOptions): Spawner {
       let removed = 0;
       const now = Date.now();
       for (const id of names) {
-        if (live.has(id)) continue;
         const dir = join(runsDir, id);
         let st;
         try {
@@ -123,6 +122,12 @@ export function shim(path: string, options: ShimOptions): Spawner {
           continue;
         }
         if (!st.isDirectory()) continue;
+        // A run being stopped when a backend went: whatever's left of it is stopped still.
+        if (stoppingAt(dir) !== undefined) {
+          escalate(dir);
+          continue;
+        }
+        if (live.has(id)) continue;
         const record = await store.getRun(id);
         if (record && record.ended_at == null) continue; // A run the backend will follow.
         const running = !existsSync(join(dir, "exit")) && shimAlive(dir);
@@ -348,6 +353,7 @@ class Tail {
   /** Where `#pending` starts in the file. */
   #at: number;
   #pending = Buffer.alloc(0);
+  #buf: Buffer | undefined;
   /** Drop what comes before the first newline (a tail started mid-line). */
   #skip: boolean;
 
@@ -392,11 +398,12 @@ class Tail {
     }
     const chunks = [this.#pending];
     let pos = this.#at + this.#pending.length;
+    // One buffer, read into each time (most reads find nothing new), and copied out of.
+    const buf = (this.#buf ??= Buffer.allocUnsafe(CHUNK));
     for (;;) {
-      const buf = Buffer.allocUnsafe(CHUNK);
       const n = readSync(this.#fd, buf, 0, CHUNK, pos);
       if (n <= 0) break;
-      chunks.push(buf.subarray(0, n));
+      chunks.push(Buffer.from(buf.subarray(0, n)));
       pos += n;
     }
     if (chunks.length > 1) this.#pending = Buffer.concat(chunks);
@@ -438,6 +445,17 @@ function readExit(dir: string): ExitStatus {
   const code = typeof e.code === "number" ? e.code : null;
   const signal = typeof e.signal === "number" ? signalName(e.signal) : typeof e.signal === "string" ? e.signal : null;
   return { code, signal, ...(typeof e.error === "string" ? { error: new Error(e.error) } : {}) };
+}
+
+/** Writes a run directory's file whole, as the shim does. */
+function writeAtomic(dir: string, name: string, content: string): void {
+  try {
+    const tmp = join(dir, `.${name}.${process.pid}.tmp`);
+    writeFileSync(tmp, content);
+    renameSync(tmp, join(dir, name));
+  } catch {
+    // The directory's gone.
+  }
 }
 
 /** Writes `exit` atomically, as the shim does. */
@@ -504,9 +522,25 @@ function startTime(pid: number): number | undefined {
   }
 }
 
+/** The session ids of the processes in process group `pgid`, if `ps` can say (Linux's can). */
+function groupSessions(pgid: number): number[] | undefined {
+  try {
+    const out = execFileSync("ps", ["-e", "-o", "pgid=", "-o", "sid="], { encoding: "utf8", env: { ...process.env, LC_ALL: "C" }, timeout: 2000, stdio: ["ignore", "pipe", "ignore"] });
+    const sids: number[] = [];
+    for (const line of out.split("\n")) {
+      const [g, sid] = line.trim().split(/\s+/).map(Number);
+      if (g === pgid && Number.isInteger(sid)) sids.push(sid!);
+    }
+    return sids;
+  } catch {
+    return undefined;
+  }
+}
+
 /**
  * The run's process group (the program's pid), if it's still the run's and anything in it is
- * running: never a group whose id the system has since given to another process.
+ * running: never a group whose id the system has since given to another process. When that can't
+ * be told, it's none.
  */
 function liveGroup(dir: string): number | undefined {
   const pid = readPid(dir, "pid");
@@ -518,28 +552,76 @@ function liveGroup(dir: string): number | undefined {
     const started = startTime(pid);
     return started !== undefined && started <= written + 1000 ? pid : undefined;
   }
-  // The program's gone, but while anything is left in its group, its id isn't given to another process.
+  // The program's gone. What's left in a group with its id is the run's only if it's in the run's
+  // session, which the shim leads (its pid is the session's id): the id may have gone to another
+  // group since, whose leader has gone too.
+  const shim = readPid(dir, "shim.pid");
+  if (shim === undefined || writtenThisBoot(dir, "shim.pid") === undefined) return undefined;
+  const sids = groupSessions(pid);
+  return sids?.length && sids.every((sid) => sid === shim) ? pid : undefined;
+}
+
+/** Whether anything is left in process group `pgid` (whoever's it is). */
+function groupExists(pgid: number): boolean {
   try {
-    process.kill(-pid, 0);
-    return pid;
+    process.kill(-pgid, 0);
+    return true;
   } catch (e) {
-    return (e as NodeJS.ErrnoException).code === "EPERM" ? pid : undefined;
+    return (e as NodeJS.ErrnoException).code === "EPERM";
+  }
+}
+
+/** When a run being stopped gets SIGKILL (its `stopping` file), if it's being stopped. */
+function stoppingAt(dir: string): number | undefined {
+  try {
+    const at = JSON.parse(readFileSync(join(dir, "stopping"), "utf8")).kill_at;
+    return typeof at === "number" ? at : undefined;
+  } catch {
+    return undefined;
   }
 }
 
 /**
  * Signals the run's process group, if it's still the run's; after SIGTERM (or another signal),
- * SIGKILL to whatever is left of it after `grace`, even if the program itself has exited.
+ * SIGKILL to whatever is left of it after `grace`, even if the program itself has exited. That's
+ * written down (`stopping`), so a backend that restarts before then carries on with it.
  */
 function terminate(dir: string, grace: number, signal: NodeJS.Signals = "SIGTERM"): void {
   const pid = liveGroup(dir);
   if (pid === undefined) return;
+  if (signal !== "SIGKILL" && stoppingAt(dir) === undefined) writeAtomic(dir, "stopping", JSON.stringify({ kill_at: Date.now() + grace }));
   signalGroup(pid, signal);
-  if (signal === "SIGKILL") return;
-  setTimeout(() => {
-    const left = liveGroup(dir);
-    if (left !== undefined) signalGroup(left, "SIGKILL");
-  }, grace).unref();
+  if (signal !== "SIGKILL") escalate(dir);
+}
+
+/** Runs whose groups this backend is waiting to SIGKILL. */
+const escalating = new Set<string>();
+
+/**
+ * Waits for a run's group that's being stopped (it has `stopping`) to go, and SIGKILLs what's
+ * left of it at its deadline. Its timers keep the backend running until then, so shutting down
+ * doesn't leave it; a backend killed meanwhile carries on after it restarts (in prune()).
+ */
+function escalate(dir: string): void {
+  if (escalating.has(dir)) return;
+  escalating.add(dir);
+  const done = () => {
+    rmSync(join(dir, "stopping"), { force: true });
+    escalating.delete(dir);
+  };
+  const step = (): void => {
+    const at = stoppingAt(dir);
+    const pid = readPid(dir, "pid");
+    if (at === undefined) return void escalating.delete(dir);
+    if (pid === undefined || !groupExists(pid)) return done();
+    if (Date.now() >= at) {
+      const group = liveGroup(dir);
+      if (group !== undefined) signalGroup(group, "SIGKILL");
+      return done();
+    }
+    setTimeout(step, Math.min(100, at - Date.now()));
+  };
+  step();
 }
 
 /**
@@ -560,7 +642,7 @@ function stopDir(dir: string, grace: number): void {
     if (readPid(dir, "pid") === undefined) {
       // Not started yet: waited for while the shim may still start it.
       const never = exited || (readPid(dir, "shim.pid") !== undefined && !shim) || Date.now() > deadline || !existsSync(dir);
-      if (!never) setTimeout(step, 50).unref();
+      if (!never) setTimeout(step, 50);
       return;
     }
     if (!exited && !shim) writeExit(dir, { code: null, signal: null, error: "its supervisor (agent-threads-shim) went away" });

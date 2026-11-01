@@ -11,6 +11,7 @@ import { fileURLToPath, pathToFileURL } from "node:url";
 import { beforeAll, describe, expect, it } from "vitest";
 import { applyEvents, initialState, type Command, type Snapshot, type ThreadEvent } from "@dire-kiwi/agent-threads-protocol";
 import { FileStore } from "../stores/file.js";
+import { shim } from "../shim.js";
 import { readJsonl, shimPath, specDir, tempDir } from "./spec.js";
 
 const { compare } = (await import(pathToFileURL(join(specDir, "tools/check-events.mjs")).href)) as {
@@ -343,5 +344,54 @@ describe.skipIf(process.platform === "win32")("a backend restart", () => {
     await b.exited;
     const argvs = readFileSync(s.log, "utf8").trim().split("\n").map((l) => JSON.parse(l)).filter((l) => l.argv).map((l) => l.argv as string[]);
     expect(argvs.map((v) => v[v.indexOf("--model") + 1])).toEqual(["old", "new"]);
+  });
+
+  it("carries on stopping a run's process group after the backend that was stopping it exits, or is killed", { timeout: 60_000 }, async () => {
+    const runsDir = tempDir();
+    const alive = (pid: number) => {
+      try {
+        process.kill(pid, 0);
+        return true;
+      } catch {
+        return false;
+      }
+    };
+    // A backend stops a run whose program exits at SIGTERM, leaving a child that ignores it; then
+    // the backend goes, before the SIGKILL is due: exiting (`exit`), or killed (`kill`).
+    const stopThenGo = (runId: string, how: "exit" | "kill") => {
+      const script = `
+        import { shim } from ${JSON.stringify(pathToFileURL(join(pkg, "dist/index.js")).href)};
+        const spawner = shim(${JSON.stringify(shimPath())}, { runsDir: ${JSON.stringify(runsDir)}, killGraceMs: 1000, pollMs: 20 });
+        const proc = spawner.spawn({ command: "sh", args: ["-c", \`sh -c 'trap "" TERM; exec sleep 30' & echo $!; wait\`], threadId: "th", runId: ${JSON.stringify(runId)} }, {
+          line: (l) => {
+            console.log(l);
+            proc.kill("SIGTERM");
+          },
+          stderr: () => {},
+          exit: () => ${how === "kill" ? "process.kill(process.pid, 'SIGKILL')" : "proc.detach()"},
+        });`;
+      return new Promise<{ child: number; at: number }>((resolve, reject) => {
+        const p = spawn(process.execPath, ["--input-type=module", "-e", script], { stdio: ["ignore", "pipe", "inherit"] });
+        let child = 0;
+        p.stdout!.on("data", (d) => (child ||= Number(String(d).trim())));
+        p.on("exit", () => (child ? resolve({ child, at: Date.now() }) : reject(new Error("no child"))));
+      });
+    };
+
+    // Exiting, it waits for the SIGKILL first.
+    const started = Date.now();
+    const exited = await stopThenGo("run_exit", "exit");
+    expect(exited.at - started).toBeGreaterThan(900);
+    expect(alive(exited.child)).toBe(false);
+
+    // Killed, the next backend does it, though the run has exited and the store has it as ended.
+    const killed = await stopThenGo("run_kill", "kill");
+    expect(existsSync(join(runsDir, "run_kill", "exit"))).toBe(true);
+    expect(alive(killed.child)).toBe(true);
+    const store = new FileStore(tempDir());
+    await shim(shimPath(), { runsDir, killGraceMs: 1000 }).prune!(store);
+    await until(() => !alive(killed.child), 5000);
+    expect(existsSync(join(runsDir, "run_kill", "stopping"))).toBe(false);
+    await store.close();
   });
 });

@@ -195,6 +195,32 @@ describe.skipIf(process.platform === "win32")("shim()", () => {
     }
   });
 
+  it("never signals a group that only has the run's old id, though its leader has gone", async () => {
+    const { runsDir, spawner } = setup();
+    const dir = join(runsDir, "reused");
+    mkdirSync(dir);
+    // Recorded a minute ago, by a run whose program is long gone.
+    writeFileSync(join(dir, "pid"), "1");
+    writeFileSync(join(dir, "shim.pid"), "999999999");
+    const ago = new Date(Date.now() - 60_000);
+    utimesSync(join(dir, "pid"), ago, ago);
+    // Since then the id went to another group, whose leader has gone and left a child.
+    const other = spawnChild("sh", ["-c", "sleep 30 & echo $!; exec sleep 0.2"], { detached: true, stdio: ["ignore", "pipe", "ignore"] });
+    const child = Number(await new Promise<string>((r) => other.stdout!.once("data", (d) => r(String(d)))));
+    await new Promise((r) => other.once("exit", r));
+    writeFileSync(join(dir, "pid"), String(other.pid));
+    utimesSync(join(dir, "pid"), ago, ago);
+    try {
+      expect(alive(other.pid!)).toBe(false);
+      expect(alive(child)).toBe(true);
+      spawner.stop!({ id: "reused", thread_id: "th", spawner: "shim", offset: 0, started_at: "", data: { dir } });
+      await new Promise((r) => setTimeout(r, 700)); // past the kill grace
+      expect(alive(child)).toBe(true);
+    } finally {
+      process.kill(child, "SIGKILL");
+    }
+  });
+
   it("needs a runs directory of the store's own", () => {
     expect(() => shim(shimPath(), {} as ShimOptions)).toThrow(/runsDir/);
   });

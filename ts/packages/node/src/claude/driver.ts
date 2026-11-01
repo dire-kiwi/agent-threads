@@ -863,13 +863,16 @@ class ClaudeSession implements HarnessSession {
           ...(typeof toolCallId === "string" ? { toolCallId } : {}),
           signal: run.abort.signal,
         });
-        return reply({
+        reply({
           result: {
             content: [{ type: "text", text: out.text }],
             ...(out.isError ? { isError: true } : {}),
             ...(out.structured !== undefined ? { structuredContent: out.structured } : {}),
           },
         });
+        // Saved as answered, though no event says so: a restart doesn't answer it again.
+        ctx.persist().catch(() => {}); // A store that fails has said so.
+        return;
       }
       default:
         return reply({ error: { code: -32601, message: `method ${msg.method} isn't supported` } });

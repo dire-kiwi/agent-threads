@@ -258,8 +258,15 @@ export class ThreadRuntime implements ThreadContext {
    */
   async persist(): Promise<void> {
     if (!this.#host.spawner.durable) return;
-    this.#scheduleFlush();
-    await this.saved();
+    // Until a write has the run as it is now: what's read while one is being written goes in the next.
+    for (let tries = 0; ; tries++) {
+      this.#scheduleFlush();
+      await this.saved();
+      // A write of only the run that failed leaves no events unsaved, so saved() doesn't say.
+      if (this.#failure) throw this.#failure.error;
+      if (!this.#runs().runs.length) return;
+      if (tries >= 3) throw new Error("the run kept changing while it was being saved");
+    }
   }
 
   #retryLater(): void {
@@ -281,7 +288,7 @@ export class ThreadRuntime implements ThreadContext {
       this.#writes = this.#writes.then(() => this.#flush());
     }
     await this.#writes;
-    if (this.#failure && (this.#unsaved.length || this.#threadChanged)) throw this.#failure.error;
+    if (this.#failure && (this.#unsaved.length || this.#threadChanged || this.#runs().runs.length)) throw this.#failure.error;
   }
 
   /** Saves a snapshot, so loading the thread needn't fold all its events; never one ahead of them. */

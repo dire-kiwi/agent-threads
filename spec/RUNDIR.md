@@ -49,6 +49,7 @@ If the program can't be started, the shim writes `exit` with an `error` and exit
 | `out.jsonl` | the program (its stdout) | Its output, appended. A harness writes one JSON message a line. |
 | `err.log` | the program (its stderr) | Its stderr, appended. |
 | `exit` | shim; or a backend that finds the shim gone | How the run ended: `{"code": 0, "signal": null}`. `code` is the exit code or `null`, `signal` the number of the signal that killed it or `null`, and `error` (optional) why it didn't start or why its end is unknown. |
+| `stopping` | backend | The run is being stopped: `{"kill_at": ...}`, when its group gets SIGKILL (see [Stopping a run](#stopping-a-run)). |
 | `.<name>.tmp` | shim, backend | A file being written, which is renamed over `<name>`: ignore it. |
 
 `shim.pid`, `pid` and `exit` are written whole and then renamed into place, so a reader never sees
@@ -125,9 +126,24 @@ program; not once its shim is gone).
 A backend **only signals a group that is still the run's**. The pid in `pid` may since have been
 given to another process: after the machine restarted, or once the program and everything in its
 group has gone. So it signals `-pid` only if `pid` was written since the machine last started, and
-either the process `pid` is running and started no later than `pid` was written (to the second:
-`ps -o lstart= -p <pid>`), or that process has gone but its group hasn't (the system doesn't give a
-process an id that's still a group's). Otherwise it sends nothing.
+either:
+
+- the process `pid` is running and started no later than `pid` was written (to the second:
+  `ps -o lstart= -p <pid>`); or
+- that process has gone, and everything left in group `pid` is in the run's session: the shim
+  leads a session of its own, whose id is its pid, so their session id is the one in `shim.pid`
+  (written since the machine started too). The group's id alone says nothing here: it may have gone
+  to another group whose leader has gone in turn. (On Linux, `ps -e -o pgid= -o sid=`.)
+
+If it can't tell (a `ps` that doesn't give session ids, say), it sends nothing.
+
+Stopping takes a while, and the backend may stop or restart meanwhile, so it writes down that it's
+stopping a run before it sends SIGTERM: a `stopping` file, `{"kill_at": <ms since the epoch>}`, when
+the SIGKILL is due. Until the group has gone and the file is removed, a backend keeps the run's
+directory, and one that starts carries on with it (whatever the store says about the run, and
+whether or not it has `exit`): at `kill_at` it sends SIGKILL to whatever is left of the group (if
+it's still the run's, as above), then removes `stopping`. A backend that shuts down meanwhile waits
+for that first.
 
 ## Re-attaching
 
