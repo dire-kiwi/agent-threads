@@ -208,6 +208,9 @@ function codexParams(method, p) {
       return { threadId: p.threadId, turnId: p.turnId };
     case "thread/compact/start":
       return { threadId: p.threadId };
+    case "skills/list":
+      // Its cwds are the thread's working directory, which differs between runs.
+      return { forceReload: !!p.forceReload };
     default:
       return p;
   }

@@ -1,4 +1,4 @@
-// Every Claude Code fixture in spec/fixtures/claude, run as spec/fixtures/README.md says: the SDK
+// Every fixture in spec/fixtures (Claude Code and Codex), run as spec/fixtures/README.md says: the SDK
 // drives the fake CLI (which replays the recording and checks what it's sent), and its events must
 // match expected.jsonl by spec/tools/check-events.mjs's rules. Its snapshot must be its events,
 // folded.
@@ -10,6 +10,7 @@ import { describe, expect, it } from "vitest";
 import { applyEvents, initialState, type Command, type Thread, type ThreadEvent } from "@dire-kiwi/agent-threads-protocol";
 import { AgentThreads } from "../agent-threads.js";
 import { claudeCode } from "../claude/driver.js";
+import { codex } from "../codex/driver.js";
 import type { McpServer } from "../harness.js";
 import type { PermissionPolicy } from "../permissions.js";
 import { MemoryStore } from "../stores/memory.js";
@@ -39,23 +40,31 @@ function matches(v: unknown, p: unknown): boolean {
 const fakeCli = join(specDir, "tools/fake-cli.mjs");
 const WAIT_MS = 10_000;
 
-const dir = join(specDir, "fixtures/claude");
-const scenarios = readdirSync(dir).filter((s) => existsSync(join(dir, s, "session.jsonl"))).sort();
+const scenarios = ["claude", "codex"].flatMap((harness) => {
+  const dir = join(specDir, "fixtures", harness);
+  return readdirSync(dir)
+    .filter((s) => existsSync(join(dir, s, "session.jsonl")))
+    .sort()
+    .map((s) => `${harness}/${s}`);
+});
 
-describe.each(scenarios)("claude/%s", (scenario) => {
+describe.each(scenarios)("%s", (scenario) => {
   it("matches expected.jsonl", { timeout: 60_000 }, async () => {
-    const fixtureDir = join(dir, scenario);
+    const fixtureDir = join(specDir, "fixtures", scenario);
     const fixture = JSON.parse(readFileSync(join(fixtureDir, "fixture.json"), "utf8")) as Fixture;
     const cwd = tempDir();
     const state = tempDir();
     const store = new MemoryStore();
     const events: ThreadEvent[] = [];
+    const env = { AGENT_THREADS_FIXTURE: fixtureDir, AGENT_THREADS_FIXTURE_STATE: state };
+    const codexHome = tempDir();
 
     const make = () => {
       const sdk = new AgentThreads({
         store,
         harnesses: {
-          claude: claudeCode({ bin: fakeCli, env: { AGENT_THREADS_FIXTURE: fixtureDir, AGENT_THREADS_FIXTURE_STATE: state } }),
+          claude: claudeCode({ bin: fakeCli, env }),
+          codex: codex({ bin: fakeCli, env, home: codexHome, login: false }),
         },
         tools: (fixture.tools ?? []).map((t) => defineTool({ name: t.name, description: t.description, input: t.input, run: () => t.result })),
         mcpServers: fixture.mcp_servers ?? {},
@@ -101,12 +110,12 @@ describe.each(scenarios)("claude/%s", (scenario) => {
     await sdk.close();
 
     // The fake CLI was sent what the recording has, in every run.
-    const runs = readJsonl(`fixtures/claude/${scenario}/session.jsonl`).filter((e) => (e as { dir?: string }).dir === "spawn").length;
+    const runs = readJsonl(`fixtures/${scenario}/session.jsonl`).filter((e) => (e as { dir?: string }).dir === "spawn").length;
     const reports = readdirSync(state).filter((f) => /^run-\d+\.json$/.test(f));
     expect(reports.sort()).toEqual(Array.from({ length: runs }, (_, n) => `run-${n + 1}.json`));
     for (const r of reports) expect(JSON.parse(readFileSync(join(state, r), "utf8")), r).toMatchObject({ ok: true });
 
-    const result = compare(readJsonl(`fixtures/claude/${scenario}/expected.jsonl`), events);
+    const result = compare(readJsonl(`fixtures/${scenario}/expected.jsonl`), events);
     if (!result.ok) expect.fail(`${result.error}\n\nEvents:\n${show(events)}`);
   });
 });

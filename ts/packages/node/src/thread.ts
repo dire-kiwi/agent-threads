@@ -416,7 +416,8 @@ export class ThreadRuntime implements ThreadContext {
     const open = this.#requests.get(requestId);
     if (!open) return;
     this.#requests.delete(requestId);
-    this.emit({ type: "request.resolved", request_id: requestId, resolution });
+    // The answers to secret questions go only to the harness: what's sent and saved hides them.
+    this.emit({ type: "request.resolved", request_id: requestId, resolution: redact(open.request, resolution) });
     if (!this.#requests.size && this.turn) this.setThread({ status: "running" });
     if (resolution.always && open.standing && (resolution.outcome === "allow" || resolution.outcome === "deny")) {
       this.#always.set(open.standing, resolution.outcome);
@@ -438,6 +439,19 @@ export class ThreadRuntime implements ThreadContext {
   error(error: unknown): void {
     this.#host.error(error);
   }
+}
+
+/** What a secret answer is shown as. */
+export const SECRET = "[secret]";
+
+/** A resolution as it may be shown and saved: a secret question's answers replaced with SECRET. */
+export function redact(request: ThreadRequest, resolution: Resolution): Resolution {
+  if (request.type !== "question" || !resolution.answers) return resolution;
+  const secret = new Set(request.questions.filter((q) => q.secret).map((q) => q.id));
+  if (![...secret].some((id) => id in resolution.answers!)) return resolution;
+  const answers: { [k: string]: string[] | undefined } = {};
+  for (const [id, a] of Object.entries(resolution.answers)) answers[id] = secret.has(id) && a?.length ? [SECRET] : a;
+  return { ...resolution, answers };
 }
 
 function toMessage(id: string, m: { text: string; attachments?: Attachment[] }): Message {

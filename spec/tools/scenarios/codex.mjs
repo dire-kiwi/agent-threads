@@ -40,7 +40,10 @@ export function threadParams(ctx, { model = MODEL, dynamicTools, mcpServers } = 
     config: {
       "features.default_mode_request_user_input": true,
       suppress_unstable_features_warning: true,
-      ...(mcpServers ? { mcp_servers: mcpServers } : {}) },
+      ...(mcpServers ? { mcp_servers: mcpServers } : {}),
+      // The user's and the project's skills, which a CODEX_HOME of its own doesn't keep out.
+      ...(ctx.hiddenSkills?.length ? { skills: { config: ctx.hiddenSkills.map((path) => ({ path, enabled: false })) } } : {}),
+    },
   };
   if (dynamicTools) p.dynamicTools = dynamicTools;
   return p;
@@ -80,6 +83,9 @@ async function start(ctx, handlers = answers()) {
   const rpc = new Rpc(p);
   await rpc.request("initialize", { clientInfo: { name: "agent-threads", title: "agent-threads", version: "0.0.0" }, capabilities: { experimentalApi: true } });
   rpc.notify("initialized");
+  // Skills Codex finds that aren't its own built-in ones are turned off in thread/start's config.
+  const { data } = await rpc.request("skills/list", { cwds: [ctx.work], forceReload: true });
+  ctx.hiddenSkills = data.flatMap((d) => d.skills).filter((s) => s.scope !== "system").map((s) => s.path);
   return { p, rpc };
 }
 

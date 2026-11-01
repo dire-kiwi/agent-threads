@@ -9,6 +9,10 @@ No CLI or login is needed.
 They were recorded on 2026-10-31 with claude 2.1.312 (model `haiku`, which is claude-haiku-5-5) and
 codex-cli 0.165.0 (model `gpt-5.6-luna`, effort `low`), by `spec/tools/record.mjs`.
 
+The Codex sessions' `skills/list` exchange was added afterwards (on 2026-11-01), with the response
+codex-cli 0.165.0 gives in a fresh CODEX_HOME and a working directory and home with no skills;
+`spec/tools/scenarios/codex.mjs` records it from now on.
+
 ## Layout
 
 Each fixture is a directory `spec/fixtures/<harness>/<scenario>/`:
@@ -103,7 +107,10 @@ backend drives each CLI:
   `message`, and the `app` server's `mcp_message`s as an MCP server would. It interrupts with a
   `control_request` `interrupt`.
 - **Codex.** Arguments `app-server`. It sends `initialize` (with `capabilities.experimentalApi`) and
-  `initialized`, then `thread/start` (or `thread/resume` with the thread's `session_id`) with the
+  `initialized`, then `skills/list` (with `forceReload`) for the skills Codex finds in the working
+  directory and the user's home, which a CODEX_HOME of the app's own doesn't keep out, and turns off
+  each one that isn't the app's or Codex's built-in (`system`) with a `skills.config` entry
+  (`{path, enabled: false}`) in the thread's config. Then `thread/start` (or `thread/resume` with the thread's `session_id`) with the
   model, `approvalPolicy: untrusted` and `sandbox: workspace-write` (permission mode `default`),
   and a config with `features.default_mode_request_user_input = true` (so the agent can ask
   questions outside plan mode), the MCP servers in `mcp_servers`, and app tools as `dynamicTools`.

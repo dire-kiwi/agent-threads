@@ -1,15 +1,15 @@
 # @dire-kiwi/agent-threads-node
 
-agent-threads' Node backend: it runs threads on Claude Code (`claude -p`), sends their events to
-your app and takes commands from it. It has no network layer: wire `subscribe()` and `handle()` to
-your own transport (a WebSocket, SSE, IPC...). Codex comes next.
+agent-threads' Node backend: it runs threads on Claude Code (`claude -p`) and Codex (`codex
+app-server`), sends their events to your app and takes commands from it. It has no network layer:
+wire `subscribe()` and `handle()` to your own transport (a WebSocket, SSE, IPC...).
 
 ```ts
-import { AgentThreads, FileStore, claudeCode, defineTool } from "@dire-kiwi/agent-threads-node";
+import { AgentThreads, FileStore, claudeCode, codex, defineTool } from "@dire-kiwi/agent-threads-node";
 
 const sdk = new AgentThreads({
   store: new FileStore("./threads"), // or MemoryStore (the default), SqliteStore, or your own Store
-  harnesses: { claude: claudeCode() }, // claudeCode({ bin, configDir, userSettings, ... })
+  harnesses: { claude: claudeCode(), codex: codex({ home: "./codex-home" }) }, // both, by default
   tools: [
     defineTool<{ order_id: string }>({
       name: "lookup_order",
@@ -34,7 +34,8 @@ await sdk.close(); // on shutdown: stops the harness processes and saves everyth
 ## Threads
 
 - `create(options)` makes a thread (`harness`, `model`, `effort`, `permission_mode`, `cwd`,
-  `title`, `metadata`) and sends its first `thread.updated`. It can have its own `tools`,
+  `title`, `metadata`) and sends its first `thread.updated`. It runs on the first harness unless
+  it names one (`harness: "codex"`). It can have its own `tools`,
   `mcpServers`, `skills`, `permissions` and `systemPrompt`, on top of the instance's.
 - `handle(command)` carries out a command from a client ([spec/PROTOCOL.md](../../../spec/PROTOCOL.md#commands)),
   and throws a `CommandError` for one it can't (an unknown thread, or a command that isn't valid by
@@ -94,6 +95,68 @@ again to finish saving. The file store undoes a write that fails partway, so a r
   with the thread's harness, and Claude is told the path, as it is for attachments with a `path`.
 - Tool results are cut to 30,000 characters (with `truncated`), and images become `[image]`.
 
+## Codex
+
+- **One `codex app-server` process per thread**, started at its first message and kept between
+  turns. It's sent `initialize` (with `experimentalApi`) and `initialized`, then `thread/start`, or
+  `thread/resume` once the thread has a session (after a restart, or a change of model, effort,
+  permission mode or config, the next message starts a new process that resumes it). A session
+  Codex no longer has is started afresh, with a `notice` that it doesn't remember the thread.
+- **Messages** are `turn/start`, with the thread's `effort`; `/compact` is `thread/compact/start`.
+  One sent during a turn is `turn/steer` (with `expectedTurnId`), `queued` until Codex's
+  `userMessage` item shows it took it in. One Codex refuses (its turn had ended), or doesn't take
+  in, starts the next turn, as with Claude.
+- **Interrupt** is `turn/interrupt`; if the turn hasn't ended after `stopGraceMs` (10s), the
+  process is stopped.
+- **Permission modes** are approval policies and sandboxes: `default` is `untrusted` in
+  `workspace-write`, `accept_edits` `on-request` in `workspace-write`, `plan` `untrusted` in
+  `read-only`, and `bypass` `never` in `danger-full-access`.
+- **Permissions**: Codex's approval requests (`item/commandExecution/requestApproval`,
+  `item/fileChange/requestApproval`, `item/permissions/requestApproval`, and the MCP elicitations it
+  approves MCP tool calls with) go to the policy, as do the app's tools. An elicitation that wants a
+  form filled in is declined. `item/tool/requestUserInput` is always a `question`, shown as a
+  `request_user_input` call. An elicitation is asked about as the tool and arguments it names, and
+  is tied to a running call only if exactly one matches it (server, thread, tool and arguments).
+- **Secret answers** (to a question Codex marks `isSecret`) go only to Codex: the
+  `request.resolved` that's sent and saved, and the call's result, show `[secret]` instead. (The
+  core does this for any harness.)
+- **Items**: `commandExecution` is `shell` (with Codex's `bash -lc` wrapper taken off the shown
+  command), `fileChange` `edit`, `mcpToolCall` `mcp`, `webSearch` `web`, `imageView` `read`,
+  `dynamicToolCall` `app`, `spawnAgent` `subagent` (its child thread's items have it as their
+  `parent_id`, and its result is the child's last message), plan updates one `todo` call per turn,
+  `agentMessage` and `plan` `assistant_message`, `reasoning` `reasoning`, and `contextCompaction`
+  `compaction`. Warnings and retried errors are `notice`s.
+- **Usage**: Codex reports the session's running totals, so a turn's usage is how far they grew
+  since the last turn's end. That's kept per session, so a new session starts again from nothing.
+- **App tools** are `dynamicTools` on `thread/start`, answered over `item/tool/call`. Codex marks
+  those experimental: with `codex({ appTools: "mcp" })`, or when Codex refuses them, they're served
+  instead by a loopback MCP server (streamable HTTP on 127.0.0.1, a random port, a random bearer
+  token), one per process, named `app`. Codex keeps the dynamic tools a session started with, and
+  resuming can't change them: after `configure()` changes the app's tools, those the session hasn't
+  as they are now are served on the MCP server, and a call to a dynamic tool that has gone or
+  changed gets an error saying where the app's tools are. The driver keeps what each session started
+  with (and its totals) in `<home>/agent-threads/sessions/`.
+- **MCP servers** go in `thread/start`'s config as `mcp_servers` (stdio, or streamable HTTP with
+  `http_headers`; Codex has no SSE). **Skills** are written to a directory for the process and
+  given with `skills/extraRoots/set`. Without `userConfig`, the other skills Codex finds (the
+  user's `~/.agents/skills`, the project's, the machine's: a CODEX_HOME of its own doesn't keep
+  those out) are listed with `skills/list` and turned off in the thread's config, so it has only the
+  app's and Codex's own built-in ones. (Skills added while a process runs are left out by the next.)
+  The system prompt is `developerInstructions`.
+- **Isolated config**: threads run with a `CODEX_HOME` of the app's own (`home`,
+  `~/.agent-threads/codex` by default), which keeps the app's sessions (so it must outlast its
+  threads) and none of the user's config, MCP servers or skills. The user's login (`auth.json` from
+  `$CODEX_HOME` or `~/.codex`, or `login`) is linked in, or copied where links can't be made, unless
+  the home has one of its own. `codex({ userConfig: true })` runs with the user's own CODEX_HOME.
+- **Attachments**: images with data are sent as data URLs, images with a path as local images, and
+  files as for Claude.
+
+`src/codex/protocol.ts` has the app server's types, generated from the schema the installed
+`codex` prints (`codex app-server generate-json-schema --experimental`) by `pnpm gen:codex`
+(`scripts/gen-codex.mjs`). Run it when Codex changes, and check the driver against the diff.
+
+## Processes
+
 Processes are started by a `Spawner`: `direct()` (the default) runs them as child processes, each
 in its own process group, so they end with the backend. A shim spawner, whose runs survive a
 restart, is coming.
@@ -101,11 +164,12 @@ restart, is coming.
 ## Tests
 
 ```sh
-pnpm test                          # stores, every Claude fixture through the fake CLI, driver tests
-AGENT_THREADS_LIVE=1 pnpm test     # also a smoke test against the real claude (a cent or so)
+pnpm test                          # stores, every fixture through the fake CLI, driver tests
+AGENT_THREADS_LIVE=1 pnpm test     # also smoke tests against the real claude and codex (a cent or so),
+                                   # and the real codex against a local stand-in model (free)
 ```
 
-The fixture test runs each recorded session in `spec/fixtures/claude` through
+The fixture test runs each recorded session in `spec/fixtures/claude` and `spec/fixtures/codex` through
 `spec/tools/fake-cli.mjs`, which checks what the driver writes to it, and compares the events with
-`expected.jsonl`. `src/test/mini-claude.mjs` is a small scriptable fake for what the recordings
-don't cover (steering past a turn's end, crashes, restarts).
+`expected.jsonl`. `src/test/mini-claude.mjs` and `src/test/mini-codex.mjs` are small scriptable fakes for what the
+recordings don't cover (steering past a turn's end, every kind of approval, crashes, restarts).
