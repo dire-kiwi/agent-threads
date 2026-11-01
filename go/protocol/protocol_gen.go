@@ -312,7 +312,7 @@ type ItemUpdatedEvent struct {
 	ItemID   string `json:"item_id"`
 
 	// Top-level fields of the item to set, e.g. {"status": "completed", "result": {...}}.
-	Patch map[string]any `json:"patch"`
+	Patch map[string]json.RawMessage `json:"patch"`
 
 	// The harness's own payload, for debugging.
 	Raw json.RawMessage `json:"raw,omitempty"`
@@ -322,7 +322,7 @@ func (v ItemUpdatedEvent) MarshalJSON() ([]byte, error) {
 	type plain ItemUpdatedEvent
 	p := plain(v)
 	if p.Patch == nil {
-		p.Patch = map[string]any{}
+		p.Patch = map[string]json.RawMessage{}
 	}
 	return json.Marshal(struct {
 		Type string `json:"type"`
@@ -1104,9 +1104,9 @@ type Thread struct {
 
 	// The app's own data, given when the thread was created. Backends store it and pass it to tools;
 	// they don't read it.
-	Metadata  map[string]any `json:"metadata,omitempty"`
-	CreatedAt string         `json:"created_at"`
-	UpdatedAt string         `json:"updated_at,omitempty"`
+	Metadata  map[string]json.RawMessage `json:"metadata,omitempty"`
+	CreatedAt string                     `json:"created_at"`
+	UpdatedAt string                     `json:"updated_at,omitempty"`
 }
 
 // ThreadStatus: idle: no turn is running. running: a turn is running. waiting: a turn is waiting on
