@@ -6,8 +6,9 @@ has no network layer: backends emit JSON events and accept JSON commands, and th
 
 It's early: so far there's the spec, the generated types, the `applyEvent` reducer, the
 conformance suite the backends run (recorded sessions replayed by a fake CLI, and store cases),
-and the Node backend with its stores and Claude Code driver
-([ts/packages/node](ts/packages/node/README.md)). See [docs/design.md](docs/design.md) for the design and [spec/PROTOCOL.md](spec/PROTOCOL.md)
+the Node backend with its stores and its Claude Code and Codex drivers
+([ts/packages/node](ts/packages/node/README.md)), and `agent-threads-shim`, which keeps runs going
+while a backend restarts ([shim/](shim/README.md)). See [docs/design.md](docs/design.md) for the design and [spec/PROTOCOL.md](spec/PROTOCOL.md)
 for the protocol.
 
 | Path | What |
@@ -19,11 +20,11 @@ for the protocol.
 | `ts/` | pnpm workspace: `@dire-kiwi/agent-threads-protocol`, `-node`, `-react` |
 | `go/` | Go module `github.com/dire-kiwi/agent-threads/go` |
 | `rust/` | Cargo workspace with the `agent-threads` crate |
-| `shim/` | `agent-threads-shim`, which keeps runs alive across backend restarts (not written yet) |
+| `shim/` | `agent-threads-shim`, which keeps runs alive across backend restarts ([README](shim/README.md), [spec/RUNDIR.md](spec/RUNDIR.md)) |
 
 ## Building
 
-You need Node 24+ with pnpm 10, Go 1.24+ and stable Rust.
+You need Node 24+ with pnpm 10, Go 1.24+ and stable Rust (the Node tests build the shim with cargo).
 
 ```sh
 (cd ts && pnpm install)

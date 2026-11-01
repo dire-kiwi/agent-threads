@@ -86,7 +86,10 @@ export function shim(path: string, options: ShimOptions = {}): Spawner {
       const dir = runDir(run) ?? join(runsDir, run.id);
       const proc = follow(run.id, dir, run.offset ?? 0, handlers, false);
       const format = readFormat(dir);
-      if (format > RUN_FORMAT) proc.fail(`the run was started by a newer backend (run directory format ${format}), which this one can't follow`);
+      if (format > RUN_FORMAT) {
+        stopDir(dir, grace);
+        proc.fail(`the run was started by a newer backend (run directory format ${format}), which this one can't follow`);
+      }
       return proc;
     },
 

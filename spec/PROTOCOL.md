@@ -50,7 +50,8 @@ A `Thread` is one conversation with one harness (`claude` or `codex`). Its `stat
 `session_id` is the harness's own session id, which the backend uses to resume the conversation
 in a new process. `run` is the process running the thread, when one is: a `direct` run is a child
 of the backend and ends with it; a `shim` run is supervised by `agent-threads-shim` and survives a
-backend restart, and its `reattached_at` is set when a restarted backend picks it up again.
+backend restart, and its `reattached_at` is set when a restarted backend picks it up again
+([RUNDIR.md](RUNDIR.md) has how backends and the shim share a run).
 `usage` sums the thread's turns. `metadata` is the app's own, given when it created the thread.
 
 Threads are created, listed and deleted through each backend's API, not through commands.

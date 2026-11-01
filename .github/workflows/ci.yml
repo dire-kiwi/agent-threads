@@ -1,6 +1,6 @@
-# Builds and tests the TypeScript, Go and Rust packages, and checks that the code generated from
-# spec/schema is up to date (make check-gen), on each pull request and push to main. It needs no
-# secrets.
+# Builds and tests the TypeScript, Go and Rust packages and the shim, and checks that the code
+# generated from spec/schema is up to date (make check-gen), on each pull request and push to main.
+# It needs no secrets.
 name: CI
 
 on:
@@ -77,6 +77,14 @@ jobs:
 
       - run: npm install -g pnpm@$PNPM_VERSION
 
+      # For agent-threads-shim, which the Node backend's tests run.
+      - name: Rust toolchain
+        run: rustup toolchain install stable --profile minimal && rustup default stable
+
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          workspaces: shim
+
       - name: pnpm install
         working-directory: ts
         run: pnpm install --frozen-lockfile
@@ -112,3 +120,19 @@ jobs:
           workspaces: rust
 
       - run: make test-rust
+
+  shim:
+    name: Shim
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Rust toolchain
+        run: rustup toolchain install stable --profile minimal --component clippy,rustfmt && rustup default stable
+
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          workspaces: shim
+
+      - run: make test-shim
