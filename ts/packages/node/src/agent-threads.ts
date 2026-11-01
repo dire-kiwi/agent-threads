@@ -20,9 +20,9 @@ import type { Harness, McpServer, Skill, ThreadConfig } from "./harness.js";
 import { newId } from "./ids.js";
 import type { PermissionPolicy } from "./permissions.js";
 import { direct, type Spawner } from "./spawner.js";
-import type { Store } from "./store.js";
+import type { RunRecord, Store } from "./store.js";
 import { MemoryStore } from "./stores/memory.js";
-import { ThreadRuntime } from "./thread.js";
+import { ThreadRuntime, type Turn } from "./thread.js";
 import type { Tool } from "./tools.js";
 
 /** Tools, MCP servers, skills and the permission policy: for every thread, or for one. */
@@ -41,7 +41,10 @@ export interface AgentThreadsOptions extends Capabilities {
   store?: Store;
   /** The harnesses threads can run on, by name. Claude Code (`claude`) and Codex (`codex`) by default. */
   harnesses?: { [name: string]: Harness };
-  /** How harness processes are started. Direct child processes by default. */
+  /**
+   * How harness processes are started: direct child processes by default, which end with the
+   * backend. With `shim(path)` they outlive it: call recover() when the app starts, to re-attach.
+   */
   spawner?: Spawner;
   /** Called with errors that aren't any command's: a store that fails, a subscriber that throws. */
   onError?: (error: unknown) => void;
@@ -62,6 +65,17 @@ export interface CreateOptions extends Capabilities {
   id?: string;
 }
 
+/** What recover() did. */
+export interface Recovered {
+  /** Threads whose runs it re-attached to (including runs that ended while the backend was down). */
+  reattached: string[];
+  /** Threads whose runs it couldn't re-attach to, and stopped: their turns ended. */
+  lost: string[];
+}
+
+/** How often the shim spawner's finished runs are pruned. */
+const PRUNE_EVERY_MS = 3600_000;
+
 /** A command that can't be carried out: an unknown thread, or a malformed command. */
 export class CommandError extends Error {
   constructor(message: string) {
@@ -81,6 +95,7 @@ export class AgentThreads {
   #subscribers = new Set<(event: ThreadEvent) => void>();
   #closed = false;
   #stopping: Promise<void> | undefined;
+  #pruner: NodeJS.Timeout | undefined;
 
   constructor(options: AgentThreadsOptions = {}) {
     this.#options = options;
@@ -174,6 +189,56 @@ export class AgentThreads {
     return () => this.#subscribers.delete(fn);
   }
 
+  /**
+   * Picks up the runs that were going when the backend last stopped (with the shim spawner, whose
+   * runs outlive it): it re-attaches to those still running, and follows those that ended while it
+   * was down to their end, so their threads carry on. Runs it can't re-attach to are stopped, and
+   * their turns end. Call it when the app starts, before taking commands; a thread a command loads
+   * first is re-attached then. It also prunes old runs' directories, now and every hour after.
+   */
+  async recover(): Promise<Recovered> {
+    this.#open();
+    const out: Recovered = { reattached: [], lost: [] };
+    for (const run of await this.store.activeRuns()) {
+      let rt: ThreadRuntime;
+      try {
+        rt = await this.#load(run.thread_id);
+      } catch (e) {
+        this.#error(e);
+        continue;
+      }
+      if (rt.thread.run?.id === run.id) {
+        if (rt.thread.run.reattached_at) out.reattached.push(run.thread_id);
+        continue;
+      }
+      if (rt.lostRun === run.id) out.lost.push(run.thread_id);
+      // Not the thread's run (any more): nothing follows it.
+      const now = await this.store.getRun(run.id);
+      if (now && now.ended_at == null) await this.#abandon(now);
+    }
+    this.#prune();
+    return out;
+  }
+
+  #prune(): void {
+    const spawner = this.spawner;
+    if (!spawner.prune || this.#pruner) return;
+    const prune = () => void spawner.prune!(this.store).catch((e) => this.#error(e));
+    prune();
+    this.#pruner = setInterval(prune, PRUNE_EVERY_MS);
+    this.#pruner.unref();
+  }
+
+  /** Stops a run nothing follows, and records that the backend is done with it. */
+  async #abandon(run: RunRecord): Promise<void> {
+    this.spawner.stop?.(run);
+    try {
+      await this.store.putRun({ ...run, ended_at: new Date().toISOString() });
+    } catch (e) {
+      this.#error(e);
+    }
+  }
+
   // ---------- commands ----------
 
   /** Carries out a command from a client. Throws a CommandError for one it can't. */
@@ -227,22 +292,27 @@ export class AgentThreads {
   }
 
   /**
-   * Stops every harness process and saves everything. It rejects if some thread's events can't be
-   * saved (the store is failing): they're kept, and calling close() again tries again. After it,
+   * Stops every harness process and saves everything. With the shim spawner, runs are left going
+   * instead (their turns too), for recover() to re-attach to when the app starts again, unless
+   * `stop` is set; a driver that can't re-attach has its runs stopped. It rejects if some thread's events can't be saved
+   * (the store is failing): they're kept, and calling close() again tries again. After it,
    * commands, snapshots and changes to threads are refused with a CommandError; get, list and
    * eventsSince still read the store, which is the app's to close.
    */
-  close(): Promise<void> {
-    this.#stopping ??= this.#stopAll();
+  close({ stop = false }: { stop?: boolean } = {}): Promise<void> {
+    this.#stopping ??= this.#stopAll(stop);
     return this.#stopping.then(() => this.#saveAll());
   }
 
   /** Stops every thread's harness, once. */
-  async #stopAll(): Promise<void> {
+  async #stopAll(stop: boolean): Promise<void> {
     this.#closed = true;
+    clearInterval(this.#pruner);
     await Promise.allSettled([...this.#loading.values()]);
     await Promise.all(
       [...this.#threads.values()].map(async (rt) => {
+        // Left going, saved as it is now, to be re-attached to.
+        if (!stop && this.spawner.durable && rt.session?.detach?.()) return;
         // A turn cut short by shutting down ends as an interrupted one.
         rt.closing = true;
         if (rt.turn) rt.turn.interrupted = true;
@@ -348,10 +418,53 @@ export class AgentThreads {
     let state = applyEvents(snap ?? initialState(thread), events);
     if (state.seq === 0) state = initialState(thread);
     const rt = this.#runtime(state);
-    // The process that ran its turn went with the backend before this one.
+    if (await this.#reattach(rt)) return rt;
+    // The process that ran its turn went with the backend before this one, or can't be followed.
     const s = rt.thread.status;
-    if (s === "running" || s === "waiting" || rt.thread.run) recoverLost(rt);
+    if (s === "running" || s === "waiting" || rt.thread.run) {
+      if (rt.thread.run) rt.lostRun = rt.thread.run.id;
+      recoverLost(rt);
+    }
     return rt;
+  }
+
+  /**
+   * Re-attaches a thread just loaded to its run, if it has one that outlived the backend before:
+   * its turn and open requests are as they were when the run was last saved, and the session
+   * carries on reading the run from there. Whether it did; if it couldn't, the run is stopped.
+   */
+  async #reattach(rt: ThreadRuntime): Promise<boolean> {
+    const run = rt.thread.run;
+    if (!run || run.spawner === "direct") return false;
+    const record = await this.store.getRun(run.id);
+    if (!record || record.ended_at != null) return false;
+    const data = (record.data ?? {}) as { turn?: Turn | null };
+    const s = rt.thread.status;
+    if (s === "running" || s === "waiting") {
+      const last = [...rt.snapshot.items].reverse().find((i) => i.turn_id)?.turn_id;
+      rt.turn = data.turn ? { ...data.turn } : { id: last ?? newId("turn"), interrupted: false };
+    }
+    rt.adoptRun(record);
+    const session = rt.session;
+    if (!this.spawner.attach || record.spawner !== this.spawner.name || !session?.reattach?.(record)) {
+      rt.turn = null;
+      await this.#abandon(record);
+      return false;
+    }
+    // Requests the session didn't take up again can't be answered.
+    const open = new Set(rt.openRequests.map((r) => r.id));
+    for (const r of rt.snapshot.requests) if (!open.has(r.id)) rt.emit({ type: "request.resolved", request_id: r.id, resolution: { outcome: "cancel" } });
+    rt.setThread({ run: { ...run, reattached_at: new Date().toISOString() } });
+    if (rt.turn) {
+      rt.addItem({
+        id: newId("n"),
+        type: "notice",
+        level: "info",
+        code: "run.reattached",
+        text: "The backend restarted while this turn was running, and picked it up again.",
+      });
+    }
+    return true;
   }
 
   #publish(event: ThreadEvent): void {

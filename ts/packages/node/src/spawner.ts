@@ -1,9 +1,10 @@
 // How harness processes are started. `direct` runs them as child processes, which end with the
-// backend; a `shim` spawner that runs them detached and survives a restart comes later, behind the
-// same interface.
+// backend; `shim` (shim.ts) runs them under agent-threads-shim, so they outlive it and a restarted
+// backend re-attaches to them.
 
 import { spawn as spawnChild } from "node:child_process";
 import { createInterface } from "node:readline";
+import type { RunRecord, Store } from "./store.js";
 
 export interface SpawnOptions {
   command: string;
@@ -33,17 +34,45 @@ export interface ProcessHandlers {
 
 export interface HarnessProcess {
   readonly pid: number | undefined;
+  /**
+   * How far into its output the lines given so far go (bytes, whole lines only), for a process
+   * that outlives the backend: the backend saves it with the events it made of those lines.
+   */
+  readonly offset?: number;
   /** Writes a line to its stdin. */
   write(line: string): void;
   /** Closes its stdin. */
   closeInput(): void;
   /** Signals it, and whatever it started (its process group, where there is one). */
   kill(signal?: NodeJS.Signals): void;
+  /**
+   * Stops following it and leaves it running, for a backend that's shutting down and will
+   * re-attach (a process that outlives the backend only). No handler is called after this.
+   */
+  detach?(): void;
 }
 
 export interface Spawner {
   readonly name: "direct" | "shim";
   spawn(options: SpawnOptions, handlers: ProcessHandlers): HarnessProcess;
+  /**
+   * Its processes outlive the backend. The backend then saves each run (its offset and what's
+   * needed to carry on reading it) with the thread's events, and re-attaches after a restart.
+   */
+  readonly durable?: boolean;
+  /** Follows a run started before a restart, from the offset saved with it. */
+  attach?(run: RunRecord, handlers: ProcessHandlers): HarnessProcess;
+  /**
+   * Stops a run nothing will follow (its thread has gone on without it, or can't re-attach): ends
+   * its input and signals its process group, escalating to SIGKILL.
+   */
+  stop?(run: RunRecord): void;
+  /**
+   * Removes what's left of runs the backend is done with (their directories), after the time it
+   * keeps them, and stops runs that aren't the store's (their backend died before saving them).
+   * The number removed.
+   */
+  prune?(store: Store): Promise<number>;
 }
 
 /** Runs harness processes as children of the backend, each in its own process group. */

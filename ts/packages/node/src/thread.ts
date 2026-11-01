@@ -7,7 +7,7 @@ import type { HarnessSession, Message, NewItem, NewRequest, ThreadConfig, Thread
 import { newId } from "./ids.js";
 import { decide, permissionKey, type PermissionDecision, type PermissionPolicy, type PermissionQuery } from "./permissions.js";
 import type { Spawner } from "./spawner.js";
-import { StoreError, type Store } from "./store.js";
+import { StoreError, type RunRecord, type Store } from "./store.js";
 
 /** An event before it's numbered: what emit() takes. */
 type Unnumbered = ThreadEvent extends infer E ? (E extends ThreadEvent ? Omit<E, "seq" | "thread_id"> : never) : never;
@@ -66,6 +66,8 @@ export class ThreadRuntime implements ThreadContext {
   turn: Turn | null = null;
   /** The backend is shutting down: a turn that ends doesn't start another. */
   closing = false;
+  /** The run it had when it was loaded, which was lost (not re-attached to). */
+  lostRun: string | undefined;
 
   #host: RuntimeHost;
   /** The live state, with the text streamed so far. */
@@ -82,6 +84,8 @@ export class ThreadRuntime implements ThreadContext {
   #failure: { error: unknown } | undefined; // why the last write failed, while writes are failing
   #retry: NodeJS.Timeout | undefined;
   #backoff = 0;
+  /** The run record last saved, while its run goes on (with a durable spawner). */
+  #run: { record: RunRecord; json: string } | undefined;
 
   constructor(host: RuntimeHost, state: Snapshot, config: ThreadConfig, policy: PermissionPolicy) {
     this.#host = host;
@@ -141,22 +145,25 @@ export class ThreadRuntime implements ThreadContext {
    */
   async #flush(): Promise<void> {
     const store = this.#host.store;
+    // Taken at the same moment as the events, so the run's offset and state are as of them.
     const events = this.#unsaved.slice();
+    const { runs, run } = this.#runs();
     const threadChanged = this.#threadChanged;
-    if (!events.length && !threadChanged) return;
+    if (!events.length && !threadChanged && !runs.length) return;
     try {
-      if (events.length) {
+      if (events.length || runs.length) {
         try {
-          await store.appendEvents(this.threadId, events);
+          await store.appendEvents(this.threadId, events, runs);
         } catch (e) {
           // An append reported as failed may have happened anyway: keep only what the store lacks.
           if (!(e instanceof StoreError && e.kind === "seq")) throw e;
           const last = await store.lastSeq(this.threadId);
           const rest = events.filter((x) => x.seq > last);
           if (rest.length === events.length) throw e;
-          if (rest.length) await store.appendEvents(this.threadId, rest);
+          await store.appendEvents(this.threadId, rest, runs);
         }
         this.#unsaved.splice(0, events.length);
+        this.#run = run;
       }
       if (threadChanged) {
         this.#threadChanged = false;
@@ -174,6 +181,45 @@ export class ThreadRuntime implements ThreadContext {
       this.#host.error(e);
       this.#retryLater();
     }
+  }
+
+  /**
+   * With a durable spawner, the runs to save with the events: the session's running one, if it
+   * changed since it was last saved, and the one before it as ended if that's done.
+   */
+  #runs(): { runs: RunRecord[]; run: { record: RunRecord; json: string } | undefined } {
+    const spawner = this.#host.spawner;
+    if (!spawner.durable) return { runs: [], run: undefined };
+    const runs: RunRecord[] = [];
+    const now = new Date().toISOString();
+    const thread = this.#saved.thread;
+    // A driver that can't re-attach still has its run recorded, so a restart can stop it.
+    const cp = this.session?.checkpoint ? this.session.checkpoint() : thread.run?.spawner === spawner.name ? { id: thread.run.id, offset: 0, state: undefined } : undefined;
+    const before = this.#run?.record;
+    let run = this.#run;
+    if (before && before.id !== cp?.id) {
+      if (before.ended_at == null) runs.push({ ...before, ended_at: now });
+      run = undefined;
+    }
+    // A run that's over is saved once more, as it ended.
+    if (!cp || (before?.id === cp.id && before.ended_at != null)) return { runs, run };
+    const record: RunRecord = {
+      id: cp.id,
+      thread_id: this.threadId,
+      spawner: spawner.name,
+      offset: cp.offset,
+      started_at: before?.id === cp.id ? before.started_at : thread.run?.id === cp.id && thread.run.started_at ? thread.run.started_at : now,
+      ...("ended" in cp && cp.ended ? { ended_at: now } : {}),
+      data: { ...("dir" in cp && cp.dir ? { dir: cp.dir } : {}), turn: this.turn, state: cp.state },
+    };
+    const json = JSON.stringify(record);
+    if (json !== this.#run?.json) runs.push(record);
+    return { runs, run: { record, json } };
+  }
+
+  /** The run record saved last, for a backend that re-attached to it. */
+  adoptRun(record: RunRecord): void {
+    this.#run = { record, json: JSON.stringify(record) };
   }
 
   #retryLater(): void {
@@ -410,6 +456,14 @@ export class ThreadRuntime implements ThreadContext {
     this.emit({ type: "request.opened", request: r });
     this.setThread({ status: "waiting" });
     return r.id;
+  }
+
+  reopen(requestId: string, answered: (resolution: Resolution) => void, standing?: string): boolean {
+    if (this.#requests.has(requestId)) return false;
+    const request = this.#state.requests.find((r) => r.id === requestId);
+    if (!request) return false;
+    this.#requests.set(requestId, { request, answered, ...(standing ? { standing } : {}) });
+    return true;
   }
 
   respond(requestId: string, resolution: Resolution): void {

@@ -9,11 +9,12 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { Resolution } from "@dire-kiwi/agent-threads-protocol";
 import { messageParts, pathText } from "../attachments.js";
-import type { Harness, HarnessSession, Message, Skill, ThreadContext } from "../harness.js";
+import type { Harness, HarnessSession, Message, RunCheckpoint, Skill, ThreadContext } from "../harness.js";
 import { newId } from "../ids.js";
 import { permissionKey, type PermissionDecision } from "../permissions.js";
 import { writeSkills } from "../skills.js";
-import type { ExitStatus, HarnessProcess } from "../spawner.js";
+import type { ExitStatus, HarnessProcess, ProcessHandlers } from "../spawner.js";
+import type { RunRecord } from "../store.js";
 import { runTool } from "../tools.js";
 import { APP_SERVER, claudePermissionMode, claudeTool, claudeUsage, editChange, questions, resultText, slim, title } from "./translate.js";
 
@@ -54,15 +55,45 @@ export function claudeCode(options: ClaudeCodeOptions = {}): Harness {
 
 type Json = { [k: string]: any };
 
+/** A request of Claude's not yet answered: the turn it came in, and the request. */
+interface OpenRequest {
+  turn: string | undefined;
+  request: Json;
+}
+
+/**
+ * What a run's checkpoint holds (see HarnessSession.checkpoint): what's needed to carry on reading
+ * its output, as of the offset saved with it.
+ */
+interface RunState {
+  v: 1;
+  ready: boolean;
+  waiting: string[];
+  /** Our control requests not yet answered: their subtypes, by id. */
+  pending: [string, string][];
+  next: number;
+  msgOfParent: [string | null, string][];
+  blockCount: [string, number][];
+  streamed: string[];
+  summaryNext: string | null;
+  asked: [string, string][];
+  open: [string, OpenRequest][];
+  sent: { ids: string[]; echo: string }[];
+  pluginDir?: string;
+  /** When the session's timers for it go off (ms since the epoch). */
+  steerAt?: number;
+  stopAt?: number;
+}
+
 /** One `claude` process, and what's needed to read it. */
 class Run {
-  readonly id = newId("run");
+  readonly id: string;
   proc: HarnessProcess | undefined;
   /** Claude answered `initialize`, so messages can go in. */
   ready = false;
   waiting: string[] = [];
   /** Our control requests, by id. */
-  pending = new Map<string, (response: Json | null) => void>();
+  pending = new Map<string, { subtype: string; resolve: (response: Json | null) => void }>();
   #nextRequest = 1;
   exited = false;
   /** Stopped on purpose (to restart), so its end doesn't end the turn. */
@@ -78,18 +109,22 @@ class Run {
   summaryNext: string | null = null; // a compaction waiting for its summary
   asked = new Map<string, string>(); // Claude's request id -> our request's
   /** Claude's requests not yet answered, with the turn each came in. */
-  open = new Map<string, string | undefined>();
+  open = new Map<string, OpenRequest>();
   /** The messages sent, oldest first, by what Claude echoes when it takes one in. */
   sent: { ids: string[]; echo: string }[] = [];
   /** The generated plugin with the thread's skills, for this run only. */
   pluginDir: string | undefined;
 
-  constructor() {
+  /** Left running when the backend shut down: nothing more is read or written. */
+  detached = false;
+
+  constructor(id = newId("run")) {
+    this.id = id;
     this.done = new Promise((r) => (this.finish = r));
   }
 
   write(msg: Json): void {
-    if (!this.exited) this.proc?.write(JSON.stringify(msg));
+    if (!this.exited && !this.detached) this.proc?.write(JSON.stringify(msg));
   }
 
   /** Writes a user message (that's the item `id`), once Claude is ready for one. */
@@ -101,9 +136,43 @@ class Run {
 
   control(request: Json): Promise<Json | null> {
     const request_id = `req_${this.#nextRequest++}`;
-    const p = new Promise<Json | null>((r) => this.pending.set(request_id, r));
+    const p = new Promise<Json | null>((resolve) => this.pending.set(request_id, { subtype: String(request.subtype), resolve }));
     this.write({ type: "control_request", request_id, request });
     return p;
+  }
+
+  state(): Omit<RunState, "steerAt" | "stopAt"> {
+    return {
+      v: 1,
+      ready: this.ready,
+      waiting: this.waiting,
+      pending: [...this.pending].map(([id, p]) => [id, p.subtype]),
+      next: this.#nextRequest,
+      msgOfParent: [...this.msgOfParent].map(([k, v]) => [k ?? null, v]),
+      blockCount: [...this.blockCount],
+      streamed: [...this.streamed],
+      summaryNext: this.summaryNext,
+      asked: [...this.asked],
+      open: [...this.open],
+      sent: this.sent,
+      ...(this.pluginDir ? { pluginDir: this.pluginDir } : {}),
+    };
+  }
+
+  /** Takes up a checkpoint's state; our requests' answers go to `answered`. */
+  restore(st: RunState, answered: (subtype: string) => (response: Json | null) => void): void {
+    this.ready = st.ready;
+    this.waiting = [...st.waiting];
+    for (const [id, subtype] of st.pending) this.pending.set(id, { subtype, resolve: answered(subtype) });
+    this.#nextRequest = st.next;
+    this.msgOfParent = new Map(st.msgOfParent.map(([k, v]) => [k ?? undefined, v]));
+    this.blockCount = new Map(st.blockCount);
+    this.streamed = new Set(st.streamed);
+    this.summaryNext = st.summaryNext;
+    this.asked = new Map(st.asked);
+    this.open = new Map(st.open);
+    this.sent = st.sent.map((x) => ({ ids: [...x.ids], echo: x.echo }));
+    if (st.pluginDir) this.pluginDir = st.pluginDir;
   }
 
   respond(request_id: string, response: Json): void {
@@ -120,12 +189,17 @@ class ClaudeSession implements HarnessSession {
   #ctx: ThreadContext;
   #o: ClaudeCodeOptions;
   #run: Run | null = null;
+  /** The run before, once it has exited (for its last checkpoint). */
+  #last: Run | null = null;
   /** A run being stopped, which the next must wait for. */
   #stopping: Promise<void> | null = null;
   /** The options changed since the run started: the next turn starts a new one. */
   #stale = false;
   #steerTimer: NodeJS.Timeout | undefined;
   #stopTimer: NodeJS.Timeout | undefined;
+  /** When those go off, for a checkpoint. */
+  #steerAt: number | undefined;
+  #stopAt: number | undefined;
   /** A directory for the thread's generated files (skills, attached files), made when needed. */
   #tmp: string | undefined;
   #closed = false;
@@ -159,21 +233,46 @@ class ClaudeSession implements HarnessSession {
     }
     // Claude has them on its stdin, and takes them in once it's ready, which starts the next turn.
     // If it doesn't, they go to a new process.
+    this.#steerAfter(run, this.#o.steerGraceMs ?? 30_000);
+  }
+
+  #steerAfter(run: Run, ms: number): void {
     clearTimeout(this.#steerTimer);
-    this.#steerTimer = setTimeout(() => this.#requeue(run), this.#o.steerGraceMs ?? 30_000);
+    this.#steerAt = Date.now() + ms;
+    this.#steerTimer = setTimeout(() => {
+      this.#steerAt = undefined;
+      this.#requeue(run);
+    }, ms);
     this.#steerTimer.unref?.();
+  }
+
+  #clearSteer(): void {
+    clearTimeout(this.#steerTimer);
+    this.#steerAt = undefined;
   }
 
   interrupt(): void {
     const run = this.#live();
     if (!run) return;
     void run.control({ subtype: "interrupt" });
+    this.#stopAfter(run, this.#o.stopGraceMs ?? 10_000);
+  }
+
+  /** Stops the run if the turn running now hasn't ended in `ms`. */
+  #stopAfter(run: Run, ms: number): void {
     const turn = this.#ctx.turnId;
-    clearTimeout(this.#stopTimer);
+    this.#clearStop();
+    this.#stopAt = Date.now() + ms;
     this.#stopTimer = setTimeout(() => {
+      this.#stopAt = undefined;
       if (this.#ctx.turnId === turn && !run.exited) void this.#stop(run, false);
-    }, this.#o.stopGraceMs ?? 10_000);
+    }, ms);
     this.#stopTimer.unref?.();
+  }
+
+  #clearStop(): void {
+    clearTimeout(this.#stopTimer);
+    this.#stopAt = undefined;
   }
 
   optionsChanged(): void {
@@ -185,7 +284,7 @@ class ClaudeSession implements HarnessSession {
   }
 
   release(): void {
-    clearTimeout(this.#steerTimer);
+    this.#clearSteer();
     const run = this.#live();
     // It has the messages on its stdin: stopped at once, it can't take them in unseen.
     if (run) void this.#stop(run, true, true);
@@ -193,13 +292,80 @@ class ClaudeSession implements HarnessSession {
 
   async close(): Promise<void> {
     this.#closed = true;
-    clearTimeout(this.#steerTimer);
-    clearTimeout(this.#stopTimer);
+    this.#clearSteer();
+    this.#clearStop();
     const run = this.#run;
     if (run) await this.#stop(run, false);
     if (this.#stopping) await this.#stopping;
     if (this.#tmp) rmSync(this.#tmp, { recursive: true, force: true });
     this.#tmp = undefined;
+  }
+
+  checkpoint(): RunCheckpoint | undefined {
+    // The last run, until another starts: one that has exited is saved once more, as it ended.
+    const run = this.#run ?? this.#last;
+    const offset = run?.proc?.offset;
+    if (!run || run.retired || offset === undefined) return undefined;
+    const state: RunState = {
+      ...run.state(),
+      ...(this.#steerAt !== undefined ? { steerAt: this.#steerAt } : {}),
+      ...(this.#stopAt !== undefined ? { stopAt: this.#stopAt } : {}),
+    };
+    const dir = (run.proc as { dir?: unknown }).dir;
+    return { id: run.id, offset, ...(typeof dir === "string" ? { dir } : {}), state, ...(run.exited ? { ended: true } : {}) };
+  }
+
+  reattach(record: RunRecord): boolean {
+    const st = (record.data as { state?: RunState } | undefined)?.state;
+    const spawner = this.#ctx.spawner;
+    if (!st || st.v !== 1 || !spawner.attach || this.#run) return false;
+    const run = new Run(record.id);
+    run.restore(st, (subtype) => (subtype === "initialize" ? (r) => this.#initialized(run, r) : () => {}));
+    this.#run = run;
+    try {
+      run.proc = spawner.attach(record, this.#handlers(run));
+    } catch (e) {
+      this.#run = null;
+      this.#ctx.error(e);
+      return false;
+    }
+    // Claude's requests that were open: the user's questions are taken up again, and the rest
+    // (a policy that hadn't decided, a tool that was running) are dealt with again.
+    for (const [id, open] of [...run.open]) this.#reopen(run, id, open);
+    if (st.steerAt !== undefined) this.#steerAfter(run, Math.max(0, st.steerAt - Date.now()));
+    if (st.stopAt !== undefined) this.#stopAfter(run, Math.max(0, st.stopAt - Date.now()));
+    return true;
+  }
+
+  detach(): boolean {
+    const run = this.#live();
+    if (!run?.proc?.detach) return false;
+    this.#closed = true;
+    clearTimeout(this.#steerTimer);
+    clearTimeout(this.#stopTimer);
+    run.detached = true;
+    run.proc.detach();
+    run.abort.abort();
+    return true;
+  }
+
+  /** A request of Claude's that was open when the backend restarted. */
+  #reopen(run: Run, requestId: string, open: OpenRequest): void {
+    const req = open.request;
+    if (req.subtype === "can_use_tool") return this.#canUseTool(run, requestId, req, run.asked.get(requestId));
+    run.open.delete(requestId);
+    if (req.subtype === "mcp_message") {
+      // An app tool that was running: it went with the backend, and isn't run again, since it may have
+      // done what it does.
+      const msg: Json = req.message ?? {};
+      run.respond(requestId, {
+        mcp_response: {
+          jsonrpc: "2.0",
+          id: msg.id ?? 0,
+          result: { content: [{ type: "text", text: "The app restarted while this tool was running, so it may or may not have finished." }], isError: true },
+        },
+      });
+    }
   }
 
   /** The thread's directory for generated files. */
@@ -302,14 +468,7 @@ class ClaudeSession implements HarnessSession {
           threadId: ctx.threadId,
           runId: run.id,
         },
-        {
-          line: (line) => this.#line(run, line),
-          stderr: (line) => {
-            run.stderr.push(line);
-            if (run.stderr.length > 20) run.stderr.shift();
-          },
-          exit: (status) => this.#exited(run, status),
-        },
+        this.#handlers(run),
       );
     } catch (e) {
       this.#exited(run, { code: null, signal: null, error: e instanceof Error ? e : new Error(String(e)) });
@@ -317,17 +476,31 @@ class ClaudeSession implements HarnessSession {
     }
     run.proc = proc;
     ctx.setThread({ run: { id: run.id, spawner: ctx.spawner.name, started_at: new Date().toISOString() } });
-    void run.control({ subtype: "initialize", ...(tools.length ? { sdkMcpServers: [APP_SERVER] } : {}) }).then((r) => {
-      if (run.exited) return;
-      if (!r) {
-        // It refused: messages can't go in, so stop it, which ends the turn.
-        run.stderr.push("Claude Code refused the initialize request.");
-        void this.#stop(run, false);
-        return;
-      }
-      run.ready = true;
-      for (const line of run.waiting.splice(0)) proc.write(line);
-    });
+    void run.control({ subtype: "initialize", ...(tools.length ? { sdkMcpServers: [APP_SERVER] } : {}) }).then((r) => this.#initialized(run, r));
+  }
+
+  #handlers(run: Run): ProcessHandlers {
+    return {
+      line: (line) => this.#line(run, line),
+      stderr: (line) => {
+        run.stderr.push(line);
+        if (run.stderr.length > 20) run.stderr.shift();
+      },
+      exit: (status) => this.#exited(run, status),
+    };
+  }
+
+  /** Claude answered `initialize` (null: it refused). */
+  #initialized(run: Run, r: Json | null): void {
+    if (run.exited || run.detached) return;
+    if (!r) {
+      // It refused: messages can't go in, so stop it, which ends the turn.
+      run.stderr.push("Claude Code refused the initialize request.");
+      void this.#stop(run, false);
+      return;
+    }
+    run.ready = true;
+    for (const line of run.waiting.splice(0)) run.proc?.write(line);
   }
 
   #args(run: Run): string[] {
@@ -365,19 +538,22 @@ class ClaudeSession implements HarnessSession {
   }
 
   #exited(run: Run, status: ExitStatus): void {
-    if (run.exited) return;
+    if (run.exited || run.detached) return;
     run.exited = true;
     run.abort.abort();
     if (run.pluginDir) rmSync(run.pluginDir, { recursive: true, force: true });
-    for (const resolve of run.pending.values()) resolve(null);
+    for (const p of run.pending.values()) p.resolve(null);
     run.pending.clear();
     const ctx = this.#ctx;
-    if (this.#run === run) this.#run = null;
+    if (this.#run === run) {
+      this.#run = null;
+      this.#last = run;
+    }
     if (ctx.thread.run?.id === run.id) ctx.setThread({ run: undefined });
     // A run that ends while its turn is running ends the turn (as interrupted, if it was).
     if (!run.retired && ctx.turnId) {
-      clearTimeout(this.#stopTimer);
-      clearTimeout(this.#steerTimer);
+      this.#clearStop();
+      this.#clearSteer();
       ctx.endTurn({ ok: false, error: exitError(status, run.stderr) });
     }
     run.finish();
@@ -396,10 +572,10 @@ class ClaudeSession implements HarnessSession {
     if (m.type === "control_response") {
       // Claude echoes our own responses back too; those aren't for a request of ours.
       const r = m.response ?? {};
-      const resolve = run.pending.get(r.request_id);
-      if (resolve) {
+      const p = run.pending.get(r.request_id);
+      if (p) {
         run.pending.delete(r.request_id);
-        resolve(r.subtype === "error" ? null : (r.response ?? {}));
+        p.resolve(r.subtype === "error" ? null : (r.response ?? {}));
       }
       return;
     }
@@ -478,8 +654,12 @@ class ClaudeSession implements HarnessSession {
       case "result": {
         // The turn's requests are moot now; its open questions are cancelled with it.
         run.open.clear();
+        // Its messages are done with: what was kept to translate them needn't be any more.
+        run.msgOfParent.clear();
+        run.blockCount.clear();
+        run.streamed.clear();
         if (!ctx.turnId) break;
-        clearTimeout(this.#stopTimer);
+        this.#clearStop();
         const failed = !!m.is_error;
         ctx.endTurn({
           ok: !failed,
@@ -505,7 +685,7 @@ class ClaudeSession implements HarnessSession {
       // It's taking its messages in, and its turn for this one may run past the grace: the grace
       // is for a Claude that takes none in. The turn's result carries over what's still queued,
       // which starts it again.
-      if (run === this.#run) clearTimeout(this.#steerTimer);
+      if (run === this.#run) this.#clearSteer();
       return;
     }
     if (typeof content === "string") {
@@ -543,12 +723,18 @@ class ClaudeSession implements HarnessSession {
     }
   }
 
-  #canUseTool(run: Run, requestId: string, req: Json): void {
+  /**
+   * A tool Claude wants to use: the policy decides, or the user is asked. `existing` is the
+   * request the user was asked with before the backend restarted, which is taken up again.
+   */
+  #canUseTool(run: Run, requestId: string, req: Json, existing?: string): void {
     const ctx = this.#ctx;
     const toolUseId: string | undefined = req.tool_use_id;
     const input = req.input ?? {};
-    const turn = ctx.turnId;
-    run.open.set(requestId, turn);
+    const turn = existing !== undefined ? run.open.get(requestId)?.turn : ctx.turnId;
+    run.open.set(requestId, { turn, request: req });
+    const ask: typeof ctx.ask = (request, toolCallId, answered, standing) =>
+      existing !== undefined && ctx.reopen(existing, answered, standing) ? existing : ctx.ask(request, toolCallId, answered, standing);
     // Whether Claude still wants this answered: not cancelled, its turn not over, its run not gone.
     const wanted = () => run.open.has(requestId) && !run.exited && !run.retired && this.#run === run && ctx.turnId === turn;
     const allow = (updatedInput: unknown) => wanted() && run.respond(requestId, { behavior: "allow", updatedInput });
@@ -558,7 +744,7 @@ class ClaudeSession implements HarnessSession {
     if (req.tool_name === "AskUserQuestion") {
       const qs = questions(input);
       if (!qs.length) return void allow(input);
-      const id = ctx.ask({ type: "question", questions: qs as [(typeof qs)[0], ...typeof qs] }, toolUseId, (res: Resolution) => {
+      const id = ask({ type: "question", questions: qs as [(typeof qs)[0], ...typeof qs] }, toolUseId, (res: Resolution) => {
         if (res.outcome === "answer") {
           const answers: { [q: string]: string } = {};
           for (const [q, a] of Object.entries(res.answers ?? {})) answers[q] = (a ?? []).join(", ");
@@ -590,7 +776,7 @@ class ClaudeSession implements HarnessSession {
       if (!wanted()) return;
       if (d === "allow") return void allow(input);
       if (d === "ask") {
-        const id = ctx.ask(
+        const id = ask(
           {
             type: "permission",
             name: t.name,
@@ -617,7 +803,8 @@ class ClaudeSession implements HarnessSession {
       deny(typeof d === "object" ? d.deny : "The app's permission policy doesn't allow this.");
       denied();
     };
-    const d = ctx.decide(query);
+    // The user was asked before the backend restarted: they still are.
+    const d = existing !== undefined ? "ask" : ctx.decide(query);
     if (d instanceof Promise) void d.then(apply);
     else apply(d);
   }
@@ -644,6 +831,8 @@ class ClaudeSession implements HarnessSession {
         const tool = tools.find((t) => t.name === name);
         if (!tool) return reply({ result: { content: [{ type: "text", text: `There's no tool ${name}.` }], isError: true } });
         const toolCallId = msg.params?._meta?.["claudecode/toolUseId"];
+        // Saved while it runs, so a backend that restarts meanwhile answers it (see #reopen).
+        run.open.set(requestId, { turn: ctx.turnId, request: req });
         const out = await runTool(tool, msg.params?.arguments ?? {}, {
           threadId: ctx.threadId,
           metadata: ctx.thread.metadata ?? {},

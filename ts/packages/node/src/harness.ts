@@ -14,6 +14,7 @@ import type {
 } from "@dire-kiwi/agent-threads-protocol";
 import type { PermissionDecision, PermissionQuery } from "./permissions.js";
 import type { Spawner } from "./spawner.js";
+import type { RunRecord } from "./store.js";
 import type { Tool } from "./tools.js";
 
 /** An external MCP server: a command to run (stdio), or a URL (streamable HTTP, or SSE). */
@@ -85,12 +86,31 @@ export interface ThreadContext {
    * `standing` (permissionKey of the tool) lets an answer given `always` stand for the thread.
    */
   ask(request: NewRequest, toolCallId: string | undefined, answered: (resolution: Resolution) => void, standing?: string): string;
+  /**
+   * Takes up a request opened before the backend restarted, which is still open: `answered` is
+   * called when the user responds, as for ask(). Whether it's open.
+   */
+  reopen(requestId: string, answered: (resolution: Resolution) => void, standing?: string): boolean;
   /** Closes a request the harness no longer wants answered. */
   cancelRequest(id: string): void;
   /** The running turn ended. */
   endTurn(end: TurnEnd): void;
   /** Something went wrong that isn't the turn's: for the app's onError. */
   error(error: unknown): void;
+}
+
+/** What a driver needs saved to carry on with its run after the backend restarts. */
+export interface RunCheckpoint {
+  /** The run's id. */
+  id: string;
+  /** How far into its output the driver has read (HarnessProcess.offset). */
+  offset: number;
+  /** Where its files are (the shim's run directory). */
+  dir?: string;
+  /** The driver's state for it, as JSON, which reattach() gets back. */
+  state: unknown;
+  /** It has exited, and the driver is done with it (its last checkpoint). */
+  ended?: boolean;
 }
 
 /** A driver's side, for one thread. */
@@ -117,6 +137,26 @@ export interface HarnessSession {
   optionsChanged(): void;
   /** Stop the harness process, if it's running. */
   close(): Promise<void>;
+
+  // With a spawner whose processes outlive the backend (Spawner.durable). A driver that has none of
+  // these has its runs stopped when the backend restarts, and their turns end.
+
+  /**
+   * The running process's checkpoint, which the core saves with the events made so far; undefined
+   * if there's none. It's called whenever events are saved, so it must be quick.
+   */
+  checkpoint?(): RunCheckpoint | undefined;
+  /**
+   * Re-attaches to a run after a restart: `run.data.state` is a checkpoint() of it, and the core
+   * has restored the thread (its running turn, its open requests) as of the same moment. Whether
+   * it could; if not, the core stops the run.
+   */
+  reattach?(run: RunRecord): boolean;
+  /**
+   * Stops following the running process and leaves it running, as the backend shuts down, to
+   * re-attach to it after. Whether there was one to leave; nothing else is called after this.
+   */
+  detach?(): boolean;
 }
 
 export interface Harness {
