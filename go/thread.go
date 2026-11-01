@@ -122,14 +122,14 @@ type threadRuntime struct {
 
 func newRuntime(sdk *AgentThreads, state protocol.Snapshot, config ThreadConfig, policy PermissionPolicy) *threadRuntime {
 	rt := &threadRuntime{
-		sdk:       sdk,
-		id:        state.Thread.ID,
-		state:     state,
-		saved:     state,
-		config:    config,
-		policy:    policy,
-		requests:  map[string]*openRequest{},
-		always:    map[string]Decision{},
+		sdk:        sdk,
+		id:         state.Thread.ID,
+		state:      state,
+		saved:      state,
+		config:     config,
+		policy:     policy,
+		requests:   map[string]*openRequest{},
+		always:     map[string]Decision{},
 		streaming:  map[string]bool{},
 		structured: map[string]json.RawMessage{},
 		changed:    make(chan struct{}),

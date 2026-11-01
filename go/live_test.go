@@ -154,7 +154,7 @@ func TestLiveCodex(t *testing.T) {
 	for _, overMCP := range []bool{false, true} {
 		t.Run(map[bool]string{false: "dynamic tools", true: "loopback MCP"}[overMCP], func(t *testing.T) {
 			sdk := agentthreads.New(agentthreads.Options{
-				Harnesses: map[string]agentthreads.Harness{"codex": agentthreads.Codex(agentthreads.CodexOptions{Bin: envOr("CODEX_BIN", "codex"), Home: t.TempDir(), AppToolsOverMCP: overMCP})},
+				Harnesses:    map[string]agentthreads.Harness{"codex": agentthreads.Codex(agentthreads.CodexOptions{Bin: envOr("CODEX_BIN", "codex"), Home: t.TempDir(), AppToolsOverMCP: overMCP})},
 				Capabilities: agentthreads.Capabilities{Tools: []agentthreads.Tool{lookupOrder()}, Permissions: agentthreads.Allow},
 			})
 			defer sdk.Close(context.Background())
