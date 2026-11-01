@@ -122,6 +122,8 @@ pub struct ThreadContext {
     pub(crate) closing: bool,
     /// The run it had when it was loaded, which was lost (not re-attached to).
     pub(crate) lost_run: Option<String>,
+    /// The run it had when it was loaded, which it re-attached to.
+    pub(crate) reattached_run: Option<String>,
     /// The live state, with the text streamed so far.
     state: Snapshot,
     /// The saved events' state, without deltas: what a change is a change to.
@@ -799,6 +801,7 @@ impl Actor {
             turn: None,
             closing: false,
             lost_run: None,
+            reattached_run: None,
             saved: state.clone(),
             state,
             queue,

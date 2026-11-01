@@ -394,9 +394,9 @@ impl AgentThreads {
             let run_id = run.id.clone();
             let (current, reattached, lost) = handle
                 .call(move |a| {
-                    let t = a.core.thread();
-                    let current = t.run.as_ref().is_some_and(|r| r.id == run_id);
-                    let reattached = current && t.run.as_ref().is_some_and(|r| r.reattached_at.is_some());
+                    // As of loading it: the run may have ended since.
+                    let reattached = a.core.reattached_run.as_deref() == Some(run_id.as_str());
+                    let current = reattached || a.core.thread().run.as_ref().is_some_and(|r| r.id == run_id);
                     (current, reattached, a.core.lost_run.as_deref() == Some(run_id.as_str()))
                 })
                 .await?;
@@ -774,6 +774,7 @@ impl AgentThreads {
                 r.reattached_at = Some(now_iso());
             }
         });
+        c.reattached_run = Some(run.id.clone());
         if c.turn.is_some() {
             c.add_item(json!({
                 "id": new_id("n"), "type": "notice", "level": "info", "code": "run.reattached",

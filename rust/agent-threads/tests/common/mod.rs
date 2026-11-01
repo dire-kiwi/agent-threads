@@ -74,3 +74,38 @@ pub fn shim_path() -> PathBuf {
     });
     bin
 }
+
+/// The Node backend's scriptable stand-ins for `claude` and `codex` (mini-claude.mjs,
+/// mini-codex.mjs), for what the recorded fixtures don't cover.
+pub fn mini(name: &str) -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR")).join("../../ts/packages/node/src/test").join(format!("mini-{name}.mjs")).canonicalize().unwrap()
+}
+
+/// Compares events with a fixture's expected events by spec/tools/check-events.mjs's rules (the
+/// expected ones without deltas when `saved_only`). Err with the first difference.
+pub fn compare(fixture: &str, events: &[Value], saved_only: bool) -> Result<(), String> {
+    let mut expected = read_jsonl(&format!("fixtures/{fixture}/expected.jsonl"));
+    if saved_only {
+        expected.retain(|e| e["type"] != "delta");
+    }
+    let dir = temp_dir();
+    let write = |name: &str, list: &[Value]| {
+        let text: String = list.iter().map(|e| format!("{e}\n")).collect();
+        fs::write(dir.join(name), text).unwrap();
+        dir.join(name)
+    };
+    let (e, a) = (write("expected.jsonl", &expected), write("actual.jsonl", events));
+    let script = format!(
+        "import {{ compare }} from {:?}; import {{ readFileSync }} from 'node:fs';\n\
+         const read = (p) => readFileSync(p, 'utf8').split('\\n').filter(Boolean).map((l) => JSON.parse(l));\n\
+         const r = compare(read(process.argv[1]), read(process.argv[2]));\n\
+         if (!r.ok) {{ console.log(r.error); process.exit(1); }}",
+        format!("file://{}", spec_dir().join("tools/check-events.mjs").display())
+    );
+    let out = std::process::Command::new("node").args(["--input-type=module", "-e", &script]).arg(&e).arg(&a).output().unwrap();
+    if out.status.success() {
+        Ok(())
+    } else {
+        Err(format!("{}{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr)))
+    }
+}
