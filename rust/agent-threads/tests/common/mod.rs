@@ -25,9 +25,32 @@ pub fn read_jsonl(path: &str) -> Vec<Value> {
         .collect()
 }
 
-/// A new temporary directory, kept for the rest of the test run (the OS clears /tmp).
+/// A new temporary directory under the target directory's (not /tmp), removed when the test
+/// process exits.
 pub fn temp_dir() -> PathBuf {
-    tempfile::Builder::new().prefix("agent-threads-").tempdir().unwrap().keep()
+    static ROOT: std::sync::LazyLock<tempfile::TempDir> = std::sync::LazyLock::new(|| {
+        let base = Path::new(env!("CARGO_TARGET_TMPDIR"));
+        fs::create_dir_all(base).unwrap();
+        let root = tempfile::Builder::new().prefix("agent-threads-").tempdir_in(base).unwrap();
+        let path = root.path().to_path_buf();
+        // Statics aren't dropped, so it's removed at exit.
+        extern "C" fn cleanup() {
+            if let Some(p) = CLEANUP.get() {
+                let _ = fs::remove_dir_all(p);
+            }
+        }
+        CLEANUP.set(path).ok();
+        unsafe { libc_atexit(cleanup) };
+        root
+    });
+    tempfile::Builder::new().tempdir_in(ROOT.path()).unwrap().keep()
+}
+
+static CLEANUP: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+
+unsafe extern "C" {
+    #[link_name = "atexit"]
+    fn libc_atexit(f: extern "C" fn()) -> i32;
 }
 
 /// agent-threads-shim, built from ../../shim if it isn't yet (or from $AGENT_THREADS_SHIM).
