@@ -81,6 +81,8 @@ type threadRuntime struct {
 	closing bool
 	// lostRun is the run it had when it was loaded, which was lost (not re-attached to).
 	lostRun string
+	// reattachedRun is the run it had when it was loaded, which it re-attached to.
+	reattachedRun string
 
 	// state is the live state, with the text streamed so far: written on the loop, read anywhere.
 	stateMu sync.RWMutex

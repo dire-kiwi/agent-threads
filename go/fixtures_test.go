@@ -312,16 +312,22 @@ func runFixture(t *testing.T, scenario, spawnerName string) {
 	}
 
 	// The events match expected.jsonl.
+	checkEvents(t, filepath.Join(dir, "expected.jsonl"), all)
+}
+
+// checkEvents compares events with an expected.jsonl, by spec/tools/check-events.mjs.
+func checkEvents(t *testing.T, expected string, events []protocol.ThreadEvent) {
+	t.Helper()
 	var lines bytes.Buffer
-	for _, e := range all {
+	for _, e := range events {
 		lines.Write(mustMarshal(e))
 		lines.WriteByte('\n')
 	}
 	actual := filepath.Join(t.TempDir(), "events.jsonl")
 	os.WriteFile(actual, lines.Bytes(), 0o644)
-	out, err := exec.Command("node", filepath.Join(specDir, "tools", "check-events.mjs"), dir, actual).CombinedOutput()
+	out, err := exec.Command("node", filepath.Join(specDir, "tools", "check-events.mjs"), expected, actual).CombinedOutput()
 	if err != nil {
-		t.Fatalf("%s\n\nEvents:\n%s", out, show(all))
+		t.Fatalf("%s\n\nEvents:\n%s", out, show(events))
 	}
 }
 

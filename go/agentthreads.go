@@ -405,12 +405,15 @@ func (a *AgentThreads) Recover(ctx context.Context) (Recovered, error) {
 			continue
 		}
 		var current *protocol.Run
-		var lost string
-		rt.loop.call(func() { current, lost = rt.state.Thread.Run, rt.lostRun })
+		var reattached, lost string
+		rt.loop.call(func() { current, reattached, lost = rt.state.Thread.Run, rt.reattachedRun, rt.lostRun })
+		// Re-attached when it was loaded (the run may have ended since, if it ended while the backend
+		// was down, and the thread have gone on).
+		if reattached == run.ID {
+			out.Reattached = append(out.Reattached, run.ThreadID)
+			continue
+		}
 		if current != nil && current.ID == run.ID {
-			if current.ReattachedAt != "" {
-				out.Reattached = append(out.Reattached, run.ThreadID)
-			}
 			continue
 		}
 		if lost == run.ID {
@@ -924,6 +927,7 @@ func (a *AgentThreads) reattach(rt *threadRuntime, record *RunRecord) (bool, *Ru
 			rt.emit(&protocol.RequestResolvedEvent{RequestID: r.ID(), Resolution: protocol.Resolution{Outcome: protocol.ResolutionOutcomeCancel}})
 		}
 	}
+	rt.reattachedRun = record.ID
 	reattached := *run
 	reattached.ReattachedAt = now()
 	rt.SetThread(func(t *protocol.Thread) { t.Run = &reattached })
