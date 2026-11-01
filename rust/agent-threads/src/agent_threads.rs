@@ -475,6 +475,11 @@ impl AgentThreads {
 
     /// Sends the agent a message: starts a turn, or steers the running one.
     pub async fn send(&self, thread_id: &str, text: &str, options: SendOptions) -> Result<()> {
+        // Checked as the protocol's schema has it (contentEncoding: base64) before anything is
+        // touched.
+        if let Some(i) = options.attachments.iter().position(|a| a.data.as_deref().is_some_and(|d| !is_base64(d))) {
+            return Err(Error::Command(format!("that isn't a valid command: attachments[{i}].data should be base64")));
+        }
         let message = Outgoing { text: text.to_string(), attachments: options.attachments, client_id: options.client_id };
         self.ready(thread_id).await?.call(move |a| a.core.send(message)).await
     }
@@ -790,6 +795,16 @@ async fn abandon(spawner: &Arc<dyn Spawner>, store: &Arc<dyn Store>, on_error: &
     if let Err(e) = store.put_run(&RunRecord { ended_at: Some(now_iso()), ..run }).await {
         on_error(Error::Store(e));
     }
+}
+
+/// Whether a string is base64 (the standard alphabet, padded), as the protocol's validator has it.
+fn is_base64(s: &str) -> bool {
+    let b = s.as_bytes();
+    if b.len() % 4 != 0 {
+        return false;
+    }
+    let pad = b.iter().rev().take_while(|&&c| c == b'=').count();
+    pad <= 2 && b[..b.len() - pad].iter().all(|c| c.is_ascii_alphanumeric() || *c == b'+' || *c == b'/')
 }
 
 fn cancel_resolution() -> Resolution {

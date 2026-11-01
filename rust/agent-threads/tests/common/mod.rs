@@ -109,3 +109,61 @@ pub fn compare(fixture: &str, events: &[Value], saved_only: bool) -> Result<(), 
         Err(format!("{}{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr)))
     }
 }
+
+/// Waits until `what` gives something, for up to `secs` seconds.
+pub async fn until<T, F: std::future::Future<Output = Option<T>>>(secs: u64, mut what: impl FnMut() -> F) -> T {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(secs);
+    loop {
+        if let Some(v) = what().await {
+            return v;
+        }
+        assert!(std::time::Instant::now() < deadline, "timed out");
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+}
+
+/// Waits until the thread is idle (or failed), with no message queued, and returns its snapshot
+/// as JSON.
+pub async fn settle(sdk: &agent_threads::AgentThreads, id: &str) -> Value {
+    until(10, || async {
+        let s = serde_json::to_value(sdk.snapshot(id).await.unwrap()).unwrap();
+        let status = s["thread"]["status"].as_str().unwrap_or("");
+        let queued = s["items"].as_array().unwrap().iter().any(|i| i["type"] == "user_message" && i["queued"] == true);
+        ((status == "idle" || status == "error") && !queued).then_some(s)
+    })
+    .await
+}
+
+/// A snapshot's items of a type.
+pub fn items<'a>(s: &'a Value, ty: &str) -> Vec<&'a Value> {
+    s["items"].as_array().unwrap().iter().filter(|i| i["type"] == ty).collect()
+}
+
+/// What the agent said, in order.
+pub fn texts(s: &Value) -> Vec<String> {
+    items(s, "assistant_message").iter().map(|i| i["text"].as_str().unwrap().to_string()).collect()
+}
+
+/// What each run of mini-claude or mini-codex was started with and sent, from its log.
+pub struct MiniRun {
+    pub argv: Vec<String>,
+    pub sent: Vec<Value>,
+    pub notes: Vec<Value>,
+}
+
+pub fn mini_runs(log: &Path) -> Vec<MiniRun> {
+    let Ok(text) = fs::read_to_string(log) else { return Vec::new() };
+    let mut out: Vec<MiniRun> = Vec::new();
+    for l in text.lines().filter(|l| !l.is_empty()) {
+        let v: Value = serde_json::from_str(l).unwrap();
+        if let Some(argv) = v.get("argv") {
+            let argv = argv.as_array().unwrap().iter().map(|a| a.as_str().unwrap().to_string()).collect();
+            out.push(MiniRun { argv, sent: Vec::new(), notes: Vec::new() });
+        } else if v.get("jsonrpc").is_some() || v.get("method").is_some() || v.get("id").is_some() || v.get("type").is_some() || v.get("result").is_some() {
+            out.last_mut().unwrap().sent.push(v);
+        } else {
+            out.last_mut().unwrap().notes.push(v);
+        }
+    }
+    out
+}
