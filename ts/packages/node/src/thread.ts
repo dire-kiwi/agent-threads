@@ -351,6 +351,8 @@ export class ThreadRuntime implements ThreadContext {
     if (!this.turn || this.turn.interrupted) return;
     this.turn.interrupted = true;
     this.session?.interrupt();
+    // No event says so, but a run that outlives the backend is saved with its turn.
+    if (this.#host.spawner.durable) this.#scheduleFlush();
   }
 
   /**
