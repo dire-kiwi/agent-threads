@@ -369,10 +369,18 @@ class CodexSession implements HarnessSession {
   interrupt(): void {
     const run = this.#live();
     if (!run) return;
-    run.withTurn((turnId) => {
-      if (turnId && !run.exited) void run.rpc.request("turn/interrupt", { threadId: run.threadId, turnId }).catch(() => {});
-    });
     this.#stopAfter(run, this.#o.stopGraceMs ?? 10_000);
+    const turn = this.#ctx.turnId;
+    const send = () => {
+      if (this.#live() !== run || run.detached || this.#ctx.turnId !== turn) return;
+      run.withTurn((turnId) => {
+        if (turnId && !run.exited) void run.rpc.request("turn/interrupt", { threadId: run.threadId, turnId }).catch(() => {});
+      });
+    };
+    // A run that outlives the backend is saved first, its turn interrupted and when it's stopped if
+    // the turn doesn't end: after a restart, one that Codex ignores the interrupt in is still stopped.
+    if (this.#ctx.spawner.durable) void this.#ctx.persist().then(send, send);
+    else send();
   }
 
   /** Stops the run if the turn running now hasn't ended in `ms`. */
@@ -480,8 +488,12 @@ class CodexSession implements HarnessSession {
     const l = st.launched;
     this.#stale = !!st.stale || !l || l.model !== t.model || l.effort !== t.effort || l.permission_mode !== t.permission_mode;
     // Codex's requests that were open: the user's questions are taken up again, an app tool that
-    // was running is answered (not run again), and the rest are dealt with again.
-    for (const [id, open] of [...run.open]) this.#reopen(run, id, open);
+    // was running is answered (not run again), and the rest are dealt with again. One answered
+    // before the restart, though that wasn't saved, is closed: Codex has its answer.
+    for (const [id, open] of [...run.open]) {
+      if (run.proc.answered?.(id)) run.open.delete(id);
+      else this.#reopen(run, id, open);
+    }
     if (st.stopAt !== undefined) this.#stopAfter(run, Math.max(0, st.stopAt - Date.now()));
     return true;
   }

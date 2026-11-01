@@ -22,7 +22,13 @@ export interface ShimOptions {
   runsDir: string;
   /** How long a finished run's directory is kept, for debugging. 14 days by default. */
   keepDays?: number;
-  /** How long a run that's stopped has to exit after SIGTERM before it's sent SIGKILL. 10s by default. */
+  /**
+   * How long a run that's stopped has to exit after SIGTERM before it's sent SIGKILL, for the runs
+   * the spawner stops itself: one nothing follows any more (found by prune(), or given up on with
+   * stop()), one in a newer format, one whose shim has gone, and a kill() with SIGTERM. 10s by
+   * default. A driver's own stops (an interrupted turn that doesn't end, close({ stop: true })) go
+   * by its closeGraceMs instead: SIGTERM that long after the input's closed, SIGKILL twice that.
+   */
   killGraceMs?: number;
   /** How often the output is read when nothing says it changed. 200ms by default. */
   pollMs?: number;
@@ -286,6 +292,10 @@ class ShimProcess implements HarnessProcess {
     } catch {
       // The run's gone; its exit says how.
     }
+  }
+
+  answered(id: string | number): boolean {
+    return this.#delivered.some((d) => d.answers === String(id));
   }
 
   closeInput(): void {
@@ -795,12 +805,16 @@ function stoppingAt(dir: string): number | undefined {
 /**
  * Signals the run's process group, if it's still the run's; after SIGTERM (or another signal),
  * SIGKILL to whatever is left of it after `grace`, even if the program itself has exited. That's
- * written down (`stopping`), so a backend that restarts before then carries on with it.
+ * written down (`stopping`), so a backend that restarts before then carries on with it. During a
+ * stop that's under way, its deadlines stand, and a SIGTERM it was still to send isn't sent again.
  */
 function terminate(dir: string, grace: number, signal: NodeJS.Signals = "SIGTERM"): void {
   const pid = liveGroup(dir);
   if (pid === undefined) return;
-  if (signal !== "SIGKILL" && stoppingAt(dir) === undefined) writeAtomic(dir, "stopping", JSON.stringify({ kill_at: Date.now() + grace }));
+  const was = readStopping(dir);
+  // A stop under way whose SIGTERM is still to come doesn't send it again: written down first.
+  if (signal === "SIGTERM" && was?.term_at !== undefined) writeAtomic(dir, "stopping", JSON.stringify({ kill_at: was.kill_at }));
+  else if (signal !== "SIGKILL" && !was) writeAtomic(dir, "stopping", JSON.stringify({ kill_at: Date.now() + grace }));
   signalGroup(pid, signal);
   if (signal !== "SIGKILL") escalate(dir);
 }

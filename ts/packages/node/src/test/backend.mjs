@@ -9,6 +9,7 @@
 // fake CLI. With TOOL_MARKER, there's an app
 // tool `lookup`, which appends a line to that file each time it runs, and then (with TOOL_HANG)
 // doesn't return. STOP_GRACE_MS and CLOSE_GRACE_MS are the drivers' stopGraceMs and closeGraceMs.
+// With SAVE_DELAY_MS, each save (appendEvents) takes that long.
 
 import { appendFileSync } from "node:fs";
 import { createInterface } from "node:readline";
@@ -20,8 +21,16 @@ const graces = {
   ...(env.STOP_GRACE_MS ? { stopGraceMs: Number(env.STOP_GRACE_MS) } : {}),
   ...(env.CLOSE_GRACE_MS ? { closeGraceMs: Number(env.CLOSE_GRACE_MS) } : {}),
 };
+const store = new FileStore(env.STORE);
+if (env.SAVE_DELAY_MS) {
+  const append = store.appendEvents.bind(store);
+  store.appendEvents = async (...args) => {
+    await new Promise((r) => setTimeout(r, Number(env.SAVE_DELAY_MS)));
+    return append(...args);
+  };
+}
 const sdk = new AgentThreads({
-  store: new FileStore(env.STORE),
+  store,
   harnesses: {
     claude: claudeCode({ bin: env.CLAUDE_BIN ?? env.FAKE_CLI, env: fakeEnv, ...graces }),
     codex: codex({ bin: env.CODEX_BIN ?? env.FAKE_CLI, env: fakeEnv, home: env.CODEX_HOME_DIR, login: false, ...graces }),
