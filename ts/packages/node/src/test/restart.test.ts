@@ -393,6 +393,52 @@ describe.skipIf(process.platform === "win32")("a backend restart", () => {
     await store.close();
   });
 
+  it.each([
+    ["claude", "an interrupt"],
+    ["codex", "an interrupt"],
+    ["claude", "close({stop: true})"],
+    ["codex", "close({stop: true})"],
+  ])("with %s, carries on stopping a run after a restart once %s has closed its input, before it was signalled", { timeout: 60_000 }, async (harness, how) => {
+    // A harness that doesn't exit when its input closes, nor when it's interrupted.
+    const s = mini({ STOP_GRACE_MS: "100", CLOSE_GRACE_MS: "1500" });
+    const a = s.start();
+    const thread = await a.call<{ id: string }>("create", { harness, cwd: s.dirs.cwd });
+    await a.call("handle", { type: "send", thread_id: thread.id, text: "stubborn" } satisfies Command);
+    await a.waitFor({ type: "turn.started" });
+    const [runId] = readdirSync(s.dirs.runs);
+    const runDir = join(s.dirs.runs, runId!);
+    await until(() => existsSync(join(runDir, "pid")));
+    // It has taken in the message, and ignores interrupts from now on.
+    await sleep(500);
+    if (how === "an interrupt") await a.call("handle", { type: "interrupt", thread_id: thread.id } satisfies Command);
+    else void a.call("close", { stop: true });
+    // It says something when its input closes, which is saved: the interrupt's grace is over by
+    // then, so that's saved without it.
+    await until(() => a.events.some((e) => JSON.stringify(e).includes("not stopping")));
+    if (how === "an interrupt") await a.call("saved", thread.id);
+    expect(existsSync(join(runDir, "input.closed"))).toBe(true);
+    await a.crash();
+    const pid = Number(readFileSync(join(runDir, "pid"), "utf8"));
+    const alive = () => {
+      try {
+        process.kill(pid, 0);
+        return true;
+      } catch {
+        return false;
+      }
+    };
+    expect(alive()).toBe(true);
+
+    const b = s.start();
+    expect(await b.call("recover")).toEqual({ reattached: [thread.id], lost: [] });
+    // SIGTERM when it was due, and the turn's over (interrupted, or stopped).
+    await until(() => !alive(), 10_000);
+    await b.waitFor({ type: "turn.completed" });
+    await until(() => !existsSync(join(runDir, "stopping")));
+    await b.call("close", { stop: true });
+    await b.exited;
+  });
+
   it("with Codex, serves the app's tools where Codex was told they are after two restarts in a row", { timeout: 60_000 }, async () => {
     // Without dynamic tools, so the app's tools are on the loopback MCP server.
     const marker = join(tempDir(), "marker");

@@ -30,6 +30,12 @@ export interface ProcessHandlers {
   stderr(line: string): void;
   /** It ended (or never started), after its last line. */
   exit(status: ExitStatus): void;
+  /**
+   * The ids of its requests the driver has yet to answer (Claude's control requests'
+   * `request_id`s, Codex's JSON-RPC request ids), for a process that outlives the backend: after a
+   * restart, an answer it was given before isn't given again while the driver may still answer.
+   */
+  unanswered?(): Iterable<string | number>;
 }
 
 export interface HarnessProcess {
@@ -51,6 +57,13 @@ export interface HarnessProcess {
   closeInput(): void;
   /** Signals it, and whatever it started (its process group, where there is one). */
   kill(signal?: NodeJS.Signals): void;
+  /**
+   * Stops it: closes its stdin, then SIGTERM in `grace` ms (at once with `now`) and SIGKILL in
+   * twice that, unless it has gone. A process that outlives the backend writes that down first,
+   * so a backend that restarts meanwhile carries on with it. Without this, the driver does it with
+   * closeInput() and kill().
+   */
+  stop?(grace: number, now?: boolean): void;
   /**
    * Stops following it and leaves it running, for a backend that's shutting down and will
    * re-attach (a process that outlives the backend only). No handler is called after this.

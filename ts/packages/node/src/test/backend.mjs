@@ -8,7 +8,7 @@
 // and CODEX_BIN run another `claude` or `codex` (mini-claude.mjs, mini-codex.mjs) instead of the
 // fake CLI. With TOOL_MARKER, there's an app
 // tool `lookup`, which appends a line to that file each time it runs, and then (with TOOL_HANG)
-// doesn't return.
+// doesn't return. STOP_GRACE_MS and CLOSE_GRACE_MS are the drivers' stopGraceMs and closeGraceMs.
 
 import { appendFileSync } from "node:fs";
 import { createInterface } from "node:readline";
@@ -16,11 +16,15 @@ import { AgentThreads, FileStore, claudeCode, codex, defineTool, shim } from "..
 
 const env = process.env;
 const fakeEnv = Object.fromEntries(Object.entries(env).filter(([k]) => k.startsWith("AGENT_THREADS_FIXTURE")));
+const graces = {
+  ...(env.STOP_GRACE_MS ? { stopGraceMs: Number(env.STOP_GRACE_MS) } : {}),
+  ...(env.CLOSE_GRACE_MS ? { closeGraceMs: Number(env.CLOSE_GRACE_MS) } : {}),
+};
 const sdk = new AgentThreads({
   store: new FileStore(env.STORE),
   harnesses: {
-    claude: claudeCode({ bin: env.CLAUDE_BIN ?? env.FAKE_CLI, env: fakeEnv }),
-    codex: codex({ bin: env.CODEX_BIN ?? env.FAKE_CLI, env: fakeEnv, home: env.CODEX_HOME_DIR, login: false }),
+    claude: claudeCode({ bin: env.CLAUDE_BIN ?? env.FAKE_CLI, env: fakeEnv, ...graces }),
+    codex: codex({ bin: env.CODEX_BIN ?? env.FAKE_CLI, env: fakeEnv, home: env.CODEX_HOME_DIR, login: false, ...graces }),
   },
   permissions: env.POLICY ?? "allow",
   tools: env.TOOL_MARKER

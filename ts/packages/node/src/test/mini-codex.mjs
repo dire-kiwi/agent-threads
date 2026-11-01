@@ -24,6 +24,8 @@
 //   sub <prompt>        spawns a subagent (a child thread), which replies, and waits for it
 //   sleep <ms>          waits (or until it's interrupted)
 //   slow                waits for an interrupt
+//   stubborn            ignores interrupts, and a closed stdin (saying "not stopping"), until it's
+//                       signalled
 //   warn <text>         a warning notification
 //   retry               an error that will be retried
 //   fail <text>         an error, and the turn fails
@@ -63,6 +65,7 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 let thread = null; // { id, totals, params, dynamicTools }
 let extraRoots = [];
 let turn = null; // { id, interrupted, wake, heard }
+let stubborn = false;
 
 const sessions = home && join(home, "mini-sessions");
 function save() {
@@ -296,6 +299,11 @@ async function step(line) {
       return wait(Number(arg));
     case "slow":
       return wait();
+    case "stubborn":
+      stubborn = true;
+      // Running with nothing else to do once its stdin's closed.
+      setInterval(() => {}, 60_000);
+      return new Promise(() => {});
     case "warn":
       return notify("warning", { threadId: thread.id, message: arg });
     case "retry":
@@ -396,7 +404,7 @@ createInterface({ input: process.stdin })
         return;
       case "turn/interrupt":
         reply({});
-        if (turn && p.turnId === turn.id) {
+        if (turn && p.turnId === turn.id && !stubborn) {
           turn.interrupted = true;
           turn.wake?.();
         }
@@ -408,4 +416,7 @@ createInterface({ input: process.stdin })
         return fail(`unknown method ${m.method}`);
     }
   })
-  .on("close", () => process.exit(0));
+  .on("close", () => {
+    if (!stubborn) process.exit(0);
+    message("not stopping");
+  });

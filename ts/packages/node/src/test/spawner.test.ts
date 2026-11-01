@@ -109,6 +109,46 @@ describe.skipIf(process.platform === "win32")("shim()", () => {
     expect(a.exit()).toBeUndefined();
   });
 
+  it("after re-attaching, doesn't answer again a request it answered before, while it may still be answered", async () => {
+    const { runsDir, spawner, run } = setup();
+    const a = run("while read -r x; do echo \"$x\"; done");
+    const answer = (id: string, behavior: string) => JSON.stringify({ type: "control_response", response: { subtype: "success", request_id: id, response: { behavior } } });
+    const input = () => readFileSync(join(runsDir, "run_1", "input.jsonl"), "utf8");
+    // Saved before these were written.
+    const saved = a.proc.inputOffset!;
+    a.proc.write("hello");
+    a.proc.write(answer("r1", "allow"));
+    a.proc.write(answer("r2", "allow"));
+    expect(await wait(() => a.lines.length === 3)).toBe(true);
+    a.proc.detach!();
+
+    // Re-attached past all the output: lines written before aren't written again, but the answer
+    // to r1, which the driver still has open (a user asked again, say), is kept until it's answered.
+    const open = new Set(["r1"]);
+    const offset = readFileSync(join(runsDir, "run_1", "out.jsonl")).length;
+    const b = spawner.attach!({ id: "run_1", thread_id: "th", spawner: "shim", offset, started_at: "", data: { input: saved } }, { line: () => {}, stderr: () => {}, exit: () => {}, unanswered: () => open });
+    await new Promise((r) => setTimeout(r, 100));
+    const r1 = saved + Buffer.byteLength("hello\n");
+    expect(b.inputOffset).toBe(r1);
+    const before = input();
+    b.write(answer("r2", "deny"));
+    expect(input()).toBe(before + answer("r2", "deny") + "\n");
+    // Answered otherwise this time: Claude has its answer already.
+    b.write(answer("r1", "deny"));
+    expect(input()).toBe(before + answer("r2", "deny") + "\n");
+    expect(b.inputOffset).toBe(Buffer.byteLength(input()));
+
+    // Re-attached again from before r1's answer: one whose request is closed meanwhile (cancelled,
+    // say) is let go of.
+    b.detach!();
+    const c = spawner.attach!({ id: "run_1", thread_id: "th", spawner: "shim", offset, started_at: "", data: { input: r1 } }, { line: () => {}, stderr: () => {}, exit: () => {}, unanswered: () => open });
+    await new Promise((r) => setTimeout(r, 100));
+    expect(c.inputOffset).toBe(r1);
+    open.delete("r1");
+    expect(c.inputOffset).toBe(Buffer.byteLength(input()));
+    c.closeInput();
+  });
+
   it("stops the run's whole process group", async () => {
     const { runsDir, run } = setup();
     const p = run("sleep 30 & echo $!; wait");

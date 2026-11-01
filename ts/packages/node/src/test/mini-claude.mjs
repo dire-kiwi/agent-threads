@@ -10,7 +10,8 @@
 //   sleep <ms> <text>     waits (or until it's interrupted), then replies with <text> and ends the turn
 //   cancelled <tool>      asks can_use_tool, then cancels the request and ends the turn
 //   slow                  waits for an interrupt, then ends the turn as interrupted
-//   stubborn              ignores interrupts (and a closed stdin), until it's signalled
+//   stubborn              ignores interrupts, and a closed stdin (saying "not stopping"), until
+//                         it's signalled
 //   crash                 writes to stderr and exits with code 3
 //   sleepcrash <ms>       waits, then crashes
 //   streamcrash <text>    streams <text> (deltas, no final message), then crashes
@@ -98,6 +99,7 @@ createInterface({ input: process.stdin })
   })
   .on("close", () => {
     if (!stubborn) process.exit(0);
+    say("not stopping");
   });
 
 let msgs = 0;
@@ -179,6 +181,8 @@ async function step(text) {
     say(`app said ${res.content[0].text}`);
   } else if (cmd === "slow" || cmd === "stubborn") {
     stubborn = cmd === "stubborn";
+    // Running with nothing else to do once its stdin's closed.
+    if (stubborn) setInterval(() => {}, 60_000);
     await new Promise((r) => (interrupted = r));
   } else if (cmd === "streamcrash" || cmd === "streamhang") {
     const id = `msg_${process.pid}_${++msgs}`;

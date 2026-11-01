@@ -598,15 +598,22 @@ class CodexSession implements HarnessSession {
   #stop(run: Run, retire: boolean, now = false): Promise<void> {
     if (retire) run.retired = true;
     if (run.exited) return run.done;
-    run.proc?.closeInput();
     const grace = this.#o.closeGraceMs ?? 5_000;
-    if (now) run.proc?.kill("SIGTERM");
-    const term = setTimeout(() => run.proc?.kill("SIGTERM"), grace);
-    const kill = setTimeout(() => run.proc?.kill("SIGKILL"), grace * 2);
-    const stopped = run.done.then(() => {
-      clearTimeout(term);
-      clearTimeout(kill);
-    });
+    let stopped: Promise<void>;
+    if (run.proc?.stop) {
+      // Written down by a process that outlives the backend, so it's carried on after a restart.
+      run.proc.stop(grace, now);
+      stopped = run.done;
+    } else {
+      run.proc?.closeInput();
+      if (now) run.proc?.kill("SIGTERM");
+      const term = setTimeout(() => run.proc?.kill("SIGTERM"), grace);
+      const kill = setTimeout(() => run.proc?.kill("SIGKILL"), grace * 2);
+      stopped = run.done.then(() => {
+        clearTimeout(term);
+        clearTimeout(kill);
+      });
+    }
     if (retire) {
       const prev = this.#stopping;
       const all = Promise.all([prev, stopped]).then(() => {
@@ -807,6 +814,7 @@ class CodexSession implements HarnessSession {
         if (run.stderr.length > 20) run.stderr.shift();
       },
       exit: (status) => this.#exited(run, status),
+      unanswered: () => run.open.keys(),
     };
   }
 

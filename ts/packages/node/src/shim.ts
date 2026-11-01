@@ -187,9 +187,13 @@ class ShimProcess implements HarnessProcess {
    * Lines in input.jsonl after the checkpoint it was re-attached from (and where each starts), in
    * order, that reading the output again hasn't written again yet.
    */
-  #delivered: { text: string; at: number }[] = [];
-  /** How much of out.jsonl there was when it was re-attached to: once that's read, nothing's written again. */
+  #delivered: { text: string; at: number; answers?: string }[] = [];
+  /**
+   * How much of out.jsonl there was when it was re-attached to: once that's read, nothing's written
+   * again but answers to requests the driver has yet to answer.
+   */
   #outAtAttach = 0;
+  #caughtUp = false;
   /** The shim's identity, once it's been checked to be the run's. */
   #shim: { identity?: Identity } = {};
   #over = false;
@@ -205,7 +209,7 @@ class ShimProcess implements HarnessProcess {
         if (o.input !== undefined) {
           let at = Math.min(o.input, all.length);
           for (const text of all.subarray(at).toString("utf8").split(/(?<=\n)/)) {
-            if (text.endsWith("\n")) this.#delivered.push({ text, at });
+            if (text.endsWith("\n")) this.#delivered.push({ text, at, ...answering(text) });
             at += Buffer.byteLength(text);
           }
         }
@@ -213,6 +217,9 @@ class ShimProcess implements HarnessProcess {
       } catch {
         // None.
       }
+      this.#inputClosed = existsSync(join(dir, "input.closed"));
+      // Being stopped when the backend went: it's carried on with.
+      if (readStopping(dir)) escalate(dir);
     }
     this.#offset = offset;
     this.#handlers = handlers;
@@ -255,7 +262,8 @@ class ShimProcess implements HarnessProcess {
   /** How much of input.jsonl is written (bytes): a checkpoint keeps it, as of the driver's state. */
   get inputOffset(): number {
     // Not past a line that's to be written again (and isn't): a restart before it is must know it's
-    // there.
+    // there. (An answer's kept only while its request's open.)
+    if (this.#caughtUp) this.#retire();
     return this.#delivered[0]?.at ?? this.#input;
   }
 
@@ -265,7 +273,11 @@ class ShimProcess implements HarnessProcess {
     // Written already, after the checkpoint this run was re-attached from: what's read again since
     // writes it again, and it isn't.
     // The first (in order) of those it's the same as.
-    const at = this.#delivered.findIndex((d) => d.text === text);
+    let at = this.#delivered.findIndex((d) => d.text === text);
+    // An answer to a request that was answered already (another way, by a user asked again, say):
+    // the harness has its answer.
+    const { answers } = answering(text);
+    if (at < 0 && answers !== undefined) at = this.#delivered.findIndex((d) => d.answers === answers);
     if (at >= 0) return void this.#delivered.splice(at, 1);
     try {
       // One write, so the shim never relays half a line.
@@ -284,6 +296,12 @@ class ShimProcess implements HarnessProcess {
     } catch {
       // As above.
     }
+  }
+
+  stop(grace: number, now = false): void {
+    if (this.#over) return;
+    this.#inputClosed = true;
+    beginStop(this.dir, now ? 0 : grace, grace * 2);
   }
 
   kill(signal: NodeJS.Signals = "SIGTERM"): void {
@@ -327,6 +345,17 @@ class ShimProcess implements HarnessProcess {
     this.#onDone();
   }
 
+  /**
+   * Forgets the lines written before the restart that won't be written again: all of them but the
+   * answers to requests the driver has yet to answer.
+   */
+  #retire(): void {
+    if (!this.#delivered.length) return;
+    const open = new Set<string>();
+    for (const id of this.#handlers.unanswered?.() ?? []) open.add(String(id));
+    this.#delivered = this.#delivered.filter((d) => d.answers !== undefined && open.has(d.answers));
+  }
+
   #nudge(): void {
     if (this.#over || this.#wake) return;
     this.#wake = true;
@@ -357,7 +386,10 @@ class ShimProcess implements HarnessProcess {
     }
     // What was there when it was re-attached to is read again, and what that writes is written (in
     // the same tick, or the next): lines written before that aren't written again now.
-    if (this.#delivered.length && this.#offset >= this.#outAtAttach) setImmediate(() => (this.#delivered = []));
+    if (!this.#caughtUp && this.#offset >= this.#outAtAttach) {
+      this.#caughtUp = true;
+      setImmediate(() => this.#retire());
+    }
     if (this.#signals.length && this.pid !== undefined) for (const s of this.#signals.splice(0)) terminate(this.dir, this.#grace, s);
     if (exited) return this.#exited(readExit(this.dir));
     const gone = this.#gone();
@@ -492,6 +524,25 @@ function readExit(dir: string): ExitStatus {
   const code = typeof e.code === "number" ? e.code : null;
   const signal = typeof e.signal === "number" ? signalName(e.signal) : typeof e.signal === "string" ? e.signal : null;
   return { code, signal, ...(typeof e.error === "string" ? { error: new Error(e.error) } : {}) };
+}
+
+/**
+ * Which of the harness's requests an input line answers, if it's an answer: a Claude
+ * `control_response`'s `request_id`, or a JSON-RPC response's `id` (Codex's).
+ */
+function answering(line: string): { answers?: string } {
+  try {
+    const m = JSON.parse(line);
+    if (!m || typeof m !== "object") return {};
+    if (m.type === "control_response") {
+      const id = m.response?.request_id;
+      return typeof id === "string" || typeof id === "number" ? { answers: String(id) } : {};
+    }
+    if ((typeof m.id === "string" || typeof m.id === "number") && !("method" in m) && ("result" in m || "error" in m)) return { answers: String(m.id) };
+  } catch {
+    // Not JSON.
+  }
+  return {};
 }
 
 /** Writes a run directory's file whole, as the shim does. */
@@ -722,14 +773,23 @@ function groupExists(pgid: number): boolean {
   }
 }
 
-/** When a run being stopped gets SIGKILL (its `stopping` file), if it's being stopped. */
-function stoppingAt(dir: string): number | undefined {
+/**
+ * A run being stopped (its `stopping` file): when its group gets SIGTERM, if it hasn't yet, and
+ * when SIGKILL.
+ */
+function readStopping(dir: string): { term_at?: number; kill_at: number } | undefined {
   try {
-    const at = JSON.parse(readFileSync(join(dir, "stopping"), "utf8")).kill_at;
-    return typeof at === "number" ? at : undefined;
+    const s = JSON.parse(readFileSync(join(dir, "stopping"), "utf8"));
+    if (typeof s.kill_at !== "number") return undefined;
+    return typeof s.term_at === "number" ? { term_at: s.term_at, kill_at: s.kill_at } : { kill_at: s.kill_at };
   } catch {
     return undefined;
   }
+}
+
+/** When a run being stopped gets SIGKILL, if it's being stopped. */
+function stoppingAt(dir: string): number | undefined {
+  return readStopping(dir)?.kill_at;
 }
 
 /**
@@ -745,34 +805,88 @@ function terminate(dir: string, grace: number, signal: NodeJS.Signals = "SIGTERM
   if (signal !== "SIGKILL") escalate(dir);
 }
 
-/** Runs whose groups this backend is waiting to SIGKILL. */
+/**
+ * Stops a run: ends its input, then SIGTERM to its group in `term` ms (if it's still there) and
+ * SIGKILL in `kill`. It's written down first (`stopping`, with both deadlines), so a backend that
+ * restarts meanwhile carries on with it. A stop already under way only ever comes sooner.
+ */
+function beginStop(dir: string, term: number, kill: number): void {
+  const now = Date.now();
+  const was = readStopping(dir);
+  // Once SIGTERM's gone (no term_at), it isn't sent again.
+  const termAt = was && was.term_at === undefined ? undefined : Math.min(was?.term_at ?? Infinity, now + term);
+  const killAt = Math.min(was?.kill_at ?? Infinity, now + kill);
+  writeAtomic(dir, "stopping", JSON.stringify(termAt === undefined ? { kill_at: killAt } : { term_at: termAt, kill_at: killAt }));
+  try {
+    writeFileSync(join(dir, "input.closed"), "");
+  } catch {
+    return; // Its directory's gone.
+  }
+  escalate(dir);
+}
+
+/** Runs whose groups this backend is waiting to SIGTERM or SIGKILL. */
 const escalating = new Set<string>();
 
 /**
- * Waits for a run's group that's being stopped (it has `stopping`) to go, and SIGKILLs what's
- * left of it at its deadline. Its timers keep the backend running until then, so shutting down
- * doesn't leave it; a backend killed meanwhile carries on after it restarts (in prune()).
+ * Carries on stopping a run (it has `stopping`): SIGTERM to its group at `term_at`, SIGKILL to
+ * what's left of it at `kill_at`, each only if the group is still the run's, until it has gone.
+ * A run its shim hasn't started yet is waited for (while its shim may still start it); one whose
+ * shim has gone gets the `exit` the shim would have written. Its timers keep the backend running
+ * until then, so shutting down doesn't leave it; a backend killed meanwhile carries on after it
+ * restarts (when it re-attaches, or in prune()).
  */
 function escalate(dir: string): void {
   if (escalating.has(dir)) return;
   escalating.add(dir);
+  let checked = false;
   const done = () => {
     rmSync(join(dir, "stopping"), { force: true });
     escalating.delete(dir);
   };
   const step = (): void => {
-    const at = stoppingAt(dir);
+    const s = readStopping(dir);
+    if (!s) return void escalating.delete(dir);
     const pid = readPid(dir, "pid");
-    if (at === undefined) return void escalating.delete(dir);
-    if (pid === undefined || !groupExists(pid)) return done();
-    if (Date.now() >= at) {
+    const exited = existsSync(join(dir, "exit"));
+    if (pid === undefined) {
+      const shim = readPid(dir, "shim.pid") !== undefined;
+      const never = exited || (shim ? !shimAlive(dir) : Date.now() - startedAt(dir) > START_TIMEOUT_MS);
+      return never ? done() : void setTimeout(step, 50);
+    }
+    if (!groupExists(pid)) return done();
+    if (!checked) {
+      checked = true;
+      if (!exited && !shimAlive(dir)) writeExit(dir, { code: null, signal: null, error: "its supervisor (agent-threads-shim) went away" });
+    }
+    const now = Date.now();
+    if (now >= s.kill_at) {
       const group = liveGroup(dir);
       if (group !== undefined) signalGroup(group, "SIGKILL");
       return done();
     }
-    setTimeout(step, Math.min(100, at - Date.now()));
+    if (s.term_at !== undefined && now >= s.term_at) {
+      // Written down first: it's sent once.
+      writeAtomic(dir, "stopping", JSON.stringify({ kill_at: s.kill_at }));
+      const group = liveGroup(dir);
+      if (group !== undefined) signalGroup(group, "SIGTERM");
+    }
+    const next = s.term_at !== undefined && s.term_at > now ? s.term_at : s.kill_at;
+    setTimeout(step, Math.max(0, Math.min(100, next - now)));
   };
   step();
+}
+
+/** When the run was started (run.json written), as near as can be told. */
+function startedAt(dir: string): number {
+  for (const name of ["run.json", "."]) {
+    try {
+      return statSync(join(dir, name)).mtimeMs;
+    } catch {
+      // The next.
+    }
+  }
+  return 0;
 }
 
 /**
@@ -781,23 +895,5 @@ function escalate(dir: string): void {
  * has gone gets the `exit` the shim would have written.
  */
 function stopDir(dir: string, grace: number): void {
-  try {
-    writeFileSync(join(dir, "input.closed"), "");
-  } catch {
-    return; // Its directory's gone.
-  }
-  const deadline = Date.now() + START_TIMEOUT_MS;
-  const step = (): void => {
-    const exited = existsSync(join(dir, "exit"));
-    const shim = shimAlive(dir);
-    if (readPid(dir, "pid") === undefined) {
-      // Not started yet: waited for while the shim may still start it.
-      const never = exited || (readPid(dir, "shim.pid") !== undefined && !shim) || Date.now() > deadline || !existsSync(dir);
-      if (!never) setTimeout(step, 50);
-      return;
-    }
-    if (!exited && !shim) writeExit(dir, { code: null, signal: null, error: "its supervisor (agent-threads-shim) went away" });
-    terminate(dir, grace);
-  };
-  step();
+  beginStop(dir, 0, grace);
 }

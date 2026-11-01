@@ -49,7 +49,7 @@ If the program can't be started, the shim writes `exit` with an `error` and exit
 | `out.jsonl` | the program (its stdout) | Its output, appended. A harness writes one JSON message a line. |
 | `err.log` | the program (its stderr) | Its stderr, appended. |
 | `exit` | shim; or a backend that finds the shim gone | How the run ended: `{"code": 0, "signal": null}`. `code` is the exit code or `null`, `signal` the number of the signal that killed it or `null`, and `error` (optional) why it didn't start or why its end is unknown. |
-| `stopping` | backend | The run is being stopped: `{"kill_at": ...}`, when its group gets SIGKILL (see [Stopping a run](#stopping-a-run)). |
+| `stopping` | backend | The run is being stopped: `{"term_at": ..., "kill_at": ...}`, when its group gets SIGTERM (until it has) and SIGKILL (see [Stopping a run](#stopping-a-run)). |
 | `.<name>.tmp` | shim, backend | A file being written, which is renamed over `<name>`: ignore it. |
 
 `shim.pid`, `pid` and `exit` are written whole and then renamed into place, so a reader never sees
@@ -103,11 +103,15 @@ what was written, so the backend saves with the offset how much of `input.jsonl`
 (the Node backend's `input`, in bytes). After a restart, the lines after that are written already:
 until it has written each of them again, a line it would write that's the same as one of them
 (byte for byte; the first of them, in order, that it's the same as) is taken to be that one, and
-isn't written again. Until then, what it saves as written goes no further than the first of those
-lines it hasn't written again, so a backend that's killed again before it has still knows they're
-there. Once it has read again all the output there was when it re-attached (and written what that
-writes), the rest won't be written again: they're forgotten. Whatever it's killed in the middle of,
-however many times, nothing that's in `input.jsonl` is written to it twice.
+isn't written again. An answer to one of the harness's requests (a Claude `control_response`, a
+JSON-RPC response) is taken to be one of them that answers the same request (by its id) even if
+it's not the same: the harness has had its answer. Until then, what it saves as written goes no
+further than the first of those lines it hasn't written again, so a backend that's killed again
+before it has still knows they're there. Once it has read again all the output there was when it
+re-attached (and written what that writes), the rest won't be written again, and are forgotten,
+except answers to requests it may still answer (asked of a user again, say), which are kept until
+it does, or the request is closed otherwise. Whatever it's killed in the middle of, however many
+times, nothing that's in `input.jsonl` is written to it twice, and no request is answered twice.
 
 ## A run whose shim is gone
 
@@ -149,8 +153,8 @@ To stop a run, a backend first asks the harness, in the harness's own protocol o
 `input.closed`, which a harness takes as the end of its input; then, if the run hasn't ended after a
 grace period, sends SIGTERM to the program's process group (`kill(-pid, SIGTERM)`, `pid` from
 `pid`), and SIGKILL if it still hasn't. (The Node backend's graces are its drivers'
-`stopGraceMs` and `closeGraceMs`.) A run nothing will follow any more is stopped from the second
-step. Signalling the group stops whatever the program started too, and the SIGKILL goes to
+`stopGraceMs` and `closeGraceMs`: SIGTERM `closeGraceMs` after `input.closed`, SIGKILL twice that.) A
+run nothing will follow any more is stopped from the second step, with SIGTERM straight away. Signalling the group stops whatever the program started too, and the SIGKILL goes to
 whatever is left of the group after the grace even if the program itself has exited (it may have
 left children that ignore SIGTERM). A backend never signals the shim: it writes `exit` once the
 program has gone.
@@ -174,12 +178,16 @@ either:
 If it can't tell (a `ps` that doesn't give session ids, say), it sends nothing.
 
 Stopping takes a while, and the backend may stop or restart meanwhile, so it writes down that it's
-stopping a run before it sends SIGTERM: a `stopping` file, `{"kill_at": <ms since the epoch>}`, when
-the SIGKILL is due. Until the group has gone and the file is removed, a backend keeps the run's
-directory, and one that starts carries on with it (whatever the store says about the run, and
-whether or not it has `exit`): at `kill_at` it sends SIGKILL to whatever is left of the group (if
-it's still the run's, as above), then removes `stopping`. A backend that shuts down meanwhile waits
-for that first.
+stopping a run before it writes `input.closed` (or, stopping a run without closing its input, before
+it sends SIGTERM): a `stopping` file, `{"term_at": <ms since the epoch>, "kill_at": <ms>}`, when
+SIGTERM and SIGKILL are due. Once it has sent SIGTERM, it writes `stopping` again without `term_at`
+(so it's sent once); `{"kill_at": ...}` alone is a stop that has. A stop that's asked for while one is
+under way only brings its deadlines sooner. Until the group has gone and the file is removed, a
+backend keeps the run's directory, and one that starts (or re-attaches to the run) carries on with
+it, whatever the store says about the run, and whether or not it has `exit`: at `term_at` it sends
+SIGTERM to the group, and at `kill_at` SIGKILL to whatever is left of it (each only if it's still
+the run's, as above, and the run's waited for if it has no `pid` yet), then removes `stopping`. A
+backend that shuts down meanwhile waits for that first.
 
 ## Re-attaching
 
