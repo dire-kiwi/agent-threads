@@ -83,6 +83,10 @@ type DurableProcess interface {
 	// twice that, unless it has gone. That's written down first, so a backend that restarts
 	// meanwhile carries on with it.
 	Stop(graceMs int64, now bool)
+	// Answered says whether an answer to its request id was written to its input already, after the
+	// checkpoint it was re-attached from (and before the backend restarted): the harness has it, so
+	// the request isn't asked again.
+	Answered(id string) bool
 	// Detach stops following it and leaves it running, for a backend that's shutting down and will
 	// re-attach. No handler is called after this.
 	Detach()

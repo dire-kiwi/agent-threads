@@ -482,8 +482,20 @@ func (s *claudeSession) Interrupt() {
 	if run == nil {
 		return
 	}
-	run.control(map[string]any{"subtype": "interrupt"}, func(jmap) {})
 	s.stopAfter(run, orDuration(s.o.StopGrace, 10*time.Second))
+	turn := s.ctx.TurnID()
+	send := func(error) {
+		if s.live() == run && !run.detached && s.ctx.TurnID() == turn {
+			run.control(map[string]any{"subtype": "interrupt"}, func(jmap) {})
+		}
+	}
+	// A run that outlives the backend is saved first, its turn interrupted and when it's stopped if
+	// the turn doesn't end: after a restart, one that Claude ignores the interrupt in is still stopped.
+	if _, durable := s.ctx.Spawner().(DurableSpawner); durable {
+		s.ctx.Persist(send)
+		return
+	}
+	send(nil)
 }
 
 // stopAfter stops the run if the turn running now hasn't ended in d.
@@ -586,9 +598,12 @@ func (s *claudeSession) Reattach(record RunRecord) bool {
 	l := st.Launched
 	s.stale = st.Stale || l == nil || *l != *launchedOf(t)
 	// Claude's requests that were open: the user's questions are taken up again, and the rest (a
-	// policy that hadn't decided, a tool that was running) are dealt with again.
+	// policy that hadn't decided, a tool that was running) are dealt with again. One answered before
+	// the restart, though that wasn't saved, is closed: Claude has its answer.
 	for _, id := range append([]string(nil), run.openOrder...) {
-		if o := run.open[id]; o != nil {
+		if s.answered(run, id) {
+			run.dropOpen(id)
+		} else if o := run.open[id]; o != nil {
 			s.reopen(run, id, o)
 		}
 	}
@@ -618,6 +633,12 @@ func (s *claudeSession) Detach() bool {
 	dp.Detach()
 	run.abort()
 	return true
+}
+
+// answered says whether an answer to Claude's request id was written before the backend restarted.
+func (s *claudeSession) answered(run *claudeRun, id string) bool {
+	dp, ok := run.proc.(DurableProcess)
+	return ok && dp.Answered(id)
 }
 
 // reopen deals with a request of Claude's that was open when the backend restarted.
@@ -1102,6 +1123,11 @@ func (s *claudeSession) message(run *claudeRun, m jmap) {
 	case "user":
 		s.user(run, m)
 	case "control_request":
+		// Read again after a restart, and answered before it (though that wasn't saved): Claude has
+		// its answer, and the user isn't asked again.
+		if s.answered(run, m.str("request_id")) {
+			return
+		}
 		s.controlRequest(run, m.str("request_id"), orObj(m.obj("request")))
 	case "control_cancel_request":
 		// It no longer wants an answer, including one a policy is still working out.

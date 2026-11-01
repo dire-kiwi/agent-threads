@@ -385,6 +385,15 @@ func (p *shimProcess) Write(line string) {
 	p.nudge()
 }
 
+func (p *shimProcess) Answered(id string) bool {
+	for _, d := range p.delivered {
+		if d.answers != "" && d.answers == id {
+			return true
+		}
+	}
+	return false
+}
+
 func (p *shimProcess) CloseInput() {
 	if p.inputClosed {
 		return
@@ -870,13 +879,19 @@ func (e *escalator) wait(ctx context.Context) error {
 
 // terminate signals the run's process group, if it's still the run's; after SIGTERM (or another
 // signal), SIGKILL to whatever is left of it after grace, even if the program itself has exited.
-// That's written down (stopping), so a backend that restarts before then carries on with it.
+// That's written down (stopping), so a backend that restarts before then carries on with it. During
+// a stop that's under way, its deadlines stand, and a SIGTERM it was still to send isn't sent again.
 func (e *escalator) terminate(dir string, grace time.Duration, sig syscall.Signal) {
 	pid := liveGroup(dir)
 	if pid == 0 {
 		return
 	}
-	if sig != syscall.SIGKILL && readStopping(dir) == nil {
+	was := readStopping(dir)
+	switch {
+	case sig == syscall.SIGTERM && was != nil && was.TermAt != nil:
+		// A stop under way whose SIGTERM is still to come doesn't send it again: written down first.
+		writeAtomic(dir, "stopping", mustJSON(stoppingFile{KillAt: was.KillAt}))
+	case sig != syscall.SIGKILL && was == nil:
 		writeAtomic(dir, "stopping", mustJSON(stoppingFile{KillAt: time.Now().Add(grace).UnixMilli()}))
 	}
 	syscall.Kill(-pid, sig)

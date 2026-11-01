@@ -451,12 +451,25 @@ func (s *codexSession) Interrupt() {
 	if run == nil {
 		return
 	}
-	run.withTurn(func(turnID string) {
-		if turnID != "" && !run.exited {
-			run.rpc.request("turn/interrupt", map[string]any{"threadId": run.threadID, "turnId": turnID}, nil, nil, nil)
-		}
-	})
 	s.stopAfter(run, orDuration(s.o.StopGrace, 10*time.Second))
+	turn := s.ctx.TurnID()
+	send := func(error) {
+		if s.live() != run || run.detached || s.ctx.TurnID() != turn {
+			return
+		}
+		run.withTurn(func(turnID string) {
+			if turnID != "" && !run.exited {
+				run.rpc.request("turn/interrupt", map[string]any{"threadId": run.threadID, "turnId": turnID}, nil, nil, nil)
+			}
+		})
+	}
+	// A run that outlives the backend is saved first, its turn interrupted and when it's stopped if
+	// the turn doesn't end: after a restart, one that Codex ignores the interrupt in is still stopped.
+	if _, durable := s.ctx.Spawner().(DurableSpawner); durable {
+		s.ctx.Persist(send)
+		return
+	}
+	send(nil)
 }
 
 // stopAfter stops the run if the turn running now hasn't ended in d.
@@ -606,9 +619,12 @@ func (s *codexSession) Reattach(record RunRecord) bool {
 	l := st.Launched
 	s.stale = st.Stale || l == nil || *l != *launchedOf(ctx.Thread())
 	// Codex's requests that were open: the user's questions are taken up again, an app tool that was
-	// running is answered (not run again), and the rest are dealt with again.
+	// running is answered (not run again), and the rest are dealt with again. One answered before the
+	// restart, though that wasn't saved, is closed: Codex has its answer.
 	for _, key := range append([]string(nil), run.openOrder...) {
-		if o := run.open[key]; o != nil {
+		if s.answered(run, json.RawMessage(key)) {
+			run.dropOpen(key)
+		} else if o := run.open[key]; o != nil {
 			s.reopen(run, key, o)
 		}
 	}
@@ -634,6 +650,12 @@ func (s *codexSession) Detach() bool {
 	run.abort()
 	run.mcp.close()
 	return true
+}
+
+// answered says whether an answer to Codex's request id was written before the backend restarted.
+func (s *codexSession) answered(run *codexRun, id json.RawMessage) bool {
+	dp, ok := run.proc.(DurableProcess)
+	return ok && dp.Answered(rpcIDString(id))
 }
 
 // reopen deals with a request of Codex's that was open when the backend restarted.
@@ -1208,8 +1230,12 @@ func (s *codexSession) line(run *codexRun, line string) {
 		}
 		return
 	}
-	if m.raw("id") != nil {
-		s.request(run, m, nil)
+	if id := m.raw("id"); id != nil {
+		// A request read again after a restart, and answered before it (though that wasn't saved):
+		// Codex has its answer, and the user isn't asked again.
+		if !s.answered(run, id) {
+			s.request(run, m, nil)
+		}
 	} else {
 		s.notification(run, m)
 	}

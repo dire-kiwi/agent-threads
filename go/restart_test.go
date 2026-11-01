@@ -16,6 +16,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"syscall"
@@ -46,9 +47,21 @@ func runBackend() {
 			fake[k] = v
 		}
 	}
-	store, err := agentthreads.NewFileStore(env("STORE"))
+	fileStore, err := agentthreads.NewFileStore(env("STORE"))
 	if err != nil {
 		panic(err)
+	}
+	var store agentthreads.Store = fileStore
+	// With SAVE_DELAY_MS, each save (AppendEvents) takes that long.
+	if ms, _ := strconv.Atoi(env("SAVE_DELAY_MS")); ms > 0 {
+		store = slowStore{fileStore, time.Duration(ms) * time.Millisecond}
+	}
+	ms := func(k string) time.Duration { n, _ := strconv.Atoi(env(k)); return time.Duration(n) * time.Millisecond }
+	or := func(k, def string) string {
+		if v := env(k); v != "" {
+			return v
+		}
+		return def
 	}
 	var policy agentthreads.PermissionPolicy = agentthreads.Allow
 	if env("POLICY") == "ask" {
@@ -63,8 +76,8 @@ func runBackend() {
 	sdk := agentthreads.New(agentthreads.Options{
 		Store: store,
 		Harnesses: map[string]agentthreads.Harness{
-			"claude": agentthreads.ClaudeCode(agentthreads.ClaudeOptions{Bin: env("FAKE_CLI"), Env: fake}),
-			"codex":  agentthreads.Codex(agentthreads.CodexOptions{Bin: env("FAKE_CLI"), Env: fake, Home: env("CODEX_HOME_DIR"), NoLogin: true}),
+			"claude": agentthreads.ClaudeCode(agentthreads.ClaudeOptions{Bin: or("CLAUDE_BIN", env("FAKE_CLI")), Env: fake, StopGrace: ms("STOP_GRACE_MS"), CloseGrace: ms("CLOSE_GRACE_MS")}),
+			"codex":  agentthreads.Codex(agentthreads.CodexOptions{Bin: or("CODEX_BIN", env("FAKE_CLI")), Env: fake, Home: env("CODEX_HOME_DIR"), NoLogin: true, StopGrace: ms("STOP_GRACE_MS"), CloseGrace: ms("CLOSE_GRACE_MS")}),
 		},
 		Capabilities: agentthreads.Capabilities{Permissions: policy},
 		Spawner:      agentthreads.Shim(env("SHIM"), agentthreads.ShimOptions{RunsDir: env("RUNS"), Poll: 50 * time.Millisecond}),
@@ -102,6 +115,11 @@ func runBackend() {
 			var id string
 			json.Unmarshal(arg(0), &id)
 			result, err = sdk.Snapshot(ctx, id)
+		case "saved":
+			// Once every event so far is saved (and the run with them).
+			var id string
+			json.Unmarshal(arg(0), &id)
+			_, err = sdk.EventsSince(ctx, id, 0, 0)
 		case "recover":
 			result, err = sdk.Recover(ctx)
 		case "close", "stop":
@@ -121,6 +139,17 @@ func runBackend() {
 			os.Exit(0)
 		}
 	}
+}
+
+// slowStore takes a while over each save.
+type slowStore struct {
+	*agentthreads.FileStore
+	delay time.Duration
+}
+
+func (s slowStore) AppendEvents(ctx context.Context, id string, events []protocol.ThreadEvent, runs []agentthreads.RunRecord) error {
+	time.Sleep(s.delay)
+	return s.FileStore.AppendEvents(ctx, id, events, runs)
 }
 
 // backend is a backend process, and what it has said.
@@ -465,4 +494,167 @@ func snapshotOf(t *testing.T, b *backend, id string) protocol.Snapshot {
 	var snap protocol.Snapshot
 	json.Unmarshal(b.call("snapshot", id), &snap)
 	return snap
+}
+
+// miniScene runs mini-claude.mjs as Claude and mini-codex.mjs as Codex (the Node backend's test
+// harnesses), for what the recordings don't cover.
+func miniScene(t *testing.T, extra ...string) *scene {
+	tests := filepath.Join(specDir, "..", "ts", "packages", "node", "src", "test")
+	return newScene(t, "claude/plain-reply", append([]string{
+		"CLAUDE_BIN=" + filepath.Join(tests, "mini-claude.mjs"), "CODEX_BIN=" + filepath.Join(tests, "mini-codex.mjs"),
+		"MINI_CLAUDE_LOG=" + filepath.Join(t.TempDir(), "log.jsonl"),
+	}, extra...)...)
+}
+
+func (s *scene) startWith(extra ...string) *backend {
+	return startBackend(s.t, append(append([]string{}, s.env...), extra...))
+}
+
+func (s *scene) create(b *backend, harness string) string {
+	var th protocol.Thread
+	json.Unmarshal(b.call("create", map[string]any{"harness": harness, "cwd": s.cwd}), &th)
+	return th.ID
+}
+
+func (s *scene) runDir() string {
+	var dir string
+	until(s.t, func() bool {
+		entries, _ := os.ReadDir(s.runs)
+		if len(entries) > 0 {
+			dir = filepath.Join(s.runs, entries[0].Name())
+		}
+		return dir != ""
+	})
+	return dir
+}
+
+func processAlive(pid int) bool {
+	err := syscall.Kill(pid, 0)
+	return err == nil || err == syscall.EPERM
+}
+
+func TestRestartStopsARunThatIgnoresAnInterrupt(t *testing.T) {
+	needNode(t)
+	for harness, interrupt := range map[string]string{"claude": `"subtype":"interrupt"`, "codex": `"method":"turn/interrupt"`} {
+		t.Run(harness, func(t *testing.T) {
+			t.Parallel()
+			s := miniScene(t, "STOP_GRACE_MS=1000", "CLOSE_GRACE_MS=500")
+			// Saving takes a while, so the backend is killed after the interrupt is sent, and before
+			// any save that comes after it would be done.
+			a := s.startWith("SAVE_DELAY_MS=500")
+			id := s.create(a, harness)
+			a.call("handle", map[string]any{"type": "send", "thread_id": id, "text": "stubborn"})
+			a.waitFor(`{"type":"turn.started"}`)
+			dir := s.runDir()
+			until(t, func() bool { _, err := os.Stat(filepath.Join(dir, "pid")); return err == nil })
+			// It has taken in the message, and ignores interrupts from now on.
+			time.Sleep(500 * time.Millisecond)
+			a.call("saved", id)
+			go a.call("handle", map[string]any{"type": "interrupt", "thread_id": id})
+			until(t, func() bool {
+				data, _ := os.ReadFile(filepath.Join(dir, "input.jsonl"))
+				return strings.Contains(string(data), interrupt)
+			})
+			a.crash()
+			pid := readPidFile(t, dir)
+			if !processAlive(pid) {
+				t.Fatal("the run's program went with the backend")
+			}
+
+			b := s.start()
+			expectRecovered(t, b, id)
+			// Stopped once the interrupt's grace is over, and the turn ends as interrupted.
+			until(t, func() bool { return !processAlive(pid) })
+			b.waitFor(`{"type":"turn.completed"}`)
+			b.waitFor(`{"type":"item.added","item":{"type":"turn_result","interrupted":true}}`)
+			until(t, func() bool { _, err := os.Stat(filepath.Join(dir, "stopping")); return err != nil })
+			b.call("stop")
+			<-b.exited
+		})
+	}
+}
+
+func readPidFile(t *testing.T, dir string) int {
+	data, err := os.ReadFile(filepath.Join(dir, "pid"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	pid, _ := strconv.Atoi(strings.TrimSpace(string(data)))
+	return pid
+}
+
+func TestRestartDoesntAskAgainWhatWasAnswered(t *testing.T) {
+	needNode(t)
+	cases := []struct{ harness, opening, text, answer string }{
+		{"claude", "saved", "tool Bash {}", `"behavior":"allow"`},
+		{"codex", "saved", "sleep 1000\nexec ls\nsleep 3000", `"decision":"accept"`},
+		{"claude", "not saved", "tool Bash {}", `"behavior":"allow"`},
+		{"codex", "not saved", "sleep 1000\nexec ls\nsleep 3000", `"decision":"accept"`},
+	}
+	for _, c := range cases {
+		t.Run(c.harness+"/"+c.opening, func(t *testing.T) {
+			t.Parallel()
+			// Claude asks a while after the tool call, and the turn runs on for a while after it's
+			// allowed (Codex's turn waits before and after the command).
+			s := miniScene(t, "POLICY=ask", "MINI_CLAUDE_ASK_DELAY=1000", "MINI_CLAUDE_TOOL_RUN_MS=3000")
+			// Saving takes a while, so the backend is killed after the answer is sent, and before the
+			// save that has it is done: and, unless the request's opening is saved first, before that is.
+			a := s.startWith("SAVE_DELAY_MS=500")
+			id := s.create(a, c.harness)
+			a.call("handle", map[string]any{"type": "send", "thread_id": id, "text": c.text})
+			a.waitFor(`{"type":"turn.started"}`)
+			// The run and its turn are saved before the request comes.
+			a.call("saved", id)
+			a.waitFor(`{"type":"request.opened"}`)
+			var requestID string
+			for _, e := range a.events.all() {
+				if o, ok := e.Value.(*protocol.RequestOpenedEvent); ok {
+					requestID = o.Request.ID()
+				}
+			}
+			if c.opening == "saved" {
+				a.call("saved", id)
+			}
+			dir := s.runDir()
+			input := func() string { data, _ := os.ReadFile(filepath.Join(dir, "input.jsonl")); return string(data) }
+			go a.call("handle", map[string]any{"type": "respond", "thread_id": id, "request_id": requestID, "resolution": map[string]any{"outcome": "allow"}})
+			until(t, func() bool { return strings.Contains(input(), c.answer) })
+			a.crash()
+
+			b := s.start()
+			expectRecovered(t, b, id)
+			// The tool's still running: nothing's asked of the user, and the turn runs on.
+			time.Sleep(500 * time.Millisecond)
+			snap := snapshotOf(t, b, id)
+			if len(snap.Requests) != 0 || snap.Thread.Status != protocol.ThreadStatusRunning {
+				t.Fatalf("got %s", mustMarshal(snap))
+			}
+			resolved, notice := -1, -1
+			for i, e := range b.events.all() {
+				switch v := e.Value.(type) {
+				case *protocol.RequestOpenedEvent:
+					t.Fatal("asked again")
+				case *protocol.RequestResolvedEvent:
+					if v.RequestID == requestID && resolved < 0 {
+						resolved = i
+					}
+				case *protocol.ItemAddedEvent:
+					if n, ok := v.Item.Value.(*protocol.Notice); ok && n.Code == "run.reattached" {
+						notice = i
+					}
+				}
+			}
+			// Closed as the run's picked up again.
+			if c.opening == "saved" && (resolved < 0 || resolved > notice) {
+				t.Fatalf("resolved at %d, notice at %d", resolved, notice)
+			}
+			b.waitFor(`{"type":"turn.completed"}`)
+			b.call("stop")
+			<-b.exited
+			// Answered once.
+			if n := strings.Count(input(), c.answer); n != 1 {
+				t.Fatalf("answered %d times", n)
+			}
+		})
+	}
 }

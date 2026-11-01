@@ -934,6 +934,10 @@ func (a *AgentThreads) reattach(rt *threadRuntime, record *RunRecord) (bool, *Ru
 			rt.emit(&protocol.RequestResolvedEvent{RequestID: r.ID(), Resolution: protocol.Resolution{Outcome: protocol.ResolutionOutcomeCancel}})
 		}
 	}
+	// With none left (one answered before the restart is closed, say), the turn runs on.
+	if rt.turn != nil && len(open) == 0 && rt.state.Thread.Status == protocol.ThreadStatusWaiting {
+		rt.SetThread(func(t *protocol.Thread) { t.Status = protocol.ThreadStatusRunning })
+	}
 	rt.reattachedRun = record.ID
 	reattached := *run
 	reattached.ReattachedAt = now()
