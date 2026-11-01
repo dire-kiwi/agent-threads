@@ -140,10 +140,12 @@ describe.skipIf(process.platform === "win32")("a backend restart", () => {
 
   // The same with each harness: a fixture whose turn waits on the user, one that streams (with
   // approvals the policy answers), and one that needs no input after it starts, which can end
-  // while the backend is down; and what marks its end in its output.
+  // while the backend is down, the pace it's replayed at, and when it's partway through that turn
+  // (with seconds of it left: Codex's reply streams in its last tenth of a second, so for Codex,
+  // once the harness says the turn has started); and what marks its end in its output.
   const harnesses = {
-    claude: { waits: "claude/permission-allow", streams: "claude/tool-calls", ends: "claude/subagent", partway: { type: "item.added", item: { type: "tool_call" } }, ended: '"type":"result"' },
-    codex: { waits: "codex/permission-allow", streams: "codex/tool-calls", ends: "codex/plain-reply", partway: { type: "delta" }, ended: '"method":"turn/completed"' },
+    claude: { waits: "claude/permission-allow", streams: "claude/tool-calls", ends: "claude/subagent", pace: "0.2", partway: { type: "item.added", item: { type: "tool_call" } }, ended: '"type":"result"' },
+    codex: { waits: "codex/permission-allow", streams: "codex/tool-calls", ends: "codex/plain-reply", pace: "0.5", partway: { out: '"method":"turn/started"' }, ended: '"method":"turn/completed"' },
   };
 
   describe.each(Object.entries(harnesses))("with %s", (_harness, f) => {
@@ -191,19 +193,23 @@ describe.skipIf(process.platform === "win32")("a backend restart", () => {
     });
 
     it("when the run ends while it's down: the new backend reads the rest and finishes the turn", { timeout: 60_000 }, async () => {
-      const s = scene(f.ends, { AGENT_THREADS_FIXTURE_SPEED: "0.2" });
+      const s = scene(f.ends, { AGENT_THREADS_FIXTURE_SPEED: f.pace });
       const a = s.start();
       const thread = await a.call<{ id: string }>("create", { ...s.fixture.thread, cwd: s.dirs.cwd });
       await a.call("handle", { ...s.fixture.steps[0].command, thread_id: thread.id });
       // Partway through the turn.
-      await a.waitFor(f.partway);
+      await until(() => readdirSync(s.dirs.runs).length > 0);
+      const [runId] = readdirSync(s.dirs.runs);
+      const runDir = join(s.dirs.runs, runId!);
+      const out = () => (existsSync(join(runDir, "out.jsonl")) ? readFileSync(join(runDir, "out.jsonl"), "utf8") : "");
+      const partway = f.partway;
+      if ("out" in partway) await until(() => out().includes(partway.out));
+      else await a.waitFor(partway);
       await a.crash();
 
       // While it's down, the turn finishes and the run ends (its input closed, as a backend would).
-      const [runId] = readdirSync(s.dirs.runs);
-      const runDir = join(s.dirs.runs, runId!);
-      expect(readFileSync(join(runDir, "out.jsonl"), "utf8")).not.toContain(f.ended);
-      await until(() => readFileSync(join(runDir, "out.jsonl"), "utf8").includes(f.ended));
+      expect(out()).not.toContain(f.ended);
+      await until(() => out().includes(f.ended));
       writeFileSync(join(runDir, "input.closed"), "");
       await until(() => existsSync(join(runDir, "exit")));
 
