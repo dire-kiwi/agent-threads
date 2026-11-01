@@ -36,7 +36,7 @@ and gets exactly one reply with that `id`, either a `result` or an `error` (a me
 | --- | --- | --- |
 | `hello` | | `{harnesses, restart}`: the harnesses threads can run on, as `[{name, label, model, models}]` (`model` the default, `models` suggestions; the user may type another), and whether `restart` is offered. |
 | `list` | | `Thread[]`, newest first. |
-| `create` | `{harness, model?, title?}` | The new `Thread`. Its first `thread.updated` is pushed too. |
+| `create` | `{harness, model?, title?}` | The new `Thread`, with the server's defaults for what's left out (the harness's model, an effort, the working directory). Its first `thread.updated` is pushed too. |
 | `snapshot` | `{thread_id}` | The thread's `Snapshot` (`sdk.snapshot`). |
 | `events_since` | `{thread_id, seq}` | `ThreadEvent[]`: its saved events after `seq` (`sdk.eventsSince`). |
 | `command` | `{command}` | `null` once the backend has taken the `Command` (`sdk.handle`); an error if it refused it. |
