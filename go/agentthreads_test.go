@@ -286,3 +286,135 @@ func TestAStoreThatFailsForAWhile(t *testing.T) {
 		time.Sleep(50 * time.Millisecond)
 	}
 }
+
+// gatedStore's GetRun fails while failing is set, and waits for gate while it's set.
+type gatedStore struct {
+	*agentthreads.MemoryStore
+	mu      sync.Mutex
+	failing bool
+	gate    chan struct{}
+	reached chan struct{}
+}
+
+func (g *gatedStore) GetRun(ctx context.Context, id string) (*agentthreads.RunRecord, error) {
+	g.mu.Lock()
+	failing, gate, reached := g.failing, g.gate, g.reached
+	g.mu.Unlock()
+	if failing {
+		return nil, errors.New("the database is busy")
+	}
+	if gate != nil {
+		close(reached)
+		<-gate
+	}
+	return g.MemoryStore.GetRun(ctx, id)
+}
+
+// savedRunning is a store with a thread that was running, under the shim, when its backend stopped.
+func savedRunning(t *testing.T) (*gatedStore, string) {
+	ctx := context.Background()
+	store := &gatedStore{MemoryStore: agentthreads.NewMemoryStore()}
+	th := protocol.Thread{ID: "th_saved", Harness: "echo", Status: protocol.ThreadStatusRunning, CreatedAt: "2026-11-01T00:00:00Z",
+		Run: &protocol.Run{ID: "run_1", Spawner: protocol.RunSpawnerShim, StartedAt: "2026-11-01T00:00:01Z"}}
+	if err := store.CreateThread(ctx, th); err != nil {
+		t.Fatal(err)
+	}
+	evs := events(t,
+		`{"type":"thread.updated","thread_id":"th_saved","seq":1,"thread":`+string(mustMarshal(th))+`}`,
+		`{"type":"item.added","thread_id":"th_saved","seq":2,"item":{"id":"u1","type":"user_message","text":"hi","turn_id":"t1"}}`,
+		`{"type":"turn.started","thread_id":"th_saved","seq":3,"turn_id":"t1"}`,
+	)
+	run := agentthreads.RunRecord{ID: "run_1", ThreadID: "th_saved", Spawner: "shim", StartedAt: "2026-11-01T00:00:01Z"}
+	if err := store.AppendEvents(ctx, "th_saved", evs, []agentthreads.RunRecord{run}); err != nil {
+		t.Fatal(err)
+	}
+	return store, "th_saved"
+}
+
+func noticeCodes(s protocol.Snapshot) []string {
+	var out []string
+	for _, it := range s.Items {
+		if n, ok := it.Value.(*protocol.Notice); ok {
+			out = append(out, n.Code)
+		}
+	}
+	return out
+}
+
+// A store that can't say what run a thread had leaves it to be loaded again, rather than taking a
+// run that may still be going for lost.
+func TestLoadingWhenTheStoreFails(t *testing.T) {
+	ctx := context.Background()
+	store, id := savedRunning(t)
+	store.failing = true
+	sdk := newEcho(t, store, agentthreads.Allow)
+	if _, err := sdk.Snapshot(ctx, id); err == nil || !strings.Contains(err.Error(), "busy") {
+		t.Fatalf("got %v", err)
+	}
+	if th, _ := store.MemoryStore.GetThread(ctx, id); th.Status != protocol.ThreadStatusRunning || th.Run == nil {
+		t.Fatalf("the thread changed: %s", mustMarshal(th))
+	}
+	store.mu.Lock()
+	store.failing = false
+	store.mu.Unlock()
+	// Loaded again: with the direct spawner, the run can't be followed, so it's lost now.
+	snap, err := sdk.Snapshot(ctx, id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if codes := noticeCodes(snap); len(codes) != 1 || codes[0] != "run.lost" || snap.Thread.Run != nil {
+		t.Fatalf("got %s", mustMarshal(snap))
+	}
+}
+
+// A command for a thread that's being loaded waits for its recovery, so recovery doesn't take the
+// turn the command starts for the one it lost.
+func TestACommandWaitsForRecovery(t *testing.T) {
+	ctx := context.Background()
+	store, id := savedRunning(t)
+	store.gate, store.reached = make(chan struct{}), make(chan struct{})
+	sdk := newEcho(t, store, agentthreads.Allow)
+	loaded := make(chan error, 1)
+	go func() { _, err := sdk.Snapshot(ctx, id); loaded <- err }()
+	<-store.reached
+	sent := make(chan error, 1)
+	go func() { sent <- sdk.Send(ctx, id, "again", agentthreads.SendOptions{}) }()
+	select {
+	case err := <-sent:
+		t.Fatalf("the command went ahead of recovery: %v", err)
+	case <-time.After(100 * time.Millisecond):
+	}
+	store.mu.Lock()
+	gate := store.gate
+	store.gate = nil
+	store.mu.Unlock()
+	close(gate)
+	if err := <-loaded; err != nil {
+		t.Fatal(err)
+	}
+	if err := <-sent; err != nil {
+		t.Fatal(err)
+	}
+	snap, _ := sdk.Snapshot(ctx, id)
+	var results []*protocol.TurnResult
+	for _, it := range snap.Items {
+		if r, ok := it.Value.(*protocol.TurnResult); ok {
+			results = append(results, r)
+		}
+	}
+	// The lost turn ended, then the new one ran.
+	if len(results) != 2 || results[0].OK || !results[1].OK || snap.Thread.Status != protocol.ThreadStatusIdle {
+		t.Fatalf("got %s", mustMarshal(snap))
+	}
+}
+
+// A command's wait gives up with its context.
+func TestCommandsHonourTheirContext(t *testing.T) {
+	sdk := newEcho(t, nil, agentthreads.Allow)
+	th, _ := sdk.Create(context.Background(), agentthreads.CreateOptions{})
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if err := sdk.Send(ctx, th.ID, "hi", agentthreads.SendOptions{}); !errors.Is(err, context.Canceled) {
+		t.Fatalf("got %v", err)
+	}
+}

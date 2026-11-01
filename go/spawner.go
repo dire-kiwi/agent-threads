@@ -10,6 +10,7 @@ import (
 	"runtime"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 )
 
@@ -145,7 +146,8 @@ func (directSpawner) Spawn(o SpawnOptions, h ProcessHandlers) (Process, error) {
 	if err := cmd.Start(); err != nil {
 		return nil, err
 	}
-	p := &directProcess{cmd: cmd, stdin: stdin}
+	p := &directProcess{cmd: cmd, stdin: stdin, wake: make(chan struct{}, 1)}
+	go p.writeInput()
 	var wg sync.WaitGroup
 	wg.Add(2)
 	read := func(r io.Reader, fn func(string)) {
@@ -169,9 +171,12 @@ func (directSpawner) Spawn(o SpawnOptions, h ProcessHandlers) (Process, error) {
 		// then something it started may still hold its stdio, so its group can still be signalled.
 		wg.Wait()
 		err := cmd.Wait()
+		p.done.Store(true)
+		// What's still queued for its stdin can't be written now.
 		p.mu.Lock()
-		p.done = true
+		p.broken, p.queue = true, nil
 		p.mu.Unlock()
+		p.nudge()
 		status := exitStatus(cmd.ProcessState, err)
 		o.Post(func() { h.Exit(status) })
 	}()
@@ -185,46 +190,81 @@ func trimCR(s string) string {
 	return s
 }
 
+// directProcess is a child process. Its stdin is written by a goroutine of its own, in order, so a
+// harness that stops reading it doesn't hold up the thread's goroutine (or Kill).
 type directProcess struct {
-	cmd    *exec.Cmd
-	stdin  io.WriteCloser
-	mu     sync.Mutex
-	closed bool
-	done   bool
+	cmd   *exec.Cmd
+	stdin io.WriteCloser
+	done  atomic.Bool
+
+	mu sync.Mutex // guards what follows
+	// queue is the lines still to be written, and closing says the input ends after them.
+	queue   []string
+	closing bool
+	// broken says writing failed (the process has gone): nothing more is written.
+	broken bool
+	wake   chan struct{}
 }
 
 func (p *directProcess) Pid() int { return p.cmd.Process.Pid }
 
 func (p *directProcess) Write(line string) {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	if p.closed {
-		return
-	}
 	if len(line) == 0 || line[len(line)-1] != '\n' {
 		line += "\n"
 	}
-	// Writing to a process that has gone fails with EPIPE; its exit says what happened.
-	if _, err := io.WriteString(p.stdin, line); err != nil {
-		p.closed = true
+	p.mu.Lock()
+	if p.closing || p.broken {
+		p.mu.Unlock()
+		return
 	}
+	p.queue = append(p.queue, line)
+	p.mu.Unlock()
+	p.nudge()
 }
 
 func (p *directProcess) CloseInput() {
 	p.mu.Lock()
-	defer p.mu.Unlock()
-	if p.closed {
-		return
+	p.closing = true
+	p.mu.Unlock()
+	p.nudge()
+}
+
+func (p *directProcess) nudge() {
+	select {
+	case p.wake <- struct{}{}:
+	default:
 	}
-	p.closed = true
-	p.stdin.Close()
+}
+
+// writeInput writes the queued lines to stdin, in order, and closes it once the input ends. A write
+// that blocks (the harness isn't reading) is unblocked by the process going: Wait closes stdin then.
+func (p *directProcess) writeInput() {
+	for {
+		p.mu.Lock()
+		if len(p.queue) == 0 {
+			if p.closing || p.broken {
+				p.mu.Unlock()
+				p.stdin.Close()
+				return
+			}
+			p.mu.Unlock()
+			<-p.wake
+			continue
+		}
+		line := p.queue[0]
+		p.queue = p.queue[1:]
+		p.mu.Unlock()
+		// Writing to a process that has gone fails with EPIPE; its exit says what happened.
+		if _, err := io.WriteString(p.stdin, line); err != nil {
+			p.mu.Lock()
+			p.broken, p.queue = true, nil
+			p.mu.Unlock()
+		}
+	}
 }
 
 func (p *directProcess) Kill(sig syscall.Signal) {
-	p.mu.Lock()
-	done := p.done
-	p.mu.Unlock()
-	if done {
+	if p.done.Load() {
 		return
 	}
 	// The group outlives its leader while anything in it runs.

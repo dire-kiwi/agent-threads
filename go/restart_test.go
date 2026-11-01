@@ -535,42 +535,50 @@ func processAlive(pid int) bool {
 
 func TestRestartStopsARunThatIgnoresAnInterrupt(t *testing.T) {
 	needNode(t)
-	for harness, interrupt := range map[string]string{"claude": `"subtype":"interrupt"`, "codex": `"method":"turn/interrupt"`} {
-		t.Run(harness, func(t *testing.T) {
-			t.Parallel()
-			s := miniScene(t, "STOP_GRACE_MS=1000", "CLOSE_GRACE_MS=500")
-			// Saving takes a while, so the backend is killed after the interrupt is sent, and before
-			// any save that comes after it would be done.
-			a := s.startWith("SAVE_DELAY_MS=500")
-			id := s.create(a, harness)
-			a.call("handle", map[string]any{"type": "send", "thread_id": id, "text": "stubborn"})
-			a.waitFor(`{"type":"turn.started"}`)
-			dir := s.runDir()
-			until(t, func() bool { _, err := os.Stat(filepath.Join(dir, "pid")); return err == nil })
-			// It has taken in the message, and ignores interrupts from now on.
-			time.Sleep(500 * time.Millisecond)
-			a.call("saved", id)
-			go a.call("handle", map[string]any{"type": "interrupt", "thread_id": id})
-			until(t, func() bool {
-				data, _ := os.ReadFile(filepath.Join(dir, "input.jsonl"))
-				return strings.Contains(string(data), interrupt)
-			})
-			a.crash()
-			pid := readPidFile(t, dir)
-			if !processAlive(pid) {
-				t.Fatal("the run's program went with the backend")
-			}
+	for _, how := range []string{"killed", "closed"} {
+		for harness, interrupt := range map[string]string{"claude": `"subtype":"interrupt"`, "codex": `"method":"turn/interrupt"`} {
+			t.Run(how+"/"+harness, func(t *testing.T) {
+				t.Parallel()
+				s := miniScene(t, "STOP_GRACE_MS=1000", "CLOSE_GRACE_MS=500")
+				// Saving takes a while, so the backend is killed after the interrupt is sent, and before
+				// any save that comes after it would be done.
+				a := s.startWith("SAVE_DELAY_MS=500")
+				id := s.create(a, harness)
+				a.call("handle", map[string]any{"type": "send", "thread_id": id, "text": "stubborn"})
+				a.waitFor(`{"type":"turn.started"}`)
+				dir := s.runDir()
+				until(t, func() bool { _, err := os.Stat(filepath.Join(dir, "pid")); return err == nil })
+				// It has taken in the message, and ignores interrupts from now on.
+				time.Sleep(500 * time.Millisecond)
+				a.call("saved", id)
+				go a.call("handle", map[string]any{"type": "interrupt", "thread_id": id})
+				until(t, func() bool {
+					data, _ := os.ReadFile(filepath.Join(dir, "input.jsonl"))
+					return strings.Contains(string(data), interrupt)
+				})
+				if how == "killed" {
+					a.crash()
+				} else {
+					// Shut down within the interrupt's grace: the run's left going, still to be stopped.
+					a.call("close")
+					<-a.exited
+				}
+				pid := readPidFile(t, dir)
+				if !processAlive(pid) {
+					t.Fatal("the run's program went with the backend")
+				}
 
-			b := s.start()
-			expectRecovered(t, b, id)
-			// Stopped once the interrupt's grace is over, and the turn ends as interrupted.
-			until(t, func() bool { return !processAlive(pid) })
-			b.waitFor(`{"type":"turn.completed"}`)
-			b.waitFor(`{"type":"item.added","item":{"type":"turn_result","interrupted":true}}`)
-			until(t, func() bool { _, err := os.Stat(filepath.Join(dir, "stopping")); return err != nil })
-			b.call("stop")
-			<-b.exited
-		})
+				b := s.start()
+				expectRecovered(t, b, id)
+				// Stopped once the interrupt's grace is over, and the turn ends as interrupted.
+				until(t, func() bool { return !processAlive(pid) })
+				b.waitFor(`{"type":"turn.completed"}`)
+				b.waitFor(`{"type":"item.added","item":{"type":"turn_result","interrupted":true}}`)
+				until(t, func() bool { _, err := os.Stat(filepath.Join(dir, "stopping")); return err != nil })
+				b.call("stop")
+				<-b.exited
+			})
+		}
 	}
 }
 

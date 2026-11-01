@@ -368,6 +368,14 @@ func (t *loopTimer) stop() {
 	}
 }
 
+// pause stops the timer from going off here, but keeps its deadline for a checkpoint: for a run left
+// going as the backend shuts down, whose next backend carries it on.
+func (t *loopTimer) pause() {
+	if t != nil {
+		t.timer.Stop()
+	}
+}
+
 func (t *loopTimer) pending() *int64 {
 	if t == nil || t.cancelled {
 		return nil
@@ -627,8 +635,9 @@ func (s *claudeSession) Detach() bool {
 		return false
 	}
 	s.closed = true
-	s.steerTimer.stop()
-	s.stopTimer.stop()
+	// Their deadlines stay in the checkpoint saved after this, for the backend that re-attaches.
+	s.steerTimer.pause()
+	s.stopTimer.pause()
 	run.detached = true
 	dp.Detach()
 	run.abort()

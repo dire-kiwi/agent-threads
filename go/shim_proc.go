@@ -194,7 +194,8 @@ func procStat(pid int) *procInfo {
 	if err != nil {
 		return nil
 	}
-	start := boot.Add(time.Duration(ticks) * time.Second / clockTicks)
+	// A tick at a time (10ms), so a host that has been up for years doesn't overflow it.
+	start := boot.Add(time.Duration(ticks) * (time.Second / clockTicks))
 	return &procInfo{start: start, zombie: fields[0] == "Z" || fields[0] == "X", source: "proc"}
 }
 

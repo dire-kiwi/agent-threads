@@ -1,6 +1,8 @@
 package agentthreads
 
 import (
+	"context"
+	"errors"
 	"fmt"
 	"sync"
 )
@@ -62,6 +64,24 @@ func (l *loop) call(fn func()) bool {
 	<-done
 	return ran
 }
+
+// callCtx is call, giving up the wait (not the function, which still runs) once ctx is done.
+func (l *loop) callCtx(ctx context.Context, fn func()) error {
+	ran := false
+	done := make(chan struct{})
+	l.push(task{fn: func() { fn(); ran = true }, done: done})
+	select {
+	case <-done:
+		if !ran {
+			return errLoopStopped
+		}
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+var errLoopStopped = errors.New("the thread is closed")
 
 func (l *loop) run() {
 	for {

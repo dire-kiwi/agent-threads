@@ -644,7 +644,8 @@ func (s *codexSession) Detach() bool {
 		return false
 	}
 	s.closed = true
-	s.stopTimer.stop()
+	// Its deadline stays in the checkpoint saved after this, for the backend that re-attaches.
+	s.stopTimer.pause()
 	run.detached = true
 	dp.Detach()
 	run.abort()

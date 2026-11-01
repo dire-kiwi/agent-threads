@@ -526,11 +526,8 @@ func (p *shimProcess) follow(out, errs *tail) {
 		if len(errLines) > 0 || len(outLines) > 0 || exited {
 			p.post(func() { p.deliver(errLines, outLines, status) })
 		}
-		if exited {
-			p.end()
-			return
-		}
-		// Signals asked for before the program's pid was known.
+		// Signals asked for before the program's pid was known, even if it has exited since: what it
+		// started may still be running in its group.
 		p.mu.Lock()
 		signals := p.signals
 		if len(signals) > 0 && readPid(p.dir, "pid") != 0 {
@@ -541,6 +538,10 @@ func (p *shimProcess) follow(out, errs *tail) {
 		p.mu.Unlock()
 		for _, sig := range signals {
 			p.spawner.esc.terminate(p.dir, p.spawner.grace, sig)
+		}
+		if exited {
+			p.end()
+			return
 		}
 		if gone := p.gone(&identity, &checked); gone != "" {
 			// Recorded as the shim would have, unless it did after all.
@@ -794,30 +795,59 @@ func idText(v json.RawMessage) string {
 	return ""
 }
 
+// tempFile writes content to a new temporary file in dir (.<name>.<random>.tmp, which readers
+// ignore): one of its own each time, since several goroutines may be writing the same file.
+func tempFile(dir, name string, content []byte) (string, bool) {
+	f, err := os.CreateTemp(dir, "."+name+".*.tmp")
+	if err != nil {
+		return "", false // The directory's gone.
+	}
+	_, werr := f.Write(content)
+	cerr := f.Close()
+	if werr != nil || cerr != nil {
+		os.Remove(f.Name())
+		return "", false
+	}
+	return f.Name(), true
+}
+
 // writeAtomic writes a run directory's file whole, as the shim does.
 func writeAtomic(dir, name string, content []byte) {
-	tmp := filepath.Join(dir, fmt.Sprintf(".%s.%d.tmp", name, os.Getpid()))
-	if os.WriteFile(tmp, content, 0o600) != nil {
-		return // The directory's gone.
+	tmp, ok := tempFile(dir, name, content)
+	if !ok {
+		return
 	}
-	os.Rename(tmp, filepath.Join(dir, name))
+	if os.Rename(tmp, filepath.Join(dir, name)) != nil {
+		os.Remove(tmp)
+	}
 }
 
 // writeExit writes exit atomically, as the shim does, unless there's one.
 func writeExit(dir, why string) {
-	tmp := filepath.Join(dir, fmt.Sprintf(".exit.%d.tmp", os.Getpid()))
-	if os.WriteFile(tmp, mustJSON(map[string]any{"code": nil, "signal": nil, "error": why}), 0o600) != nil {
-		return
-	}
 	if exists(filepath.Join(dir, "exit")) {
-		os.Remove(tmp)
 		return
 	}
-	// A hard link fails if exit appeared meanwhile, where a rename would replace it.
-	if os.Link(tmp, filepath.Join(dir, "exit")) != nil {
+	tmp, ok := tempFile(dir, "exit", mustJSON(map[string]any{"code": nil, "signal": nil, "error": why}))
+	if !ok {
+		return
+	}
+	// A hard link fails if exit appeared meanwhile, where a rename would replace it. Only where links
+	// can't be made at all is it renamed.
+	if err := os.Link(tmp, filepath.Join(dir, "exit")); err != nil && !errors.Is(err, os.ErrExist) && !exists(filepath.Join(dir, "exit")) {
 		os.Rename(tmp, filepath.Join(dir, "exit"))
 	}
 	os.Remove(tmp)
+}
+
+// stoppingLocks serialize the changes to each run directory's stopping file (by directory): the
+// thread's goroutine, a run's follower, pruning and escalation all read it and write it again.
+var stoppingLocks sync.Map
+
+func lockStopping(dir string) func() {
+	m, _ := stoppingLocks.LoadOrStore(dir, &sync.Mutex{})
+	mu := m.(*sync.Mutex)
+	mu.Lock()
+	return mu.Unlock
 }
 
 type stoppingFile struct {
@@ -886,6 +916,7 @@ func (e *escalator) terminate(dir string, grace time.Duration, sig syscall.Signa
 	if pid == 0 {
 		return
 	}
+	unlock := lockStopping(dir)
 	was := readStopping(dir)
 	switch {
 	case sig == syscall.SIGTERM && was != nil && was.TermAt != nil:
@@ -894,6 +925,7 @@ func (e *escalator) terminate(dir string, grace time.Duration, sig syscall.Signa
 	case sig != syscall.SIGKILL && was == nil:
 		writeAtomic(dir, "stopping", mustJSON(stoppingFile{KillAt: time.Now().Add(grace).UnixMilli()}))
 	}
+	unlock()
 	syscall.Kill(-pid, sig)
 	if sig != syscall.SIGKILL {
 		e.escalate(dir)
@@ -904,6 +936,7 @@ func (e *escalator) terminate(dir string, grace time.Duration, sig syscall.Signa
 // and SIGKILL in kill. It's written down first (stopping, with both deadlines), so a backend that
 // restarts meanwhile carries on with it. A stop already under way only ever comes sooner.
 func (e *escalator) beginStop(dir string, term, kill time.Duration) {
+	unlock := lockStopping(dir)
 	nowMs := time.Now().UnixMilli()
 	was := readStopping(dir)
 	next := stoppingFile{KillAt: nowMs + kill.Milliseconds()}
@@ -919,6 +952,7 @@ func (e *escalator) beginStop(dir string, term, kill time.Duration) {
 		next.TermAt = &t
 	}
 	writeAtomic(dir, "stopping", mustJSON(next))
+	unlock()
 	if os.WriteFile(filepath.Join(dir, "input.closed"), nil, 0o600) != nil {
 		return // Its directory's gone.
 	}
@@ -947,7 +981,11 @@ func (e *escalator) escalate(dir string) {
 			e.mu.Unlock()
 			e.wg.Done()
 		}()
-		done := func() { os.Remove(filepath.Join(dir, "stopping")) }
+		done := func() {
+			unlock := lockStopping(dir)
+			os.Remove(filepath.Join(dir, "stopping"))
+			unlock()
+		}
 		checked := false
 		for {
 			s := readStopping(dir)
@@ -990,7 +1028,12 @@ func (e *escalator) escalate(dir string) {
 			}
 			if s.TermAt != nil && nowMs >= *s.TermAt {
 				// Written down first: it's sent once.
-				writeAtomic(dir, "stopping", mustJSON(stoppingFile{KillAt: s.KillAt}))
+				// Read again under the lock, so a sooner deadline written meanwhile stands.
+				unlock := lockStopping(dir)
+				if now := readStopping(dir); now != nil {
+					writeAtomic(dir, "stopping", mustJSON(stoppingFile{KillAt: now.KillAt}))
+				}
+				unlock()
 				if group := liveGroup(dir); group != 0 {
 					syscall.Kill(-group, syscall.SIGTERM)
 				}

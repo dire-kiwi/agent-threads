@@ -197,21 +197,45 @@ func (a *AgentThreads) Create(ctx context.Context, o CreateOptions) (protocol.Th
 			thread.Metadata[k] = data
 		}
 	}
+	// Until the thread's live (its first event made), a command for it waits, as for one loading.
 	a.mu.Lock()
+	if a.threads[id] != nil || a.loading[id] != nil {
+		a.mu.Unlock()
+		return protocol.Thread{}, NewStoreError(StoreErrExists, "thread %s exists", id)
+	}
+	l := &loadCall{done: make(chan struct{})}
+	a.loading[id] = l
 	a.configs[id] = o.Capabilities
 	a.mu.Unlock()
-	if err := a.store.CreateThread(ctx, thread); err != nil {
-		return protocol.Thread{}, err
+	rt, err := a.createRuntime(ctx, thread)
+	a.mu.Lock()
+	if err == nil {
+		a.threads[id] = rt
 	}
-	rt, err := a.runtime(protocol.InitialState(thread))
+	delete(a.loading, id)
+	l.rt, l.err = rt, err
+	a.mu.Unlock()
+	close(l.done)
 	if err != nil {
 		return protocol.Thread{}, err
 	}
-	rt.loop.call(func() { rt.emit(&protocol.ThreadUpdatedEvent{Thread: thread}) })
 	if err := rt.waitSaved(ctx); err != nil {
 		return protocol.Thread{}, err
 	}
 	return thread, nil
+}
+
+// createRuntime stores a new thread, and makes its runtime with its first event.
+func (a *AgentThreads) createRuntime(ctx context.Context, thread protocol.Thread) (*threadRuntime, error) {
+	if err := a.store.CreateThread(ctx, thread); err != nil {
+		return nil, err
+	}
+	rt, err := a.runtime(protocol.InitialState(thread))
+	if err != nil {
+		return nil, err
+	}
+	rt.loop.call(func() { rt.emit(&protocol.ThreadUpdatedEvent{Thread: thread}) })
+	return rt, nil
 }
 
 func (a *AgentThreads) defaultHarness() string {
@@ -594,8 +618,11 @@ func (a *AgentThreads) do(ctx context.Context, threadID string, fn func(rt *thre
 	if err := a.open(); err != nil {
 		return err
 	}
-	if !rt.loop.call(func() { fn(rt) }) {
-		return commandErr("this AgentThreads is closed")
+	if err := rt.loop.callCtx(ctx, func() { fn(rt) }); err != nil {
+		if errors.Is(err, errLoopStopped) {
+			return commandErr("this AgentThreads is closed")
+		}
+		return err
 	}
 	return nil
 }
@@ -806,11 +833,9 @@ func (a *AgentThreads) runtime(state protocol.Snapshot) (*threadRuntime, error) 
 	if harness == nil {
 		return nil, commandErr("thread %s runs on %s, which isn't configured", id, state.Thread.Harness)
 	}
+	// Not live yet: the caller makes it so (in a.threads) once it's ready to take commands.
 	rt := newRuntime(a, state, a.config(id), a.policy(id))
 	rt.loop.call(func() { rt.session = harness.Open(rt) })
-	a.mu.Lock()
-	a.threads[id] = rt
-	a.mu.Unlock()
 	return rt, nil
 }
 
@@ -826,9 +851,14 @@ func (a *AgentThreads) load(ctx context.Context, threadID string) (*threadRuntim
 		l = &loadCall{done: make(chan struct{})}
 		a.loading[threadID] = l
 		go func() {
-			l.rt, l.err = a.fromStore(background, threadID)
+			rt, err := a.fromStore(background, threadID)
+			// Live once it's been recovered, and not before: a command that comes meanwhile waits.
 			a.mu.Lock()
+			if err == nil {
+				a.threads[threadID] = rt
+			}
 			delete(a.loading, threadID)
+			l.rt, l.err = rt, err
 			a.mu.Unlock()
 			close(l.done)
 		}()
@@ -866,15 +896,21 @@ func (a *AgentThreads) fromStore(ctx context.Context, threadID string) (*threadR
 	if state.Seq == 0 {
 		state = protocol.InitialState(*thread)
 	}
+	// The run it had, read first: a store that can't say leaves the thread to be loaded again later,
+	// rather than taking a run that may still be going for lost.
+	var record *RunRecord
+	if run := state.Thread.Run; run != nil && run.Spawner != protocol.RunSpawnerDirect {
+		r, err := a.store.GetRun(ctx, run.ID)
+		if err != nil {
+			return nil, err
+		}
+		if r != nil && r.Active() {
+			record = r
+		}
+	}
 	rt, err := a.runtime(state)
 	if err != nil {
 		return nil, err
-	}
-	var record *RunRecord
-	if run := rt.state.Thread.Run; run != nil && run.Spawner != protocol.RunSpawnerDirect {
-		if r, err := a.store.GetRun(ctx, run.ID); err == nil && r != nil && r.Active() {
-			record = r
-		}
 	}
 	var abandon *RunRecord
 	rt.loop.call(func() {

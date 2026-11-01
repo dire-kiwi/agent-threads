@@ -25,13 +25,25 @@ import (
 )
 
 func TestReadsOnly(t *testing.T) {
-	for cmd, want := range map[string]bool{
-		"cat notes.txt": true, "ls -la": true, "sed -n '1,5p' notes.txt": true, "wc -l a b": true,
-		"rm -rf /": false, "cat a | sh": false, "cat $(echo a)": false, "ls; rm a": false, "echo hi > a": false,
-		"sed -n 1p -i notes.txt": false, "sed -n 1p": false, "sed -e 'w x' a": false, "": false,
+	// chat-node's server/policy.test.ts cases.
+	for _, c := range []string{"cat a.txt", "cat 'a b.txt'", "cat '*.txt'", "ls -la", "head -n 5 notes.txt", "grep -rn widget .", "sed -n '1,240p' /tmp/x/SKILL.md", "sed -n 5p a b"} {
+		if !readsOnly(c) {
+			t.Errorf("readsOnly(%q) should be true", c)
+		}
+	}
+	for _, c := range []string{
+		"rm x", "touch a", "cat a > b", "cat a | sh", "ls; rm -rf /", "cat a && rm b", `cat "$(rm x)"`, "cat `rm x`",
+		"cat $HOME/.ssh/id_rsa", "sed -i 's/a/b/' f", "sed -n '1,5p'", "sed -n 'w out' f",
+		// GNU sed takes options after the script and files too.
+		"sed -n 1p -i notes.txt", "sed -n '1,5p' --in-place=.bak f", "sed -n 1p -e 'w /tmp/x' f", "sed -n 1p f -i", "sed -n 1p -- -i",
+		// Globs: with a file called -i there, `sed -n 1p *` is `sed -n 1p -i notes.txt`.
+		"sed -n 1p *", "sed -n 1p notes.?", "sed -n 1p [-]i notes.txt", "cat *",
+		// Quotes partway through a word, which the shell joins up.
+		"sed -n 1p -'i' notes.txt", "sed -n 1p 'notes'.txt -'-in-place'", "'cat'chsegv touch x", "'cat",
+		"", "rm -rf /", "cat $(echo a)", "echo hi > a", "sed -n 1p",
 	} {
-		if got := readsOnly(cmd); got != want {
-			t.Errorf("readsOnly(%q) = %v", cmd, got)
+		if readsOnly(c) {
+			t.Errorf("readsOnly(%q) should be false", c)
 		}
 	}
 }
