@@ -21,9 +21,9 @@ import { revertPoint, type RewindPoint } from "../sessions.js";
 import { writeSkills } from "../skills.js";
 import type { ExitStatus, HarnessProcess, ProcessHandlers } from "../spawner.js";
 import type { RunRecord } from "../store.js";
-import { SECRET } from "../thread.js";
+import { addUsage, SECRET } from "../thread.js";
 import { runTool, type Tool } from "../tools.js";
-import { defaultCodexHome, prepareCodexHome, readSessionState, userCodexHome, writeSessionState, type SessionState } from "./home.js";
+import { defaultCodexHome, prepareCodexHome, readSessionState, userCodexHome, writeSessionState } from "./home.js";
 import type {
   CommandExecutionRequestApprovalParams,
   DynamicToolCallParams,
@@ -35,7 +35,6 @@ import type {
   ThreadItem,
   ThreadStartParams,
   ThreadStartResponse,
-  TokenUsageBreakdown,
   ToolRequestUserInputParams,
   ToolRequestUserInputResponse,
   Turn,
@@ -44,7 +43,7 @@ import type {
   UserInput,
 } from "./protocol.js";
 import { Rpc, RpcError, type Incoming, type PendingRequest, type RequestId } from "./rpc.js";
-import { APP_SERVER, codexDone, codexPolicy, codexTool, codexUsage, isToolItem, mcpServerConfig, questions, todos, unwrapCommand } from "./translate.js";
+import { APP_SERVER, callUsage, codexDone, codexPolicy, codexTool, isToolItem, mcpServerConfig, questions, todos, unwrapCommand } from "./translate.js";
 
 export interface CodexOptions {
   /** The `codex` binary. */
@@ -118,12 +117,14 @@ interface RunState {
   turnId?: string;
   starting: boolean;
   compacting: boolean;
-  total: TokenUsageBreakdown | null;
+  /** Codex has reported the thread's tokens in this run. */
+  reported?: boolean;
+  /** What the running turn has used so far, since its turn/started. */
+  used?: Usage | null;
   error: string | null;
   home: string;
   dynamic: ToolSpec[] | null;
   mcpApp: boolean;
-  baseline: Totals | null;
   hiddenSkills: string[];
   noticedServers: boolean;
   skillsDir?: string;
@@ -168,8 +169,14 @@ class Run {
   #turnWaiters: ((id: string | undefined) => void)[] = [];
   /** The running turn is a compaction. */
   compacting = false;
-  /** The thread's token totals, as Codex last reported them in this run. */
-  total: TokenUsageBreakdown | null = null;
+  /** Codex has reported the thread's tokens in this run (so its turns' usage is known). */
+  reported = false;
+  /**
+   * What the running turn has used: each model call's tokens (tokenUsage.last), summed from its
+   * turn/started on. Codex's running totals aren't used: for a session the thread adopted they
+   * include what came before, and a revert doesn't take them back.
+   */
+  used: Usage | null = null;
   /** The running turn's last error that won't be retried. */
   error: string | null = null;
   /** The CODEX_HOME it runs with. */
@@ -181,8 +188,6 @@ class Run {
   dynamic: Map<string, ToolSpec> | null = null;
   /** Some of the app's tools are on the loopback MCP server (those the session hasn't as dynamic tools). */
   mcpApp = false;
-  /** Codex's token totals for the session after its last turn, when they're known. */
-  baseline: Totals | null = null;
   /** Skills Codex found that aren't the app's (the user's, the project's): they're turned off. */
   hiddenSkills: string[] = [];
   /** Notices about the thread's MCP servers were given. */
@@ -230,12 +235,12 @@ class Run {
       ...(this.turnId ? { turnId: this.turnId } : {}),
       starting: this.starting,
       compacting: this.compacting,
-      total: this.total,
+      reported: this.reported,
+      used: this.used,
       error: this.error,
       home: this.home,
       dynamic: this.dynamic ? [...this.dynamic.values()] : null,
       mcpApp: this.mcpApp,
-      baseline: this.baseline,
       hiddenSkills: this.hiddenSkills,
       noticedServers: this.noticedServers,
       ...(this.skillsDir ? { skillsDir: this.skillsDir } : {}),
@@ -260,12 +265,12 @@ class Run {
     this.turnId = st.turnId;
     this.starting = st.starting;
     this.compacting = st.compacting;
-    this.total = st.total;
+    this.reported = st.reported ?? false;
+    this.used = st.used ?? null;
     this.error = st.error;
     this.home = st.home;
     this.dynamic = st.dynamic ? new Map(st.dynamic.map((t) => [t.name, t])) : null;
     this.mcpApp = st.mcpApp;
-    this.baseline = st.baseline;
     this.hiddenSkills = st.hiddenSkills;
     this.noticedServers = st.noticedServers;
     if (st.skillsDir) this.skillsDir = st.skillsDir;
@@ -736,7 +741,6 @@ class CodexSession implements HarnessSession {
       // Codex keeps the dynamic tools the session started with, and resuming can't change them.
       const state = readSessionState(run.home, session);
       run.dynamic = state ? new Map(state.dynamicTools.map((t) => [t.name, t])) : null;
-      run.baseline = state?.totals ?? null;
       let r: ThreadStartResponse | undefined;
       try {
         r = await run.rpc.request<ThreadStartResponse>("thread/resume", { threadId: session, ...(await this.#threadParams(run, false)), excludeTurns: true });
@@ -770,17 +774,15 @@ class CodexSession implements HarnessSession {
       run.dynamic = new Map();
       r = await run.rpc.request<ThreadStartResponse>("thread/start", await this.#threadParams(run, true));
     }
-    // A new session's totals start at nothing.
-    run.baseline = { inputTokens: 0, cachedInputTokens: 0, outputTokens: 0, cacheWriteInputTokens: 0 };
     this.#saveState(run, r.thread.id);
     return r;
   }
 
-  /** Records the session's dynamic tools and totals, where they're known. */
+  /** Records the session's dynamic tools, where they're known. */
   #saveState(run: Run, session: string): void {
     if (!run.dynamic) return;
     try {
-      writeSessionState(run.home, session, { dynamicTools: [...run.dynamic.values()], totals: run.baseline });
+      writeSessionState(run.home, session, { dynamicTools: [...run.dynamic.values()] });
     } catch (e) {
       this.#ctx.error(e);
     }
@@ -938,13 +940,17 @@ class CodexSession implements HarnessSession {
           run.starting = true;
           run.error = null;
           run.setTurn(p.turn.id);
+          run.used = { input_tokens: 0, output_tokens: 0, cache_read_tokens: 0, cache_write_tokens: 0 };
         }
         return;
       case "turn/completed":
         if (own) return this.#turnCompleted(run, p.turn as Turn);
         return this.#childDone(run, p.threadId, p.turn as Turn, parent_id!);
       case "thread/tokenUsage/updated":
-        if (own && p.tokenUsage?.total) run.total = p.tokenUsage.total;
+        if (!own || !p.tokenUsage) return;
+        run.reported = true;
+        // A report outside a turn (a resumed session's totals, say) isn't any turn's.
+        if (run.used && p.tokenUsage.last) run.used = addUsage(run.used, callUsage(p.tokenUsage.last))!;
         return;
       case "warning":
         if (own && p.threadId && p.message) this.#notice(p.message);
@@ -1061,13 +1067,8 @@ class CodexSession implements HarnessSession {
     run.error = null;
     // The turn's requests are moot now; its open ones are cancelled with it.
     run.open.clear();
-    // Codex reports the session's totals: the turn used how far they grew. (Where the session's
-    // totals before it aren't known, the thread's usage stands in for them.)
-    const usage = run.total ? codexUsage(run.total, run.baseline ? totalsAsUsage(run.baseline) : ctx.thread.usage) : undefined;
-    if (run.total) {
-      run.baseline = run.total;
-      if (run.threadId) this.#saveState(run, run.threadId);
-    }
+    const usage = run.reported ? (run.used ?? { input_tokens: 0, output_tokens: 0, cache_read_tokens: 0, cache_write_tokens: 0 }) : undefined;
+    run.used = null;
     if (!ctx.turnId) return;
     this.#clearStop();
     const ok = turn?.status === "completed";
@@ -1347,17 +1348,12 @@ class CodexSession implements HarnessSession {
 }
 
 type ToolSpec = { name: string; description: string; inputSchema: unknown };
-type Totals = NonNullable<SessionState["totals"]>;
 
 /** A tool as Codex has it as a dynamic tool. */
 function toolSpec(t: Tool): ToolSpec {
   return { name: t.name, description: t.description, inputSchema: t.input };
 }
 
-/** Codex's totals as the usage they'd be if a turn had used them all. */
-function totalsAsUsage(t: Totals): Usage {
-  return { input_tokens: t.inputTokens - t.cachedInputTokens, cache_read_tokens: t.cachedInputTokens, output_tokens: t.outputTokens, cache_write_tokens: t.cacheWriteInputTokens ?? 0 };
-}
 
 /** A path with its symlinks resolved, where it exists. */
 function canonicalPath(path: string): string {

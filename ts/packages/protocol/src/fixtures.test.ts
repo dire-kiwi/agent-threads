@@ -37,9 +37,14 @@ describe.each(fixtures)("spec/fixtures/%s/expected.jsonl", (fixture) => {
     expect(s.seq).toBe(events.filter((e) => e.type !== "delta").length);
     expect(s.requests).toEqual([]);
     expect(["idle", "error"]).toContain(s.thread.status);
-    // Every turn ended with a turn_result, and nothing was left running.
-    const turns = events.filter((e) => e.type === "turn.started").length;
-    expect(s.items.filter((i) => i.type === "turn_result")).toHaveLength(turns);
+    // Every turn ended, with a turn_result, and the snapshot has those a rewind didn't remove.
+    const started = events.flatMap((e) => (e.type === "turn.started" ? [e.turn_id] : []));
+    const completed = events.flatMap((e) => (e.type === "turn.completed" ? [e.turn_id] : []));
+    expect(completed).toEqual(started);
+    const results = events.flatMap((e) => (e.type === "item.added" && e.item.type === "turn_result" ? [e.item] : []));
+    expect(results.map((r) => r.turn_id)).toEqual(started);
+    const removed = new Set(events.flatMap((e) => (e.type === "items.removed" ? e.item_ids : [])));
+    expect(s.items.filter((i) => i.type === "turn_result").map((i) => i.id)).toEqual(results.filter((r) => !removed.has(r.id)).map((r) => r.id));
     expect(s.items.filter((i) => i.type === "tool_call" && (i.status === "running" || i.status === "pending"))).toEqual([]);
     expect(s.items.filter((i) => i.type === "user_message" && i.queued)).toEqual([]);
   });

@@ -105,20 +105,16 @@ export function codexDone(item: ToolItem, denied: boolean): { [k: string]: unkno
 }
 
 /**
- * What a turn used. Codex reports the thread's running totals (again after a resume), so it's how
- * far they are past the thread's usage before the turn. Its input tokens include the cached ones,
- * which (as Claude's do) `input_tokens` leaves out.
+ * What a model call used (a tokenUsage report's `last`), as usage: a turn used its calls' sum. Its
+ * input tokens include the cached ones, which (as Claude's do) `input_tokens` leaves out.
  */
-export function codexUsage(total: TokenUsageBreakdown, before: Usage = {} as Usage): Usage {
-  const b = before as Partial<Usage>;
-  const cached = total.cachedInputTokens - (b.cache_read_tokens ?? 0);
-  const input = total.inputTokens - (b.input_tokens ?? 0) - (b.cache_read_tokens ?? 0);
-  const pos = (n: number) => Math.max(0, n);
+export function callUsage(last: TokenUsageBreakdown): Usage {
+  const pos = (n: number | undefined) => Math.max(0, n ?? 0);
   return {
-    input_tokens: pos(input - cached),
-    output_tokens: pos(total.outputTokens - (b.output_tokens ?? 0)),
-    cache_read_tokens: pos(cached),
-    cache_write_tokens: pos((total.cacheWriteInputTokens ?? 0) - (b.cache_write_tokens ?? 0)),
+    input_tokens: pos(last.inputTokens - last.cachedInputTokens),
+    output_tokens: pos(last.outputTokens),
+    cache_read_tokens: pos(last.cachedInputTokens),
+    cache_write_tokens: pos(last.cacheWriteInputTokens),
   };
 }
 

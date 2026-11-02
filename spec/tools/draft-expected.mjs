@@ -254,7 +254,9 @@ class Draft {
     for (const it of gone) this.items.delete(it.id);
     this.queued = this.queued.filter((q) => this.items.has(q.id));
     this.emit({ type: "items.removed", item_ids: gone.map((it) => it.id) });
-    this.setThread({ session_id: point.session_id, resume_at: point.resume_at });
+    // A rewind not yet made in the same session still has to be, if this one has no mark to go to.
+    const pending = point.session_id !== undefined && point.session_id === this.thread.session_id ? this.thread.resume_at : undefined;
+    this.setThread({ session_id: point.session_id, resume_at: point.resume_at ?? pending });
     this.item({ id: this.ph("n"), type: "notice", level: "info", code: "rewind", text: REWIND_TEXT });
   }
 
@@ -620,18 +622,17 @@ function draftCodex(d, runs) {
   let first = true;
   let mainThread = null;
   const children = new Map(); // child thread id -> spawnAgent call id
-  // Each Codex thread's totals after its last turn (as usage), and the main thread's now: a new one
-  // starts at nothing, and one resumed where it left off (or, for one the thread adopted, at the
-  // thread's usage, as nothing else is known).
-  const baselines = new Map();
-  let baseline;
   for (const [, entries] of runs) {
     if (!first) d.newRun();
     first = false;
     const asked = new Map(); // server request id -> request
     const sentReq = new Map(); // our request id -> method
     const streamed = new Set();
-    let total = null;
+    // Whether Codex has reported the thread's tokens in this run, and what its turn has used: the sum
+    // of each model call's (`last`) since the turn started. (Its running totals aren't: they're the
+    // session's from before the thread adopted it, and a revert doesn't take them back.)
+    let reported = false;
+    let used = null;
     let lastChildMessage = new Map();
     let error = null;
     const text = (m) => (m.params?.input ?? []).filter((i) => i.type === "text").map((i) => i.text).join("\n");
@@ -677,7 +678,6 @@ function draftCodex(d, runs) {
         const method = sentReq.get(m.id);
         if ((method === "thread/start" || method === "thread/resume") && m.result?.thread) {
           mainThread = m.result.thread.id;
-          baseline = method === "thread/start" ? { input_tokens: 0, output_tokens: 0, cache_read_tokens: 0, cache_write_tokens: 0 } : baselines.get(mainThread);
           if (d.thread.session_id !== mainThread) d.setThread({ session_id: mainThread });
         }
         // A rewind's revert is done.
@@ -793,8 +793,13 @@ function draftCodex(d, runs) {
           if (p.willRetry) d.item({ id: d.ph("n"), type: "notice", level: "warning", code: "retry", text: p.error.message });
           else error = p.error.message;
           break;
+        case "turn/started":
+          if (!child) used = { input_tokens: 0, output_tokens: 0, cache_read_tokens: 0, cache_write_tokens: 0 };
+          break;
         case "thread/tokenUsage/updated":
-          if (!child) total = p.tokenUsage.total;
+          if (child) break;
+          reported = true;
+          if (used) used = addUsage(used, callUsage(p.tokenUsage.last));
           break;
         case "turn/completed": {
           if (child) {
@@ -803,13 +808,8 @@ function draftCodex(d, runs) {
           }
           const turn = p.turn;
           d.mark(turn.id);
-          // Codex reports the thread's running totals (again after a resume), so a turn used what
-          // they've grown by since the thread's usage before it.
-          const usage = total ? codexUsage(total, baseline ?? d.thread.usage) : undefined;
-          if (total) {
-            baseline = { input_tokens: total.inputTokens - total.cachedInputTokens, output_tokens: total.outputTokens, cache_read_tokens: total.cachedInputTokens, cache_write_tokens: total.cacheWriteInputTokens ?? 0 };
-            baselines.set(mainThread, baseline);
-          }
+          const usage = reported ? (used ?? { input_tokens: 0, output_tokens: 0, cache_read_tokens: 0, cache_write_tokens: 0 }) : undefined;
+          used = null;
           d.endTurn({
             ok: turn.status === "completed",
             error: turn.status === "failed" ? (turn.error?.message ?? error ?? "the turn failed") : undefined,
@@ -824,14 +824,13 @@ function draftCodex(d, runs) {
   }
 }
 
-function codexUsage(total, before = {}) {
-  const cached = total.cachedInputTokens - (before.cache_read_tokens ?? 0);
-  const input = total.inputTokens - (before.input_tokens ?? 0) - (before.cache_read_tokens ?? 0);
+/** A model call's tokens (tokenUsage.last) as usage: input_tokens leaves out the cached ones. */
+function callUsage(last) {
   return {
-    input_tokens: input - cached,
-    output_tokens: total.outputTokens - (before.output_tokens ?? 0),
-    cache_read_tokens: cached,
-    cache_write_tokens: (total.cacheWriteInputTokens ?? 0) - (before.cache_write_tokens ?? 0),
+    input_tokens: last.inputTokens - last.cachedInputTokens,
+    output_tokens: last.outputTokens,
+    cache_read_tokens: last.cachedInputTokens,
+    cache_write_tokens: last.cacheWriteInputTokens ?? 0,
   };
 }
 

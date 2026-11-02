@@ -337,7 +337,7 @@ async function runTurn(input, id0 = uid("turn")) {
   thread.totals.cachedInputTokens += 40;
   thread.totals.outputTokens += 10;
   save();
-  notify("thread/tokenUsage/updated", { threadId: thread.id, turnId: id, tokenUsage: { total: { ...thread.totals }, last: {} } });
+  notify("thread/tokenUsage/updated", { threadId: thread.id, turnId: id, tokenUsage: { total: { ...thread.totals }, last: { totalTokens: 110, inputTokens: 100, cachedInputTokens: 40, cacheWriteInputTokens: 0, outputTokens: 10 } } });
   turn = null;
   notify("turn/completed", { threadId: thread.id, turn: { id, status, error, durationMs: 7, items: [] } });
 }

@@ -170,7 +170,8 @@ backend drives each CLI:
 - **`rewind`** to before turn T: an `items.removed` with, in the items' order, the items of T and of
   every turn after it (by `turn_id`), and the items with no `turn_id` after T's first item; then a
   `thread.updated` with the `session_id` and `resume_at` the rules in
-  [PROTOCOL.md](../PROTOCOL.md#sessions) give (or without them); then a `notice` (`level: info`,
+  [PROTOCOL.md](../PROTOCOL.md#sessions) give (or without them; a `resume_at` already there for the
+  same session stays when they give none); then a `notice` (`level: info`,
   `code: rewind`, "The conversation was rewound to here: the agent doesn't remember what came
   after."). Once the harness has gone back there (Claude Code's `init`, Codex's `thread/revert`
   response), a `thread.updated` clears `resume_at`.
@@ -239,11 +240,12 @@ backend drives each CLI:
   with one `<id>: <labels>` line per question.
 - **Notices**: a `warning` notification is a `notice` with `level: warning`; an `error` that will
   be retried is a `notice` with `code: retry`. One that won't is the turn's `error`.
-- **Usage**: Codex reports the thread's running totals, so a turn's usage is how far the last
-  totals in the turn are past the session's after its last turn: nothing, for a session
-  `thread/start` started, and the thread's usage for one it adopted (whose totals before aren't
-  known). `input_tokens` leaves out the cached
-  ones (`cache_read_tokens`), as Claude's do. `duration_ms` is the turn's `durationMs`.
+- **Usage**: a turn used what its model calls did: the sum of the `last` of each of the thread's
+  own `thread/tokenUsage/updated` from its `turn/started` to its `turn/completed` (none, if Codex
+  hasn't reported tokens in the process at all). Not Codex's running totals: a session the thread
+  adopted has them from before, a resumed one reports them before its turn starts, and
+  `thread/revert` doesn't take them back. `input_tokens` leaves out the cached ones
+  (`cache_read_tokens`), as Claude's do. `duration_ms` is the turn's `durationMs`.
 
 ## Comparing events
 

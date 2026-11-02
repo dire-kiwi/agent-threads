@@ -141,6 +141,20 @@ describe("rewind", () => {
     expect((await snap()).thread).toMatchObject({ session_id: "S0", resume_at: "c1" });
   });
 
+  it("keeps a Codex revert not yet made when a second rewind, to before turns with no mark, needs it", async () => {
+    const { sdk, id, turn, snap } = await setup(revertPoint);
+    await turn("one", "S", "c1");
+    await turn("two"); // failed before Codex marked it
+    await turn("three", undefined, "c3");
+    const [, t2, t3] = turnIds((await snap()).items);
+    await sdk.rewind(id, t3!);
+    expect((await snap()).thread).toMatchObject({ session_id: "S", resume_at: "c3" });
+    // Codex still has turn three: reverting to before it is what takes it back to before turn two.
+    await sdk.rewind(id, t2!);
+    expect((await snap()).thread).toMatchObject({ session_id: "S", resume_at: "c3" });
+    expect(turnIds((await snap()).items)).toHaveLength(1);
+  });
+
   it("is refused while a turn runs, and for a turn the thread hasn't", async () => {
     const { sdk, id, turn, snap } = await setup();
     await turn("one", "S1", "m1");
@@ -197,5 +211,48 @@ describe("the rewind points", () => {
     expect(revertPoint([s("A", "a1", true), s("A"), s("A", "a3")], 1)).toEqual({ session_id: "A", resume_at: "a3" });
     expect(revertPoint([s("A", "a1", true), s("A"), s("B", "b1", true)], 1)).toEqual({ session_id: "A" });
     expect(revertPoint([s("A", "a1", true)], 0)).toEqual({});
+  });
+});
+
+describe("a turn the backend lost", () => {
+  /** A thread whose turn was running when its backend went (without closing), loaded by another. */
+  async function lost(create: { session_id?: string }, before?: (t: Awaited<ReturnType<typeof setup>>) => Promise<void>) {
+    const store = new MemoryStore();
+    const first = fake(resumeAtPoint);
+    const sdk = new AgentThreads({ store, harnesses: { fake: first.harness }, permissions: "allow" });
+    const thread = await sdk.create(create);
+    const t = { sdk, h: first.h, id: thread.id } as unknown as Awaited<ReturnType<typeof setup>>;
+    if (before) await before(t);
+    await sdk.send(thread.id, "the lost one");
+    // The harness says which session the turn runs in (a new one, if the thread had none), then the
+    // backend goes.
+    first.h.ctx!.setThread({ session_id: create.session_id ?? "S-new" });
+    await sdk.eventsSince(thread.id, 0);
+    const next = new AgentThreads({ store, harnesses: { fake: fake(resumeAtPoint).harness }, permissions: "allow" });
+    const s = await next.snapshot(thread.id);
+    return { next, id: thread.id, s };
+  }
+
+  it("records that it started the session it got", async () => {
+    const { next, id, s } = await lost({});
+    expect(sessions(s.items)).toEqual([{ id: "S-new", started: true }]);
+    await next.rewind(id, turnIds(s.items)[0]!);
+    expect((await next.snapshot(id)).thread.session_id).toBeUndefined();
+  });
+
+  it("records that it started the one it got after a new_session", async () => {
+    const { s } = await lost({}, async ({ sdk, h, id }) => {
+      await sdk.send(id, "one");
+      h.ctx!.setThread({ session_id: "S-old" });
+      h.ctx!.endTurn({ ok: true, session_at: "m1" });
+      await sdk.newSession(id);
+    });
+    expect(sessions(s.items)).toEqual([{ id: "S-old", at: "m1", started: true }, { id: "S-new", started: true }]);
+  });
+
+  it("records that it continued a session the thread adopted", async () => {
+    const { next, id, s } = await lost({ session_id: "S0" });
+    expect(sessions(s.items)).toEqual([{ id: "S0" }]);
+    await expect(next.rewind(id, turnIds(s.items)[0]!)).rejects.toThrow(CommandError);
   });
 });

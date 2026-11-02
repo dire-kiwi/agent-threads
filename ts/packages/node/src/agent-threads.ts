@@ -3,6 +3,7 @@
 // transport.
 
 import {
+  applyEvent,
   applyEvents,
   initialState,
   validate,
@@ -471,14 +472,23 @@ export class AgentThreads {
     let state = applyEvents(snap ?? initialState(thread), events);
     if (state.seq === 0) state = initialState(thread);
     const rt = this.#runtime(state);
-    if (await this.#reattach(rt)) return rt;
+    // The session the running turn (if one is) started in, which a turn rebuilt here starts with.
+    const running = rt.thread.status === "running" || rt.thread.status === "waiting";
+    const turnId = [...state.items].reverse().find((i) => i.turn_id)?.turn_id;
+    const startedIn = running && turnId ? (sessionAtStart(snap ?? initialState(thread), events, turnId) ?? (await this.#sessionAtStart(thread, turnId))) : undefined;
+    const session = startedIn ?? (rt.thread.session_id ? { session: rt.thread.session_id } : {});
+    if (await this.#reattach(rt, session)) return rt;
     // The process that ran its turn went with the backend before this one, or can't be followed.
-    const s = rt.thread.status;
-    if (s === "running" || s === "waiting" || rt.thread.run) {
+    if (running || rt.thread.run) {
       if (rt.thread.run) rt.lostRun = rt.thread.run.id;
-      recoverLost(rt);
+      recoverLost(rt, session);
     }
     return rt;
+  }
+
+  /** The session the turn `turnId` started in, from all the thread's events (see sessionAtStart). */
+  async #sessionAtStart(thread: Thread, turnId: string): Promise<{ session?: string } | undefined> {
+    return sessionAtStart(initialState(thread), await this.store.readEvents(thread.id, { after: 0 }), turnId);
   }
 
   /**
@@ -486,7 +496,7 @@ export class AgentThreads {
    * its turn and open requests are as they were when the run was last saved, and the session
    * carries on reading the run from there. Whether it did; if it couldn't, the run is stopped.
    */
-  async #reattach(rt: ThreadRuntime): Promise<boolean> {
+  async #reattach(rt: ThreadRuntime, startedIn: { session?: string }): Promise<boolean> {
     const run = rt.thread.run;
     if (!run || run.spawner === "direct") return false;
     const record = await this.store.getRun(run.id);
@@ -495,8 +505,7 @@ export class AgentThreads {
     const s = rt.thread.status;
     if (s === "running" || s === "waiting") {
       const last = [...rt.snapshot.items].reverse().find((i) => i.turn_id)?.turn_id;
-      const session = rt.thread.session_id ? { session: rt.thread.session_id } : {};
-      rt.turn = data.turn ? { ...data.turn } : { id: last ?? newId("turn"), interrupted: false, ...session };
+      rt.turn = data.turn ? { ...data.turn } : { id: last ?? newId("turn"), interrupted: false, ...startedIn };
     }
     rt.adoptRun(record);
     const session = rt.session;
@@ -544,14 +553,31 @@ function idle(rt: ThreadRuntime, what: string): void {
   if (rt.turn) throw new CommandError(`a turn is running: the thread can't be ${what} until it ends (interrupt it first)`);
 }
 
-/** Ends a turn whose process was lost when the backend stopped. */
-function recoverLost(rt: ThreadRuntime): void {
+/**
+ * The thread's session_id when the turn `turnId` started (as `{session}`, empty for none), from
+ * `events` folded onto `from`; undefined if its turn.started isn't among them. (A session the turn
+ * starts is set after its turn.started.)
+ */
+function sessionAtStart(from: Snapshot, events: ThreadEvent[], turnId: string): { session?: string } | undefined {
+  let state = from;
+  let found: { session?: string } | undefined;
+  for (const e of events) {
+    if (e.type === "turn.started" && e.turn_id === turnId) found = state.thread.session_id ? { session: state.thread.session_id } : {};
+    state = applyEvent(state, e);
+  }
+  return found;
+}
+
+/**
+ * Ends a turn whose process was lost when the backend stopped. `startedIn` is the session it
+ * started in.
+ */
+function recoverLost(rt: ThreadRuntime, startedIn: { session?: string }): void {
   const s = rt.thread.status;
   if (s === "running" || s === "waiting") {
     const items = rt.snapshot.items;
     const turnId = [...items].reverse().find((i) => i.turn_id)?.turn_id ?? newId("turn");
-    // Its session as it is now, which is as it was when it started unless the turn started it.
-    rt.turn = { id: turnId, interrupted: false, ...(rt.thread.session_id ? { session: rt.thread.session_id } : {}) };
+    rt.turn = { id: turnId, interrupted: false, ...startedIn };
     for (const r of rt.snapshot.requests) {
       rt.emit({ type: "request.resolved", request_id: r.id, resolution: { outcome: "cancel" } });
     }

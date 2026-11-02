@@ -461,8 +461,13 @@ export class ThreadRuntime implements ThreadContext {
     const gone = items.filter((it, i) => (it.turn_id !== undefined ? dropped.has(it.turn_id) : i > first)).map((it) => it.id);
     const goneSet = new Set(gone);
     this.#queue = this.#queue.filter((id) => !goneSet.has(id));
+    // A rewind not yet made (resume_at) went back to before a later turn of the same session: with
+    // no mark of its own to go to, this one still needs that one made, as the turns since added
+    // nothing to the session but the ones it took back are still in it.
+    const t = this.#state.thread;
+    const resumeAt = point.resume_at ?? (point.session_id !== undefined && point.session_id === t.session_id ? t.resume_at : undefined);
     this.emit({ type: "items.removed", item_ids: gone });
-    this.setThread({ session_id: point.session_id, resume_at: point.resume_at });
+    this.setThread({ session_id: point.session_id, resume_at: resumeAt });
     this.addItem({ id: newId("n"), type: "notice", level: "info", code: "rewind", text: REWIND_TEXT });
     this.session.optionsChanged();
   }
