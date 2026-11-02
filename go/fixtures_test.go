@@ -289,10 +289,11 @@ func runFixture(t *testing.T, scenario, spawnerName string) {
 				if err != nil {
 					t.Fatal(err)
 				}
-				if len(snap.Requests) != 1 {
-					t.Fatalf("%s: %d requests open, not 1", where, len(snap.Requests))
+				open := protocol.OpenRequests(snap)
+				if len(open) != 1 {
+					t.Fatalf("%s: %d requests open, not 1", where, len(open))
 				}
-				cmd["request_id"] = snap.Requests[0].ID()
+				cmd["request_id"] = open[0].ID()
 			}
 			from = rec.len()
 			if err := sdk.HandleJSON(ctx, mustMarshal(cmd)); err != nil {

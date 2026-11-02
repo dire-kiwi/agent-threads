@@ -18,7 +18,9 @@ use tokio::sync::{mpsc, watch};
 
 use crate::agent_threads::Error;
 use crate::attachments::{Part, message_parts, path_text};
-use crate::harness::{BoxFuture, ControlReply, Harness, HarnessSession, Message, RunCheckpoint, TurnEnd};
+use crate::harness::{
+    BoxFuture, ControlReply, Harness, HarnessSession, LaunchOptions, Message, RunCheckpoint, TurnEnd,
+};
 use crate::ids::{new_id, now_iso, now_ms, private_temp_dir};
 use crate::permissions::{Decided, PermissionDecision, PermissionQuery, permission_key};
 use crate::protocol::{DeltaEventKind, Item, Resolution, ResolutionOutcome, ToolKind, ToolStatus};
@@ -116,6 +118,20 @@ struct Launched {
     effort: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     permission_mode: Option<String>,
+    #[serde(default, skip_serializing_if = "LaunchOptions::is_empty")]
+    launch: LaunchOptions,
+}
+
+impl Launched {
+    fn of(ctx: &ThreadContext) -> Self {
+        let t = ctx.thread();
+        Launched {
+            model: t.model.clone(),
+            effort: t.effort.clone(),
+            permission_mode: t.permission_mode.map(|m| m.to_string()),
+            launch: ctx.launch().clone(),
+        }
+    }
 }
 
 /// What a run's checkpoint holds: what's needed to carry on reading its output, as of the offset
@@ -593,7 +609,9 @@ impl ClaudeSession {
                 None => env.remove(k),
             };
         }
-        if let Some(dir) = &o.config_dir {
+        let launch = ctx.launch();
+        launch.apply_env(&mut env);
+        if let Some(dir) = launch.config_dir.as_ref().or(o.config_dir.as_ref()) {
             env.insert("CLAUDE_CONFIG_DIR".into(), dir.to_string_lossy().into());
         }
         let options = SpawnOptions {
@@ -618,12 +636,7 @@ impl ClaudeSession {
                 return;
             }
         };
-        let t = ctx.thread();
-        let launched = Launched {
-            model: t.model.clone(),
-            effort: t.effort.clone(),
-            permission_mode: t.permission_mode.map(|m| m.to_string()),
-        };
+        let launched = Launched::of(ctx);
         let tools = !ctx.config().tools.is_empty();
         let run = self.run(id).unwrap();
         run.proc = Some(proc);
@@ -730,7 +743,12 @@ impl ClaudeSession {
         if let Some(p) = &config.system_prompt {
             args.extend(["--append-system-prompt".into(), p.clone()]);
         }
+        let launch = ctx.launch();
+        for d in &launch.add_dirs {
+            args.extend(["--add-dir".into(), d.to_string_lossy().into()]);
+        }
         args.extend(o.args.iter().cloned());
+        args.extend(launch.args.iter().cloned());
         args
     }
 
@@ -1662,12 +1680,7 @@ impl HarnessSession for ClaudeSession {
         self.current = Some(id.clone());
         forward(ctx, &id, rx);
         // A process started with other options than the thread's now is replaced at the next turn.
-        let t = ctx.thread();
-        let now = Launched {
-            model: t.model.clone(),
-            effort: t.effort.clone(),
-            permission_mode: t.permission_mode.map(|m| m.to_string()),
-        };
+        let now = Launched::of(ctx);
         self.stale = st.stale || st.launched.as_ref() != Some(&now);
         // Claude's requests that were open: the user's questions are taken up again, and the rest
         // (a policy that hadn't decided, a tool that was running) are dealt with again.

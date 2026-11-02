@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"math"
+	"strings"
 	"time"
 
 	"github.com/dire-kiwi/agent-threads/go/protocol"
@@ -48,6 +49,91 @@ type ThreadConfig struct {
 	SystemPrompt string
 }
 
+// LaunchOptions are how a thread's harness process is started, on top of the harness's own options:
+// stored with the thread (but not sent to clients), so a run started after a restart has them too.
+// A change applies from the next process the thread starts, as a model change does.
+type LaunchOptions struct {
+	// Args are more arguments, after the harness's (and its options' Args): for Claude Code, say,
+	// --allowedTools, --disallowedTools or --settings; for Codex, -c key=value.
+	Args []string `json:"args,omitempty"`
+	// Env is changes to the environment, after the harness options' Env: a value sets a variable,
+	// nil removes it.
+	Env map[string]*string `json:"env,omitempty"`
+	// AddDirs are more directories the agent may use besides the working directory: --add-dir for
+	// Claude Code, writable roots (sandbox_workspace_write.writable_roots) for Codex.
+	AddDirs []string `json:"add_dirs,omitempty"`
+	// ConfigDir is the harness's config directory, in place of the harness options': CLAUDE_CONFIG_DIR
+	// for Claude Code, CODEX_HOME for Codex (used as it is, with its own login and config). The
+	// harness keeps its sessions there, so a thread that changes it can't resume what it had.
+	ConfigDir string `json:"config_dir,omitempty"`
+}
+
+// IsEmpty says whether there are none.
+func (l LaunchOptions) IsEmpty() bool {
+	return len(l.Args) == 0 && len(l.Env) == 0 && len(l.AddDirs) == 0 && l.ConfigDir == ""
+}
+
+// applyEnv makes these changes to an environment (the backend's, with the harness options' changes).
+func (l LaunchOptions) applyEnv(env []string) []string {
+	if len(l.Env) == 0 {
+		return env
+	}
+	set := map[string]string{}
+	out := make([]string, 0, len(env)+len(l.Env))
+	for _, kv := range env {
+		k, _, _ := strings.Cut(kv, "=")
+		if _, ok := l.Env[k]; !ok {
+			out = append(out, kv)
+		}
+	}
+	for k, v := range l.Env {
+		if v != nil {
+			set[k] = *v
+		}
+	}
+	for _, k := range sortedKeys(set) {
+		out = append(out, k+"="+set[k])
+	}
+	return out
+}
+
+// launchField is the stored thread's field the launch options are kept in.
+const launchField = "launch"
+
+// withLaunch is the thread as the store keeps it: with its launch options, which clients aren't sent.
+func withLaunch(t protocol.Thread, l LaunchOptions) protocol.Thread {
+	extra := make(map[string]json.RawMessage, len(t.Extra)+1)
+	for k, v := range t.Extra {
+		if k != launchField {
+			extra[k] = v
+		}
+	}
+	if !l.IsEmpty() {
+		data, err := json.Marshal(l)
+		if err == nil {
+			extra[launchField] = data
+		}
+	}
+	if len(extra) == 0 {
+		extra = nil
+	}
+	t.Extra = extra
+	return t
+}
+
+// splitLaunch is a stored thread without its launch options (its launch field), and them (or none).
+func splitLaunch(t protocol.Thread) (protocol.Thread, LaunchOptions) {
+	var l LaunchOptions
+	raw, ok := t.Extra[launchField]
+	if !ok {
+		return t, l
+	}
+	if json.Unmarshal(raw, &l) != nil {
+		l = LaunchOptions{}
+	}
+	return withLaunch(t, LaunchOptions{}), l
+}
+
 // Message is a message to give the harness: its user_message item's id, text and attachments.
 type Message struct {
 	ID          string
@@ -72,6 +158,9 @@ type ThreadContext interface {
 	ThreadID() string
 	Thread() protocol.Thread
 	Config() ThreadConfig
+	// Launch is how the thread's harness process is started: its args, environment, directories and
+	// config directory. Don't change what it returns.
+	Launch() LaunchOptions
 	Spawner() Spawner
 	// TurnID is the running turn's id, or "" if none is running.
 	TurnID() string
@@ -161,7 +250,8 @@ type Session interface {
 	// Release says the core gave up carrying the queued messages over: make sure nothing acts on
 	// them (stop a process that has them). They're sent again with the next turn's Start.
 	Release()
-	// OptionsChanged says the thread's options (model, effort, permission mode) or config changed.
+	// OptionsChanged says the thread's options (model, effort, permission mode), launch options or
+	// config changed.
 	OptionsChanged()
 	// Close stops the harness process, if it's running, and calls done once it has.
 	Close(done func())

@@ -2,12 +2,13 @@
 // memoized, and an event leaves the items (and rows) it doesn't change as they were, so only the
 // rows it changes redraw.
 
-import type { AssistantMessage as AssistantMessageItem, Attachment, Item, Reasoning as ReasoningItem, UserMessage as UserMessageItem } from "@dire-kiwi/agent-threads-protocol";
+import type { AssistantMessage as AssistantMessageItem, Attachment, Item, Reasoning as ReasoningItem, ThreadRequest, UserMessage as UserMessageItem } from "@dire-kiwi/agent-threads-protocol";
 import { memo, useMemo, useRef } from "react";
 import { useThreadConfig, useThreadState } from "../hooks.js";
 import { BrainIcon, ClockIcon } from "../icons.js";
 import { groupRows, NO_ITEMS, rowKey, type Row as RowItem } from "../view.js";
 import { CompactionLine, Notice, TurnResult } from "./Lines.js";
+import { RequestCard } from "./Requests.js";
 import { StreamingText } from "./StreamingText.js";
 import { ToolCall, ToolGroup, toolRenderer } from "./ToolCall.js";
 import { Collapsible, cx, Markdown } from "./ui.js";
@@ -15,13 +16,14 @@ import { Collapsible, cx, Markdown } from "./ui.js";
 /** The rows of the thread (or, given `parentId`, of that subagent's own thread). */
 export const MessageList = memo(function MessageList({ parentId = "", className }: { parentId?: string; className?: string }) {
   const items = useThreadState((s) => s.view.children.get(parentId) ?? NO_ITEMS);
+  const answered = useThreadState((s) => s.view.answered.get(parentId) ?? NO_REQUESTS);
   const config = useThreadConfig();
   const alone = useMemo(() => {
     if (!config.tools && !config.toolKinds) return undefined;
     return (call: Parameters<typeof toolRenderer>[1]) => !!toolRenderer(config, call).alone;
   }, [config]);
   const prev = useRef<readonly RowItem[]>(undefined);
-  const rows = useMemo(() => (prev.current = groupRows(items, prev.current, alone)), [items, alone]);
+  const rows = useMemo(() => (prev.current = groupRows(items, prev.current, alone, answered)), [items, alone, answered]);
   return (
     <div className={cx("at-message-list", className)}>
       {rows.map((row) => (
@@ -31,10 +33,13 @@ export const MessageList = memo(function MessageList({ parentId = "", className 
   );
 });
 
-/** One row: an item, or a group of tool calls. */
+const NO_REQUESTS: readonly ThreadRequest[] = [];
+
+/** One row: an item, a group of tool calls, or an answered request. */
 export const MessageRow = memo(function MessageRow({ row }: { row: RowItem }) {
   const { renderItem } = useThreadConfig();
   if (row.type === "tool_group") return <ToolGroup group={row} />;
+  if (row.type === "request") return <RequestCard request={row.request} />;
   const custom = renderItem?.(row);
   if (custom !== undefined) return <>{custom}</>;
   return <ItemView item={row} />;

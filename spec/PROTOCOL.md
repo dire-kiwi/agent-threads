@@ -13,11 +13,12 @@ source of truth for the shapes, and this document says what they mean. See
 | [request.schema.json](schema/request.schema.json) | `ThreadRequest` (`PermissionRequest`, `QuestionRequest`), `Question`, `Resolution` |
 | [event.schema.json](schema/event.schema.json) | `ThreadEvent` and its variants |
 | [command.schema.json](schema/command.schema.json) | `Command` and its variants |
-| [snapshot.schema.json](schema/snapshot.schema.json) | `Snapshot` |
+| [snapshot.schema.json](schema/snapshot.schema.json) | `Snapshot`, `ItemPage` |
 
 `protocol.schema.json` bundles them into one schema, and the TS, Go and Rust types are generated
 from it: run `make gen` after changing a schema. [examples/](examples/) has a whole thread's events,
-the snapshot they fold into, and one of each command; every language's tests read them.
+the snapshot they fold into, a window of it and a page before that window, and one of each command;
+every language's tests read them.
 [fixtures/](fixtures/README.md) has recorded Claude and Codex sessions with the events a backend
 must make of them, which is where the translation from each harness is pinned down.
 
@@ -118,7 +119,9 @@ the subagent returned.
 
 A request is something the agent is waiting on the user for. It's open from `request.opened` until
 `request.resolved`, and the user answers it with a `respond` command. A thread can have several
-open at once (e.g. from parallel subagents).
+open at once (e.g. from parallel subagents). Once it's resolved, the thread's state keeps it with
+its `resolution` set, so a UI can go on showing what was asked and how it was answered; a request
+without a `resolution` is open.
 
 - `permission`: the agent wants to call a tool and the app's permission policy said "ask". It has
   the tool's `name`, `kind` and `input`, the `tool_call_id` of the call when there is one, a `title`
@@ -147,7 +150,7 @@ Every event has `type`, `thread_id` and `seq`, and may have `raw`.
 | `item.updated` | `item_id`, `patch` | Fields of an item changed: each of the patch's fields replaces the item's, and one set to `null` is removed. `id` and `type` never change. |
 | `delta` | `item_id`, `kind`, `offset`, `text` | Streamed text to append to an `assistant_message` (`kind: text`) or `reasoning` (`kind: reasoning`) item's `text`, which was `offset` long before it. |
 | `request.opened` | `request` | A request was opened. |
-| `request.resolved` | `request_id`, `resolution` | A request was answered or cancelled. |
+| `request.resolved` | `request_id`, `resolution` | A request was answered or cancelled. It stays in the state, with this `resolution`. |
 
 The backend changes the thread's `status` with `thread.updated` alongside these (to `running` when
 a turn starts, `waiting` while a request is open, and back), and doesn't leave a client to infer it.
@@ -176,8 +179,10 @@ the same rules:
 2. A saved event whose `seq` is at or below the state's is already in it, and changes nothing. So
    events can be delivered more than once.
 3. Otherwise the event is applied as described above, and the state's `seq` becomes the event's.
-   (`turn.*` events change nothing else.) An `item.updated` or `request.resolved` for an id the
-   state doesn't have only advances `seq`.
+   (`turn.*` events change nothing else.) A `request.opened` adds its request at the end of
+   `requests`, or replaces the one with its id in place. A `request.resolved` sets its request's
+   `resolution` (replacing one it had), leaving it where it is in `requests`. An `item.updated` or
+   `request.resolved` for an id the state doesn't have only advances `seq`.
 4. A `delta` is applied when the state has its item, the item is the delta's `kind`'s type, and
    the delta's `seq` isn't below the state's (one from before the last saved event the state has
    is already in it). Its `text` goes at `offset` in the item's text: what's already there (the
@@ -189,6 +194,55 @@ A backend's live snapshot includes the deltas it has applied, so a client that c
 middle of a message gets the text so far. Deltas it gets after the snapshot that the snapshot
 already has (it subscribed first, so as to miss nothing) carry offsets the snapshot's text is
 already past, and are skipped rather than added twice.
+
+### Windows
+
+A thread can run to thousands of items, so a client needn't load them all: a backend's snapshot can
+be a **window** of the thread, taken with a limit, that has only its last items, and the client loads
+earlier ones a page at a time as the user scrolls back. Items are only ever added at the end of a
+thread's list (an `item.added` for an id it has replaces that item in place), so an item's index in
+the whole list never changes, and windows and pages are told where they are by index.
+
+A window of a state with `n` items and a limit `limit` (less than `n`; with a limit of `n` or more it
+is the whole state) has:
+
+- `start`: `n - limit`, the index of the first item of the window. The window has the items from
+  `start` to the end.
+- `context`: the indices of the items from before `start` the window needs, ascending: the
+  `parent_id` of each of its items, and of each open request, and the request's `tool_call_id`, and
+  each subagent call (a `tool_call` of kind `subagent`) that's still `pending` or `running` (it may
+  add items to the window later, which would have no call to belong to), and then each of those
+  items' own `parent_id`, and so on (the subagent calls they belong to, however nested), where
+  they're before `start`. `items` starts with these, in that order, followed by the
+  window's items. Left out when there are none.
+- `requests`: the open requests, and the resolved requests whose **anchor** is at `start` or after,
+  or that have none, in the state's order. A request's anchor is the index of its `tool_call_id`'s
+  item if the state has one, or else that of the last item with its `turn_id`.
+- `thread` and `seq` as the state's.
+
+A **page** (`ItemPage`) is the thread's items before an index `before` (a window's `start`), at most
+`limit` of them: it has `start`, `max(0, before - limit)`; `items`, the items from before `start`
+that its items need (`context`, worked out as for a window from its own items' `parent_id`s), then
+the items from `start` up to `before`; `requests`, the requests whose anchor is in that range; and
+`seq`, that of the state it was taken from. `start` 0 means there's nothing before it.
+
+Events apply to a window as to any state (an event about an item or request it doesn't have only
+advances `seq`), and leave `start` and `context` as they are. A client puts a page into its window
+by putting the page's items in front of its own (`withPage` in `@dire-kiwi/agent-threads-protocol`):
+the context items of both, ordered by index (the page's version of one they share), those of them
+the page's own items include dropped, then the page's items from its `start`, then its own from its
+old `start`. Its `start` becomes the page's, and `context` the indices of the context items it kept
+(left out once `start` is 0). The page's requests go in front of its own, a page's version of one
+it has replacing it in place. (So a window with pages put in it may not have its requests in the
+state's order: a resolved request from a page can come before an open one the window had. A UI
+places resolved requests by their anchor.)
+
+A page may be taken from a later state than the client's (its `seq` is higher), and that's fine:
+events the client applies after it set what they set again. One taken from an earlier state can't
+be: the backend takes it after the client asked for it, so it has every event the client had then.
+A client applies the saved events it applies while it waits for the page (those with a `seq` above
+the page's) to the page's items and requests too, before putting it in, leaving out events that
+would add one the page doesn't have.
 
 ### Reconnecting
 

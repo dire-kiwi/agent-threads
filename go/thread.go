@@ -74,6 +74,7 @@ type threadRuntime struct {
 	id      string
 	loop    *loop
 	config  ThreadConfig
+	launch  LaunchOptions // how its harness process is started: stored with the thread
 	policy  PermissionPolicy
 	session Session
 	turn    *turnState
@@ -127,13 +128,14 @@ type threadRuntime struct {
 	raw json.RawMessage
 }
 
-func newRuntime(sdk *AgentThreads, state protocol.Snapshot, config ThreadConfig, policy PermissionPolicy) *threadRuntime {
+func newRuntime(sdk *AgentThreads, state protocol.Snapshot, config ThreadConfig, launch LaunchOptions, policy PermissionPolicy) *threadRuntime {
 	rt := &threadRuntime{
 		sdk:        sdk,
 		id:         state.Thread.ID,
 		state:      state,
 		saved:      state,
 		config:     config,
+		launch:     launch,
 		policy:     policy,
 		requests:   map[string]*openRequest{},
 		always:     map[string]Decision{},
@@ -158,6 +160,8 @@ func (rt *threadRuntime) ThreadID() string { return rt.id }
 func (rt *threadRuntime) Thread() protocol.Thread { return rt.state.Thread }
 
 func (rt *threadRuntime) Config() ThreadConfig { return rt.config }
+
+func (rt *threadRuntime) Launch() LaunchOptions { return rt.launch }
 
 func (rt *threadRuntime) Spawner() Spawner { return rt.sdk.spawner }
 
@@ -233,7 +237,7 @@ func (rt *threadRuntime) take() {
 	b.runs = rt.runs()
 	if rt.threadChanged {
 		rt.threadChanged = false
-		t := clone(rt.saved.Thread)
+		t := withLaunch(clone(rt.saved.Thread), rt.launch)
 		b.thread = &t
 	}
 	if rt.snapshotDue {
@@ -754,6 +758,18 @@ func (rt *threadRuntime) FromHarness(runID, line string, handle func()) {
 	}
 }
 
+// setLaunch changes how the harness process is started, from the next one; it's saved with the
+// thread.
+func (rt *threadRuntime) setLaunch(launch LaunchOptions) {
+	if sameJSONValue(launch, rt.launch) {
+		return
+	}
+	rt.launch = clone(launch)
+	rt.threadChanged = true
+	rt.flushQueued = true
+	rt.session.OptionsChanged()
+}
+
 func sameJSONValue(a, b any) bool {
 	x, err1 := json.Marshal(a)
 	y, err2 := json.Marshal(b)
@@ -1012,7 +1028,8 @@ func (rt *threadRuntime) Reopen(requestID string, answered func(protocol.Resolut
 		return false
 	}
 	for _, r := range rt.state.Requests {
-		if r.ID() == requestID {
+		// One that's been resolved stays in the state, with its resolution, but can't be reopened.
+		if r.ID() == requestID && r.Resolution() == nil {
 			rt.addRequest(requestID, &openRequest{request: r, answered: answered, standing: standing})
 			return true
 		}

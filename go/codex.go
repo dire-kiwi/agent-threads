@@ -620,8 +620,7 @@ func (s *codexSession) Reattach(record RunRecord) bool {
 		}
 	}
 	// A process started with other options than the thread's now is replaced at the next turn.
-	l := st.Launched
-	s.stale = st.Stale || l == nil || *l != *launchedOf(ctx.Thread())
+	s.stale = st.Stale || st.Launched.stale(ctx)
 	// Codex's requests that were open: the user's questions are taken up again, an app tool that was
 	// running is answered (not run again), and the rest are dealt with again. One answered before the
 	// restart, though that wasn't saved, is closed: Codex has its answer.
@@ -854,9 +853,13 @@ func (s *codexSession) spawn(run *codexRun) {
 		return
 	}
 	ctx := s.ctx
+	launch := ctx.Launch()
 	var home string
 	var err error
-	if s.o.UserConfig {
+	if launch.ConfigDir != "" {
+		// The thread's own CODEX_HOME is used as it is.
+		home, err = filepath.Abs(launch.ConfigDir)
+	} else if s.o.UserConfig {
 		home = userCodexHome()
 	} else {
 		h := s.o.Home
@@ -881,8 +884,8 @@ func (s *codexSession) spawn(run *codexRun) {
 	if bin == "" {
 		bin = "codex"
 	}
-	args := append(append(append([]string{}, s.o.BinArgs...), "app-server"), s.o.Args...)
-	env := mergeEnv(mergeEnv(os.Environ(), s.o.Env), map[string]string{"CODEX_HOME": home})
+	args := append(append(append(append([]string{}, s.o.BinArgs...), "app-server"), s.o.Args...), launch.Args...)
+	env := mergeEnv(launch.applyEnv(mergeEnv(os.Environ(), s.o.Env)), map[string]string{"CODEX_HOME": home})
 	proc, err := ctx.Spawner().Spawn(SpawnOptions{
 		Command: bin, Args: args, Cwd: ctx.Thread().Cwd, Env: env, ThreadID: ctx.ThreadID(), RunID: run.id, Post: ctx.Post,
 	}, s.handlers(run))
@@ -892,7 +895,7 @@ func (s *codexSession) spawn(run *codexRun) {
 		return
 	}
 	run.proc = proc
-	run.launched = launchedOf(ctx.Thread())
+	run.launched = launchedOf(ctx)
 	ctx.SetThread(func(t *protocol.Thread) {
 		t.Run = &protocol.Run{ID: run.id, Spawner: protocol.RunSpawner(ctx.Spawner().Name()), StartedAt: now()}
 	})
@@ -1152,6 +1155,19 @@ func (s *codexSession) threadParams(run *codexRun, fresh bool) (map[string]any, 
 	if len(servers) > 0 {
 		config["mcp_servers"] = servers
 	}
+	// The thread's other directories are writable as its working directory is (relative ones are
+	// in it), after any the options give.
+	if dirs := ctx.Launch().AddDirs; len(dirs) > 0 {
+		const key = "sandbox_workspace_write.writable_roots"
+		roots := jsonList(config[key])
+		for _, d := range dirs {
+			if t.Cwd != "" && !filepath.IsAbs(d) {
+				d = filepath.Join(t.Cwd, d)
+			}
+			roots = append(roots, d)
+		}
+		config[key] = roots
+	}
 	if len(run.hiddenSkills) > 0 {
 		var list []any
 		for _, p := range run.hiddenSkills {
@@ -1178,6 +1194,16 @@ func (s *codexSession) threadParams(run *codexRun, fresh bool) (map[string]any, 
 		params["developerInstructions"] = cfg.SystemPrompt
 	}
 	return params, nil
+}
+
+// jsonList is v as a JSON array's values, or none if it isn't one.
+func jsonList(v any) []any {
+	data, err := json.Marshal(v)
+	var out []any
+	if err != nil || json.Unmarshal(data, &out) != nil {
+		return nil
+	}
+	return out
 }
 
 func (s *codexSession) handlers(run *codexRun) ProcessHandlers {

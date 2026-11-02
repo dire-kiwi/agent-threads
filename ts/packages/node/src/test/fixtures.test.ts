@@ -8,7 +8,7 @@ import { existsSync, readdirSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import { pathToFileURL } from "node:url";
 import { describe, expect, it } from "vitest";
-import { applyEvents, initialState, type Command, type Thread, type ThreadEvent } from "@dire-kiwi/agent-threads-protocol";
+import { applyEvents, initialState, openRequests, type Command, type Thread, type ThreadEvent } from "@dire-kiwi/agent-threads-protocol";
 import { AgentThreads, ControlError } from "../agent-threads.js";
 import { claudeCode } from "../claude/driver.js";
 import { codex } from "../codex/driver.js";
@@ -113,7 +113,7 @@ describe.each(scenarios)("%s", (scenario) => {
       } else if ("command" in step) {
         const command = { ...step.command, thread_id: thread.id } as Command;
         if (command.type === "respond") {
-          const { requests } = await sdk.snapshot(thread.id);
+          const requests = openRequests(await sdk.snapshot(thread.id));
           expect(requests, where).toHaveLength(1);
           command.request_id = requests[0]!.id;
         }

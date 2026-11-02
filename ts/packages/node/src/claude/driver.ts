@@ -12,6 +12,7 @@ import { messageParts, pathText } from "../attachments.js";
 import { CommandError, ControlError } from "../errors.js";
 import { parseLine, type Harness, type HarnessSession, type Message, type RunCheckpoint, type Skill, type ThreadContext } from "../harness.js";
 import { newId } from "../ids.js";
+import { applyLaunchEnv, launchedNow, launchedOf, withEnv, type Launched } from "../launch.js";
 import { permissionKey, type PermissionDecision } from "../permissions.js";
 import { writeSkills } from "../skills.js";
 import type { ExitStatus, HarnessProcess, ProcessHandlers } from "../spawner.js";
@@ -89,9 +90,6 @@ interface RunState {
   steerAt?: number;
   stopAt?: number;
 }
-
-/** The thread's options a process is started with: a different one needs another. */
-type Launched = { model?: string; effort?: string; permission_mode?: string };
 
 /** One `claude` process, and what's needed to read it. */
 class Run {
@@ -360,9 +358,7 @@ class ClaudeSession implements HarnessSession {
       return false;
     }
     // A process started with other options than the thread's now is replaced at the next turn.
-    const t = this.#ctx.thread;
-    const l = st.launched;
-    this.#stale = !!st.stale || !l || l.model !== t.model || l.effort !== t.effort || l.permission_mode !== t.permission_mode;
+    this.#stale = !!st.stale || !launchedNow(st.launched, this.#ctx);
     // Claude's requests that were open: the user's questions are taken up again, and the rest
     // (a policy that hadn't decided, a tool that was running) are dealt with again. One answered
     // before the restart, though that wasn't saved, is closed: Claude has its answer.
@@ -525,6 +521,9 @@ class ClaudeSession implements HarnessSession {
     const thread = ctx.thread;
     const { tools } = ctx.config;
     const o = this.#o;
+    const env = applyLaunchEnv(withEnv(o.env), ctx.launch);
+    const configDir = ctx.launch.configDir || o.configDir;
+    if (configDir) env.CLAUDE_CONFIG_DIR = configDir;
     let proc: HarnessProcess;
     try {
       proc = ctx.spawner.spawn(
@@ -532,7 +531,7 @@ class ClaudeSession implements HarnessSession {
           command: o.bin ?? "claude",
           args: [...(o.binArgs ?? []), ...this.#args(run)],
           ...(thread.cwd ? { cwd: thread.cwd } : {}),
-          env: { ...process.env, ...o.env, ...(o.configDir ? { CLAUDE_CONFIG_DIR: o.configDir } : {}) },
+          env,
           threadId: ctx.threadId,
           runId: run.id,
         },
@@ -543,7 +542,7 @@ class ClaudeSession implements HarnessSession {
       return;
     }
     run.proc = proc;
-    run.launched = { model: thread.model, effort: thread.effort, permission_mode: thread.permission_mode };
+    run.launched = launchedOf(ctx);
     ctx.setThread({ run: { id: run.id, spawner: ctx.spawner.name, started_at: new Date().toISOString() } });
     void run.control({ subtype: "initialize", ...(tools.length ? { sdkMcpServers: [APP_SERVER] } : {}) }).then((r) => this.#initialized(run, r));
   }
@@ -606,7 +605,9 @@ class ClaudeSession implements HarnessSession {
       args.push("--plugin-dir", run.pluginDir);
     }
     if (systemPrompt) args.push("--append-system-prompt", systemPrompt);
-    args.push(...(o.args ?? []));
+    const launch = ctx.launch;
+    for (const d of launch.addDirs ?? []) args.push("--add-dir", d);
+    args.push(...(o.args ?? []), ...(launch.args ?? []));
     return args;
   }
 

@@ -9,6 +9,7 @@ use std::path::PathBuf;
 use std::pin::Pin;
 use std::sync::Arc;
 
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::agent_threads::Error;
@@ -97,6 +98,54 @@ impl McpServer {
 pub enum Skill {
     Dir(PathBuf),
     Inline { name: String, content: String },
+}
+
+/// How a thread's harness process is started, on top of the harness's own options: stored with the
+/// thread (but not sent to clients), so a run started after a restart has them too. A change
+/// applies from the next process the thread starts, as a model change does.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct LaunchOptions {
+    /// More arguments, after the harness's (and its options' `args`): for Claude Code, say,
+    /// `--allowedTools`, `--disallowedTools` or `--settings`; for Codex, `-c key=value`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub args: Vec<String>,
+    /// Changes to the environment, after the harness options' `env`: a value sets a variable,
+    /// `None` removes it.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub env: BTreeMap<String, Option<String>>,
+    /// More directories the agent may use besides the working directory: `--add-dir` for Claude
+    /// Code, writable roots (`sandbox_workspace_write.writable_roots`) for Codex.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub add_dirs: Vec<PathBuf>,
+    /// The harness's config directory, in place of the harness options': CLAUDE_CONFIG_DIR for
+    /// Claude Code, CODEX_HOME for Codex (used as it is, with its own login and config). The
+    /// harness keeps its sessions there, so a thread that changes it can't resume what it had.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub config_dir: Option<PathBuf>,
+}
+
+impl LaunchOptions {
+    pub fn is_empty(&self) -> bool {
+        self == &LaunchOptions::default()
+    }
+
+    /// Makes these changes to an environment (the backend's, with the harness options' changes).
+    pub(crate) fn apply_env(&self, env: &mut std::collections::HashMap<String, String>) {
+        for (k, v) in &self.env {
+            match v {
+                Some(v) => env.insert(k.clone(), v.clone()),
+                None => env.remove(k),
+            };
+        }
+    }
+
+    /// The launch options in a stored thread (its `launch` field), or none.
+    pub(crate) fn from_stored(thread: &Value) -> LaunchOptions {
+        thread
+            .get("launch")
+            .and_then(|l| serde_json::from_value(l.clone()).ok())
+            .unwrap_or_default()
+    }
 }
 
 /// What a thread runs with: the instance's settings with the thread's own on top.

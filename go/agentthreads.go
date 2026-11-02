@@ -73,6 +73,10 @@ type CreateOptions struct {
 	Metadata map[string]any
 	// ID is the thread's id; a new one by default.
 	ID string
+	// Launch is how its harness process is started (args, environment, directories, config
+	// directory), on top of the harness's options. It's stored with the thread, but not sent to
+	// clients.
+	Launch LaunchOptions
 }
 
 // SendOptions are a message's attachments and the client's id for it.
@@ -86,6 +90,9 @@ type ThreadOptions struct {
 	Model          *string
 	Effort         *string
 	PermissionMode *protocol.PermissionMode
+	// Launch, if it isn't nil, replaces how the thread's harness process is started, in full. Only
+	// the app sets it: the set_options command doesn't.
+	Launch *LaunchOptions
 }
 
 // Recovered is what Recover did.
@@ -226,7 +233,7 @@ func (a *AgentThreads) Create(ctx context.Context, o CreateOptions) (protocol.Th
 	a.loading[id] = l
 	a.configs[id] = o.Capabilities
 	a.mu.Unlock()
-	rt, err := a.createRuntime(ctx, thread)
+	rt, err := a.createRuntime(ctx, thread, clone(o.Launch))
 	a.mu.Lock()
 	if err == nil {
 		a.threads[id] = rt
@@ -245,11 +252,11 @@ func (a *AgentThreads) Create(ctx context.Context, o CreateOptions) (protocol.Th
 }
 
 // createRuntime stores a new thread, and makes its runtime with its first event.
-func (a *AgentThreads) createRuntime(ctx context.Context, thread protocol.Thread) (*threadRuntime, error) {
-	if err := a.store.CreateThread(ctx, thread); err != nil {
+func (a *AgentThreads) createRuntime(ctx context.Context, thread protocol.Thread, launch LaunchOptions) (*threadRuntime, error) {
+	if err := a.store.CreateThread(ctx, withLaunch(thread, launch)); err != nil {
 		return nil, err
 	}
-	rt, err := a.runtime(protocol.InitialState(thread))
+	rt, err := a.runtime(protocol.InitialState(thread), launch)
 	if err != nil {
 		return nil, err
 	}
@@ -324,7 +331,12 @@ func (a *AgentThreads) Get(ctx context.Context, threadID string) (*protocol.Thre
 		t := rt.liveThread()
 		return &t, nil
 	}
-	return a.store.GetThread(ctx, threadID)
+	t, err := a.store.GetThread(ctx, threadID)
+	if t != nil {
+		// Its launch options aren't the client's.
+		*t, _ = splitLaunch(*t)
+	}
+	return t, err
 }
 
 // List is every thread, oldest first.
@@ -336,6 +348,8 @@ func (a *AgentThreads) List(ctx context.Context) ([]protocol.Thread, error) {
 	for i, t := range threads {
 		if rt := a.live(t.ID); rt != nil {
 			threads[i] = rt.liveThread()
+		} else {
+			threads[i], _ = splitLaunch(t)
 		}
 	}
 	return threads, nil
@@ -388,6 +402,28 @@ func (a *AgentThreads) Snapshot(ctx context.Context, threadID string) (protocol.
 		return protocol.Snapshot{}, err
 	}
 	return rt.snapshot(), nil
+}
+
+// SnapshotWindow is the thread's state now, as Snapshot, but a window of it: its last limit items
+// and what they need from before them, for a client that loads earlier ones with ItemsBefore
+// (spec/PROTOCOL.md, "Windows"). With a negative limit, or one it's within, it's the whole state.
+func (a *AgentThreads) SnapshotWindow(ctx context.Context, threadID string, limit int) (protocol.Snapshot, error) {
+	snap, err := a.Snapshot(ctx, threadID)
+	if err != nil {
+		return protocol.Snapshot{}, err
+	}
+	return protocol.SnapshotWindow(snap, limit), nil
+}
+
+// ItemsBefore is the thread's items before index before (a window's start), at most limit of them,
+// with the subagent calls they belong to and the requests they have: a page for a client that has
+// a window to load earlier items into.
+func (a *AgentThreads) ItemsBefore(ctx context.Context, threadID string, before int64, limit int) (protocol.ItemPage, error) {
+	snap, err := a.Snapshot(ctx, threadID)
+	if err != nil {
+		return protocol.ItemPage{}, err
+	}
+	return protocol.ItemsBefore(snap, before, limit), nil
 }
 
 // EventsSince is the thread's saved events after seq (at most limit of them, if limit > 0), for a
@@ -607,7 +643,8 @@ func (a *AgentThreads) Respond(ctx context.Context, threadID, requestID string, 
 	return a.do(ctx, threadID, func(rt *threadRuntime) { rt.respond(requestID, res) })
 }
 
-// SetOptions changes the thread's model, effort or permission mode, from its next turn.
+// SetOptions changes the thread's model, effort, permission mode or launch options, from its next
+// turn.
 func (a *AgentThreads) SetOptions(ctx context.Context, threadID string, o ThreadOptions) error {
 	if o.PermissionMode != nil {
 		if problems := protocol.ValidateValue(*o.PermissionMode, "PermissionMode"); len(problems) > 0 {
@@ -630,6 +667,9 @@ func (a *AgentThreads) SetOptions(ctx context.Context, threadID string, o Thread
 		after := rt.state.Thread
 		if before.Model != after.Model || before.Effort != after.Effort || before.PermissionMode != after.PermissionMode {
 			rt.session.OptionsChanged()
+		}
+		if o.Launch != nil {
+			rt.setLaunch(*o.Launch)
 		}
 	})
 }
@@ -919,14 +959,14 @@ func (a *AgentThreads) policy(threadID string) PermissionPolicy {
 	return Ask
 }
 
-func (a *AgentThreads) runtime(state protocol.Snapshot) (*threadRuntime, error) {
+func (a *AgentThreads) runtime(state protocol.Snapshot, launch LaunchOptions) (*threadRuntime, error) {
 	id := state.Thread.ID
 	harness := a.harnesses[state.Thread.Harness]
 	if harness == nil {
 		return nil, commandErr("thread %s runs on %s, which isn't configured", id, state.Thread.Harness)
 	}
 	// Not live yet: the caller makes it so (in a.threads) once it's ready to take commands.
-	rt := newRuntime(a, state, a.config(id), a.policy(id))
+	rt := newRuntime(a, state, a.config(id), launch, a.policy(id))
 	rt.loop.call(func() { rt.session = harness.Open(rt) })
 	return rt, nil
 }
@@ -972,6 +1012,9 @@ func (a *AgentThreads) fromStore(ctx context.Context, threadID string) (*threadR
 	if thread == nil {
 		return nil, commandErr("there's no thread %s", threadID)
 	}
+	// Its launch options are kept with it in the store, but aren't part of its state.
+	stored, launch := splitLaunch(*thread)
+	thread = &stored
 	snap, err := a.store.LoadSnapshot(ctx, threadID)
 	if err != nil {
 		return nil, err
@@ -1000,7 +1043,7 @@ func (a *AgentThreads) fromStore(ctx context.Context, threadID string) (*threadR
 			record = r
 		}
 	}
-	rt, err := a.runtime(state)
+	rt, err := a.runtime(state, launch)
 	if err != nil {
 		return nil, err
 	}
@@ -1057,7 +1100,7 @@ func (a *AgentThreads) reattach(rt *threadRuntime, record *RunRecord) (bool, *Ru
 	}
 	// Requests the session didn't take up again can't be answered.
 	open := rt.openRequestIDs()
-	for _, r := range rt.state.Requests {
+	for _, r := range protocol.OpenRequests(rt.state) {
 		if !open[r.ID()] {
 			rt.emit(&protocol.RequestResolvedEvent{RequestID: r.ID(), Resolution: protocol.Resolution{Outcome: protocol.ResolutionOutcomeCancel}})
 		}
@@ -1093,7 +1136,7 @@ func recoverLost(rt *threadRuntime) {
 	s := rt.state.Thread.Status
 	if s == protocol.ThreadStatusRunning || s == protocol.ThreadStatusWaiting {
 		rt.turn = &turnState{ID: lastTurn(rt.state.Items)}
-		for _, r := range rt.state.Requests {
+		for _, r := range protocol.OpenRequests(rt.state) {
 			rt.emit(&protocol.RequestResolvedEvent{RequestID: r.ID(), Resolution: protocol.Resolution{Outcome: protocol.ResolutionOutcomeCancel}})
 		}
 		rt.AddItem(&protocol.Notice{

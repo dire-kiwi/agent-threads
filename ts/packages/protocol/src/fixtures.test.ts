@@ -8,7 +8,7 @@ import addFormats from "ajv-formats";
 import { describe, expect, it } from "vitest";
 import { readJson, readJsonl, specDir } from "./examples.js";
 import type { Snapshot, ThreadEvent } from "./generated.js";
-import { applyEvents, initialState } from "./reducer.js";
+import { applyEvents, initialState, openRequests } from "./reducer.js";
 
 const ajv = new Ajv2020({ strict: true, allErrors: true });
 addFormats.default(ajv);
@@ -35,7 +35,7 @@ describe.each(fixtures)("spec/fixtures/%s/expected.jsonl", (fixture) => {
     expect(first.type).toBe("thread.updated");
     const s: Snapshot = applyEvents(initialState(first.type === "thread.updated" ? first.thread : (undefined as never)), events);
     expect(s.seq).toBe(events.filter((e) => e.type !== "delta").length);
-    expect(s.requests).toEqual([]);
+    expect(openRequests(s)).toEqual([]);
     expect(["idle", "error"]).toContain(s.thread.status);
     // Every turn ended with a turn_result, and nothing was left running.
     const turns = events.filter((e) => e.type === "turn.started").length;

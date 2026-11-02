@@ -210,6 +210,39 @@ func (u ThreadRequest) TurnID() string {
 	return ""
 }
 
+// ParentID is the request's parent_id: the subagent call that's asking, if one is.
+func (u ThreadRequest) ParentID() string {
+	switch r := u.Value.(type) {
+	case *PermissionRequest:
+		return r.ParentID
+	case *QuestionRequest:
+		return r.ParentID
+	}
+	return ""
+}
+
+// ToolCallID is the request's tool_call_id: the tool call it's about, if there is one.
+func (u ThreadRequest) ToolCallID() string {
+	switch r := u.Value.(type) {
+	case *PermissionRequest:
+		return r.ToolCallID
+	case *QuestionRequest:
+		return r.ToolCallID
+	}
+	return ""
+}
+
+// Resolution is how the request was resolved, or nil while it's open.
+func (u ThreadRequest) Resolution() *Resolution {
+	switch r := u.Value.(type) {
+	case *PermissionRequest:
+		return r.Resolution
+	case *QuestionRequest:
+		return r.Resolution
+	}
+	return nil
+}
+
 // ThreadID is the command's thread_id.
 func (u Command) ThreadID() string {
 	switch c := u.Value.(type) {

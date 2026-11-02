@@ -862,6 +862,9 @@ export const schema: { readonly $defs: { readonly [name: string]: unknown } } = 
         "parent_id": {
           "type": "string"
         },
+        "resolution": {
+          "$ref": "#/$defs/Resolution"
+        },
         "turn_id": {
           "type": "string"
         },
@@ -898,6 +901,9 @@ export const schema: { readonly $defs: { readonly [name: string]: unknown } } = 
         },
         "parent_id": {
           "type": "string"
+        },
+        "resolution": {
+          "$ref": "#/$defs/Resolution"
         },
         "turn_id": {
           "type": "string"
@@ -1014,6 +1020,60 @@ export const schema: { readonly $defs: { readonly [name: string]: unknown } } = 
           "type": "array",
           "items": {
             "$ref": "#/$defs/ThreadRequest"
+          }
+        },
+        "seq": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "start": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "context": {
+          "type": "array",
+          "items": {
+            "type": "integer",
+            "minimum": 0
+          }
+        }
+      }
+    },
+    "ItemPage": {
+      "type": "object",
+      "required": [
+        "thread_id",
+        "items",
+        "requests",
+        "start",
+        "context",
+        "seq"
+      ],
+      "properties": {
+        "thread_id": {
+          "type": "string"
+        },
+        "items": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/Item"
+          }
+        },
+        "requests": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/ThreadRequest"
+          }
+        },
+        "start": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "context": {
+          "type": "array",
+          "items": {
+            "type": "integer",
+            "minimum": 0
           }
         },
         "seq": {
