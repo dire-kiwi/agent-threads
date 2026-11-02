@@ -2,6 +2,8 @@
 // agent-threads backend does, playing the backend's part (initialize, user messages, answers to
 // can_use_tool and the in-process MCP server's mcp_message requests).
 
+import { mkdirSync, writeFileSync } from "node:fs";
+import { join } from "node:path";
 import { appTool, echoServer } from "./common.mjs";
 
 export const MODEL = "haiku";
@@ -103,6 +105,16 @@ async function oneTurn(ctx, prompt, { argv = args(), handlers, sdkMcpServers, se
   return result;
 }
 
+/** The skill the skill-fork scenario gives the thread. */
+export const skillFork = `---
+name: first-line
+description: Reads notes.txt and reports its first line.
+context: fork
+---
+
+Read notes.txt with the Read tool and reply with its first line only.
+`;
+
 export const scenarios = {
   "plain-reply": {
     description: "A plain reply: one turn with streamed text and no tools.",
@@ -179,6 +191,42 @@ export const scenarios = {
         "Use the Task tool to start a general-purpose subagent with this prompt: 'Read notes.txt with the Read tool and reply with its first line only.' Then reply with just what the subagent said.",
         { handlers: answers() },
       ),
+  },
+
+  "background-subagent": {
+    description:
+      "A background subagent (run_in_background): its call returns at once, it carries on after the turn ends, and when it's done Claude starts a turn by itself to say so.",
+    async run(ctx) {
+      const p = ctx.spawn(args(), answers());
+      await initialize(p);
+      user(
+        p,
+        "Use the Agent tool with run_in_background set to true to start a general-purpose subagent with this prompt: 'Run `sleep 3` with the Bash tool, then read notes.txt with the Read tool and reply with its first line only.' Don't wait for it: reply with just: started",
+      );
+      const call = (await p.next(isToolUse("Agent"), "the Agent call")).message.content.find((c) => c.type === "tool_use");
+      await p.next(isResult, "the turn's result");
+      // The subagent finishes, and Claude tells the agent, which makes a turn of its own.
+      await p.next((m) => m.type === "system" && m.subtype === "task_notification" && m.tool_use_id === call.id, "the subagent's notification");
+      await p.next(isResult, "the result of the turn Claude started");
+      p.close();
+      await p.exited;
+    },
+  },
+
+  "skill-fork": {
+    description: "A skill with context: fork, which Claude runs as a subagent of the Skill call (task_started with task_type local_agent).",
+    async run(ctx) {
+      // A plugin named app, as backends give a thread's skills.
+      const plugin = join(ctx.tmp, "plugin");
+      mkdirSync(join(plugin, ".claude-plugin"), { recursive: true });
+      writeFileSync(join(plugin, ".claude-plugin", "plugin.json"), JSON.stringify({ name: "app", version: "1.0.0", description: "The app's skills" }));
+      mkdirSync(join(plugin, "skills", "first-line"), { recursive: true });
+      writeFileSync(join(plugin, "skills", "first-line", "SKILL.md"), skillFork);
+      await oneTurn(ctx, "Use the Skill tool to run the app:first-line skill. Then reply with just what it reported.", {
+        argv: args({ extra: ["--plugin-dir", plugin] }),
+        handlers: answers(),
+      });
+    },
   },
 
   steer: {

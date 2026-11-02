@@ -66,11 +66,21 @@ async function record(harnessName, scenarioName, scenario, mod) {
   mkdirSync(work);
   seedWorkdir(work);
   const { env, paths } = h.setup(tmp);
-  const clean = sanitizer([[work, "/work"], ...paths, [repo, "/repo"], [tmp, "/tmp/recording"], [basename(tmp), "recording"]]);
+  // The CLIs keep their own temporary files under the system's (Claude's are in claude-<uid>), shown as /tmp.
+  const system = realpathSync(tmpdir());
+  const clean = sanitizer([
+    [work, "/work"],
+    ...paths,
+    [repo, "/repo"],
+    [tmp, "/tmp/recording"],
+    [basename(tmp), "recording"],
+    ...(system !== "/tmp" ? [[system + "/", "/tmp/"]] : []),
+  ]);
   const entries = [];
   let runs = 0;
   const ctx = {
     work,
+    tmp,
     /** What the scenario adds to the session's meta line (e.g. the thread options it was made with). */
     meta: {},
     /**

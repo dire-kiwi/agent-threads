@@ -133,11 +133,12 @@ or `CODEX_HOME` that has only the login linked in (`.credentials.json` or `auth.
 user's settings, MCP servers, skills, plugins and history stay out.
 
 Before it's written, the recording is sanitized ([lib/sanitize.mjs](lib/sanitize.mjs)): the
-temporary directories become `/work`, `/config`, `/codex-home` and `/tmp/recording`, this checkout
-`/repo`, the home directory `/home/user`, the machine's temporary directory `/tmp`, and the user
-name, host name (in any case) and git email and name are replaced (Claude Code tells the model the
-git user, which can end up in a compaction summary); Codex's `skills/list` answer keeps only its
-built-in skills, not the ones the machine has (and the config that turned those off goes too);
+temporary directories become `/work`, `/config`, `/codex-home` and `/tmp/recording`, the system's
+own (a `TMPDIR` other than `/tmp`, where Claude keeps its tasks' output) `/tmp`, this checkout
+`/repo`, the home directory `/home/user`, and the user name, host name (in any case) and git email
+and name are replaced (Claude Code tells the model the git user, which can end up in a compaction
+summary); Codex's `skills/list` answer keeps only its built-in skills, not the ones the machine has
+(and the config that turned those off goes too);
 account details (Claude's `account`, Codex's rate limits, emails, organization names, installation
 ids) are replaced with placeholders; and it fails if anything still looks like a secret (an API key,
 a JWT, a bearer token). Streamed text is cleaned as a whole stream, since a path can be split

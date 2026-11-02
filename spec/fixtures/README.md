@@ -9,6 +9,8 @@ No CLI or login is needed.
 They were recorded on 2026-10-31 with claude 2.1.312 (model `haiku`, which is claude-haiku-5-5) and
 codex-cli 0.165.0 (model `gpt-5.6-luna`, effort `low`), by `spec/tools/record.mjs`.
 
+`background-subagent` and `skill-fork` were added on 2026-11-02, with the same claude 2.1.312.
+
 The Codex sessions' `skills/list` exchange was added afterwards (on 2026-11-01), with the response
 codex-cli 0.165.0 gives in a fresh CODEX_HOME and a working directory and home with no skills;
 `spec/tools/scenarios/codex.mjs` records it from now on. The `adopt`, `rewind`, `new-session` and
@@ -41,7 +43,9 @@ Each fixture is a directory `spec/fixtures/<harness>/<scenario>/`:
 | `ask-user-question` | A question the user answers | AskUserQuestion via `can_use_tool` | `item/tool/requestUserInput` |
 | `app-tool` | A tool the app defines (`lookup_order`) | the in-process `app` MCP server, over `mcp_message` | `dynamicTools` and `item/tool/call` |
 | `mcp-tool` | A tool on an external stdio MCP server (`echo`, [../tools/mcp-echo.mjs](../tools/mcp-echo.mjs)) | `--mcp-config` | `mcp_servers` in `thread/start`'s config, approved through an elicitation |
-| `subagent` | A subagent and what it does | the Agent tool, with `parent_tool_use_id` | `spawnAgent` and a child thread |
+| `subagent` | A subagent and what it does | the Agent tool, with `parent_tool_use_id` and `task_*` messages | `spawnAgent` and a child thread |
+| `background-subagent` | A subagent that runs in the background, past its turn | the Agent tool with `run_in_background`; when it's done, Claude starts a turn by itself | |
+| `skill-fork` | A skill run in a forked subagent | a skill with `context: fork` (its Skill call's `task_started` is a `local_agent`'s) | |
 | `steer` | A message sent while a turn runs | stdin, echoed back when it's taken in | `turn/steer` |
 | `interrupt` | Stopping a turn while a command runs | `control_request` interrupt | `turn/interrupt` |
 | `resume` | A turn, a backend restart, then a turn in a new process | `--resume <session_id>` | `thread/resume` |
@@ -171,16 +175,18 @@ backend drives each CLI:
   `item.updated` sets its `status` and `result` when it ends.
 - **A permission request** (when the policy asks): an `item.updated` sets the call `pending`, then
   `request.opened` and a `thread.updated` that's `waiting`. The answer sends `request.resolved`, a
-  `thread.updated` that's `running`, and an `item.updated` that sets the call `running` (or
-  `denied`). A denied call's later result only sets its `result`. With the `allow` policy, nothing
+  `thread.updated` that's `running` (`idle` if no turn is running, for a background subagent's),
+  and an `item.updated` that sets the call `running` (or `denied`). A denied call's later result only sets its `result`. With the `allow` policy, nothing
   of this is sent.
 - **A question**: the same, with a `question` request.
-- **The end of a turn**: calls still `running` or `pending` become `cancelled`, open requests are
-  resolved with `cancel`, then a `turn_result` item is added, `turn.completed` is sent, and a
-  `thread.updated` sets the thread `idle` (or `error`, with the turn's `error`) and adds the
-  turn's usage to the thread's. The `turn_result`'s `session` has the thread's `session_id` (if it
-  has one), the harness's mark for the turn as `at` (below), and `started` if the thread had no
-  `session_id` when the turn started.
+- **The end of a turn**: calls still `running` or `pending` become `cancelled` (and a running
+  subagent of one `stopped`) and open requests are resolved with `cancel`, except those of a
+  background subagent that's still running, which carry on; then a `turn_result` item is added,
+  `turn.completed` is sent, and a `thread.updated` sets the thread `idle` (`waiting` while such a
+  request is open, or `error`, with the turn's `error`) and adds the turn's usage to the thread's.
+  The `turn_result`'s `session` has the thread's `session_id` (if it has one), the harness's mark
+  for the turn as `at` (below), and `started` if the thread had no `session_id` when the turn
+  started.
 - **A thread created with a `session_id`** has it in its first `thread.updated`.
 - **`compact`** starts a turn as `send` does, but with no `user_message`: `turn.started` and a
   `thread.updated` that's `running`. The harness's compaction is its `compaction` item.
@@ -225,7 +231,32 @@ backend drives each CLI:
   `[image]`, tool references their tool's name). `is_error` makes it `failed`, or `cancelled`
   after an interrupt.
 - **Subagents**: messages with `parent_tool_use_id` are the subagent's, with that as `parent_id`.
-  The subagent's own prompt (its first user message) isn't an item.
+  The subagent's own prompt (its first user message) isn't an item. A `system` `task_started`
+  whose `task_type` is `local_agent` sets its call's `subagent` (`status: running`, `background`
+  from `is_backgrounded`, `agent_type` from `subagent_type`, `model` from its `model` or the call's
+  input's); if the call (a Skill's) isn't a `subagent` call, it becomes one, with the
+  `description` as its `title` if it has none. The `task_*` messages after it name the call by
+  `tool_use_id`, or by the `task_id` its `task_started` gave: `task_progress` sets `activity`
+  (its `description`) and `tool_uses` (`usage.tool_uses`); `task_updated`'s `patch.status` and
+  `task_notification`'s `status` end a running subagent (`completed`/`success` is `completed`,
+  `failed`/`error` `failed`, and `killed`/`stopped`/`cancelled`/`interrupted` `stopped`), and
+  `task_updated` with `running` sets it running again (without its `summary`);
+  `task_notification` sets `tool_uses`, and a background subagent's `summary`. The call's
+  `tool_result` sets `model` (`resolvedModel`), `agent_type` (`agentType`) and `tool_uses`
+  (`totalToolUseCount`) from its `tool_use_result`; if that has `isAsync`, or `status:
+  async_launched`, or its text starts with "Async agent launched", the subagent is `background`,
+  and otherwise a running one ends (`failed` for an error, `stopped` after an interrupt, else the
+  `status` as above, or `completed`). A call whose subagent never started (an error result, and no
+  `task_started`) gets no `subagent`. Other tasks (`local_bash`...) aren't subagents.
+- **Background subagents**: at the end of a turn, the calls and requests of a background subagent
+  still running aren't cancelled. A call cancelled at a turn's end stops its running subagent. When
+  no turn is running, an `init` system message starts one (Claude telling the agent a background
+  subagent has ended), with no `user_message`. If a turn of the user's started first (Claude hadn't
+  taken its message in yet), Claude's own turn's items go in it, and its result (`origin.kind:
+  task-notification`) doesn't end it: the user's turn ends with its own result, with both results'
+  usage. When the process ends, or the backend restarts and can't pick it up again, its subagents
+  still running are `stopped`, and their calls still running `cancelled`; a turn is ended as lost
+  only if one was running (a thread can be `waiting` on a background subagent's request with none).
 - **Questions**: AskUserQuestion's `can_use_tool` is always a question (whatever the policy). Each
   question's `id` is its text, and `allow_other` is set (Claude Code always offers "Other").
 - **Notices**: a `system` message `api_retry` is a `notice` with `level: warning` and `code:
@@ -251,9 +282,9 @@ backend drives each CLI:
   them.
 - **Left out**: `assistant` messages from the `<synthetic>` model (the error is in the turn's
   result), user messages that aren't a replay or a tool result, system messages other than `init`,
-  `compact_boundary`, `api_retry` and `hook_response`, stream events other than text and thinking
-  deltas, the echoes of the backend's own control responses, and messages of types the driver
-  doesn't know. A replayed (`isReplay`) user message
+  `compact_boundary`, `api_retry`, `hook_response` and `task_*`, stream events other than text and
+  thinking deltas, the echoes of the backend's own control responses, and messages of types the
+  driver doesn't know. A replayed (`isReplay`) user message
   takes in the queued message with the same text, if there is one.
 - **The result**: `ok` is `!is_error`; `error` is the result's text; `duration_ms` is the
   result's. `usage` is the result's `model_usage_since_last_result`, summed over its models:

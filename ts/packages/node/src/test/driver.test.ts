@@ -436,6 +436,87 @@ describe("the Claude driver", () => {
     expect(texts(s.items).at(-1)).toBe('ran with {"command":"pwd"}');
   });
 
+  it("keeps a background subagent's calls and requests after its turn, and runs the turn Claude starts when it ends", async () => {
+    const { sdk, events, runs } = setup({ permissions: (q) => (q.kind === "shell" ? "ask" : "allow") });
+    const t = await sdk.create({ model: "mini" });
+    await sdk.send(t.id, "background 0 apple");
+    // The turn ends with the subagent's call waiting for the user, who's still asked.
+    const req = await until(() => events.find((e) => e.type === "request.opened"));
+    await until(() => events.some((e) => e.type === "turn.completed"));
+    let s = await sdk.snapshot(t.id);
+    expect(s.thread.status).toBe("waiting");
+    expect(openRequests(s)).toHaveLength(1);
+    let [agent, bash] = s.items.filter((i): i is ToolCall => i.type === "tool_call");
+    expect(agent).toMatchObject({ name: "Agent", kind: "subagent", status: "completed", subagent: { status: "running", background: true, agent_type: "general-purpose", model: "mini-1" } });
+    expect(bash).toMatchObject({ name: "Bash", status: "pending", parent_id: agent!.id });
+
+    await sdk.handle({ type: "respond", thread_id: t.id, request_id: req.type === "request.opened" ? req.request.id : "", resolution: { outcome: "allow" } });
+    s = await until(async () => {
+      const x = await sdk.snapshot(t.id);
+      return results(x.items).length === 2 && x.thread.status === "idle" && x;
+    });
+    [agent, bash] = s.items.filter((i): i is ToolCall => i.type === "tool_call");
+    expect(agent!.subagent).toEqual({ status: "completed", background: true, agent_type: "general-purpose", model: "mini-1", activity: "Running true", tool_uses: 1, summary: "apple" });
+    expect(bash).toMatchObject({ status: "completed", result: { content: "done" } });
+    expect(runs()[0]!.sent).toContainEqual(expect.objectContaining({ type: "control_response", response: expect.objectContaining({ response: expect.objectContaining({ behavior: "allow" }) }) }));
+    // Claude's own turn has no message of the user's.
+    const [, second] = results(s.items);
+    expect(s.items.filter((i) => i.type === "user_message" && i.turn_id === second!.turn_id)).toEqual([]);
+    expect(texts(s.items).at(-1)).toBe("the subagent said apple");
+    expectTracked(events, runs());
+  });
+
+  it("keeps a turn of the user's going past a turn Claude makes by itself before taking the user's message in", async () => {
+    const { sdk, events } = setup({ env: { MINI_CLAUDE_NOTIFY_FIRST: "1" } });
+    const t = await sdk.create({ model: "mini" });
+    await sdk.send(t.id, "background 300 apple");
+    await until(() => events.some((e) => e.type === "turn.completed"));
+    // Sent before the subagent is done: Claude reports the subagent first, then takes this in.
+    const from = events.length;
+    await sdk.send(t.id, "reply hi");
+    const s = await until(async () => {
+      const x = await sdk.snapshot(t.id);
+      return texts(x.items).at(-1) === "hi" && x.thread.status === "idle" && x;
+    });
+    expectIdleAfter(events, from, "hi");
+    const [, second] = results(s.items);
+    expect(results(s.items)).toHaveLength(2);
+    // The user's turn has its message, both replies, and both results' usage.
+    expect(s.items.filter((i) => i.turn_id === second!.turn_id && i.type !== "turn_result").map((i) => (i.type === "user_message" || i.type === "assistant_message" ? i.text : i.type))).toEqual([
+      "reply hi",
+      "the subagent said apple",
+      "hi",
+    ]);
+    expect(second!.usage).toMatchObject({ input_tokens: 2, output_tokens: 4 });
+  });
+
+  it("keeps a background subagent's app tool's structured output for the result that comes after its turn", async () => {
+    const lookup = defineTool({ name: "lookup", description: "Looks it up.", input: { type: "object" }, run: () => ({ text: "42", structured: { answer: 42 } }) });
+    const { sdk } = setup({ tools: [lookup], env: { MINI_CLAUDE_BACKGROUND_APP: "lookup" } });
+    const t = await sdk.create({ model: "mini" });
+    await sdk.send(t.id, "background 200 apple");
+    const s = await until(async () => {
+      const x = await sdk.snapshot(t.id);
+      return results(x.items).length === 2 && x.thread.status === "idle" && x;
+    });
+    const call = s.items.find((i): i is ToolCall => i.type === "tool_call" && i.name === "lookup");
+    expect(call).toMatchObject({ status: "completed", result: { content: "42", structured: { answer: 42 } } });
+  });
+
+  it("stops a run's subagents when it ends, and cancels what they were doing", async () => {
+    const { sdk, events } = setup();
+    const t = await sdk.create({ model: "mini" });
+    await sdk.send(t.id, "background 60000 apple");
+    await until(async () => {
+      const x = await sdk.snapshot(t.id);
+      return x.thread.status === "idle" && x.items.some((i) => i.type === "tool_call" && i.name === "Bash" && i.status === "running");
+    });
+    await sdk.close();
+    const [agent, bash] = applyEvents(initialState(t), events).items.filter((i): i is ToolCall => i.type === "tool_call");
+    expect(agent).toMatchObject({ status: "completed", subagent: { status: "stopped", background: true } });
+    expect(bash).toMatchObject({ status: "cancelled", parent_id: agent!.id });
+  });
+
   it("gives a window of a thread's last items, and pages of the items before it", async () => {
     const { sdk } = setup();
     const t = await sdk.create();

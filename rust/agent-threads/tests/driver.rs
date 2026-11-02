@@ -500,6 +500,177 @@ async fn asks_the_policy_and_remembers_an_answer_given_always() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn keeps_a_background_subagents_calls_and_requests_after_its_turn_and_runs_the_turn_claude_starts() {
+    let policy = PermissionPolicy::from_fn(|q, _| match q.kind {
+        ToolKind::Shell => PermissionDecision::Ask,
+        _ => PermissionDecision::Allow,
+    });
+    let env = setup(Setup {
+        capabilities: Capabilities {
+            permissions: Some(policy),
+            ..Default::default()
+        },
+        ..Default::default()
+    });
+    let t = env.sdk.create(create()).await.unwrap();
+    env.sdk
+        .send(&t.id, "background 0 apple", SendOptions::default())
+        .await
+        .unwrap();
+    // The turn ends with the subagent's call waiting for the user, who's still asked.
+    let s = until(5, || async {
+        let s = serde_json::to_value(env.sdk.snapshot(&t.id).await.unwrap()).unwrap();
+        (results(&s).len() == 1).then_some(s)
+    })
+    .await;
+    assert_eq!(s["thread"]["status"], "waiting");
+    let open: Vec<&Value> = s["requests"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|r| r.get("resolution").is_none())
+        .collect();
+    assert_eq!(open.len(), 1);
+    let request = open[0]["id"].clone();
+    let calls = items(&s, "tool_call");
+    assert_eq!(
+        (calls[0]["status"].clone(), calls[0]["subagent"].clone()),
+        (
+            json!("completed"),
+            json!({"status": "running", "background": true, "agent_type": "general-purpose", "model": "mini-1"})
+        )
+    );
+    assert_eq!(
+        (calls[1]["status"].clone(), calls[1]["parent_id"].clone()),
+        (json!("pending"), calls[0]["id"].clone())
+    );
+
+    let respond =
+        json!({"type": "respond", "thread_id": t.id, "request_id": request, "resolution": {"outcome": "allow"}});
+    env.sdk.handle_json(respond).await.unwrap();
+    let s = until(5, || async {
+        let s = serde_json::to_value(env.sdk.snapshot(&t.id).await.unwrap()).unwrap();
+        (results(&s).len() == 2 && s["thread"]["status"] == "idle").then_some(s)
+    })
+    .await;
+    let calls = items(&s, "tool_call");
+    assert_eq!(
+        calls[0]["subagent"],
+        json!({"status": "completed", "background": true, "agent_type": "general-purpose", "model": "mini-1", "activity": "Running true", "tool_uses": 1, "summary": "apple"})
+    );
+    assert_eq!(calls[1]["status"], "completed");
+    // Claude's own turn has no message of the user's.
+    let second = results(&s)[1]["turn_id"].clone();
+    assert!(items(&s, "user_message").iter().all(|u| u["turn_id"] != second));
+    assert_eq!(texts(&s).last().unwrap(), "the subagent said apple");
+    assert!(
+        env.runs()[0]
+            .sent
+            .iter()
+            .any(|m| m["response"]["response"]["behavior"] == "allow")
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn keeps_a_users_turn_going_past_a_turn_claude_makes_before_taking_its_message_in() {
+    let mut env = setup(Setup {
+        env: vec![("MINI_CLAUDE_NOTIFY_FIRST", "1".into())],
+        ..Default::default()
+    });
+    let t = env.sdk.create(create()).await.unwrap();
+    env.sdk
+        .send(&t.id, "background 300 apple", SendOptions::default())
+        .await
+        .unwrap();
+    until(5, || async {
+        let s = serde_json::to_value(env.sdk.snapshot(&t.id).await.unwrap()).unwrap();
+        (results(&s).len() == 1).then_some(())
+    })
+    .await;
+    // Sent before the subagent is done: Claude reports the subagent first, then takes this in.
+    env.sdk.send(&t.id, "reply hi", SendOptions::default()).await.unwrap();
+    let s = until(5, || async {
+        let s = serde_json::to_value(env.sdk.snapshot(&t.id).await.unwrap()).unwrap();
+        (texts(&s).last().map(String::as_str) == Some("hi") && s["thread"]["status"] == "idle").then_some(s)
+    })
+    .await;
+    let results = results(&s);
+    assert_eq!(results.len(), 2, "{:?}", env.events_json());
+    // The user's turn has its message, both replies, and both results' usage.
+    let turn = results[1]["turn_id"].clone();
+    let said: Vec<&Value> = s["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|i| i["turn_id"] == turn && i["type"] != "turn_result")
+        .map(|i| &i["text"])
+        .collect();
+    assert_eq!(
+        said,
+        [&json!("reply hi"), &json!("the subagent said apple"), &json!("hi")]
+    );
+    assert_eq!(results[1]["usage"]["input_tokens"], 2);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn keeps_a_background_subagents_app_tools_structured_output_for_the_result_after_its_turn() {
+    let lookup = tool("lookup", "Looks it up.", json!({"type": "object"}), |_, _| async {
+        agent_threads::ToolOutput::text("42").with_structured(json!({"answer": 42}))
+    });
+    let env = setup(Setup {
+        env: vec![("MINI_CLAUDE_BACKGROUND_APP", "lookup".into())],
+        capabilities: Capabilities {
+            tools: vec![lookup],
+            permissions: Some(PermissionPolicy::allow()),
+            ..Default::default()
+        },
+        ..Default::default()
+    });
+    let t = env.sdk.create(create()).await.unwrap();
+    env.sdk
+        .send(&t.id, "background 200 apple", SendOptions::default())
+        .await
+        .unwrap();
+    let s = until(5, || async {
+        let s = serde_json::to_value(env.sdk.snapshot(&t.id).await.unwrap()).unwrap();
+        (results(&s).len() == 2 && s["thread"]["status"] == "idle").then_some(s)
+    })
+    .await;
+    let call = items(&s, "tool_call")
+        .into_iter()
+        .find(|c| c["name"] == "lookup")
+        .unwrap()
+        .clone();
+    assert_eq!(call["status"], "completed");
+    assert_eq!(call["result"]["structured"], json!({"answer": 42}), "{call}");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn stops_a_runs_subagents_when_it_ends_and_cancels_what_they_were_doing() {
+    let mut env = setup(Setup::default());
+    let t = env.sdk.create(create()).await.unwrap();
+    env.sdk
+        .send(&t.id, "background 60000 apple", SendOptions::default())
+        .await
+        .unwrap();
+    until(5, || async {
+        let s = serde_json::to_value(env.sdk.snapshot(&t.id).await.unwrap()).unwrap();
+        let calls = items(&s, "tool_call");
+        (s["thread"]["status"] == "idle" && calls.len() == 2 && calls[1]["status"] == "running").then_some(())
+    })
+    .await;
+    env.sdk.close(false).await.unwrap();
+    let events = env.events_json();
+    let patches: Vec<&Value> = events
+        .iter()
+        .filter(|e| e["type"] == "item.updated")
+        .map(|e| &e["patch"])
+        .collect();
+    assert!(patches.iter().any(|p| p["subagent"]["status"] == "stopped"));
+    assert!(patches.iter().any(|p| p["status"] == "cancelled"));
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn gives_a_window_of_a_threads_last_items_and_pages_of_the_items_before_it() {
     let env = setup(Setup::default());
     let t = env.sdk.create(create()).await.unwrap();

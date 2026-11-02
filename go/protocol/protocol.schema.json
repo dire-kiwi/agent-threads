@@ -718,6 +718,10 @@
           },
           "description": "todo: the whole list after the call."
         },
+        "subagent": {
+          "$ref": "#/$defs/SubagentState",
+          "description": "subagent: the subagent itself, once the harness says it has started. Its status is the subagent's, which a background subagent's call (completed as soon as it has started it) doesn't show."
+        },
         "parent_id": {
           "type": "string",
           "description": "The id of the subagent tool_call this item belongs to. Absent for the main conversation."
@@ -787,6 +791,54 @@
           "description": "shell: the command's exit code."
         }
       }
+    },
+    "SubagentState": {
+      "type": "object",
+      "description": "A subagent, as its call (a tool_call of kind subagent) shows it: how it's getting on, and how it ended.",
+      "required": [
+        "status"
+      ],
+      "properties": {
+        "status": {
+          "$ref": "#/$defs/SubagentStatus"
+        },
+        "background": {
+          "type": "boolean",
+          "default": false,
+          "description": "It runs in the background: its call returned as soon as it started, and it carries on (its items keep arriving, after its turn has ended too) until it ends."
+        },
+        "agent_type": {
+          "type": "string",
+          "description": "What kind of agent it is (Claude's subagent_type, e.g. general-purpose)."
+        },
+        "model": {
+          "type": "string",
+          "description": "The model it runs on."
+        },
+        "activity": {
+          "type": "string",
+          "description": "What it's doing, as of its latest progress report (e.g. Reading notes.txt)."
+        },
+        "tool_uses": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "How many tool calls it has made."
+        },
+        "summary": {
+          "type": "string",
+          "description": "A background subagent's final report, once it has ended. (A foreground one's is its call's result.)"
+        }
+      }
+    },
+    "SubagentStatus": {
+      "type": "string",
+      "description": "running: it's working. completed: it finished. failed: it ended with an error. stopped: it was stopped (killed, interrupted, or its harness process ended) before it finished.",
+      "enum": [
+        "running",
+        "completed",
+        "failed",
+        "stopped"
+      ]
     },
     "FileChange": {
       "type": "object",

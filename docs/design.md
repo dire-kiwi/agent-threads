@@ -196,7 +196,7 @@ Tool handlers get a `ctx` with the thread id and metadata, so an app can scope t
 | Permissions | `--permission-prompt-tool stdio` → `can_use_tool` control requests | Approval server requests (`commandExecution`, `fileChange`, MCP elicitation) |
 | Questions to the user | `AskUserQuestion`, answered through the permission callback | `item/tool/requestUserInput` |
 | Skills | The app's skills copied into a generated plugin passed with `--plugin-dir` (Claude doesn't look in `.claude/skills` directories with `--setting-sources ""`) | `skills/extraRoots/set` |
-| Subagents | `parent_tool_use_id`, plus `--agents` for app-defined agents | Child threads |
+| Subagents | `parent_tool_use_id`; the `task_*` system messages for how each is getting on (background ones, and skills run with `context: fork`, included), plus `--agents` for app-defined agents | Child threads |
 
 ## The shim: runs that outlive the backend
 

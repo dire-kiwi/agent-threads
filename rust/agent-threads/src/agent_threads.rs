@@ -18,7 +18,8 @@ use crate::harness::{
 use crate::ids::{new_id, now_iso};
 use crate::permissions::PermissionPolicy;
 use crate::protocol::{
-    Attachment, Command, Item, ItemPage, PermissionMode, Resolution, Snapshot, Thread, ThreadEvent, ThreadStatus,
+    Attachment, Command, Item, ItemPage, PermissionMode, Resolution, Snapshot, SubagentStatus, Thread, ThreadEvent,
+    ThreadStatus,
 };
 use crate::reducer::{apply_event, initial_state, open_requests};
 use crate::spawner::{Spawner, direct};
@@ -1268,23 +1269,27 @@ impl AgentThreads {
             // thread (no turn ended as lost), and the error is the caller's.
             Err(e) => return Err(Error::Store(e)),
         };
-        let saved_turn: Option<Turn> = record
+        // A run saved with no turn running (null) had none: it may be waiting only on a background
+        // subagent's request. A run saved before runs had their turn has the last one.
+        let saved_turn: Option<Option<Turn>> = record
             .data
             .as_ref()
             .and_then(|d| d.get("turn"))
-            .and_then(|t| serde_json::from_value(t.clone()).ok());
+            .map(|t| serde_json::from_value(t.clone()).ok());
         if matches!(
             actor.core.thread().status,
             ThreadStatus::Running | ThreadStatus::Waiting
         ) {
             let id = lost.id.clone().or_else(|| last_turn(actor.core.snapshot()));
-            actor.core.turn = Some(saved_turn.unwrap_or_else(|| Turn {
-                id: id.unwrap_or_else(|| new_id("turn")),
-                interrupted: false,
-                session: lost.session.clone(),
-                carried: 0,
-                progressed: false,
-            }));
+            actor.core.turn = saved_turn.unwrap_or_else(|| {
+                Some(Turn {
+                    id: id.unwrap_or_else(|| new_id("turn")),
+                    interrupted: false,
+                    session: lost.session.clone(),
+                    carried: 0,
+                    progressed: false,
+                })
+            });
         }
         actor.core.adopt_run(record.clone());
         // The configuration and policy as they are now, not as they were when the actor was made
@@ -1313,9 +1318,15 @@ impl AgentThreads {
         for id in stale {
             c.emit_resolved(&id, &cancel_resolution());
         }
-        // With none left (one answered before the restart is closed, say), the turn runs on.
-        if c.turn.is_some() && open.is_empty() && c.thread().status == ThreadStatus::Waiting {
-            c.set_thread(|t| t.status = ThreadStatus::Running);
+        // With none left (one answered before the restart is closed, say), the turn runs on, or
+        // the thread is idle if none was running.
+        if open.is_empty() && c.thread().status == ThreadStatus::Waiting {
+            let status = if c.turn.is_some() {
+                ThreadStatus::Running
+            } else {
+                ThreadStatus::Idle
+            };
+            c.set_thread(|t| t.status = status);
         }
         c.set_thread(|t| {
             if let Some(r) = &mut t.run {
@@ -1430,25 +1441,51 @@ fn fold_events(state: &mut Snapshot, events: Vec<Value>) -> Option<LostTurn> {
     open
 }
 
-/// Ends a turn whose process was lost when the backend stopped: `lost` (or, with no id, the latest
-/// turn).
+/// The turn a thread's items say is still running: its last, if it has no turn_result. (A thread
+/// waiting with none running is waiting on a background subagent's request.)
+fn open_turn(s: &Snapshot) -> Option<String> {
+    let last = last_turn(s)?;
+    let ended = s
+        .items
+        .iter()
+        .any(|i| matches!(i, Item::TurnResult(r) if r.turn_id.as_deref() == Some(last.as_str())));
+    (!ended).then_some(last)
+}
+
+/// Ends a turn whose process was lost when the backend stopped (`lost`, the one its events have
+/// open, which a compaction with no items yet is too; or the one its items have open), and stops
+/// the subagents that went with it (a background one may be running with no turn).
 fn recover_lost(c: &mut ThreadContext, lost: LostTurn) {
-    if matches!(c.thread().status, ThreadStatus::Running | ThreadStatus::Waiting) {
-        let id = lost
-            .id
-            .or_else(|| last_turn(c.snapshot()))
-            .unwrap_or_else(|| new_id("turn"));
+    let status = c.thread().status;
+    let open = lost.id.or_else(|| open_turn(c.snapshot()));
+    let turn = status == ThreadStatus::Running || (status == ThreadStatus::Waiting && open.is_some());
+    if turn {
         c.turn = Some(Turn {
-            id,
+            id: open.unwrap_or_else(|| new_id("turn")),
             interrupted: false,
             session: lost.session,
             carried: 0,
             progressed: false,
         });
-        let requests: Vec<String> = open_requests(c.snapshot()).map(|r| r.id().to_string()).collect();
-        for id in requests {
-            c.emit_resolved(&id, &cancel_resolution());
-        }
+    }
+    let running: Vec<String> = c
+        .snapshot()
+        .items
+        .iter()
+        .filter_map(|i| match i {
+            Item::ToolCall(t) if t.subagent.as_ref().is_some_and(|s| s.status == SubagentStatus::Running) => {
+                Some(t.id.clone())
+            }
+            _ => None,
+        })
+        .collect();
+    c.stop_subagents(&running);
+    // Its open requests can't be answered now.
+    let requests: Vec<String> = open_requests(c.snapshot()).map(|r| r.id().to_string()).collect();
+    for id in requests {
+        c.emit_resolved(&id, &cancel_resolution());
+    }
+    if turn {
         c.add_item(json!({
             "id": new_id("n"), "type": "notice", "level": "warning", "code": "run.lost",
             "text": "The backend stopped while this turn was running, and couldn't pick its run up again.",
@@ -1460,6 +1497,8 @@ fn recover_lost(c: &mut ThreadContext, lost: LostTurn) {
             ..Default::default()
         };
         c.finish_turn(end, false, false);
+    } else if c.thread().status == ThreadStatus::Waiting {
+        c.set_thread(|t| t.status = ThreadStatus::Idle);
     }
     c.set_thread(|t| t.run = None);
 }
