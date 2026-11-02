@@ -196,6 +196,13 @@ impl ThreadRequest {
             ThreadRequest::Question(r) => r.turn_id.as_deref(),
         }
     }
+
+    pub fn tool_call_id(&self) -> Option<&str> {
+        match self {
+            ThreadRequest::Permission(r) => r.tool_call_id.as_deref(),
+            ThreadRequest::Question(r) => r.tool_call_id.as_deref(),
+        }
+    }
 }
 
 impl ThreadEvent {

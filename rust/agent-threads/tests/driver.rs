@@ -425,6 +425,95 @@ async fn asks_the_policy_and_remembers_an_answer_given_always() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn keeps_a_background_subagents_calls_and_requests_after_its_turn_and_runs_the_turn_claude_starts() {
+    let policy = PermissionPolicy::from_fn(|q, _| match q.kind {
+        ToolKind::Shell => PermissionDecision::Ask,
+        _ => PermissionDecision::Allow,
+    });
+    let env = setup(Setup {
+        capabilities: Capabilities {
+            permissions: Some(policy),
+            ..Default::default()
+        },
+        ..Default::default()
+    });
+    let t = env.sdk.create(create()).await.unwrap();
+    env.sdk
+        .send(&t.id, "background 0 apple", SendOptions::default())
+        .await
+        .unwrap();
+    // The turn ends with the subagent's call waiting for the user, who's still asked.
+    let s = until(5, || async {
+        let s = serde_json::to_value(env.sdk.snapshot(&t.id).await.unwrap()).unwrap();
+        (results(&s).len() == 1).then_some(s)
+    })
+    .await;
+    assert_eq!(s["thread"]["status"], "waiting");
+    assert_eq!(s["requests"].as_array().unwrap().len(), 1);
+    let calls = items(&s, "tool_call");
+    assert_eq!(
+        (calls[0]["status"].clone(), calls[0]["subagent"].clone()),
+        (
+            json!("completed"),
+            json!({"status": "running", "background": true, "agent_type": "general-purpose", "model": "mini-1"})
+        )
+    );
+    assert_eq!(
+        (calls[1]["status"].clone(), calls[1]["parent_id"].clone()),
+        (json!("pending"), calls[0]["id"].clone())
+    );
+
+    let respond = json!({"type": "respond", "thread_id": t.id, "request_id": s["requests"][0]["id"], "resolution": {"outcome": "allow"}});
+    env.sdk.handle_json(respond).await.unwrap();
+    let s = until(5, || async {
+        let s = serde_json::to_value(env.sdk.snapshot(&t.id).await.unwrap()).unwrap();
+        (results(&s).len() == 2 && s["thread"]["status"] == "idle").then_some(s)
+    })
+    .await;
+    let calls = items(&s, "tool_call");
+    assert_eq!(
+        calls[0]["subagent"],
+        json!({"status": "completed", "background": true, "agent_type": "general-purpose", "model": "mini-1", "activity": "Running true", "tool_uses": 1, "summary": "apple"})
+    );
+    assert_eq!(calls[1]["status"], "completed");
+    // Claude's own turn has no message of the user's.
+    let second = results(&s)[1]["turn_id"].clone();
+    assert!(items(&s, "user_message").iter().all(|u| u["turn_id"] != second));
+    assert_eq!(texts(&s).last().unwrap(), "the subagent said apple");
+    assert!(
+        env.runs()[0]
+            .sent
+            .iter()
+            .any(|m| m["response"]["response"]["behavior"] == "allow")
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn stops_a_runs_subagents_when_it_ends_and_cancels_what_they_were_doing() {
+    let mut env = setup(Setup::default());
+    let t = env.sdk.create(create()).await.unwrap();
+    env.sdk
+        .send(&t.id, "background 60000 apple", SendOptions::default())
+        .await
+        .unwrap();
+    until(5, || async {
+        let s = serde_json::to_value(env.sdk.snapshot(&t.id).await.unwrap()).unwrap();
+        let calls = items(&s, "tool_call");
+        (s["thread"]["status"] == "idle" && calls.len() == 2 && calls[1]["status"] == "running").then_some(())
+    })
+    .await;
+    env.sdk.close(false).await.unwrap();
+    let events = env.events_json();
+    let patches: Vec<&Value> = events
+        .iter()
+        .filter(|e| e["type"] == "item.updated")
+        .map(|e| &e["patch"])
+        .collect();
+    assert!(patches.iter().any(|p| p["subagent"]["status"] == "stopped"));
+    assert!(patches.iter().any(|p| p["status"] == "cancelled"));
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn runs_app_tools_with_the_threads_id_metadata_and_call() {
     let seen: Arc<Mutex<Option<ToolContext>>> = Arc::default();
     let s2 = seen.clone();
