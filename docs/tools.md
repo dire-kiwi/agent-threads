@@ -274,6 +274,38 @@ the user's (or one the app points at).
 Both drivers take `bin` (and `binArgs`, for a script run by `node`), extra `args` and `env`; Codex
 takes extra `config` for `thread/start` (its `config.toml` keys, dotted).
 
+### Per-thread launch options
+
+A thread can have launch options of its own, on top of the harness's: given when it's created, and
+changed with `setOptions` (Go `SetOptions`, Rust `set_options`). They're stored with the thread
+(in the store's thread record, as `launch`, not in the protocol's `Thread`, so clients never see
+them), so a thread picked up after a restart starts its processes with them. A change applies from
+the next process the thread starts, as a model change does; the `set_options` command from a client
+can't change them.
+
+```ts
+const thread = await sdk.create({
+  harness: "claude",
+  launch: {
+    args: ["--allowedTools", "Read Grep", "--settings", settingsJson],
+    env: { TMPDIR: "/tmp/thread-1", NO_COLOR: null }, // null removes a variable
+    addDirs: ["/srv/shared", "/srv/attachments"],
+    configDir: "/srv/profiles/team-a/claude",
+  },
+});
+await sdk.setOptions(thread.id, { launch: { ...launch, args: ["--disallowedTools", "Bash"] } }); // replaces them in full
+```
+
+| | Claude Code | Codex |
+| --- | --- | --- |
+| `args` | After the driver's and the options' `args`: `--allowedTools`, `--disallowedTools`, `--settings` and so on | After `app-server` and the options' `args`: `-c key=value`, say |
+| `env` | On top of the options' `env`; `null` (Go `nil`, Rust `None`) removes a variable | The same |
+| `addDirs` (Go `AddDirs`, Rust `add_dirs`) | `--add-dir`, once for each | Writable roots (`sandbox_workspace_write.writable_roots`, after any the options' `config` gives), relative ones in the thread's `cwd` |
+| `configDir` (Go `ConfigDir`, Rust `config_dir`) | `CLAUDE_CONFIG_DIR`, in place of the options' `configDir` | `CODEX_HOME`, in place of the app's `home`, used as it is: its own login and `config.toml`, nothing linked in |
+
+The harness keeps its sessions in its config directory, so a thread whose `configDir` changes can't
+resume the session it had.
+
 ## Subagents
 
 Subagents are the harness's own (Claude's Agent tool, Codex's child threads): a `tool_call` of kind
