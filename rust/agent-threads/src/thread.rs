@@ -506,24 +506,20 @@ impl ThreadContext {
     /// false (shutting down, or recovering a turn the backend lost), or they've been tried enough.
     pub(crate) fn finish_turn(&mut self, end: TurnEnd, live: bool, carry: bool) {
         let Some(turn) = self.turn.clone() else { return };
-        // Text streamed but never finished (its process went first) is kept as it was shown.
-        let unfinished: Vec<(String, String)> = self
-            .state
-            .items
-            .iter()
-            .filter_map(|it| {
-                let text = it.streamed_text()?;
-                let saved = self.item(it.id())?.streamed_text()?;
-                (saved != text).then(|| (it.id().to_string(), text.to_string()))
-            })
-            .collect();
-        for (id, text) in unfinished {
-            self.update_item(&id, json!({"text": text}));
-        }
-        self.streaming.clear();
-        self.structured.clear();
         // What a background subagent that's still running does carries on after the turn: its
-        // calls and requests too.
+        // text still streaming, its calls (and their structured output, still to go with their
+        // results) and its requests.
+        // Text streamed but never finished (its process went first) is kept as it was shown.
+        self.finish_text(|c, id| !c.in_background(id));
+        let ending: Vec<String> = self
+            .structured
+            .keys()
+            .filter(|id| !self.in_background(id))
+            .cloned()
+            .collect();
+        for id in ending {
+            self.structured.remove(&id);
+        }
         let cut: Vec<(String, Option<SubagentState>)> = self
             .state
             .items
@@ -651,6 +647,26 @@ impl ThreadContext {
             .push_back(Effect::CarryOver(left.iter().map(queued_message).collect()));
     }
 
+    /// Keeps text streamed into the items `which` picks, but never finished, as it was shown.
+    fn finish_text(&mut self, which: impl Fn(&ThreadContext, &str) -> bool) {
+        let unfinished: Vec<(String, String)> = self
+            .state
+            .items
+            .iter()
+            .filter(|it| which(self, it.id()))
+            .filter_map(|it| {
+                let text = it.streamed_text()?;
+                let saved = self.item(it.id())?.streamed_text()?;
+                (saved != text).then(|| (it.id().to_string(), text.to_string()))
+            })
+            .collect();
+        for (id, text) in unfinished {
+            self.update_item(&id, json!({"text": text}));
+        }
+        let done: Vec<String> = self.streaming.iter().filter(|id| which(self, id)).cloned().collect();
+        self.streaming.retain(|id| !done.contains(id));
+    }
+
     /// The harness started a turn by itself, with no message (Claude does, to tell the agent that a
     /// background subagent has ended). Does nothing if a turn is running.
     pub fn begin_turn(&mut self) {
@@ -695,6 +711,11 @@ impl ThreadContext {
         }
         let within =
             |ctx: &ThreadContext, id: &str| ctx.ancestors(id).iter().any(|a| stopped.iter().any(|s| s == a.id()));
+        self.finish_text(within);
+        let done: Vec<String> = self.structured.keys().filter(|id| within(self, id)).cloned().collect();
+        for id in done {
+            self.structured.remove(&id);
+        }
         let cut: Vec<String> = self
             .state
             .items

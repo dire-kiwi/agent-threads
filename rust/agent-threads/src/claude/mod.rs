@@ -21,11 +21,11 @@ use crate::attachments::{Part, message_parts, path_text};
 use crate::harness::{BoxFuture, Harness, HarnessSession, Message, RunCheckpoint, TurnEnd};
 use crate::ids::{new_id, now_iso, now_ms, private_temp_dir};
 use crate::permissions::{Decided, PermissionDecision, PermissionQuery, permission_key};
-use crate::protocol::{DeltaEventKind, Item, Resolution, ResolutionOutcome, ToolKind, ToolStatus};
+use crate::protocol::{DeltaEventKind, Item, Resolution, ResolutionOutcome, ToolKind, ToolStatus, Usage};
 use crate::skills::write_skills;
 use crate::spawner::{ExitStatus, HarnessProcess, ProcessEvent, Signal, SpawnOptions};
 use crate::store::RunRecord;
-use crate::thread::{ThreadContext, Timer, running_in_background};
+use crate::thread::{ThreadContext, Timer, add_usage, running_in_background};
 use crate::tools::{Cancellation, ToolContext, run_tool};
 
 pub(crate) use translate::{APP_SERVER, result_text, slim, title};
@@ -142,6 +142,11 @@ struct RunState {
     /// The calls whose subagents it ran.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     agents: Vec<String>,
+    /// The turn Claude started by itself, and the usage of its turns held for the user's.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    auto_turn: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    held_usage: Option<Usage>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     plugin_dir: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -188,6 +193,10 @@ struct Run {
     tasks: HashMap<String, String>,
     /// The calls whose subagents it ran, which are stopped when it ends.
     agents: Vec<String>,
+    /// The turn it started by itself (begin_turn), if it has.
+    auto_turn: Option<String>,
+    /// The usage of turns Claude made by itself while one of the user's waited, for that turn's.
+    held_usage: Option<Usage>,
     /// The generated plugin with the thread's skills, for this run only.
     plugin_dir: Option<PathBuf>,
     launched: Option<Launched>,
@@ -219,6 +228,8 @@ impl Run {
             sent: Vec::new(),
             tasks: HashMap::new(),
             agents: Vec::new(),
+            auto_turn: None,
+            held_usage: None,
             plugin_dir: None,
             launched: None,
             detached: false,
@@ -311,6 +322,8 @@ impl Run {
                 t
             },
             agents: self.agents.clone(),
+            auto_turn: self.auto_turn.clone(),
+            held_usage: self.held_usage.clone(),
             plugin_dir: self.plugin_dir.as_ref().map(|p| p.to_string_lossy().into()),
             launched: self.launched.clone(),
             stale: false,
@@ -333,6 +346,8 @@ impl Run {
         self.sent = st.sent.clone();
         self.tasks = st.tasks.iter().cloned().collect();
         self.agents = st.agents.clone();
+        self.auto_turn = st.auto_turn.clone();
+        self.held_usage = st.held_usage.clone();
         self.plugin_dir = st.plugin_dir.as_ref().map(PathBuf::from);
         self.launched = st.launched.clone();
     }
@@ -896,8 +911,10 @@ impl ClaudeSession {
             "system" => {
                 // Claude starts a turn by itself to tell the agent that a background subagent has
                 // ended.
-                if m["subtype"] == "init" {
+                if m["subtype"] == "init" && ctx.turn_id().is_none() {
                     ctx.begin_turn();
+                    let turn = ctx.turn_id().map(String::from);
+                    self.run(id).unwrap().auto_turn = turn;
                 }
                 if m["subtype"].as_str().is_some_and(|s| s.starts_with("task_")) {
                     self.task(ctx, id, m);
@@ -1041,6 +1058,16 @@ impl ClaudeSession {
                 if ctx.turn_id().is_none() {
                     return;
                 }
+                // The end of a turn Claude made by itself (to tell the agent a background subagent
+                // ended) while a turn of the user's waited for it: the user's goes on to its own
+                // result, which gets this one's usage too.
+                let usage: Option<Usage> = serde_json::from_value(claude_usage(m)).ok();
+                let run = self.run(id).unwrap();
+                if m["origin"]["kind"] == "task-notification" && ctx.turn_id() != run.auto_turn.as_deref() {
+                    run.held_usage = add_usage(run.held_usage.as_ref(), usage.as_ref());
+                    return;
+                }
+                let usage = add_usage(run.held_usage.take().as_ref(), usage.as_ref());
                 self.clear_stop();
                 let failed = m["is_error"].as_bool().unwrap_or(false);
                 let error = failed.then(|| {
@@ -1062,7 +1089,7 @@ impl ClaudeSession {
                 let end = TurnEnd {
                     ok: !failed,
                     error,
-                    usage: serde_json::from_value(claude_usage(m)).ok(),
+                    usage,
                     duration_ms: m["duration_ms"].as_f64().map(|d| d as u64),
                 };
                 let live = self.live_id().is_some();
