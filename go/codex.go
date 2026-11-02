@@ -1296,8 +1296,9 @@ func (s *codexSession) notification(run *codexRun, m jmap) {
 			run.setTurn(id)
 		}
 		if !own {
-			// A child taking up work again (a follow-up sent to it).
-			s.subagent(parent, func(st protocol.SubagentState) (protocol.SubagentState, bool) {
+			// A child taking up work again (a follow-up sent to it): its report is to come.
+			delete(run.lastChild, p.str("threadId"))
+			s.subagent(run, parent, func(st protocol.SubagentState) (protocol.SubagentState, bool) {
 				return collabSubagent(st, jmap{"status": mustJSON("running")})
 			})
 		}
@@ -1438,7 +1439,7 @@ func (s *codexSession) item(run *codexRun, item jmap, done bool, parent, child s
 		for _, t := range sortedKeys(states) {
 			if call, ok := run.children[t]; ok {
 				state := orObj(states.obj(t))
-				s.subagent(call, func(st protocol.SubagentState) (protocol.SubagentState, bool) { return collabSubagent(st, state) })
+				s.subagent(run, call, func(st protocol.SubagentState) (protocol.SubagentState, bool) { return collabSubagent(st, state) })
 			}
 		}
 		return
@@ -1598,20 +1599,41 @@ func (s *codexSession) turnCompleted(run *codexRun, turn jmap) {
 
 // childDone says a subagent's turn ended: so did the subagent, with its last message.
 func (s *codexSession) childDone(run *codexRun, child string, turn jmap, callID string) {
-	s.subagent(callID, func(st protocol.SubagentState) (protocol.SubagentState, bool) {
+	s.subagent(run, callID, func(st protocol.SubagentState) (protocol.SubagentState, bool) {
 		return childTurnSubagent(st, turn, run.lastChild[child]), true
 	})
 }
 
-// subagent changes a spawnAgent call's subagent, if it has one (change says !ok to leave it).
-func (s *codexSession) subagent(callID string, change func(protocol.SubagentState) (protocol.SubagentState, bool)) {
+// subagent changes a spawnAgent call's subagent, if it has one (change says !ok to leave it). One
+// that ends leaves nothing running: what it was doing is cancelled, and its requests with it.
+func (s *codexSession) subagent(run *codexRun, callID string, change func(protocol.SubagentState) (protocol.SubagentState, bool)) {
 	call, ok := s.callFields(callID)
 	if !ok || call.Subagent == nil {
 		return
 	}
-	if next, ok := change(*call.Subagent); ok {
-		s.ctx.UpdateItem(callID, Patch{"subagent": next})
+	next, ok := change(*call.Subagent)
+	if !ok {
+		return
 	}
+	if call.Subagent.Status == protocol.SubagentStatusRunning && next.Status != protocol.SubagentStatusRunning {
+		within := func(c string) bool {
+			if c == callID {
+				return true
+			}
+			for _, a := range ancestors(s.ctx.Item, c) {
+				if a.ID() == callID {
+					return true
+				}
+			}
+			return false
+		}
+		for _, key := range append([]string(nil), run.openOrder...) {
+			if parent, _, _ := s.parent(run, orObj(run.open[key].Msg.obj("params")).raw("threadId")); parent != "" && within(parent) {
+				run.dropOpen(key)
+			}
+		}
+	}
+	s.ctx.EndSubagent(callID, next)
 }
 
 // inBackground says whether a request from the child thread of this subagent call is a background

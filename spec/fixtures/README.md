@@ -244,7 +244,9 @@ backend drives each CLI:
   `running` are `running` (and drop the `summary`), `completed` is `completed`, `errored` and
   `notFound` are `failed`, and `shutdown` and `interrupted` are `stopped`, with the state's
   `message`, if any, as the `summary`. A child's `turn/started` (a follow-up sent to it) makes its
-  subagent `running` again.
+  subagent `running` again, with no `summary` (nor the last message of its turn before). A
+  subagent that ends leaves nothing running: its calls still `running` or `pending` are
+  `cancelled`, and its open requests are resolved with `cancel`.
 - **Requests**: an approval is a `permission` for the item it names (an MCP elicitation, for the
   running call on that server). `item/tool/requestUserInput` adds a `tool_call` named
   `request_user_input` (`other`, `pending`) for it before the question; the answer completes it

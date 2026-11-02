@@ -412,3 +412,60 @@ func TestARunsChildThreadsStopWithIt(t *testing.T) {
 		t.Fatalf("after closing:\n%s", show(rec.all()))
 	}
 }
+
+// A child thread that ends (its turn interrupted, or closed) after its parent's turn leaves nothing
+// unfinished: its calls are cancelled and its requests with them.
+func TestACodexChildThreadThatEndsLeavesNothingRunning(t *testing.T) {
+	ctx := context.Background()
+	shell := agentthreads.PolicyFunc(func(_ context.Context, q agentthreads.PermissionQuery, _ agentthreads.PermissionContext) agentthreads.Decision {
+		if q.Kind == protocol.ToolKindShell {
+			return agentthreads.Ask
+		}
+		return agentthreads.Allow
+	})
+	for _, end := range []string{"endchild interrupted", "closechild"} {
+		t.Run(end, func(t *testing.T) {
+			sdk, rec := miniCodex(t, shell)
+			th, _ := sdk.Create(ctx, agentthreads.CreateOptions{Harness: "codex", Cwd: t.TempDir()})
+			sdk.Send(ctx, th.ID, "bg sleep 60", agentthreads.SendOptions{})
+			at := rec.waitFor(0, []byte(`{"type":"turn.completed"}`), waitFor)
+			if at < 0 {
+				t.Fatal("the turn didn't end")
+			}
+			sdk.Send(ctx, th.ID, end, agentthreads.SendOptions{})
+			if rec.waitFor(at+1, []byte(`{"type":"turn.completed"}`), waitFor) < 0 {
+				t.Fatal("the second turn didn't end")
+			}
+			var snap protocol.Snapshot
+			until(t, func() bool {
+				snap, _ = sdk.Snapshot(ctx, th.ID)
+				return snap.Thread.Status == protocol.ThreadStatusIdle
+			})
+			calls := toolCalls(snap)
+			if got := string(mustMarshal(calls[0].Subagent)); got != `{"status":"stopped","background":true,"model":"mini-child"}` || calls[1].Status != protocol.ToolStatusCancelled || len(snap.Requests) != 0 {
+				t.Fatalf("after the child ended:\n%s", show(rec.all()))
+			}
+		})
+	}
+}
+
+// A child's follow-up turn that ends without a report doesn't report the turn before it.
+func TestACodexChildsFollowUpWithNoReportHasNone(t *testing.T) {
+	ctx := context.Background()
+	sdk, rec := miniCodex(t, agentthreads.Allow)
+	th, _ := sdk.Create(ctx, agentthreads.CreateOptions{Harness: "codex", Cwd: t.TempDir()})
+	sdk.Send(ctx, th.ID, "sub old summary", agentthreads.SendOptions{})
+	at := rec.waitFor(0, []byte(`{"type":"turn.completed"}`), waitFor)
+	snap, _ := sdk.Snapshot(ctx, th.ID)
+	if got := string(mustMarshal(toolCalls(snap)[0].Subagent)); got != `{"status":"completed","background":true,"summary":"child says old summary"}` {
+		t.Fatalf("the subagent: %s", got)
+	}
+	sdk.Send(ctx, th.ID, "followup interrupted", agentthreads.SendOptions{})
+	if rec.waitFor(at+1, []byte(`{"type":"turn.completed"}`), waitFor) < 0 {
+		t.Fatal("the second turn didn't end")
+	}
+	snap, _ = sdk.Snapshot(ctx, th.ID)
+	if got := string(mustMarshal(toolCalls(snap)[0].Subagent)); got != `{"status":"stopped","background":true}` {
+		t.Fatalf("the subagent after its follow-up: %s", got)
+	}
+}

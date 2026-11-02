@@ -2,7 +2,7 @@
 // steering queue and open requests. Every change is an event, numbered, applied, sent to the
 // subscribers, and saved to the store in order (deltas aren't saved).
 
-import { applyEvent, type Attachment, type Item, type Resolution, type Snapshot, type Thread, type ThreadEvent, type ThreadRequest, type Usage, type UserMessage } from "@dire-kiwi/agent-threads-protocol";
+import { applyEvent, type Attachment, type Item, type Resolution, type Snapshot, type SubagentState, type Thread, type ThreadEvent, type ThreadRequest, type Usage, type UserMessage } from "@dire-kiwi/agent-threads-protocol";
 import { ancestors, inBackground, type HarnessSession, type Message, type NewItem, type NewRequest, type ThreadConfig, type ThreadContext, type TurnEnd } from "./harness.js";
 import { newId } from "./ids.js";
 import { decide, permissionKey, type PermissionDecision, type PermissionPolicy, type PermissionQuery } from "./permissions.js";
@@ -528,16 +528,27 @@ export class ThreadRuntime implements ThreadContext {
   }
 
   stopSubagents(ids: Iterable<string>): void {
-    const stopped = new Set<string>();
+    const ends = new Map<string, SubagentState>();
     for (const id of ids) {
       const it = this.item(id);
-      if (it?.type !== "tool_call" || it.subagent?.status !== "running") continue;
-      stopped.add(id);
-      this.updateItem(id, { subagent: { ...it.subagent, status: "stopped" } });
+      if (it?.type === "tool_call" && it.subagent?.status === "running") ends.set(id, { ...it.subagent, status: "stopped" });
     }
-    if (!stopped.size) return;
+    this.#endSubagents(ends);
+  }
+
+  endSubagent(id: string, end: SubagentState): void {
+    const it = this.item(id);
+    if (it?.type !== "tool_call") return;
+    if (it.subagent?.status === "running" && end.status !== "running") this.#endSubagents(new Map([[id, end]]));
+    else this.updateItem(id, { subagent: end });
+  }
+
+  /** Subagents that ended, as each says: what they left unfinished is cancelled. */
+  #endSubagents(ends: Map<string, SubagentState>): void {
+    if (!ends.size) return;
+    for (const [id, end] of ends) this.updateItem(id, { subagent: end });
     const lookup = (id: string) => this.item(id);
-    const within = (id: string) => [...ancestors(lookup, id)].some((a) => stopped.has(a.id));
+    const within = (id: string) => [...ancestors(lookup, id)].some((a) => ends.has(a.id));
     this.#finishText(within);
     for (const id of [...this.#structured.keys()]) if (within(id)) this.#structured.delete(id);
     for (const it of this.#state.items) {

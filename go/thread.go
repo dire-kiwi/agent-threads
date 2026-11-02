@@ -928,24 +928,47 @@ func (rt *threadRuntime) BeginTurn() {
 }
 
 func (rt *threadRuntime) StopSubagents(ids []string) {
-	stopped := map[string]bool{}
+	ends := map[string]protocol.SubagentState{}
+	var order []string
 	for _, id := range ids {
 		it, ok := rt.Item(id)
 		c, isCall := it.Value.(*protocol.ToolCall)
-		if !ok || !isCall || c.Subagent == nil || c.Subagent.Status != protocol.SubagentStatusRunning || stopped[id] {
+		if _, seen := ends[id]; !ok || !isCall || c.Subagent == nil || c.Subagent.Status != protocol.SubagentStatusRunning || seen {
 			continue
 		}
-		stopped[id] = true
 		s := *c.Subagent
 		s.Status = protocol.SubagentStatusStopped
-		rt.UpdateItem(id, Patch{"subagent": s})
+		ends[id] = s
+		order = append(order, id)
 	}
-	if len(stopped) == 0 {
+	rt.endSubagents(ends, order)
+}
+
+func (rt *threadRuntime) EndSubagent(id string, end protocol.SubagentState) {
+	it, ok := rt.Item(id)
+	c, isCall := it.Value.(*protocol.ToolCall)
+	if !ok || !isCall {
 		return
+	}
+	if c.Subagent != nil && c.Subagent.Status == protocol.SubagentStatusRunning && end.Status != protocol.SubagentStatusRunning {
+		rt.endSubagents(map[string]protocol.SubagentState{id: end}, []string{id})
+		return
+	}
+	rt.UpdateItem(id, Patch{"subagent": end})
+}
+
+// endSubagents says these subagents ended, as each says (in order): what they left unfinished is
+// cancelled.
+func (rt *threadRuntime) endSubagents(ends map[string]protocol.SubagentState, order []string) {
+	if len(ends) == 0 {
+		return
+	}
+	for _, id := range order {
+		rt.UpdateItem(id, Patch{"subagent": ends[id]})
 	}
 	within := func(id string) bool {
 		for _, a := range ancestors(rt.Item, id) {
-			if stopped[a.ID()] {
+			if _, ok := ends[a.ID()]; ok {
 				return true
 			}
 		}

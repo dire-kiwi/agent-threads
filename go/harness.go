@@ -120,6 +120,9 @@ type ThreadContext interface {
 	// StopSubagents says the subagents of these calls that are still running were stopped (their
 	// harness process ended): their calls still running are cancelled, and their open requests too.
 	StopSubagents(ids []string)
+	// EndSubagent sets a subagent call's subagent. If it was running and has ended, what it left
+	// unfinished is cancelled: its calls still running, its streaming text and its open requests.
+	EndSubagent(id string, subagent protocol.SubagentState)
 	// Error reports something that went wrong that isn't the turn's, to the app's OnError.
 	Error(err error)
 	// Post runs fn on the thread's goroutine, after what's running there now.

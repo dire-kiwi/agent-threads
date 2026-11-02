@@ -24,6 +24,10 @@
 //   sub <prompt>        spawns a subagent (a child thread), which replies, and waits for it
 //   bg <command>        spawns a subagent that runs on after the turn: it runs the command (asking
 //                       first), replies, and ends (its turn fails if the command is declined)
+//   endchild <status>   the last subagent's turn ends with that status (and no message)
+//   followup <status>   the last subagent takes up a turn again, which ends with that status (and
+//                       no message)
+//   closechild          closes the last subagent (closeAgent, whose agentsStates say it's shut down)
 //   sleep <ms>          waits (or until it's interrupted)
 //   slow                waits for an interrupt
 //   stubborn            ignores interrupts, and a closed stdin (saying "not stopping"), until it's
@@ -68,6 +72,7 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 let thread = null; // { id, totals, params, dynamicTools }
 let extraRoots = [];
 let turn = null; // { id, interrupted, wake, heard }
+let lastChild = null; // { id, turn }: the last subagent spawned, and its turn
 let stubborn = false;
 
 const sessions = home && join(home, "mini-sessions");
@@ -293,6 +298,7 @@ async function step(line) {
       item("item/started", { ...base, status: "inProgress", receiverThreadIds: [] });
       item("item/completed", { ...base, status: "completed", receiverThreadIds: [child] });
       const childTurn = uid("turn");
+      lastChild = { id: child, turn: childTurn };
       notify("turn/started", { threadId: child, turn: { id: childTurn, status: "inProgress", items: [] } });
       item("item/started", { type: "userMessage", id: uid("um"), content: [{ type: "text", text: arg }] }, child);
       message(`child says ${arg}`, child);
@@ -309,6 +315,7 @@ async function step(line) {
       item("item/started", { ...base, status: "inProgress", receiverThreadIds: [], agentsStates: {} });
       item("item/completed", { ...base, status: "completed", receiverThreadIds: [child], agentsStates: { [child]: { status: "pendingInit", message: null } } });
       const childTurn = uid("turn");
+      lastChild = { id: child, turn: childTurn };
       const on = (method, it) => notify(method, { item: it, threadId: child, turnId: childTurn });
       notify("turn/started", { threadId: child, turn: { id: childTurn, status: "inProgress", items: [] } });
       const cid = uid("exec");
@@ -324,6 +331,19 @@ async function step(line) {
         notify("turn/completed", { threadId: child, turn: { id: childTurn, status: ok ? "completed" : "failed", error, items: [] } });
       });
       return message("started");
+    }
+    case "followup":
+      lastChild.turn = uid("turn");
+      notify("turn/started", { threadId: lastChild.id, turn: { id: lastChild.turn, status: "inProgress", items: [] } });
+    // falls through
+    case "endchild":
+      notify("turn/completed", { threadId: lastChild.id, turn: { id: lastChild.turn, status: arg, error: null, items: [] } });
+      return message(`the subagent's turn is ${arg}`);
+    case "closechild": {
+      const close = { type: "collabAgentToolCall", id: uid("close"), tool: "closeAgent", senderThreadId: thread.id, receiverThreadIds: [lastChild.id], prompt: null };
+      item("item/started", { ...close, status: "inProgress", agentsStates: {} });
+      item("item/completed", { ...close, status: "completed", agentsStates: { [lastChild.id]: { status: "shutdown", message: null } } });
+      return message("closed it");
     }
     case "sleep":
       return wait(Number(arg));

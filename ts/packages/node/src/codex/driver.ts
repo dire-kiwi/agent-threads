@@ -13,7 +13,7 @@ import { join, resolve, sep } from "node:path";
 import type { Resolution, SubagentState, ToolCall, Usage } from "@dire-kiwi/agent-threads-protocol";
 import { messageParts } from "../attachments.js";
 import { title } from "../claude/translate.js";
-import { inBackground, runningInBackground, type Harness, type HarnessSession, type Message, type RunCheckpoint, type ThreadContext } from "../harness.js";
+import { ancestors, inBackground, runningInBackground, type Harness, type HarnessSession, type Message, type RunCheckpoint, type ThreadContext } from "../harness.js";
 import { newId } from "../ids.js";
 import { serveTools, type LoopbackMcp } from "../mcp-http.js";
 import { permissionKey, type PermissionDecision, type PermissionQuery } from "../permissions.js";
@@ -936,8 +936,11 @@ class CodexSession implements HarnessSession {
           run.error = null;
           run.setTurn(p.turn.id);
         }
-        // A child taking up work again (a follow-up sent to it).
-        if (!own) this.#subagent(parent_id!, (s) => collabSubagent(s, { status: "running" }));
+        // A child taking up work again (a follow-up sent to it): its report is to come.
+        if (!own) {
+          run.lastChild.delete(p.threadId);
+          this.#subagent(run, parent_id!, (s) => collabSubagent(s, { status: "running" }));
+        }
         return;
       case "turn/completed":
         if (own) return this.#turnCompleted(run, p.turn as Turn);
@@ -1016,7 +1019,7 @@ class CodexSession implements HarnessSession {
         // Any collab call's completion says how the child threads it's about are getting on.
         for (const [t, state] of Object.entries(item.agentsStates ?? {})) {
           const call = run.children.get(t);
-          if (call) this.#subagent(call, (s) => collabSubagent(s, state));
+          if (call) this.#subagent(run, call, (s) => collabSubagent(s, state));
         }
         return;
       }
@@ -1090,15 +1093,25 @@ class CodexSession implements HarnessSession {
 
   /** A subagent's turn ended: so did the subagent, with its last message. */
   #childDone(run: Run, child: string, turn: Turn, callId: string): void {
-    this.#subagent(callId, (s) => childTurnSubagent(s, turn, run.lastChild.get(child)));
+    this.#subagent(run, callId, (s) => childTurnSubagent(s, turn, run.lastChild.get(child)));
   }
 
-  /** Changes a spawnAgent call's subagent, if it has one (`change` returns undefined to leave it). */
-  #subagent(callId: string, change: (s: SubagentState) => SubagentState | undefined): void {
-    const it = this.#ctx.item(callId);
+  /**
+   * Changes a spawnAgent call's subagent, if it has one (`change` returns undefined to leave it).
+   * One that ends leaves nothing running: what it was doing is cancelled, and its requests with it.
+   */
+  #subagent(run: Run, callId: string, change: (s: SubagentState) => SubagentState | undefined): void {
+    const ctx = this.#ctx;
+    const it = ctx.item(callId);
     if (it?.type !== "tool_call" || !it.subagent) return;
     const next = change(it.subagent);
-    if (next) this.#ctx.updateItem(callId, { subagent: next });
+    if (!next) return;
+    if (it.subagent.status === "running" && next.status !== "running") {
+      const lookup = (id: string) => ctx.item(id);
+      const within = (call: string | null | undefined) => !!call && (call === callId || [...ancestors(lookup, call)].some((a) => a.id === callId));
+      for (const id of [...run.open.keys()]) if (within(this.#parent(run, run.open.get(id)!.msg.params?.threadId))) run.open.delete(id);
+    }
+    ctx.endSubagent(callId, next);
   }
 
   /** Whether what comes from the child thread of this subagent call is a background subagent's, which carries on after its turn. */

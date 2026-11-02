@@ -286,6 +286,33 @@ class Draft {
     this.update(id, { ...extra, subagent: next });
   }
 
+  /**
+   * Changes a subagent call's subagent as subagent() does; one that ends leaves nothing running: its
+   * calls still running are cancelled, and its open requests too.
+   */
+  endSubagent(id, change) {
+    const running = this.items.get(id)?.subagent?.status === "running";
+    this.subagent(id, change);
+    if (!running || this.items.get(id)?.subagent?.status === "running") return;
+    const within = (x) => {
+      const seen = new Set();
+      for (let p = this.items.get(x)?.parent_id; p && !seen.has(p); p = this.items.get(p)?.parent_id) {
+        if (p === id) return true;
+        seen.add(p);
+      }
+      return false;
+    };
+    for (const it of this.items.values()) {
+      if (it.type === "tool_call" && (it.status === "running" || it.status === "pending") && within(it.id)) this.update(it.id, { status: "cancelled" });
+    }
+    for (const r of this.requests.values()) {
+      if (r.resolved || !r.tool_call_id || !within(r.tool_call_id)) continue;
+      r.resolved = true;
+      this.emit({ type: "request.resolved", request_id: r.id, resolution: { outcome: "cancel" } });
+    }
+    if (!this.turn && this.thread.status === "waiting" && ![...this.requests.values()].some((r) => !r.resolved)) this.setThread({ status: "idle" });
+  }
+
   endTurn({ ok, error, usage, duration_ms }) {
     // What a background subagent that's still running is doing carries on after the turn.
     for (const it of this.items.values()) {
@@ -766,7 +793,7 @@ function draftCodex(d, runs) {
               for (const [t, s] of Object.entries(item.agentsStates ?? {})) {
                 const status = COLLAB_STATUS[s?.status];
                 if (!status || !children.has(t)) continue;
-                d.subagent(children.get(t), { status, ...(status === "running" ? { summary: undefined } : s.message ? { summary: s.message } : {}) });
+                d.endSubagent(children.get(t), { status, ...(status === "running" ? { summary: undefined } : s.message ? { summary: s.message } : {}) });
               }
               break;
             }
@@ -800,7 +827,8 @@ function draftCodex(d, runs) {
           if (!child) total = p.tokenUsage.total;
           break;
         case "turn/started":
-          // A child taking up work again (a follow-up sent to it).
+          // A child taking up work again (a follow-up sent to it): its report is to come.
+          if (child) lastChildMessage.delete(child);
           if (child && d.items.get(parent)?.subagent) d.subagent(parent, { status: "running", summary: undefined });
           break;
         case "turn/completed": {
@@ -809,7 +837,7 @@ function draftCodex(d, runs) {
             const turn = p.turn;
             const status = turn.status === "completed" ? "completed" : turn.status === "interrupted" ? "stopped" : "failed";
             const summary = (status === "failed" ? turn.error?.message : undefined) ?? lastChildMessage.get(child);
-            d.subagent(parent, { status, ...(summary ? { summary } : {}) });
+            d.endSubagent(parent, { status, ...(summary ? { summary } : {}) });
             break;
           }
           const turn = p.turn;

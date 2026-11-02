@@ -115,7 +115,8 @@ too. Its calls and requests aren't cancelled when its turn ends, so the thread c
 (on one of its requests) with no turn running; answering it leaves the thread `idle`. When it ends,
 its `subagent.summary` is its report (its call's `result`, if it has one, only says it started).
 A subagent still running when its harness process ends is `stopped`, and its calls still running
-are `cancelled`. Codex's child threads are background subagents: the `spawnAgent` call returns as
+are `cancelled`. Whenever a subagent ends, what it left unfinished goes with it: its calls still
+running are `cancelled`, and its open requests are resolved with `cancel`. Codex's child threads are background subagents: the `spawnAgent` call returns as
 soon as the child has started.
 
 The harness can start a **turn by itself**, with no `user_message`: Claude Code does when a

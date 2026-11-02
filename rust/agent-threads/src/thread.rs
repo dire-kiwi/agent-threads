@@ -691,7 +691,7 @@ impl ThreadContext {
     /// The subagents of these calls that are still running were stopped (their harness process
     /// ended): their calls still running are cancelled, and their open requests too.
     pub fn stop_subagents(&mut self, ids: &[String]) {
-        let mut stopped: Vec<String> = Vec::new();
+        let mut ends: Vec<(String, SubagentState)> = Vec::new();
         for id in ids {
             let Some(Item::ToolCall(c)) = self.item(id) else {
                 continue;
@@ -699,16 +699,36 @@ impl ThreadContext {
             let Some(mut s) = c.subagent.clone().filter(|s| s.status == SubagentStatus::Running) else {
                 continue;
             };
-            if stopped.contains(id) {
+            if ends.iter().any(|(e, _)| e == id) {
                 continue;
             }
-            stopped.push(id.clone());
             s.status = SubagentStatus::Stopped;
-            self.update_item(id, json!({"subagent": s}));
+            ends.push((id.clone(), s));
         }
-        if stopped.is_empty() {
+        self.end_subagents(ends);
+    }
+
+    /// Sets a subagent call's subagent. If it was running and has ended, what it left unfinished
+    /// is cancelled: its calls still running, its streaming text and its open requests.
+    pub fn end_subagent(&mut self, id: &str, end: SubagentState) {
+        let Some(Item::ToolCall(c)) = self.item(id) else { return };
+        let running = c.subagent.as_ref().is_some_and(|s| s.status == SubagentStatus::Running);
+        if running && end.status != SubagentStatus::Running {
+            self.end_subagents(vec![(id.to_string(), end)]);
+        } else {
+            self.update_item(id, json!({ "subagent": end }));
+        }
+    }
+
+    /// These subagents ended, as each says: what they left unfinished is cancelled.
+    fn end_subagents(&mut self, ends: Vec<(String, SubagentState)>) {
+        if ends.is_empty() {
             return;
         }
+        for (id, s) in &ends {
+            self.update_item(id, json!({ "subagent": s }));
+        }
+        let stopped: Vec<String> = ends.into_iter().map(|(id, _)| id).collect();
         let within =
             |ctx: &ThreadContext, id: &str| ctx.ancestors(id).iter().any(|a| stopped.iter().any(|s| s == a.id()));
         self.finish_text(within);

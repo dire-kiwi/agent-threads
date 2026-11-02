@@ -907,3 +907,62 @@ async fn stops_a_runs_child_threads_when_it_ends_and_cancels_what_they_were_doin
     assert!(patches.iter().any(|p| p["status"] == "cancelled"));
     assert!(events.iter().any(|e| e["type"] == "request.resolved"));
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn cancels_what_a_child_thread_left_unfinished_when_it_ends_after_its_parents_turn() {
+    for end in ["endchild interrupted", "closechild"] {
+        let env = setup(shell_asks(), plain(), &[]);
+        let t = env.sdk.create(create()).await.unwrap();
+        env.sdk
+            .send(&t.id, "bg sleep 60", SendOptions::default())
+            .await
+            .unwrap();
+        until(5, || async {
+            let s = serde_json::to_value(env.sdk.snapshot(&t.id).await.unwrap()).unwrap();
+            (results(&s).len() == 1 && s["thread"]["status"] == "waiting").then_some(())
+        })
+        .await;
+        env.sdk.send(&t.id, end, SendOptions::default()).await.unwrap();
+        let s = until(5, || async {
+            let s = serde_json::to_value(env.sdk.snapshot(&t.id).await.unwrap()).unwrap();
+            (results(&s).len() == 2 && s["thread"]["status"] == "idle").then_some(s)
+        })
+        .await;
+        let c = calls(&s);
+        assert_eq!(
+            c[0]["subagent"],
+            json!({"status": "stopped", "background": true, "model": "mini-child"}),
+            "{end}"
+        );
+        assert_eq!(c[1]["status"], "cancelled", "{end}");
+        assert_eq!(s["requests"], json!([]), "{end}");
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn doesnt_take_a_child_threads_earlier_report_for_a_follow_up_that_ends_without_one() {
+    let env = setup(Capabilities::default(), plain(), &[]);
+    let t = env.sdk.create(create()).await.unwrap();
+    env.sdk
+        .send(&t.id, "sub old summary", SendOptions::default())
+        .await
+        .unwrap();
+    let s = settle(&env.sdk, &t.id).await;
+    assert_eq!(
+        calls(&s)[0]["subagent"],
+        json!({"status": "completed", "background": true, "summary": "child says old summary"})
+    );
+    env.sdk
+        .send(&t.id, "followup interrupted", SendOptions::default())
+        .await
+        .unwrap();
+    let s = until(5, || async {
+        let s = serde_json::to_value(env.sdk.snapshot(&t.id).await.unwrap()).unwrap();
+        (results(&s).len() == 2 && s["thread"]["status"] == "idle").then_some(s)
+    })
+    .await;
+    assert_eq!(
+        calls(&s)[0]["subagent"],
+        json!({"status": "stopped", "background": true})
+    );
+}

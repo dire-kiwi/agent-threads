@@ -418,6 +418,38 @@ describe("the Codex driver", () => {
     expect(cmd).toMatchObject({ status: "denied" });
   });
 
+  for (const [how, end] of [
+    ["its turn is interrupted", "endchild interrupted"],
+    ["it's closed", "closechild"],
+  ]) {
+    it(`cancels what a child thread left unfinished when ${how} after its parent's turn`, async () => {
+      const { sdk, events } = setup({ permissions: (q) => (q.kind === "shell" ? "ask" : "allow") });
+      const t = await sdk.create({ harness: "codex", cwd: tempDir() });
+      await sdk.send(t.id, "bg sleep 60");
+      const r = await request(sdk, t.id);
+      await until(() => events.some((e) => e.type === "turn.completed"));
+      expect((await sdk.snapshot(t.id)).thread.status).toBe("waiting");
+      await sdk.send(t.id, end!);
+      const s = await settle(sdk, t.id);
+      const [spawn, cmd] = calls(s.items);
+      expect(spawn!.subagent).toEqual({ status: "stopped", background: true, model: "mini-child" });
+      expect(cmd).toMatchObject({ status: "cancelled", parent_id: spawn!.id });
+      expect(s.requests).toEqual([]);
+      expect(events).toContainEqual(expect.objectContaining({ type: "request.resolved", request_id: r.id, resolution: { outcome: "cancel" } }));
+    });
+  }
+
+  it("doesn't take a child thread's earlier report for a follow-up turn that ends without one", async () => {
+    const { sdk } = setup();
+    const t = await sdk.create({ harness: "codex", cwd: tempDir() });
+    await sdk.send(t.id, "sub old summary");
+    let s = await settle(sdk, t.id);
+    expect(calls(s.items)[0]!.subagent).toEqual({ status: "completed", background: true, summary: "child says old summary" });
+    await sdk.send(t.id, "followup interrupted");
+    s = await settle(sdk, t.id);
+    expect(calls(s.items)[0]!.subagent).toEqual({ status: "stopped", background: true });
+  });
+
   it("stops a run's child threads when it ends, and cancels what they were doing", async () => {
     const { sdk, events } = setup({ permissions: "ask" });
     const t = await sdk.create({ harness: "codex", cwd: tempDir() });

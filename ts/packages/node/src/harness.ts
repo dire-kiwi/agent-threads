@@ -8,6 +8,7 @@ import type {
   PermissionRequest,
   QuestionRequest,
   Resolution,
+  SubagentState,
   Thread,
   Usage,
   UserMessage,
@@ -117,6 +118,11 @@ export interface ThreadContext {
    * ended): their calls still running are cancelled, and their open requests too.
    */
   stopSubagents(ids: Iterable<string>): void;
+  /**
+   * Sets a subagent call's subagent. If it was running and has ended, what it left unfinished is
+   * cancelled: its calls still running, its streaming text and its open requests.
+   */
+  endSubagent(id: string, subagent: SubagentState): void;
   /** Something went wrong that isn't the turn's: for the app's onError. */
   error(error: unknown): void;
 }
