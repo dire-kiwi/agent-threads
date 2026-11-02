@@ -192,14 +192,7 @@ transports, end to end.
 
 ## Using it from this repository
 
-Nothing is published yet: apps use the packages from this repository until the API settles. The
-repository is private, so each tool fetching it needs your GitHub credentials: a git credential
-helper for `https://github.com` (what `gh auth setup-git` sets up), or SSH with git told to fetch
-GitHub's https URLs over it, which `go get` needs since it asks for the https URL:
-
-```sh
-git config --global url."git@github.com:".insteadOf "https://github.com/"
-```
+Nothing is published yet: apps use the packages from this repository until the API settles.
 
 ### TypeScript packages
 
@@ -267,8 +260,7 @@ The module is in the repository's `go/` directory, so its path is
 `github.com/dire-kiwi/agent-threads/go`. Without tags, `go get` takes a commit as a pseudo-version:
 
 ```sh
-export GOPRIVATE=github.com/dire-kiwi/agent-threads   # fetch it with git, not the public proxy
-go get github.com/dire-kiwi/agent-threads/go@main     # or @<commit>
+go get github.com/dire-kiwi/agent-threads/go@main   # or @<commit>
 # go.mod: require github.com/dire-kiwi/agent-threads/go v0.0.0-20261101062210-3dca55768cb5
 ```
 
@@ -296,14 +288,12 @@ async-trait = "0.1" # only to implement the Tool trait yourself
 ```
 
 The crate is async on tokio, so the app needs tokio's runtime, and `serde_json` for the JSON it takes
-and gives (tool schemas and arguments, commands). For a private repository, let Cargo fetch with
-git's own credentials: `CARGO_NET_GIT_FETCH_WITH_CLI=true` (or `net.git-fetch-with-cli = true` in
-`.cargo/config.toml`). It bundles SQLite (rusqlite's `bundled`).
+and gives (tool schemas and arguments, commands). It bundles SQLite (rusqlite's `bundled`).
 
 ### Shim binary
 
 ```sh
-CARGO_NET_GIT_FETCH_WITH_CLI=true cargo install --git https://github.com/dire-kiwi/agent-threads agent-threads-shim
+cargo install --git https://github.com/dire-kiwi/agent-threads agent-threads-shim
 ```
 
 or `make shim` in a checkout (`shim/target/debug/agent-threads-shim`). See [docs/shim.md](docs/shim.md).
@@ -322,3 +312,7 @@ make check-gen   # fail if the generated code is out of date (CI runs it)
 
 The backends' tests replay the recorded sessions with a fake CLI, so they need no login. Each
 backend also has live smoke tests against the real CLIs (`AGENT_THREADS_LIVE=1`; a cent or so).
+
+## Licence
+
+MIT: see [LICENSE](LICENSE).
