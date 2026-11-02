@@ -262,7 +262,7 @@ async fn starts_the_thread_with_its_options_mcp_servers_app_tools_and_system_pro
             "cwd": cwd,
             "model": "gpt-test",
             "approvalPolicy": "untrusted",
-            "sandbox": "read-only",
+            "sandbox": "workspace-write",
             "developerInstructions": "Be brief.",
             "config": {
                 "model_reasoning_summary": "auto",
@@ -780,11 +780,13 @@ async fn starts_a_new_process_resuming_the_session_when_the_config_changes() {
             resume["approvalPolicy"].clone(),
             resume["sandbox"].clone()
         ),
-        (json!("b"), json!("never"), json!("danger-full-access"))
+        (json!("b"), json!("never"), json!("workspace-write"))
     );
-    // The new process has them: its turn doesn't override them.
+    // The new process has them (its sandbox comes with its first turn): its turn doesn't override
+    // the rest.
     let turn = env.sent("turn/start")[0]["params"].clone();
     assert!(turn.get("model").is_none() && turn.get("approvalPolicy").is_none());
+    assert_eq!(turn["sandboxPolicy"], json!({"type": "dangerFullAccess"}));
 }
 
 /// A thread in plan mode.
@@ -850,8 +852,11 @@ async fn in_plan_mode_asks_the_user_about_a_proposed_plan_and_implements_it_in_t
     assert_eq!(turns[1]["collaborationMode"]["mode"], "default");
     // Its approval policy's the same.
     assert_eq!(
-        (turns[1].get("approvalPolicy"), turns[1]["sandboxPolicy"].clone()),
-        (None, json!({"type": "workspaceWrite"}))
+        (
+            turns[1].get("approvalPolicy"),
+            turns[1]["sandboxPolicy"]["type"].clone()
+        ),
+        (None, json!("workspaceWrite"))
     );
     // One turn, of both Codex turns.
     let r = results(&s);
@@ -933,8 +938,83 @@ async fn in_plan_mode_keeps_the_configs_workspace_write_settings_when_a_plans_ap
     settle(&env.sdk, &t).await;
     assert_eq!(
         turn_starts(&env)[1]["sandboxPolicy"],
-        json!({"type": "workspaceWrite", "networkAccess": true, "excludeTmpdirEnvVar": true, "excludeSlashTmp": true})
+        json!({"type": "workspaceWrite", "writableRoots": [], "networkAccess": true, "excludeTmpdirEnvVar": true, "excludeSlashTmp": true})
     );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn starts_threads_in_the_workspace_write_sandbox_and_switches_back_to_it_as_codex_has_it() {
+    // In plan or bypass mode too, with its config dir's settings and its other directories.
+    for mode in [PermissionMode::Plan, PermissionMode::Bypass] {
+        let config = [("sandbox_workspace_write.writable_roots".to_string(), json!(["/base"]))]
+            .into_iter()
+            .collect();
+        let env = setup(Capabilities::default(), CodexOptions { config, ..plain() }, &[]);
+        let (home, cwd) = (common::temp_dir(), common::temp_dir());
+        std::fs::write(
+            home.join("config.toml"),
+            "[sandbox_workspace_write]\nexclude_tmpdir_env_var = true\nexclude_slash_tmp = true\n",
+        )
+        .unwrap();
+        let t = env
+            .sdk
+            .create(CreateOptions {
+                cwd: Some(cwd.clone()),
+                permission_mode: Some(mode),
+                launch: LaunchOptions {
+                    add_dirs: vec!["extra".into()],
+                    config_dir: Some(home),
+                    ..Default::default()
+                },
+                ..create()
+            })
+            .await
+            .unwrap();
+        if mode == PermissionMode::Plan {
+            env.sdk
+                .send(&t.id, "propose One.", SendOptions::default())
+                .await
+                .unwrap();
+            let r = env.request(&t.id).await;
+            env.sdk
+                .handle_json(respond(
+                    &t.id,
+                    &r,
+                    json!({"outcome": "allow", "permission_mode": "accept_edits"}),
+                ))
+                .await
+                .unwrap();
+        } else {
+            env.sdk.send(&t.id, "reply one", SendOptions::default()).await.unwrap();
+            settle(&env.sdk, &t.id).await;
+            let cmd = json!({"type": "set_options", "thread_id": t.id, "permission_mode": "accept_edits"});
+            env.sdk.handle_json(cmd).await.unwrap();
+            env.sdk.send(&t.id, "reply two", SendOptions::default()).await.unwrap();
+        }
+        settle(&env.sdk, &t.id).await;
+        let (approval, first) = if mode == PermissionMode::Plan {
+            ("untrusted", "readOnly")
+        } else {
+            ("never", "dangerFullAccess")
+        };
+        let start = env.sent("thread/start")[0]["params"].clone();
+        assert_eq!(
+            (start["approvalPolicy"].clone(), start["sandbox"].clone()),
+            (json!(approval), json!("workspace-write"))
+        );
+        let turns = turn_starts(&env);
+        assert_eq!(turns[0]["sandboxPolicy"], json!({"type": first}));
+        assert_eq!(
+            turns[1]["sandboxPolicy"],
+            json!({
+                "type": "workspaceWrite",
+                "writableRoots": ["/base", cwd.join("extra")],
+                "networkAccess": false,
+                "excludeTmpdirEnvVar": true,
+                "excludeSlashTmp": true,
+            })
+        );
+    }
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -991,10 +1071,10 @@ async fn in_plan_mode_carries_on_in_the_mode_the_user_approves_the_plan_in() {
     assert_eq!(
         (
             p["approvalPolicy"].clone(),
-            p["sandboxPolicy"].clone(),
+            p["sandboxPolicy"]["type"].clone(),
             p["collaborationMode"]["mode"].clone()
         ),
-        (json!("on-request"), json!({"type": "workspaceWrite"}), json!("default"))
+        (json!("on-request"), json!("workspaceWrite"), json!("default"))
     );
 }
 

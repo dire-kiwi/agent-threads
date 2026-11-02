@@ -296,6 +296,8 @@ struct RunState {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     workspace: Option<Value>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    sandbox: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     collab: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     proposed: Option<String>,
@@ -373,6 +375,9 @@ struct Run {
     model: Option<String>,
     /// The workspace-write sandbox Codex last said the thread had, with its settings.
     workspace: Option<Value>,
+    /// The sandbox mode it has (none: its permission mode's, from a checkpoint from before this was
+    /// kept).
+    sandbox: Option<String>,
     /// The collaboration mode it was last given, `plan` or `default` (none: it's in its default
     /// one).
     collab: Option<String>,
@@ -426,6 +431,7 @@ impl Run {
             launched: None,
             model: None,
             workspace: None,
+            sandbox: None,
             collab: None,
             proposed: None,
             planned: None,
@@ -523,6 +529,7 @@ impl Run {
             launched: self.launched.clone(),
             model: self.model.clone(),
             workspace: self.workspace.clone(),
+            sandbox: self.sandbox.clone(),
             collab: self.collab.clone(),
             proposed: self.proposed.clone(),
             planned: self.planned.clone(),
@@ -560,6 +567,7 @@ impl Run {
         self.launched = st.launched.clone();
         self.model = st.model.clone();
         self.workspace = st.workspace.clone();
+        self.sandbox = st.sandbox.clone();
         self.collab = st.collab.clone();
         self.proposed = st.proposed.clone();
         self.planned = st.planned.clone();
@@ -905,7 +913,10 @@ impl CodexSession {
                         return s.turn_failed(ctx, &run, &e);
                     }
                 };
-                let before = s.runs.get(&run).map(|r| (r.launched.clone(), r.collab.clone()));
+                let before = s
+                    .runs
+                    .get(&run)
+                    .map(|r| (r.launched.clone(), r.collab.clone(), r.sandbox.clone()));
                 let mut params = json!({"threadId": thread_id, "input": input});
                 for (k, v) in s.turn_options(ctx, &run) {
                     params[k] = v;
@@ -938,12 +949,13 @@ impl CodexSession {
             o.insert("approvalPolicy".into(), json!(approval));
         }
         // Only a new sandbox, since what's sent replaces all of it.
-        if sandbox != sandbox_before {
+        if r.sandbox.as_deref().unwrap_or(sandbox_before) != sandbox {
             o.insert(
                 "sandboxPolicy".into(),
                 sandbox_policy(sandbox, r.workspace.as_ref(), &self.o.config),
             );
         }
+        r.sandbox = Some(sandbox.to_string());
         let collab = if t.permission_mode == Some(PermissionMode::Plan) {
             Some("plan")
         } else if r.collab.as_deref() == Some("plan") {
@@ -1518,8 +1530,11 @@ impl CodexSession {
                 .collect();
             cfg.insert("skills".into(), json!({"config": skills}));
         }
-        let (approval, sandbox) = codex_policy(t.permission_mode);
-        let mut params = json!({"approvalPolicy": approval, "sandbox": sandbox, "config": cfg});
+        // The thread starts in the workspace-write sandbox whatever its mode, so that Codex says what
+        // that sandbox is with all of its config (CODEX_HOME's, the thread's writable roots...): the
+        // first turn puts it in its mode's, and switching back to workspace-write later has it all.
+        let (approval, _) = codex_policy(t.permission_mode);
+        let mut params = json!({"approvalPolicy": approval, "sandbox": "workspace-write", "config": cfg});
         if let Some(cwd) = &t.cwd {
             params["cwd"] = json!(cwd);
         }
@@ -1532,6 +1547,7 @@ impl CodexSession {
             Vec::new()
         };
         r.launched = Some(Launched::of(ctx));
+        r.sandbox = Some("workspace-write".into());
         if !dynamic.is_empty() {
             let tools: Vec<Value> = dynamic
                 .into_iter()
@@ -2842,7 +2858,7 @@ impl CodexSession {
 
 /// The options a process had before a turn/start gave it more: its launched options and its
 /// collaboration mode.
-type Before = (Option<Launched>, Option<String>);
+type Before = (Option<Launched>, Option<String>, Option<String>);
 
 /// What's done with turn/start's answer: for the messages `sent` (none: the driver's own input),
 /// sent to a process that had the options `before` (none: they aren't known).
@@ -2857,11 +2873,12 @@ fn turn_started(sent: Option<Sent>, before: Option<Before>) -> Then {
         }
         Err(e) => {
             // Refused, the process hasn't the options it was sent with it.
-            if let Some((launched, collab)) = before
+            if let Some((launched, collab, sandbox)) = before
                 && let Some(r) = s.run(run)
             {
                 r.launched = launched;
                 r.collab = collab;
+                r.sandbox = sandbox;
             }
             if let Some(sent) = &sent {
                 s.refused(run, sent);

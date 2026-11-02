@@ -17,7 +17,12 @@ codex-cli 0.165.0 gives in a fresh CODEX_HOME and a working directory and home w
 
 The `plan` and `set-options` scenarios were recorded on 2026-11-02 with the same CLIs. Their Codex
 sessions' `skills/list` response is the one the others have: the machine they were recorded on has
-skills of its own, which were taken out (with the `skills.config` entries thread/start had for them).
+skills of its own, which were taken out (with the `skills.config` entries thread/start had for them). Since, the
+Codex `plan` session's thread/start asks for the workspace-write sandbox (and its response says so)
+and its first turn/start for the read-only one, as backends do now; Codex was recorded starting the
+thread read-only, which comes to the same, since nothing ran before that turn. The `set-options`
+session's second turn/start had a `sandboxPolicy` that didn't change the sandbox, which backends
+don't send, and it was taken out.
 
 The `pass-through` sessions (2026-11-02) are made by hand from the `plain-reply` recordings, since
 what they add (an API retry, hooks, a usage limit that's been reached, rate limit windows, the
@@ -143,14 +148,14 @@ backend drives each CLI:
   directory and the user's home, which a CODEX_HOME of the app's own doesn't keep out, and turns off
   each one that isn't the app's or Codex's built-in (`system`) with a `skills.config` entry
   (`{path, enabled: false}`) in the thread's config. Then `thread/start` (or `thread/resume` with the thread's `session_id`) with the
-  model, `approvalPolicy: untrusted` and `sandbox: workspace-write` (permission mode `default`),
-  and a config with `features.default_mode_request_user_input = true` (so the agent can ask
+  model, the permission mode's `approvalPolicy` (`untrusted` for `default`) and `sandbox:
+  workspace-write` whatever the mode (Codex says what that sandbox is, with all its config, and the
+  first turn/start's `sandboxPolicy` puts the thread in its mode's), and a config with `features.default_mode_request_user_input = true` (so the agent can ask
   questions outside plan mode), the MCP servers in `mcp_servers`, and app tools as `dynamicTools`.
   A message is `turn/start` with the text and the thread's `effort`, and the options the process
   doesn't have yet: `model`, `approvalPolicy` and `sandboxPolicy` when they changed since
   thread/start (each on its own: a `sandboxPolicy` replaces all of the sandbox's settings, so a
-  workspace-write one has those Codex last reported for the thread, or else the config's
-  `sandbox_workspace_write`), and in permission mode `plan` a `collaborationMode` of `plan` (then `default`, on
+  workspace-write one is the one Codex last reported for the thread), and in permission mode `plan` a `collaborationMode` of `plan` (then `default`, on
   the first turn after it); one sent during a turn is
   `turn/steer`; `/compact` is `thread/compact/start`; an interrupt is `turn/interrupt`. It answers
   approvals with `accept` or `decline`, MCP elicitations with `accept`, `requestUserInput` with

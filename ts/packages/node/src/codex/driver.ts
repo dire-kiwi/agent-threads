@@ -41,6 +41,7 @@ import type {
   ToolRequestUserInputResponse,
   Turn,
   TurnPlanUpdatedNotification,
+  SandboxMode,
   SandboxPolicy,
   TurnStartParams,
   TurnStartResponse,
@@ -155,6 +156,7 @@ interface RunState {
   launched?: Launched;
   model?: string;
   workspace?: SandboxPolicy;
+  sandbox?: SandboxMode;
   collab?: "plan" | "default";
   proposed?: string;
   planned?: Planned;
@@ -231,6 +233,8 @@ class Run {
   model: string | undefined;
   /** The workspace-write sandbox Codex last said the thread had, with its settings. */
   workspace: SandboxPolicy | undefined;
+  /** The sandbox mode it has (none: its permission mode's, from a checkpoint from before this was kept). */
+  sandbox: SandboxMode | undefined;
   /** The collaboration mode it was last given (none: it's in its default one). */
   collab: "plan" | "default" | undefined;
   /** The plan the running Codex turn proposed, in plan mode. */
@@ -281,6 +285,7 @@ class Run {
       ...(this.launched ? { launched: this.launched } : {}),
       ...(this.model ? { model: this.model } : {}),
       ...(this.workspace ? { workspace: this.workspace } : {}),
+      ...(this.sandbox ? { sandbox: this.sandbox } : {}),
       ...(this.collab ? { collab: this.collab } : {}),
       ...(this.proposed !== undefined ? { proposed: this.proposed } : {}),
       ...(this.planned ? { planned: this.planned } : {}),
@@ -315,6 +320,7 @@ class Run {
     if (st.launched) this.launched = { ...st.launched };
     this.model = st.model;
     this.workspace = st.workspace;
+    this.sandbox = st.sandbox;
     this.collab = st.collab;
     this.proposed = st.proposed;
     if (st.planned) this.planned = { ...st.planned };
@@ -635,10 +641,10 @@ class CodexSession implements HarnessSession {
   /** Starts a Codex turn with the input: the messages `sent`, or the driver's own. */
   #startTurn(run: Run, input: UserInput[], sent?: Sent): void {
     run.starting = true;
-    let before: Pick<Run, "launched" | "collab"> | undefined;
+    let before: Pick<Run, "launched" | "collab" | "sandbox"> | undefined;
     void run.ready
       .then((threadId) => {
-        before = { launched: run.launched, collab: run.collab };
+        before = { launched: run.launched, collab: run.collab, sandbox: run.sandbox };
         return run.rpc.request<TurnStartResponse>("turn/start", { threadId, input, ...this.#turnOptions(run) }, sent ? { sent } : {});
       })
       .then((r) => {
@@ -667,7 +673,8 @@ class CodexSession implements HarnessSession {
     const now = codexPolicy(t.permission_mode);
     if (before.approvalPolicy !== now.approvalPolicy) o.approvalPolicy = now.approvalPolicy;
     // Only a new sandbox, since what's sent replaces all of it.
-    if (before.sandbox !== now.sandbox) o.sandboxPolicy = sandboxPolicy(now.sandbox, run.workspace, this.#o.config);
+    if ((run.sandbox ?? before.sandbox) !== now.sandbox) o.sandboxPolicy = sandboxPolicy(now.sandbox, run.workspace, this.#o.config);
+    run.sandbox = now.sandbox;
     const collab = t.permission_mode === "plan" ? "plan" : run.collab === "plan" ? "default" : undefined;
     if (collab) {
       const model = t.model ?? l.model ?? run.model ?? "";
@@ -944,10 +951,15 @@ class CodexSession implements HarnessSession {
     };
     const dynamic = fresh ? [...(run.dynamic?.values() ?? [])] : [];
     run.launched = launchedOf(ctx);
+    // The thread starts in the workspace-write sandbox whatever its mode, so that Codex says what
+    // that sandbox is with all of its config (CODEX_HOME's, the thread's writable roots...): the
+    // first turn puts it in its mode's, and switching back to workspace-write later has it all.
+    run.sandbox = "workspace-write";
     return {
       ...(t.cwd ? { cwd: t.cwd } : {}),
       ...(t.model ? { model: t.model } : {}),
-      ...codexPolicy(t.permission_mode),
+      approvalPolicy: codexPolicy(t.permission_mode).approvalPolicy,
+      sandbox: "workspace-write",
       config,
       ...(dynamic.length ? { dynamicTools: dynamic.map((d) => ({ type: "function" as const, ...d })) } : {}),
       ...(systemPrompt ? { developerInstructions: systemPrompt } : {}),

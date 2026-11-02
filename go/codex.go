@@ -140,6 +140,7 @@ type codexRunState struct {
 	Launched       *launched       `json:"launched,omitempty"`
 	Model          string          `json:"model,omitempty"`
 	Workspace      json.RawMessage `json:"workspace,omitempty"`
+	Sandbox        string          `json:"sandbox,omitempty"`
 	Collab         string          `json:"collab,omitempty"`
 	Proposed       *string         `json:"proposed,omitempty"`
 	Planned        *codexPlanned   `json:"planned,omitempty"`
@@ -219,6 +220,9 @@ type codexRun struct {
 	model string
 	// workspace is the workspace-write sandbox Codex last said the thread had, with its settings.
 	workspace json.RawMessage
+	// sandbox is the sandbox mode it has ("": its permission mode's, from a checkpoint from before
+	// this was kept).
+	sandbox string
 	// collab is the collaboration mode it was last given ("plan" or "default"; "": it's in its
 	// default one).
 	collab string
@@ -320,7 +324,7 @@ func (r *codexRun) state() *codexRunState {
 		Error: r.errText, Home: r.home, Dynamic: r.dynamic, MCPApp: r.mcpApp, Baseline: r.baseline,
 		HiddenSkills: orEmptyList(r.hiddenSkills), NoticedServers: r.noticedServers, SkillsDir: r.skillsDir, MCP: r.mcpEndpoint,
 		Streamed: sortedKeys(r.streamed), MCPCalls: append([]mcpCall{}, r.mcpCalls...), RPC: r.rpc.state(), Launched: r.launched,
-		Model: r.model, Workspace: r.workspace, Collab: r.collab, Proposed: r.proposed,
+		Model: r.model, Workspace: r.workspace, Sandbox: r.sandbox, Collab: r.collab, Proposed: r.proposed,
 		SummaryPart: [][2]any{}, Children: [][2]string{}, LastChild: [][2]string{}, Open: [][2]any{}, Asked: [][2]any{}, Sent: []codexSent{}, Held: sortedKeys(r.held),
 	}
 	for _, k := range sortedKeys(r.summaryPart) {
@@ -384,7 +388,7 @@ func (r *codexRun) restore(st codexRunState) {
 	for _, id := range st.Held {
 		r.held[id] = true
 	}
-	r.launched, r.model, r.workspace, r.collab, r.proposed, r.planned = st.Launched, st.Model, st.Workspace, st.Collab, st.Proposed, st.Planned
+	r.launched, r.model, r.workspace, r.sandbox, r.collab, r.proposed, r.planned = st.Launched, st.Model, st.Workspace, st.Sandbox, st.Collab, st.Proposed, st.Planned
 	r.readyDone, r.readyID = true, st.ThreadID
 }
 
@@ -817,7 +821,7 @@ func (s *codexSession) startTurn(run *codexRun, input []map[string]any, sent *co
 			return
 		}
 		params := map[string]any{"threadId": threadID, "input": input}
-		launched, collab := run.launched, run.collab
+		launched, collab, sandbox := run.launched, run.collab, run.sandbox
 		s.turnOptions(run, params)
 		var meta any
 		if sent != nil {
@@ -829,7 +833,7 @@ func (s *codexSession) startTurn(run *codexRun, input []map[string]any, sent *co
 			}
 		}, func(e error) {
 			// Refused, the process hasn't the options it was sent with it.
-			run.launched, run.collab = launched, collab
+			run.launched, run.collab, run.sandbox = launched, collab, sandbox
 			fail(e)
 		})
 	})
@@ -856,9 +860,13 @@ func (s *codexSession) turnOptions(run *codexRun, params map[string]any) {
 		params["approvalPolicy"] = approval
 	}
 	// Only a new sandbox, since what's sent replaces all of it.
+	if run.sandbox != "" {
+		sandboxBefore = run.sandbox
+	}
 	if sandbox != sandboxBefore {
 		params["sandboxPolicy"] = sandboxPolicy(sandbox, run.workspace, s.o.Config)
 	}
+	run.sandbox = sandbox
 	collab := ""
 	if t.PermissionMode == protocol.PermissionModePlan {
 		collab = "plan"
@@ -1317,9 +1325,13 @@ func (s *codexSession) threadParams(run *codexRun, fresh bool) (map[string]any, 
 		}
 		config["skills"] = map[string]any{"config": list}
 	}
-	approval, sandbox := codexPolicy(t.PermissionMode)
-	params := map[string]any{"approvalPolicy": approval, "sandbox": sandbox, "config": config}
+	// The thread starts in the workspace-write sandbox whatever its mode, so that Codex says what that
+	// sandbox is with all of its config (CODEX_HOME's, the thread's writable roots...): the first turn
+	// puts it in its mode's, and switching back to workspace-write later has it all.
+	approval, _ := codexPolicy(t.PermissionMode)
+	params := map[string]any{"approvalPolicy": approval, "sandbox": "workspace-write", "config": config}
 	run.launched = launchedOf(s.ctx)
+	run.sandbox = "workspace-write"
 	if t.Cwd != "" {
 		params["cwd"] = t.Cwd
 	}

@@ -162,7 +162,8 @@ describe("the Codex driver", () => {
       cwd,
       model: "gpt-test",
       approvalPolicy: "untrusted",
-      sandbox: "read-only",
+      // Plan mode's read-only sandbox comes with the first turn.
+      sandbox: "workspace-write",
       developerInstructions: "Be brief.",
       config: {
         model_reasoning_summary: "auto",
@@ -185,7 +186,11 @@ describe("the Codex driver", () => {
       const t = await sdk.create({ harness: "codex", permission_mode: mode as keyof typeof modes, cwd: tempDir() });
       await sdk.send(t.id, "reply ok");
       await settle(sdk, t.id);
-      expect(sent("thread/start")[0]!.params).toMatchObject({ approvalPolicy, sandbox });
+      // The thread starts in the workspace-write sandbox, and the first turn puts it in another.
+      expect(sent("thread/start")[0]!.params).toMatchObject({ approvalPolicy, sandbox: "workspace-write" });
+      const turn = sent("turn/start")[0]!.params;
+      if (sandbox === "workspace-write") expect(turn).not.toHaveProperty("sandboxPolicy");
+      else expect(turn.sandboxPolicy).toEqual({ type: "dangerFullAccess" });
     }
   });
 
@@ -523,6 +528,36 @@ describe("the Codex driver", () => {
     expect(turns.map((p) => p.collaborationMode)).toEqual([undefined, undefined, undefined]);
   });
 
+  it.each(["plan", "bypass"] as const)(
+    "starts a thread in %s mode in the workspace-write sandbox, and switches back to it as Codex has it, with its config dir's settings and its other directories",
+    async (mode) => {
+      const { sdk, sent } = setup({ codex: { config: { "sandbox_workspace_write.writable_roots": ["/base"] } } });
+      const [home, cwd] = [tempDir(), tempDir()];
+      writeFileSync(join(home, "config.toml"), "[sandbox_workspace_write]\nexclude_tmpdir_env_var = true\nexclude_slash_tmp = true\n");
+      const t = await sdk.create({ harness: "codex", cwd, permission_mode: mode, launch: { addDirs: ["extra"], configDir: home } });
+      await sdk.send(t.id, mode === "plan" ? "propose One." : "reply one");
+      if (mode === "plan") {
+        const r = await request(sdk, t.id);
+        await sdk.respond(t.id, r.id, { outcome: "allow", permission_mode: "accept_edits" });
+      } else {
+        await settle(sdk, t.id);
+        await sdk.setOptions(t.id, { permission_mode: "accept_edits" });
+        await sdk.send(t.id, "reply two");
+      }
+      await settle(sdk, t.id);
+      expect(sent("thread/start")[0]!.params).toMatchObject({ approvalPolicy: mode === "plan" ? "untrusted" : "never", sandbox: "workspace-write" });
+      const turns = sent("turn/start").map((m) => m.params);
+      expect(turns[0]!.sandboxPolicy).toEqual({ type: mode === "plan" ? "readOnly" : "dangerFullAccess" });
+      expect(turns[1]!.sandboxPolicy).toEqual({
+        type: "workspaceWrite",
+        writableRoots: ["/base", join(cwd, "extra")],
+        networkAccess: false,
+        excludeTmpdirEnvVar: true,
+        excludeSlashTmp: true,
+      });
+    },
+  );
+
   it("changes only the approval policy when the sandbox stays, and switches back to the sandbox Codex had", async () => {
     // Codex takes a sandboxPolicy's settings that are left out as false.
     const config = { "sandbox_workspace_write.network_access": true, "sandbox_workspace_write.exclude_slash_tmp": true };
@@ -563,10 +598,11 @@ describe("the Codex driver", () => {
     await sdk.send(t.id, "reply two");
     await settle(sdk, t.id);
     expect(runs()).toHaveLength(2);
-    expect(sent("thread/resume")[0]!.params).toMatchObject({ model: "b", approvalPolicy: "never", sandbox: "danger-full-access" });
-    // The new process has them: its turn doesn't override them.
+    expect(sent("thread/resume")[0]!.params).toMatchObject({ model: "b", approvalPolicy: "never", sandbox: "workspace-write" });
+    // The new process has them (its sandbox comes with its first turn): its turn doesn't override the rest.
     expect(sent("turn/start")[0]!.params).not.toHaveProperty("model");
     expect(sent("turn/start")[0]!.params).not.toHaveProperty("approvalPolicy");
+    expect(sent("turn/start")[0]!.params.sandboxPolicy).toEqual({ type: "dangerFullAccess" });
   });
 
   describe("in plan mode", () => {
@@ -631,7 +667,7 @@ describe("the Codex driver", () => {
       const r = await request(sdk, t.id);
       await sdk.respond(t.id, r.id, { outcome: "allow", permission_mode: "accept_edits" });
       await settle(sdk, t.id);
-      expect(planTurns(sent)[1]!.sandboxPolicy).toEqual({ type: "workspaceWrite", networkAccess: true, excludeTmpdirEnvVar: true, excludeSlashTmp: true });
+      expect(planTurns(sent)[1]!.sandboxPolicy).toEqual({ type: "workspaceWrite", writableRoots: [], networkAccess: true, excludeTmpdirEnvVar: true, excludeSlashTmp: true });
     });
 
     it("carries on in the mode the user approves the plan in", async () => {

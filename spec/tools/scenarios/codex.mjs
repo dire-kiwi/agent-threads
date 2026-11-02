@@ -31,13 +31,14 @@ class Rpc {
  * The thread/start parameters a backend sends for a thread with the default permission mode: the
  * agent works in the workspace and asks before anything else.
  */
-export function threadParams(ctx, { model = MODEL, dynamicTools, mcpServers, plan } = {}) {
+export function threadParams(ctx, { model = MODEL, dynamicTools, mcpServers } = {}) {
   const p = {
     cwd: ctx.work,
     model,
     approvalPolicy: "untrusted",
-    // Permission mode plan: nothing's written.
-    sandbox: plan ? "read-only" : "workspace-write",
+    // Whatever the permission mode: Codex says what this sandbox is, with all its config, and the
+    // first turn puts the thread in its mode's (plan: read-only).
+    sandbox: "workspace-write",
     config: {
       "features.default_mode_request_user_input": true,
       suppress_unstable_features_warning: true,
@@ -244,8 +245,9 @@ export const scenarios = {
       "Plan mode (collaboration mode plan): the agent proposes a plan and its turn ends; the user's feedback is another plan-mode turn; they approve the second plan, which is a default-mode turn with Codex's own \"Implement the plan.\" and the accept_edits policy, in which the edit isn't asked about.",
     async run(ctx) {
       const { p, rpc } = await start(ctx);
-      const { thread } = await rpc.request("thread/start", threadParams(ctx, { plan: true }));
+      const { thread } = await rpc.request("thread/start", threadParams(ctx));
       await turn(rpc, thread.id, "Plan this change: in notes.txt, change the line apple to apricot. Don't ask me any questions, and keep the plan short.", {
+        sandboxPolicy: { type: "readOnly" },
         collaborationMode: collaboration("plan"),
       });
       await p.next(turnCompleted(thread.id), "the first plan");

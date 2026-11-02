@@ -263,7 +263,10 @@ A new mode or model applies straight away where it can: Claude Code's running pr
 the same process. (A new effort starts a new Claude Code process at the next turn, as does clearing
 Codex's model or effort. Claude Code
 can't be switched to bypass mode unless it was started in it: until the next turn's new process,
-the driver allows what it asks about.)
+the driver allows what it asks about.) A Codex thread is started in the `workspace-write` sandbox
+whatever its mode, and its first turn puts it in its mode's: Codex says what that sandbox is with
+all of its config (CODEX_HOME's `config.toml`, the thread's `addDirs`...), so switching back to it
+later, or approving a plan, keeps all of it.
 
 **Plans** aren't permissions either: in plan mode, Claude's `ExitPlanMode` and the plan Codex
 proposes at the end of a turn open a `plan` request (`PlanCard`), whatever the policy says.

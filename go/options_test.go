@@ -458,6 +458,50 @@ func TestCodexGivesTheProcessNewOptionsWithItsNextTurn(t *testing.T) {
 	}
 }
 
+func TestCodexStartsThreadsInTheWorkspaceWriteSandbox(t *testing.T) {
+	// In plan or bypass mode too, and it's switched back to it as Codex has it, with its config dir's
+	// settings and its other directories.
+	for _, mode := range []protocol.PermissionMode{protocol.PermissionModePlan, protocol.PermissionModeBypass} {
+		t.Run(string(mode), func(t *testing.T) {
+			t.Parallel()
+			m := newMiniConfig(t, agentthreads.Allow, nil, map[string]any{"sandbox_workspace_write.writable_roots": []string{"/base"}})
+			home := t.TempDir()
+			toml := "[sandbox_workspace_write]\nexclude_tmpdir_env_var = true\nexclude_slash_tmp = true\n"
+			if err := os.WriteFile(filepath.Join(home, "config.toml"), []byte(toml), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			id := m.create(agentthreads.CreateOptions{Harness: "codex", PermissionMode: mode, Launch: agentthreads.LaunchOptions{AddDirs: []string{"extra"}, ConfigDir: home}})
+			if mode == protocol.PermissionModePlan {
+				m.send(id, "propose One.")
+				r := m.request(id)
+				m.respond(id, r.ID(), protocol.Resolution{Outcome: protocol.ResolutionOutcomeAllow, PermissionMode: protocol.PermissionModeAcceptEdits})
+			} else {
+				m.send(id, "reply one")
+				m.settle(id)
+				m.setOptions(id, agentthreads.ThreadOptions{PermissionMode: ptr(protocol.PermissionModeAcceptEdits)})
+				m.send(id, "reply two")
+			}
+			m.settle(id)
+			run := m.runs()[0]
+			approval, first := "untrusted", "readOnly"
+			if mode == protocol.PermissionModeBypass {
+				approval, first = "never", "dangerFullAccess"
+			}
+			if start := run.params("thread/start")[0]; !has(start, `{"approvalPolicy":"`+approval+`","sandbox":"workspace-write"}`) {
+				t.Fatalf("thread/start %s", mustMarshal(start))
+			}
+			turns := run.params("turn/start")
+			if !sameAs(turns[0]["sandboxPolicy"], `{"type":"`+first+`"}`) {
+				t.Fatalf("turn 0: %s", mustMarshal(turns[0]))
+			}
+			want := `{"type":"workspaceWrite","writableRoots":["/base",` + string(mustMarshal(filepath.Join(m.cwd, "extra"))) + `],"networkAccess":false,"excludeTmpdirEnvVar":true,"excludeSlashTmp":true}`
+			if !sameAs(turns[1]["sandboxPolicy"], want) {
+				t.Fatalf("turn 1: %s", mustMarshal(turns[1]))
+			}
+		})
+	}
+}
+
 func TestCodexChangesOnlyTheApprovalPolicyWhenTheSandboxStays(t *testing.T) {
 	// And switches back to the sandbox Codex had: it takes a sandboxPolicy's settings that are left
 	// out as false.
@@ -532,11 +576,15 @@ func TestCodexStartsANewProcessWhenTheConfigChanges(t *testing.T) {
 		t.Fatalf("%d runs", len(runs))
 	}
 	resumed := runs[1].params("thread/resume")
-	if len(resumed) != 1 || !has(resumed[0], `{"model":"b","approvalPolicy":"never","sandbox":"danger-full-access"}`) {
+	if len(resumed) != 1 || !has(resumed[0], `{"model":"b","approvalPolicy":"never","sandbox":"workspace-write"}`) {
 		t.Fatalf("thread/resume %s", mustMarshal(resumed))
 	}
-	// The new process has them: its turn doesn't override them.
+	// The new process has them (its sandbox comes with its first turn): its turn doesn't override
+	// the rest.
 	turn := runs[1].params("turn/start")[0]
+	if !has(turn, `{"sandboxPolicy":{"type":"dangerFullAccess"}}`) {
+		t.Fatalf("turn/start %s", mustMarshal(turn))
+	}
 	if _, ok := turn["model"]; ok {
 		t.Fatalf("turn/start %s", mustMarshal(turn))
 	}
@@ -634,7 +682,7 @@ func TestCodexInPlanMode(t *testing.T) {
 		r := m.request(id)
 		m.respond(id, r.ID(), protocol.Resolution{Outcome: protocol.ResolutionOutcomeAllow, PermissionMode: protocol.PermissionModeAcceptEdits})
 		m.settle(id)
-		want := `{"type":"workspaceWrite","networkAccess":true,"excludeTmpdirEnvVar":true,"excludeSlashTmp":true}`
+		want := `{"type":"workspaceWrite","writableRoots":[],"networkAccess":true,"excludeTmpdirEnvVar":true,"excludeSlashTmp":true}`
 		if turn := m.runs()[0].params("turn/start")[1]; !sameAs(turn["sandboxPolicy"], want) {
 			t.Fatalf("turn 1: %s", mustMarshal(turn))
 		}

@@ -328,13 +328,33 @@ async function step(line) {
   }
 }
 
-/** The sandbox policy thread/start's sandbox and config make, as Codex reports it. */
+/**
+ * The sandbox policy thread/start's sandbox and config make, as Codex reports it: the thread's
+ * config over $CODEX_HOME/config.toml's [sandbox_workspace_write] (`key = value` lines of JSON).
+ */
 function sandboxOf(p) {
   if (p.sandbox === "read-only") return { type: "readOnly", networkAccess: false };
   if (p.sandbox === "danger-full-access") return { type: "dangerFullAccess" };
+  const toml = {};
+  const file = home && join(home, "config.toml");
+  if (file && existsSync(file)) {
+    let section = "";
+    for (const line of readFileSync(file, "utf8").split("\n")) {
+      const head = /^\[(.+)\]$/.exec(line.trim());
+      if (head) section = head[1];
+      const kv = /^(\w+)\s*=\s*(.+)$/.exec(line.trim());
+      if (kv && section === "sandbox_workspace_write") toml[kv[1]] = JSON.parse(kv[2]);
+    }
+  }
   const c = p.config ?? {};
-  const set = (k) => (c.sandbox_workspace_write ?? {})[k] ?? c[`sandbox_workspace_write.${k}`] ?? false;
-  return { type: "workspaceWrite", writableRoots: [], networkAccess: set("network_access"), excludeTmpdirEnvVar: set("exclude_tmpdir_env_var"), excludeSlashTmp: set("exclude_slash_tmp") };
+  const set = (k, none) => (c.sandbox_workspace_write ?? {})[k] ?? c[`sandbox_workspace_write.${k}`] ?? toml[k] ?? none;
+  return {
+    type: "workspaceWrite",
+    writableRoots: set("writable_roots", []),
+    networkAccess: set("network_access", false),
+    excludeTmpdirEnvVar: set("exclude_tmpdir_env_var", false),
+    excludeSlashTmp: set("exclude_slash_tmp", false),
+  };
 }
 
 async function runTurn(input, id0 = uid("turn")) {
