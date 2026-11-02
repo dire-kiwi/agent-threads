@@ -2,8 +2,8 @@
 // steering queue and open requests. Every change is an event, numbered, applied, sent to the
 // subscribers, and saved to the store in order (deltas aren't saved).
 
-import { applyEvent, type Attachment, type Item, type Resolution, type Snapshot, type Thread, type ThreadEvent, type ThreadRequest, type Usage, type UserMessage } from "@dire-kiwi/agent-threads-protocol";
-import type { HarnessSession, Message, NewItem, NewRequest, ThreadConfig, ThreadContext, TurnEnd } from "./harness.js";
+import { applyEvent, type Attachment, type Item, type RateLimit, type Resolution, type Snapshot, type Thread, type ThreadEvent, type ThreadRequest, type Usage, type UserMessage } from "@dire-kiwi/agent-threads-protocol";
+import type { HarnessMessage, HarnessSession, Message, NewItem, NewRequest, ThreadConfig, ThreadContext, TurnEnd } from "./harness.js";
 import { newId } from "./ids.js";
 import { decide, permissionKey, type PermissionDecision, type PermissionPolicy, type PermissionQuery } from "./permissions.js";
 import type { Spawner } from "./spawner.js";
@@ -54,7 +54,11 @@ export interface Outgoing {
 export interface RuntimeHost {
   store: Store;
   spawner: Spawner;
+  /** Fill in events' `raw` (the raw option). */
+  raw: boolean;
   publish(event: ThreadEvent): void;
+  /** A line from the thread's harness, for the app's onHarnessMessage. */
+  harnessMessage(message: HarnessMessage): void;
   error(error: unknown): void;
 }
 
@@ -93,6 +97,8 @@ export class ThreadRuntime implements ThreadContext {
   #streaming = new Set<string>();
   /** App tools' structured output, by tool call, until the harness gives the call its result. */
   #structured = new Map<string, unknown>();
+  /** The harness message being handled, which events made now have as their `raw` (with the raw option). */
+  #raw: unknown = undefined;
 
   constructor(host: RuntimeHost, state: Snapshot, config: ThreadConfig, policy: PermissionPolicy) {
     this.#host = host;
@@ -124,6 +130,13 @@ export class ThreadRuntime implements ThreadContext {
   // ---------- events ----------
 
   emit(event: Unnumbered): void {
+    // An item or request has the harness message it came from, and its event doesn't as well.
+    const raw = this.#raw;
+    if (raw !== undefined) {
+      if (event.type === "item.added") event = { ...event, item: { ...event.item, raw } };
+      else if (event.type === "request.opened") event = { ...event, request: { ...event.request, raw } };
+      else event = { ...event, raw };
+    }
     const saved = event.type !== "delta";
     const e = { ...event, thread_id: this.threadId, seq: this.#state.seq + (saved ? 1 : 0) } as ThreadEvent;
     this.#state = applyEvent(this.#state, e);
@@ -390,6 +403,24 @@ export class ThreadRuntime implements ThreadContext {
     next.updated_at = new Date().toISOString();
     this.#threadChanged = true;
     this.emit({ type: "thread.updated", thread: next as unknown as Thread });
+  }
+
+  rateLimits(limits: RateLimit[]): void {
+    if (!limits.length) return;
+    const all = new Map((this.thread.rate_limits ?? []).map((l) => [l.id, l]));
+    for (const l of limits) all.set(l.id, l);
+    this.setThread({ rate_limits: [...all.values()].sort((a, b) => (a.id < b.id ? -1 : a.id > b.id ? 1 : 0)) });
+  }
+
+  fromHarness(runId: string, line: string, message: unknown, handle: () => void): void {
+    const before = this.#raw;
+    if (this.#host.raw && message !== undefined) this.#raw = message;
+    try {
+      handle();
+    } finally {
+      this.#raw = before;
+    }
+    this.#host.harnessMessage({ threadId: this.threadId, runId, harness: this.thread.harness, line, ...(message !== undefined ? { message } : {}) });
   }
 
   // ---------- turns ----------

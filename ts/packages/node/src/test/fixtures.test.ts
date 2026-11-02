@@ -1,17 +1,18 @@
 // Every fixture in spec/fixtures (Claude Code and Codex), run as spec/fixtures/README.md says: the SDK
 // drives the fake CLI (which replays the recording and checks what it's sent), and its events must
 // match expected.jsonl by spec/tools/check-events.mjs's rules. Its snapshot must be its events,
-// folded.
+// folded. The pass-through fixtures' control requests, harness messages and raw payloads are checked
+// too.
 
 import { existsSync, readdirSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import { pathToFileURL } from "node:url";
 import { describe, expect, it } from "vitest";
 import { applyEvents, initialState, type Command, type Thread, type ThreadEvent } from "@dire-kiwi/agent-threads-protocol";
-import { AgentThreads } from "../agent-threads.js";
+import { AgentThreads, ControlError } from "../agent-threads.js";
 import { claudeCode } from "../claude/driver.js";
 import { codex } from "../codex/driver.js";
-import type { McpServer } from "../harness.js";
+import type { HarnessMessage, McpServer } from "../harness.js";
 import type { PermissionPolicy } from "../permissions.js";
 import { shim } from "../shim.js";
 import { direct } from "../spawner.js";
@@ -24,7 +25,10 @@ interface Fixture {
   permissions?: "allow" | "ask";
   tools?: { name: string; description: string; input: { [k: string]: unknown }; result: string }[];
   mcp_servers?: { [name: string]: McpServer };
-  steps: ({ command: { [k: string]: unknown } } | { wait: unknown } | { restart: true })[];
+  steps: ({ command: { [k: string]: unknown } } | { wait: unknown } | { restart: true } | { control: unknown; result?: unknown; error?: string })[];
+  raw?: boolean;
+  harness_messages?: unknown[];
+  raw_checks?: { event: unknown; raw: unknown }[];
 }
 
 const { compare } = (await import(pathToFileURL(join(specDir, "tools/check-events.mjs")).href)) as {
@@ -61,6 +65,7 @@ describe.each(scenarios)("%s", (scenario) => {
     const state = tempDir();
     const store = new MemoryStore();
     const events: ThreadEvent[] = [];
+    const messages: HarnessMessage[] = [];
     const env = { AGENT_THREADS_FIXTURE: fixtureDir, AGENT_THREADS_FIXTURE_STATE: state };
     const codexHome = tempDir();
     const spawner = spawnerName === "shim" ? shim(shimPath(), { runsDir: tempDir() }) : direct();
@@ -79,6 +84,7 @@ describe.each(scenarios)("%s", (scenario) => {
         onError: (e) => {
           throw e;
         },
+        ...(fixture.raw ? { raw: true, onHarnessMessage: (m: HarnessMessage) => messages.push(m) } : {}),
       });
       sdk.subscribe((e) => events.push(e));
       return sdk;
@@ -94,6 +100,16 @@ describe.each(scenarios)("%s", (scenario) => {
         await sdk.close({ stop: true });
         sdk = make();
         from = events.length;
+      } else if ("control" in step) {
+        const answer = sdk.control(thread.id, step.control);
+        if (step.error !== undefined) {
+          const e = await answer.then(
+            () => expect.fail(`${where}: it didn't fail`),
+            (e: unknown) => e,
+          );
+          expect(e, where).toBeInstanceOf(ControlError);
+          expect((e as Error).message, where).toContain(step.error);
+        } else expect(await answer, where).toEqual(step.result);
       } else if ("command" in step) {
         const command = { ...step.command, thread_id: thread.id } as Command;
         if (command.type === "respond") {
@@ -124,6 +140,21 @@ describe.each(scenarios)("%s", (scenario) => {
 
     const result = compare(readJsonl(`fixtures/${scenario}/expected.jsonl`), events);
     if (!result.ok) expect.fail(`${result.error}\n\nEvents:\n${show(events)}`);
+
+    // What the protocol leaves out came through.
+    for (const m of messages) expect(m, "a harness message").toMatchObject({ threadId: thread.id, harness, line: expect.any(String) });
+    for (const p of fixture.harness_messages ?? []) {
+      expect(messages.some((m) => matches(m.message, p)), `a harness message like ${JSON.stringify(p)}`).toBe(true);
+    }
+    for (const { event, raw } of fixture.raw_checks ?? []) {
+      const matching = events.filter((e) => matches(e, event));
+      expect(matching.length, `an event like ${JSON.stringify(event)}`).toBeGreaterThan(0);
+      for (const e of matching) {
+        const got = e.type === "item.added" ? e.item.raw : e.type === "request.opened" ? e.request.raw : e.raw;
+        if (raw === null) expect(got, `${JSON.stringify(e).slice(0, 300)} has no raw`).toBeUndefined();
+        else expect(matches(got, raw), `${JSON.stringify(e).slice(0, 300)} has a raw like ${JSON.stringify(raw)}: ${JSON.stringify(got)?.slice(0, 300)}`).toBe(true);
+      }
+    }
   });
 });
 

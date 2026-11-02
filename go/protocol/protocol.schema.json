@@ -1223,6 +1223,13 @@
           "$ref": "#/$defs/Run",
           "description": "The harness process running the thread, if one is. Absent when it's idle with no process."
         },
+        "rate_limits": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/RateLimit"
+          },
+          "description": "The usage limits of the account the harness runs on, as it last reported them in this thread, sorted by id. Absent until it reports one."
+        },
         "metadata": {
           "type": "object",
           "additionalProperties": true,
@@ -1286,6 +1293,44 @@
           "type": "string",
           "format": "date-time",
           "description": "When a restarted backend last re-attached to the run. Absent if it never has."
+        }
+      }
+    },
+    "RateLimit": {
+      "type": "object",
+      "description": "A usage limit of the account the harness runs on (a subscription's session or weekly limit, say), as the harness last reported it.",
+      "required": [
+        "id",
+        "status"
+      ],
+      "properties": {
+        "id": {
+          "type": "string",
+          "description": "Which limit, by the harness's name for it: Claude Code's rateLimitType (five_hour, seven_day, seven_day_opus...), Codex's primary and secondary windows."
+        },
+        "status": {
+          "type": "string",
+          "enum": [
+            "allowed",
+            "warning",
+            "rejected"
+          ],
+          "description": "allowed: there's room. warning: it's nearly used up, or used up with extra usage carrying on. rejected: the harness refuses turns until it resets."
+        },
+        "used_percent": {
+          "type": "number",
+          "minimum": 0,
+          "description": "How much of it is used, from 0 to 100, when the harness says."
+        },
+        "resets_at": {
+          "type": "string",
+          "format": "date-time",
+          "description": "When it resets, when the harness says."
+        },
+        "window_minutes": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "How long its window is, when the harness says."
         }
       }
     },

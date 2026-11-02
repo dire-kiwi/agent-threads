@@ -18,6 +18,8 @@ export class RpcError extends Error {
     readonly method: string,
     message: string,
     readonly code?: number,
+    /** The error response's error object, if it was one. */
+    readonly error?: unknown,
   ) {
     super(message);
     this.name = "RpcError";
@@ -69,7 +71,7 @@ export class Rpc {
     const p = this.#pending.get(msg.id);
     if (!p) return true;
     this.#pending.delete(msg.id);
-    if (msg.error) p.reject(new RpcError(p.method, msg.error.message ?? `${p.method} failed`, msg.error.code));
+    if (msg.error) p.reject(new RpcError(p.method, msg.error.message ?? `${p.method} failed`, msg.error.code, msg.error));
     else p.resolve(msg.result ?? {});
     return true;
   }

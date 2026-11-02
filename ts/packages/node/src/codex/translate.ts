@@ -1,8 +1,8 @@
 // Codex's items, plans, questions and usage in the protocol's terms (spec/fixtures/README.md,
 // "Codex").
 
-import type { FileChange, PermissionMode, Question, Todo, ToolStatus, Usage } from "@dire-kiwi/agent-threads-protocol";
-import type { McpServer } from "../harness.js";
+import type { FileChange, PermissionMode, Question, RateLimit, Todo, ToolStatus, Usage } from "@dire-kiwi/agent-threads-protocol";
+import { unixTime, type McpServer } from "../harness.js";
 import { resultText, slim, type ToolFields } from "../claude/translate.js";
 import type {
   AskForApproval,
@@ -159,4 +159,24 @@ export function mcpServerConfig(s: McpServer): { [k: string]: unknown } | { unsu
     return { url: s.url, ...(s.headers && Object.keys(s.headers).length ? { http_headers: s.headers } : {}) };
   }
   return { command: s.command, ...(s.args ? { args: s.args } : {}), ...(s.env ? { env: s.env } : {}) };
+}
+
+/**
+ * The limits an `account/rateLimits/updated` notification's snapshot reports: its primary and
+ * secondary windows, named by its limitId when that isn't Codex's own.
+ */
+export function codexRateLimits(rl: { [k: string]: any }): RateLimit[] {
+  const prefix = typeof rl.limitId === "string" && rl.limitId && rl.limitId !== "codex" ? `${rl.limitId}:` : "";
+  const out: RateLimit[] = [];
+  for (const key of ["primary", "secondary"]) {
+    const w = rl[key];
+    if (!w || typeof w !== "object") continue;
+    const used = typeof w.usedPercent === "number" && Number.isFinite(w.usedPercent) ? w.usedPercent : undefined;
+    const limit: RateLimit = { id: prefix + key, status: used !== undefined && used >= 100 ? "rejected" : "allowed" };
+    if (used !== undefined) limit.used_percent = used;
+    if (typeof w.resetsAt === "number" && Number.isFinite(w.resetsAt)) limit.resets_at = unixTime(w.resetsAt);
+    if (typeof w.windowDurationMins === "number" && Number.isInteger(w.windowDurationMins) && w.windowDurationMins >= 0) limit.window_minutes = w.windowDurationMins;
+    out.push(limit);
+  }
+  return out;
 }

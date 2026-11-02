@@ -7,6 +7,7 @@ import type {
   Item,
   PermissionRequest,
   QuestionRequest,
+  RateLimit,
   Resolution,
   Thread,
   Usage,
@@ -48,6 +49,32 @@ export interface TurnEnd {
   duration_ms?: number;
 }
 
+/** A line a thread's harness process wrote, for the app's onHarnessMessage. */
+export interface HarnessMessage {
+  threadId: string;
+  /** The process that wrote it (the thread's `run.id` while it runs). */
+  runId: string;
+  harness: string;
+  /** The line, without its newline. */
+  line: string;
+  /** The line parsed as JSON; absent if it isn't JSON. */
+  message?: unknown;
+}
+
+/** A line parsed as JSON, or undefined if it isn't JSON. */
+export function parseLine(line: string): unknown {
+  try {
+    return JSON.parse(line);
+  } catch {
+    return undefined;
+  }
+}
+
+/** Unix seconds as an RFC 3339 time, to the second: YYYY-MM-DDTHH:MM:SSZ. */
+export function unixTime(seconds: number): string {
+  return new Date(Math.floor(seconds) * 1000).toISOString().replace(/\.\d{3}Z$/, "Z");
+}
+
 /** A request to open, without the fields the core fills in. */
 export type NewRequest = Omit<PermissionRequest, "id" | "turn_id" | "tool_call_id" | "parent_id"> | Omit<QuestionRequest, "id" | "turn_id" | "tool_call_id" | "parent_id">;
 
@@ -76,6 +103,17 @@ export interface ThreadContext {
   delta(itemId: string, kind: "text" | "reasoning", text: string): void;
   /** Changes the thread's fields (undefined removes one); sends nothing if nothing changes. */
   setThread(patch: Partial<Thread>): void;
+  /**
+   * The harness reported usage limits: they replace the thread's `rate_limits` with the same ids
+   * (sending a thread.updated if that changes them).
+   */
+  rateLimits(limits: RateLimit[]): void;
+  /**
+   * Handles a line the harness process `runId` wrote (`message` is it parsed, if it's JSON): runs
+   * `handle`, which translates it, with the events it makes taking it as their `raw` (with the
+   * raw option on), and then passes it to the app's onHarnessMessage.
+   */
+  fromHarness(runId: string, line: string, message: unknown, handle: () => void): void;
   /** The harness took in the queued message with this id. Whether it was queued. */
   tookIn(id: string): boolean;
   /**
@@ -151,6 +189,12 @@ export interface HarnessSession {
   optionsChanged(): void;
   /** Stop the harness process, if it's running. */
   close(): Promise<void>;
+  /**
+   * Sends the running process a request of the app's own (AgentThreads.control) and resolves with
+   * its answer; rejects with a CommandError if there's no process to send it to, or a ControlError
+   * if the harness refuses it or doesn't answer. A driver without it takes no requests.
+   */
+  control?(request: unknown): Promise<unknown>;
 
   // With a spawner whose processes outlive the backend (Spawner.durable). A driver that has none of
   // these has its runs stopped when the backend restarts, and their turns end.

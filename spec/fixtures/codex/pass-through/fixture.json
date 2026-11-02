@@ -1,0 +1,179 @@
+{
+  "description": "Made by hand from plain-reply: what the protocol leaves out. A turn with rate limit windows and a notification the driver doesn't know, then control requests (one Codex refuses). With raw payloads on.",
+  "recorded": {
+    "cli": "codex-cli 0.165.0",
+    "model": "gpt-5.6-luna",
+    "date": "2026-11-02"
+  },
+  "thread": {
+    "harness": "codex",
+    "model": "gpt-5.6-luna",
+    "effort": "low"
+  },
+  "permissions": "allow",
+  "raw": true,
+  "steps": [
+    {
+      "command": {
+        "type": "send",
+        "text": "Reply with exactly these words and nothing else: hello from the fixture",
+        "client_id": "c1"
+      }
+    },
+    {
+      "wait": {
+        "type": "thread.updated",
+        "thread": {
+          "status": "idle"
+        }
+      }
+    },
+    {
+      "control": {
+        "method": "account/rateLimits/read"
+      },
+      "result": {
+        "rateLimits": {
+          "limitId": "codex",
+          "limitName": null,
+          "primary": {
+            "usedPercent": 43,
+            "windowDurationMins": 300,
+            "resetsAt": 1800000000
+          },
+          "secondary": {
+            "usedPercent": 100,
+            "windowDurationMins": 10080,
+            "resetsAt": 1800500000
+          },
+          "credits": {
+            "hasCredits": false,
+            "unlimited": false,
+            "balance": null
+          },
+          "planType": "plus",
+          "rateLimitReachedType": "rate_limit_reached"
+        },
+        "rateLimitsByLimitId": {
+          "codex": {
+            "limitId": "codex",
+            "limitName": null,
+            "primary": {
+              "usedPercent": 43,
+              "windowDurationMins": 300,
+              "resetsAt": 1800000000
+            },
+            "secondary": {
+              "usedPercent": 100,
+              "windowDurationMins": 10080,
+              "resetsAt": 1800500000
+            },
+            "credits": {
+              "hasCredits": false,
+              "unlimited": false,
+              "balance": null
+            },
+            "planType": "plus",
+            "rateLimitReachedType": "rate_limit_reached"
+          }
+        }
+      }
+    },
+    {
+      "control": {
+        "method": "no/such/method",
+        "params": {
+          "x": 1
+        }
+      },
+      "error": "Invalid request: unknown variant `no/such/method`"
+    }
+  ],
+  "harness_messages": [
+    {
+      "method": "thread/tokenUsage/updated"
+    },
+    {
+      "method": "future/notification"
+    },
+    {
+      "method": "account/rateLimits/updated",
+      "params": {
+        "rateLimits": {
+          "planType": "plus"
+        }
+      }
+    },
+    {
+      "result": {
+        "codexHome": "/codex-home"
+      }
+    }
+  ],
+  "raw_checks": [
+    {
+      "event": {
+        "type": "item.added",
+        "item": {
+          "type": "user_message"
+        }
+      },
+      "raw": null
+    },
+    {
+      "event": {
+        "type": "turn.started"
+      },
+      "raw": null
+    },
+    {
+      "event": {
+        "type": "item.added",
+        "item": {
+          "type": "assistant_message"
+        }
+      },
+      "raw": {
+        "method": "item/agentMessage/delta"
+      }
+    },
+    {
+      "event": {
+        "type": "delta"
+      },
+      "raw": {
+        "method": "item/agentMessage/delta"
+      }
+    },
+    {
+      "event": {
+        "type": "item.updated",
+        "patch": {
+          "text": "hello from the fixture"
+        }
+      },
+      "raw": {
+        "method": "item/completed"
+      }
+    },
+    {
+      "event": {
+        "type": "item.added",
+        "item": {
+          "type": "turn_result"
+        }
+      },
+      "raw": {
+        "method": "turn/completed"
+      }
+    },
+    {
+      "event": {
+        "type": "turn.completed"
+      },
+      "raw": {
+        "method": "turn/completed"
+      }
+    }
+  ]
+}
