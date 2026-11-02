@@ -4,10 +4,10 @@
 
 import { expect, test, type Page } from "@playwright/test";
 import WebSocket from "ws";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, utimesSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { spawnSync } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import { FIXTURES, SHIM, runs, startServer, stopRuns, type Server } from "./server.ts";
 
 let server: Server | undefined;
@@ -161,34 +161,75 @@ test("a supervised server and its run with a request open are stopped after a te
   throw new Error(`${ON_PURPOSE}, with the request open`);
 });
 
-test("a run is stopped with whatever its program started, though that outlives the program", async () => {
-  test.skip(!existsSync(SHIM), "agent-threads-shim isn't built (make shim)");
-  const data = mkdtempSync(join(tmpdir(), "chat-e2e-"));
-  const dir = join(data, "runs", "run_left");
-  mkdirSync(dir, { recursive: true });
-  const ready = join(data, "ready");
-  // The program starts one that ignores SIGTERM (and says its pid once it does), and goes itself
-  // on SIGTERM.
-  const child = `process.on("SIGTERM", () => {}); require("fs").writeFileSync(${JSON.stringify(ready)}, String(process.pid)); setInterval(() => {}, 1000);`;
-  const program = `require("child_process").spawn(process.execPath, ["-e", ${JSON.stringify(child)}], { stdio: "ignore" }); setInterval(() => {}, 1000);`;
-  // As a backend runs it: with its stdio at /dev/null (the shim keeps it, so a pipe would never close).
-  expect(spawnSync(SHIM, [dir, "--", process.execPath, "-e", program], { stdio: "ignore" }).status).toBe(0);
-  let started: number | undefined;
-  try {
-    await expect.poll(() => existsSync(ready)).toBe(true);
-    started = Number(readFileSync(ready, "utf8"));
-    expect(runs(data)[0]!.left()).toContain(started);
+for (const source of ["proc", "ps"] as const) {
+  test(`a run is stopped with whatever its program started, though that outlives the program (${source})`, async () => {
+    test.skip(!existsSync(SHIM), "agent-threads-shim isn't built (make shim)");
+    const data = mkdtempSync(join(tmpdir(), "chat-e2e-"));
+    const dir = join(data, "runs", "run_left");
+    mkdirSync(dir, { recursive: true });
+    const ready = join(data, "ready");
+    // The program starts one that ignores SIGTERM (and says its pid once it does), and goes itself
+    // on SIGTERM.
+    const child = `process.on("SIGTERM", () => {}); require("fs").writeFileSync(${JSON.stringify(ready)}, String(process.pid)); setInterval(() => {}, 1000);`;
+    const program = `require("child_process").spawn(process.execPath, ["-e", ${JSON.stringify(child)}], { stdio: "ignore" }); setInterval(() => {}, 1000);`;
+    // As a backend runs it: with its stdio at /dev/null (the shim keeps it, so a pipe would never close).
+    expect(spawnSync(SHIM, [dir, "--", process.execPath, "-e", program], { stdio: "ignore" }).status).toBe(0);
+    let started: number | undefined;
+    try {
+      await expect.poll(() => existsSync(ready)).toBe(true);
+      started = Number(readFileSync(ready, "utf8"));
+      expect(runs(data, source)[0]!.left()).toContain(started);
 
-    expect(await stopRuns(data)).toEqual([]);
-    // The program went on SIGTERM, and the shim with it, saying so; what it started had SIGKILL.
-    expect(existsSync(join(dir, "exit"))).toBe(true);
-    expect(runs(data)[0]!.left()).toEqual([]);
-    // Told apart from left(): gone, once it's reaped.
-    await expect.poll(() => exists(started!), { timeout: 2_000 }).toBe(false);
-  } finally {
-    if (started !== undefined && exists(started)) process.kill(started, "SIGKILL");
-  }
-});
+      expect(await stopRuns(data, source)).toEqual([]);
+      // The program went on SIGTERM, and the shim with it, saying so; what it started had SIGKILL.
+      expect(existsSync(join(dir, "exit"))).toBe(true);
+      expect(runs(data, source)[0]!.left()).toEqual([]);
+      // Told apart from left(): gone, once it's reaped.
+      await expect.poll(() => exists(started!), { timeout: 2_000 }).toBe(false);
+    } finally {
+      if (started !== undefined && exists(started)) process.kill(started, "SIGKILL");
+    }
+  });
+
+  test(`a run's pids that have since gone to other processes aren't taken for its (${source})`, async () => {
+    const data = mkdtempSync(join(tmpdir(), "chat-e2e-"));
+    const dir = join(data, "runs", "run_stale");
+    mkdirSync(dir, { recursive: true });
+    // Another process, in a session and group of its own (as a shim's and a program's are), which
+    // the pids of a run that's long over may since have been given to; and a pid that's gone.
+    const other = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], { detached: true, stdio: "ignore" });
+    const gone = spawnSync("true").pid;
+    try {
+      await expect.poll(() => exists(other.pid!)).toBe(true);
+      // Written a minute ago (since the machine started), before it started.
+      const ago = new Date(Date.now() - 60_000);
+      const write = (name: string, content: string) => {
+        writeFileSync(join(dir, name), content);
+        utimesSync(join(dir, name), ago, ago);
+      };
+      write("exit", '{"code":0,"signal":null}');
+      for (const [shim, program] of [
+        [gone, other.pid!],
+        [other.pid!, gone],
+        [other.pid!, other.pid!],
+      ]) {
+        write("shim.pid", String(shim));
+        write("pid", String(program));
+        expect(runs(data, source)[0]!.left()).toEqual([]);
+        expect(await stopRuns(data, source)).toEqual([]);
+      }
+      // Written just now, as it started: only its session tells it from the run's program.
+      writeFileSync(join(dir, "shim.pid"), String(gone));
+      writeFileSync(join(dir, "pid"), String(other.pid));
+      expect(runs(data, source)[0]!.left()).toEqual([]);
+      expect(await stopRuns(data, source)).toEqual([]);
+      // Nothing was sent to it: it would have gone on SIGTERM.
+      expect(exists(other.pid!)).toBe(true);
+    } finally {
+      other.kill("SIGKILL");
+    }
+  });
+}
 
 function exists(pid: number): boolean {
   try {
