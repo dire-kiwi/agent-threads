@@ -21,6 +21,8 @@ import (
 type turnState struct {
 	ID          string `json:"id"`
 	Interrupted bool   `json:"interrupted"`
+	// Session is the thread's session_id when it started ("": it starts a new session).
+	Session string `json:"session,omitempty"`
 	// Carried is how many turns in a row (this one included) are retries for messages left queued
 	// that took none in: carried over from the turn before, or sent again with an explicit message.
 	Carried int `json:"carried,omitempty"`
@@ -790,7 +792,7 @@ func (rt *threadRuntime) send(m outgoing) {
 		// Messages still queued from before weren't delivered: they go first, in this turn, and stay
 		// queued until the harness takes them in. Such a turn is a retry for them.
 		left := rt.Queued()
-		rt.turn = &turnState{ID: NewID("turn")}
+		rt.turn = &turnState{ID: NewID("turn"), Session: rt.state.Thread.SessionID}
 		if len(left) > 0 {
 			rt.turn.Carried = 1
 		}
@@ -870,11 +872,13 @@ func (rt *threadRuntime) interrupt() {
 	}
 }
 
-func (rt *threadRuntime) EndTurn(end TurnEnd) { rt.endTurn(end, true) }
+func (rt *threadRuntime) EndTurn(end TurnEnd) { rt.endTurn(end, true, false) }
 
 // endTurn ends the running turn. Its queued messages are carried over to a new turn unless carry
-// is false (shutting down, or recovering a turn the backend lost), or they've been tried enough.
-func (rt *threadRuntime) endTurn(end TurnEnd, carry bool) {
+// is false (shutting down, or recovering a turn the backend lost), or they've been tried enough. A
+// lost one (its process was lost when the backend stopped) with no mark is noted as such in its
+// session: what it left there isn't known.
+func (rt *threadRuntime) endTurn(end TurnEnd, carry, lost bool) {
 	turn := rt.turn
 	if turn == nil {
 		return
@@ -938,7 +942,15 @@ func (rt *threadRuntime) endTurn(end TurnEnd, carry bool) {
 			errText = "The turn failed."
 		}
 	}
-	rt.AddItem(&protocol.TurnResult{ID: NewID("tr"), OK: ok, Interrupted: turn.Interrupted, Error: errText, Usage: end.Usage, DurationMs: end.DurationMs})
+	var session *protocol.TurnSession
+	at := end.SessionAt
+	if at == "" {
+		at = rt.state.Thread.TurnAt
+	}
+	if id := rt.state.Thread.SessionID; id != "" {
+		session = &protocol.TurnSession{ID: id, At: at, Started: turn.Session == "", Lost: lost && at == ""}
+	}
+	rt.AddItem(&protocol.TurnResult{ID: NewID("tr"), OK: ok, Interrupted: turn.Interrupted, Error: errText, Usage: end.Usage, DurationMs: end.DurationMs, Session: session})
 	rt.emit(&protocol.TurnCompletedEvent{TurnID: turn.ID})
 	rt.turn = nil
 	usage := addUsage(rt.state.Thread.Usage, end.Usage)
@@ -967,7 +979,7 @@ func (rt *threadRuntime) endTurn(end TurnEnd, carry bool) {
 		} else if rt.waiting() {
 			status = protocol.ThreadStatusWaiting
 		}
-		rt.SetThread(func(t *protocol.Thread) { t.Status = status; t.Error = errText; t.Usage = usage })
+		rt.SetThread(func(t *protocol.Thread) { t.Status = status; t.Error = errText; t.Usage = usage; t.TurnAt = "" })
 		if len(left) > 0 && carry && !rt.closing && rt.session != nil {
 			rt.session.Release()
 		}
@@ -978,17 +990,151 @@ func (rt *threadRuntime) endTurn(end TurnEnd, carry bool) {
 		return
 	}
 	// The next turn starts straight away, so the thread doesn't go idle in between.
-	rt.turn = &turnState{ID: NewID("turn"), Carried: carried + 1}
+	rt.turn = &turnState{ID: NewID("turn"), Session: rt.state.Thread.SessionID, Carried: carried + 1}
 	for _, q := range left {
 		rt.UpdateItem(q.ID, Patch{"turn_id": rt.turn.ID})
 	}
 	rt.emit(&protocol.TurnStartedEvent{TurnID: rt.turn.ID})
-	rt.SetThread(func(t *protocol.Thread) { t.Status = protocol.ThreadStatusRunning; t.Error = ""; t.Usage = usage })
+	rt.SetThread(func(t *protocol.Thread) {
+		t.Status = protocol.ThreadStatusRunning
+		t.Error = ""
+		t.Usage = usage
+		t.TurnAt = ""
+	})
 	msgs := make([]Message, 0, len(left))
 	for _, q := range left {
 		msgs = append(msgs, toMessage(q))
 	}
 	rt.session.CarryOver(msgs)
+}
+
+// The notices a rewind and a new session add.
+const (
+	rewindText     = "The conversation was rewound to here: the agent doesn't remember what came after."
+	newSessionText = "A new conversation starts here: the agent doesn't remember what came before."
+)
+
+// compact compacts the harness's context: a turn with no message. The caller checks one can start.
+func (rt *threadRuntime) compact(session CompactingSession) {
+	rt.turn = &turnState{ID: NewID("turn"), Session: rt.state.Thread.SessionID}
+	rt.emit(&protocol.TurnStartedEvent{TurnID: rt.turn.ID})
+	rt.SetThread(func(t *protocol.Thread) { t.Status = protocol.ThreadStatusRunning; t.Error = "" })
+	session.Compact()
+}
+
+// newSession has the next turn start a new session. The caller checks no turn is running.
+func (rt *threadRuntime) newSession() {
+	if rt.state.Thread.SessionID == "" {
+		return
+	}
+	rt.retire()
+	rt.SetThread(func(t *protocol.Thread) { t.SessionID, t.ResumeAt = "", "" })
+	rt.AddItem(&protocol.Notice{ID: NewID("n"), Level: protocol.NoticeLevelInfo, Code: "session.new", Text: newSessionText})
+}
+
+// retire stops what's still going on in the harness's old session as it changes (new_session,
+// rewind): its running subagents (a background one, with no turn) are stopped and its open requests
+// cancelled (questions kept open after their turns too: an answer would go to a conversation that's
+// gone), and its process is retired, so that nothing it says after reaches the thread (Claude
+// would start a turn of its own when a background subagent ended, in the old session).
+func (rt *threadRuntime) retire() {
+	var running []string
+	for _, it := range rt.saved.Items {
+		if c, ok := it.Value.(*protocol.ToolCall); ok && c.Subagent != nil && c.Subagent.Status == protocol.SubagentStatusRunning {
+			running = append(running, c.ID)
+		}
+	}
+	rt.StopSubagents(running)
+	for _, id := range append([]string(nil), rt.requestOrder...) {
+		rt.CancelRequest(id)
+	}
+	rt.cancelLate()
+	if rt.turn == nil && rt.state.Thread.Status == protocol.ThreadStatusWaiting {
+		rt.SetThread(func(t *protocol.Thread) { t.Status = protocol.ThreadStatusIdle })
+	}
+	if r, ok := rt.session.(RetiringSession); ok {
+		r.Retire()
+	} else {
+		rt.session.ConfigChanged()
+	}
+}
+
+// rewind takes the conversation back to before the turn turnID: its items and every later turn's
+// go, and the session goes where the harness says (see sessions.go). It returns a *RewindError for a
+// turn the thread hasn't, or one the harness can't rewind to. The caller checks no turn is running.
+func (rt *threadRuntime) rewind(turnID string) error {
+	items := rt.saved.Items
+	var results []*protocol.TurnResult
+	var resultAt []int // Each result's index in items.
+	index := -1
+	for i, it := range items {
+		if r, ok := it.Value.(*protocol.TurnResult); ok && r.ParentID == "" {
+			if r.TurnID == turnID && index < 0 {
+				index = len(results)
+			}
+			results = append(results, r)
+			resultAt = append(resultAt, i)
+		}
+	}
+	if index < 0 {
+		return &RewindError{Message: fmt.Sprintf("there's no turn %s in the thread", turnID)}
+	}
+	rewinder, ok := rt.session.(RewindingSession)
+	if !ok {
+		return &RewindError{Message: fmt.Sprintf("%s threads can't be rewound", rt.state.Thread.Harness)}
+	}
+	sessions := make([]*protocol.TurnSession, len(results))
+	for i, r := range results {
+		sessions[i] = r.Session
+	}
+	point, err := rewinder.RewindPoint(sessions, index)
+	if err != nil {
+		return err
+	}
+	// The turn and those after it, in the order they ran (a message carried over to a later turn
+	// keeps its place in the items, so their order isn't the turns'). What isn't any turn's goes
+	// too, after the last turn kept and the first item of one that goes.
+	dropped := map[string]bool{}
+	for _, r := range results[index:] {
+		dropped[r.TurnID] = true
+	}
+	kept, first := -1, -1
+	if index > 0 {
+		kept = resultAt[index-1]
+	}
+	for i, it := range items {
+		if t := it.TurnID(); t != "" && dropped[t] {
+			first = i
+			break
+		}
+	}
+	gone, indices := []string{}, []int64{}
+	goneSet := map[string]bool{}
+	for i, it := range items {
+		if t := it.TurnID(); (t != "" && dropped[t]) || (t == "" && i > kept && i > first) {
+			gone, indices = append(gone, it.ID()), append(indices, int64(i))
+			goneSet[it.ID()] = true
+		}
+	}
+	queue := rt.queue[:0:0]
+	for _, id := range rt.queue {
+		if !goneSet[id] {
+			queue = append(queue, id)
+		}
+	}
+	rt.queue = queue
+	// A rewind not yet made (resume_at) went back to before a later turn of the same session: with
+	// no mark of its own to go to, this one still needs that one made, as the turns since added
+	// nothing to the session but the ones it took back are still in it.
+	resumeAt := point.ResumeAt
+	if th := rt.state.Thread; resumeAt == "" && point.SessionID != "" && point.SessionID == th.SessionID {
+		resumeAt = th.ResumeAt
+	}
+	rt.emit(&protocol.ItemsRemovedEvent{ItemIDs: gone, Indices: indices})
+	rt.retire()
+	rt.SetThread(func(t *protocol.Thread) { t.SessionID, t.ResumeAt = point.SessionID, resumeAt })
+	rt.AddItem(&protocol.Notice{ID: NewID("n"), Level: protocol.NoticeLevelInfo, Code: "rewind", Text: rewindText})
+	return nil
 }
 
 // finishText keeps text streamed into the items which picks, but never finished, as it was shown.
@@ -1011,11 +1157,17 @@ func (rt *threadRuntime) finishText(which func(id string) bool) {
 	}
 }
 
+func (rt *threadRuntime) Mark(at string) {
+	if rt.turn != nil && rt.state.Thread.TurnAt != at {
+		rt.SetThread(func(t *protocol.Thread) { t.TurnAt = at })
+	}
+}
+
 func (rt *threadRuntime) BeginTurn() {
 	if rt.turn != nil || rt.closing || rt.disposed {
 		return
 	}
-	rt.turn = &turnState{ID: NewID("turn")}
+	rt.turn = &turnState{ID: NewID("turn"), Session: rt.state.Thread.SessionID}
 	rt.emit(&protocol.TurnStartedEvent{TurnID: rt.turn.ID})
 	rt.SetThread(func(t *protocol.Thread) { t.Status = protocol.ThreadStatusRunning; t.Error = "" })
 }

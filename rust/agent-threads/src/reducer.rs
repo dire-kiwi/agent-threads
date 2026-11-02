@@ -63,6 +63,21 @@ pub fn apply_event(state: &mut Snapshot, event: &ThreadEvent) {
                 patch_item(item, &e.patch);
             }
         }
+        ThreadEvent::ItemsRemoved(e) => {
+            state.items.retain(|i| !e.item_ids.iter().any(|id| id == i.id()));
+            // A window: its start, and the indices of its context items left, go down by the
+            // removed items before them.
+            if let Some(start) = state.start.filter(|s| *s > 0) {
+                let below = |at: u64| e.indices.iter().filter(|i| **i < at).count() as u64;
+                state.start = Some(start - below(start));
+                state.context = state
+                    .context
+                    .iter()
+                    .filter(|i| !e.indices.contains(i))
+                    .map(|i| i - below(*i))
+                    .collect();
+            }
+        }
         ThreadEvent::RequestOpened(e) => match state.requests.iter().rposition(|r| r.id() == e.request.id()) {
             Some(at) => state.requests[at] = e.request.clone(),
             None => state.requests.push(e.request.clone()),
@@ -255,6 +270,7 @@ impl ThreadEvent {
             ThreadEvent::TurnCompleted(e) => &e.thread_id,
             ThreadEvent::ItemAdded(e) => &e.thread_id,
             ThreadEvent::ItemUpdated(e) => &e.thread_id,
+            ThreadEvent::ItemsRemoved(e) => &e.thread_id,
             ThreadEvent::Delta(e) => &e.thread_id,
             ThreadEvent::RequestOpened(e) => &e.thread_id,
             ThreadEvent::RequestResolved(e) => &e.thread_id,
@@ -269,6 +285,7 @@ impl ThreadEvent {
             ThreadEvent::TurnCompleted(e) => e.seq.get(),
             ThreadEvent::ItemAdded(e) => e.seq.get(),
             ThreadEvent::ItemUpdated(e) => e.seq.get(),
+            ThreadEvent::ItemsRemoved(e) => e.seq.get(),
             ThreadEvent::Delta(e) => e.seq,
             ThreadEvent::RequestOpened(e) => e.seq.get(),
             ThreadEvent::RequestResolved(e) => e.seq.get(),

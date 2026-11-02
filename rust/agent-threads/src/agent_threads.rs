@@ -169,6 +169,9 @@ pub struct CreateOptions {
     pub standing_answers: Vec<StandingAnswer>,
     /// The thread's id; a new one by default.
     pub id: Option<String>,
+    /// The harness's own session to adopt (Claude Code's session id, Codex's thread id): the thread's
+    /// first turn resumes it. Its messages so far aren't made into items.
+    pub session_id: Option<String>,
     /// The thread's own tools, MCP servers, skills, policy and system prompt, on top of the
     /// instance's. They aren't stored: after a restart, set them again with
     /// [`configure`](AgentThreads::configure).
@@ -395,6 +398,7 @@ impl AgentThreads {
             ("title", &options.title),
             ("model", &options.model),
             ("effort", &options.effort),
+            ("session_id", &options.session_id),
         ] {
             if let Some(v) = v.as_ref().filter(|v| !v.is_empty()) {
                 thread[k] = json!(v);
@@ -760,6 +764,9 @@ impl AgentThreads {
                 };
                 self.set_options(&c.thread_id, o).await
             }
+            Command::Rewind(c) => self.rewind(&c.thread_id, &c.turn_id).await,
+            Command::NewSession(c) => self.new_session(&c.thread_id).await,
+            Command::Compact(c) => self.compact(&c.thread_id).await,
         }
     }
 
@@ -839,6 +846,56 @@ impl AgentThreads {
                 a.settle();
             })
             .await
+    }
+
+    /// Takes the conversation back to before the turn `turn_id`: the harness forgets it and every
+    /// turn after it (from the next turn, which resumes the session there), and their items are
+    /// removed. Refused while a turn is running, for a turn the thread hasn't, and where the harness
+    /// can't go back (a Claude Code session the thread adopted, to before its first turn in it).
+    pub async fn rewind(&self, thread_id: &str, turn_id: &str) -> Result<()> {
+        let turn_id = turn_id.to_string();
+        self.ready(thread_id)
+            .await?
+            .call(move |a| {
+                idle(a, "rewound")?;
+                a.rewind(&turn_id)
+                    .map_err(|e| Error::Command(format!("the thread can't be rewound to before that turn: {e}")))
+            })
+            .await?
+    }
+
+    /// The next turn starts a new conversation with the harness; the thread's items stay.
+    pub async fn new_session(&self, thread_id: &str) -> Result<()> {
+        self.ready(thread_id)
+            .await?
+            .call(|a| {
+                idle(a, "given a new session")?;
+                a.new_session();
+                Ok(())
+            })
+            .await?
+    }
+
+    /// Compacts the harness's context now, in a turn of its own. Refused while a turn is running,
+    /// and when the thread has no session yet.
+    pub async fn compact(&self, thread_id: &str) -> Result<()> {
+        self.ready(thread_id)
+            .await?
+            .call(|a| {
+                idle(a, "compacted")?;
+                if a.core.thread().session_id.is_none() {
+                    return Err(Error::Command("the thread has no conversation to compact yet".into()));
+                }
+                if !a.session.can_compact() {
+                    return Err(Error::Command(format!(
+                        "{} threads can't be compacted",
+                        a.core.thread().harness
+                    )));
+                }
+                a.core.compact();
+                Ok(())
+            })
+            .await?
     }
 
     /// Stops every harness process and saves everything. With the shim spawner, runs are left
@@ -925,7 +982,7 @@ impl AgentThreads {
                     let _ = h
                         .call(|a| {
                             if a.core.turn.is_some() {
-                                a.core.finish_turn(TurnEnd::default(), false, false);
+                                a.core.finish_turn(TurnEnd::default(), false, false, false);
                             }
                         })
                         .await;
@@ -1185,24 +1242,35 @@ impl AgentThreads {
             .await?
             .and_then(|s| serde_json::from_value(s).ok());
         let mut state = snap.unwrap_or_else(|| initial_state(thread.clone()));
-        for e in store.read_events(thread_id, state.seq, None).await? {
-            match serde_json::from_value::<ThreadEvent>(e.clone()) {
-                Ok(e) => apply_event(&mut state, &e),
-                // A newer backend's event: counted, and nothing else.
-                Err(_) => state.seq = e["seq"].as_u64().unwrap_or(state.seq).max(state.seq),
-            }
-        }
+        let events = store.read_events(thread_id, state.seq, None).await?;
+        let since = fold_events(&mut state, events);
         if state.seq == 0 {
-            state = initial_state(thread);
+            state = initial_state(thread.clone());
         }
+        // The turn that was running, if one was (a compaction may have no items yet), and the
+        // session it started in: what a turn rebuilt here is. From the events since the snapshot,
+        // or else from all the thread's.
+        let running = matches!(state.thread.status, ThreadStatus::Running | ThreadStatus::Waiting);
+        let open = match (running, since) {
+            (false, _) => None,
+            (true, Some(t)) => Some(t),
+            (true, None) => {
+                let events = store.read_events(thread_id, 0, None).await?;
+                fold_events(&mut initial_state(thread), events)
+            }
+        };
+        let lost = open.unwrap_or_else(|| LostTurn {
+            id: None,
+            session: state.thread.session_id.clone(),
+        });
         let (handle, mut actor, rx) = self.actor(state, launch)?;
-        if !self.reattach(&mut actor).await? {
+        if !self.reattach(&mut actor, &lost).await? {
             // The process that ran its turn went with the backend before this one, or can't be
             // followed.
             let t = actor.core.thread();
-            if matches!(t.status, ThreadStatus::Running | ThreadStatus::Waiting) || t.run.is_some() {
+            if running || t.run.is_some() {
                 actor.core.lost_run = t.run.as_ref().map(|r| r.id.clone());
-                recover_lost(&mut actor.core);
+                recover_lost(&mut actor.core, lost);
             } else {
                 // Questions kept open after their turns ended are taken up again (or cancelled,
                 // if they can't be any more).
@@ -1216,8 +1284,8 @@ impl AgentThreads {
     /// Re-attaches a thread just loaded to its run, if it has one that outlived the backend
     /// before: its turn and open requests are as they were when the run was last saved, and the
     /// session carries on reading the run from there. Whether it did; if it couldn't, the run is
-    /// stopped.
-    async fn reattach(&self, actor: &mut Actor) -> Result<bool> {
+    /// stopped. `lost` is the turn that was running (when the run has no turn saved).
+    async fn reattach(&self, actor: &mut Actor, lost: &LostTurn) -> Result<bool> {
         let Some(run) = actor.core.thread().run.clone() else {
             return Ok(false);
         };
@@ -1242,11 +1310,12 @@ impl AgentThreads {
             actor.core.thread().status,
             ThreadStatus::Running | ThreadStatus::Waiting
         ) {
-            let last = last_turn(actor.core.snapshot());
+            let id = lost.id.clone().or_else(|| last_turn(actor.core.snapshot()));
             actor.core.turn = saved_turn.unwrap_or_else(|| {
                 Some(Turn {
-                    id: last.unwrap_or_else(|| new_id("turn")),
+                    id: id.unwrap_or_else(|| new_id("turn")),
                     interrupted: false,
+                    session: lost.session.clone(),
                     carried: 0,
                     progressed: false,
                 })
@@ -1349,6 +1418,51 @@ fn last_turn(s: &Snapshot) -> Option<String> {
     s.items.iter().rev().find_map(Item::turn_id).map(String::from)
 }
 
+/// Refuses a command that needs the thread idle: one that's running a turn.
+fn idle(a: &Actor, what: &str) -> Result<()> {
+    if a.core.turn.is_some() {
+        return Err(Error::Command(format!(
+            "a turn is running: the thread can't be {what} until it ends (interrupt it first)"
+        )));
+    }
+    Ok(())
+}
+
+/// A turn that was running when the thread was loaded: its id, and the session it started in.
+struct LostTurn {
+    id: Option<String>,
+    session: Option<String>,
+}
+
+/// Folds a thread's stored events onto `state`. The turn that's still running in them (the last
+/// turn.started with no turn.completed after it), with the thread's session_id when it started (a
+/// session the turn starts is set after its turn.started); None if there's none in them.
+fn fold_events(state: &mut Snapshot, events: Vec<Value>) -> Option<LostTurn> {
+    let mut open: Option<LostTurn> = None;
+    for e in events {
+        match serde_json::from_value::<ThreadEvent>(e.clone()) {
+            Ok(e) => {
+                match &e {
+                    ThreadEvent::TurnStarted(t) => {
+                        open = Some(LostTurn {
+                            id: Some(t.turn_id.clone()),
+                            session: state.thread.session_id.clone(),
+                        })
+                    }
+                    ThreadEvent::TurnCompleted(t) if open.as_ref().and_then(|o| o.id.as_ref()) == Some(&t.turn_id) => {
+                        open = None
+                    }
+                    _ => {}
+                }
+                apply_event(state, &e);
+            }
+            // A newer backend's event: counted, and nothing else.
+            Err(_) => state.seq = e["seq"].as_u64().unwrap_or(state.seq).max(state.seq),
+        }
+    }
+    open
+}
+
 /// The turn a thread's items say is still running: its last, if it has no turn_result. (A thread
 /// waiting with none running is waiting on a background subagent's request.)
 fn open_turn(s: &Snapshot) -> Option<String> {
@@ -1360,16 +1474,18 @@ fn open_turn(s: &Snapshot) -> Option<String> {
     (!ended).then_some(last)
 }
 
-/// Ends a turn whose process was lost when the backend stopped, and stops the subagents that went
-/// with it (a background one may be running with no turn).
-fn recover_lost(c: &mut ThreadContext) {
+/// Ends a turn whose process was lost when the backend stopped (`lost`, the one its events have
+/// open, which a compaction with no items yet is too; or the one its items have open), and stops
+/// the subagents that went with it (a background one may be running with no turn).
+fn recover_lost(c: &mut ThreadContext, lost: LostTurn) {
     let status = c.thread().status;
-    let open = open_turn(c.snapshot());
+    let open = lost.id.or_else(|| open_turn(c.snapshot()));
     let turn = status == ThreadStatus::Running || (status == ThreadStatus::Waiting && open.is_some());
     if turn {
         c.turn = Some(Turn {
             id: open.unwrap_or_else(|| new_id("turn")),
             interrupted: false,
+            session: lost.session,
             carried: 0,
             progressed: false,
         });
@@ -1394,12 +1510,13 @@ fn recover_lost(c: &mut ThreadContext) {
             "text": "The backend stopped while this turn was running, and couldn't pick its run up again.",
         }));
         // Not carried over: loading a thread starts no process. Its queued messages go with the next.
+        // Its mark is the last the harness gave (turn_at); with none, it's lost.
         let end = TurnEnd {
             ok: false,
             error: Some("The backend stopped while this turn was running.".into()),
             ..Default::default()
         };
-        c.finish_turn(end, false, false);
+        c.finish_turn(end, false, false, true);
     } else if c.thread().status == ThreadStatus::Waiting {
         c.set_thread(|t| t.status = ThreadStatus::Idle);
     }

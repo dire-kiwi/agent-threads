@@ -17,6 +17,8 @@ func (u ThreadEvent) ThreadID() string {
 		return e.ThreadID
 	case *ItemUpdatedEvent:
 		return e.ThreadID
+	case *ItemsRemovedEvent:
+		return e.ThreadID
 	case *DeltaEvent:
 		return e.ThreadID
 	case *RequestOpenedEvent:
@@ -39,6 +41,8 @@ func (u ThreadEvent) Seq() int64 {
 	case *ItemAddedEvent:
 		return e.Seq
 	case *ItemUpdatedEvent:
+		return e.Seq
+	case *ItemsRemovedEvent:
 		return e.Seq
 	case *DeltaEvent:
 		return e.Seq
@@ -76,6 +80,8 @@ func (u ThreadEvent) Number(threadID string, seq int64) {
 	case *ItemAddedEvent:
 		e.ThreadID, e.Seq = threadID, seq
 	case *ItemUpdatedEvent:
+		e.ThreadID, e.Seq = threadID, seq
+	case *ItemsRemovedEvent:
 		e.ThreadID, e.Seq = threadID, seq
 	case *DeltaEvent:
 		e.ThreadID, e.Seq = threadID, seq

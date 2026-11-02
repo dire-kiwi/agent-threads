@@ -9,7 +9,7 @@ source of truth for the shapes, and this document says what they mean. See
 | Schema | Defines |
 | --- | --- |
 | [thread.schema.json](schema/thread.schema.json) | `Thread`, `ThreadStatus`, `PermissionMode`, `Run`, `RateLimit`, `Usage` |
-| [item.schema.json](schema/item.schema.json) | `Item` and its variants, `ToolKind`, `ToolStatus`, `ToolResult`, `FileChange`, `Todo`, `Attachment` |
+| [item.schema.json](schema/item.schema.json) | `Item` and its variants, `ToolKind`, `ToolStatus`, `ToolResult`, `FileChange`, `Todo`, `TurnSession`, `Attachment` |
 | [request.schema.json](schema/request.schema.json) | `ThreadRequest` (`PermissionRequest`, `QuestionRequest`, `PlanRequest`), `Question`, `Resolution` |
 | [event.schema.json](schema/event.schema.json) | `ThreadEvent` and its variants |
 | [command.schema.json](schema/command.schema.json) | `Command` and its variants |
@@ -49,8 +49,9 @@ A `Thread` is one conversation with one harness (`claude` or `codex`). Its `stat
 - `error`: the last turn failed or the harness couldn't start (`error` says why). The next `send`
   tries again.
 
-`session_id` is the harness's own session id, which the backend uses to resume the conversation
-in a new process. `run` is the process running the thread, when one is: a `direct` run is a child
+`session_id` is the harness's own session id (Claude Code's `session_id`, Codex's thread id), which
+the backend uses to resume the conversation in a new process; `resume_at` is set after a rewind,
+until the harness has gone back there (see [Sessions](#sessions)). `run` is the process running the thread, when one is: a `direct` run is a child
 of the backend and ends with it; a `shim` run is supervised by `agent-threads-shim` and survives a
 backend restart, and its `reattached_at` is set when a restarted backend picks it up again
 ([RUNDIR.md](RUNDIR.md) has how backends and the shim share a run).
@@ -67,7 +68,9 @@ another thread (or app) used the account since; an app that queues work until a 
 switches logins, reads them from whichever thread reported last. How each harness's reports map onto
 them is in [fixtures/README.md](fixtures/README.md#the-expected-events).
 
-Threads are created, listed and deleted through each backend's API, not through commands.
+Threads are created, listed and deleted through each backend's API, not through commands. A thread
+can be created with a `session_id`, to adopt a conversation the harness already has: its first turn
+resumes it. The conversation so far isn't made into items; the thread starts empty.
 
 ## Items
 
@@ -82,7 +85,7 @@ and may have `parent_id`, `turn_id`, `created_at` and `raw`.
 | `tool_call` | A tool call and, once it has one, its `result`. See below. |
 | `compaction` | The harness compacted its context: `trigger` (`auto` or `manual`), `summary`, `tokens_before`. |
 | `notice` | Something to tell the user that isn't the agent talking: `level` (`info`, `warning`, `error`), `text`, `detail`, and a `code` such as `run.reattached`, `run.lost`, `retry`, `hook` or `stderr`. |
-| `turn_result` | How a turn ended; the last item of each turn. `ok`, `interrupted`, `error`, `usage`, `duration_ms`. |
+| `turn_result` | How a turn ended; the last item of each turn. `ok`, `interrupted`, `error`, `usage`, `duration_ms`, and `session`: where the turn left the harness's session (see [Sessions](#sessions)). |
 
 ### Tool calls
 
@@ -138,6 +141,56 @@ background subagent ends, to tell the agent. It goes as any turn does (`turn.sta
 theirs is running), what the harness does by itself goes in the user's turn, which ends when the
 harness is done with the user's message. A backend that restarts and can't pick up a thread's run
 stops its subagents that were running.
+
+## Sessions
+
+A thread's conversation with its harness is a **session**, whose id is the thread's `session_id`.
+The backend starts one at the thread's first turn (or adopts the one the thread was created with),
+resumes it in each new process, and can take it back, replace it, or compact it:
+
+- **Rewind** (the `rewind` command): back to before one of the thread's turns. The harness forgets
+  that turn and every turn after it: Claude Code resumes the session at the last message of the turn
+  before (`--resume <session_id> --resume-session-at <uuid>`), and Codex reverts its thread to before
+  the turn (`thread/revert`). The thread's items from that turn on are removed with an
+  `items.removed` event, and a `notice` with code `rewind` is added where they were.
+- **New session** (the `new_session` command): the next turn starts a new conversation, in the same
+  thread, with its items kept. A `notice` with code `session.new` marks where.
+- **Compaction** (the `compact` command): the harness compacts its context now, in a turn of its
+  own, which adds a `compaction` item (Claude Code's `/compact`, Codex's `thread/compact/start`).
+
+Each `turn_result` has the turn's `session` (when the thread had one at its end): its `id`, the
+harness's own mark for the turn as `at` (Claude Code's last message in it, Codex's id for the turn:
+its first, for a turn that went on after a plan), and `started` if the turn started that session. That's what a rewind works from, so it can go back
+to a turn in an earlier session (before a `new_session`) too.
+
+While a turn runs, the thread's `turn_at` is its mark so far, set (with a `thread.updated`) as the
+harness gives it: Claude Code's latest message, Codex's turn once it starts. A turn the backend
+lost while it ran (it stopped, and couldn't pick the run up again) ends with that mark as its
+`at`; with none, its session has `lost: true` instead, as the harness may have taken in some of
+it without saying so.
+
+To rewind to before turn T:
+
+- If T started its session, or there was none at its end, the next turn starts a new session.
+- Otherwise T continued session S (its `session.id`). **Claude Code** resumes S at the `at` of the
+  latest turn before T in S that has one. If there's none (T was the first turn in the thread of a
+  session it was created with, whose earlier messages it doesn't know), it can't rewind there.
+  **Codex** reverts S to before the `at` of the first turn from T on, in S, that has one; if none
+  has, S is as it was before T, and nothing is reverted, except what an earlier rewind in S not
+  yet made (the thread's `resume_at`) still has to: it stays.
+- Either way, a `lost` turn passed over on the way to that `at` (or, for Codex, with none found)
+  may have left more in S: the rewind is refused.
+
+The thread's `session_id` becomes S (or is cleared), and its `resume_at` the message to resume at
+or the turn to revert to before. The harness goes back there at the start of the next turn, in a
+new process, and `resume_at` is cleared once it has.
+
+A rewind or `new_session` is the end of what was still going on in the old session: the thread's
+running subagents (a background one goes on after its turn) are `stopped`, its open requests
+(questions kept open after their turns included: their answers would go to a conversation that's
+gone) are resolved with `cancel`, and its harness process is stopped at once, and nothing it says after
+reaches the thread (Claude Code would otherwise start a turn of its own, in the old session, when
+a background subagent ended).
 
 ## Requests
 
@@ -196,6 +249,7 @@ Every event has `type`, `thread_id` and `seq`, and may have `raw`.
 | `turn.completed` | `turn_id` | A turn ended. Its `turn_result` item comes just before. |
 | `item.added` | `item` | An item was added at the end of the list. If the thread already has an item with its id, it replaces that one in place. |
 | `item.updated` | `item_id`, `patch` | Fields of an item changed: each of the patch's fields replaces the item's, and one set to `null` is removed. `id` and `type` never change. |
+| `items.removed` | `item_ids` | Items were removed from the list (a rewind took the conversation back to before them). |
 | `delta` | `item_id`, `kind`, `offset`, `text` | Streamed text to append to an `assistant_message` (`kind: text`) or `reasoning` (`kind: reasoning`) item's `text`, which was `offset` long before it. |
 | `request.opened` | `request` | A request was opened. |
 | `request.resolved` | `request_id`, `resolution` | A request was answered or cancelled. It stays in the state, with this `resolution`. |
@@ -230,7 +284,8 @@ the same rules:
    (`turn.*` events change nothing else.) A `request.opened` adds its request at the end of
    `requests`, or replaces the one with its id in place. A `request.resolved` sets its request's
    `resolution` (replacing one it had), leaving it where it is in `requests`. An `item.updated` or
-   `request.resolved` for an id the state doesn't have only advances `seq`.
+   `request.resolved` for an id the state doesn't have only advances `seq`, and `items.removed`
+   skips ids it doesn't have.
 4. A `delta` is applied when the state has its item, the item is the delta's `kind`'s type, and
    the delta's `seq` isn't below the state's (one from before the last saved event the state has
    is already in it). Its `text` goes at `offset` in the item's text: what's already there (the
@@ -247,9 +302,10 @@ already past, and are skipped rather than added twice.
 
 A thread can run to thousands of items, so a client needn't load them all: a backend's snapshot can
 be a **window** of the thread, taken with a limit, that has only its last items, and the client loads
-earlier ones a page at a time as the user scrolls back. Items are only ever added at the end of a
-thread's list (an `item.added` for an id it has replaces that item in place), so an item's index in
-the whole list never changes, and windows and pages are told where they are by index.
+earlier ones a page at a time as the user scrolls back. Items are added at the end of a thread's list
+(an `item.added` for an id it has replaces that item in place), and only `items.removed` (a rewind)
+takes any out, saying where they were: so windows and pages are told where they are by index, and an
+item's index only changes, by the number of removed items before it, with an `items.removed`.
 
 A window of a state with `n` items and a limit `limit` (less than `n`; with a limit of `n` or more it
 is the whole state) has:
@@ -275,7 +331,12 @@ the items from `start` up to `before`; `requests`, the requests whose anchor is 
 `seq`, that of the state it was taken from. `start` 0 means there's nothing before it.
 
 Events apply to a window as to any state (an event about an item or request it doesn't have only
-advances `seq`), and leave `start` and `context` as they are. A client puts a page into its window
+advances `seq`), and leave `start` and `context` as they are, but for `items.removed`: its items
+the window has go (context ones too), `start` goes down by the number of its `indices` below it,
+and each index left in `context` by the number below that one. A page asked for before an
+`items.removed` the client has applied since (by the time the page is put in: see below) is left out
+(it's placed by indices that may have changed, either side of the removal) and the page before the
+window's new `start` asked for instead. A client puts a page into its window
 by putting the page's items in front of its own (`withPage` in `@dire-kiwi/agent-threads-protocol`):
 the context items of both, ordered by index (the page's version of one they share), those of them
 the page's own items include dropped, then the page's items from its `start`, then its own from its
@@ -285,8 +346,14 @@ it has replacing it in place. (So a window with pages put in it may not have its
 state's order: a resolved request from a page can come before an open one the window had. A UI
 places resolved requests by their anchor.)
 
-A page may be taken from a later state than the client's (its `seq` is higher), and that's fine:
-events the client applies after it set what they set again. One taken from an earlier state can't
+A page may be taken from a later state than the client's (its `seq` is higher): the client keeps it
+until it has applied the events up to the page's `seq` (they're on their way, as the page was taken
+after them), and then puts it in, with what events it applied since setting what they set again;
+unless one of those was an `items.removed`, which leaves it out as below, since the page's indices
+already have the removal its window doesn't have yet. The page shows the client is behind, so it
+also catches up as under Reconnecting (the events may have been missed, with no later one to show the
+gap); if that doesn't bring the client to the page's `seq`, the load fails. A client that disconnects
+while it waits gives the page up, and stops loading. One taken from an earlier state can't
 be: the backend takes it after the client asked for it, so it has every event the client had then.
 A client applies the saved events it applies while it waits for the page (those with a `seq` above
 the page's) to the page's items and requests too, before putting it in, leaving out events that
@@ -308,6 +375,12 @@ Every command has `type` and `thread_id`.
 | `interrupt` | | Stop the running turn. Its `turn_result` has `interrupted`. Does nothing if no turn is running. |
 | `respond` | `request_id`, `resolution` | Answer an open request. Answering one that isn't open does nothing. |
 | `set_options` | `model?`, `effort?`, `permission_mode?`, `standing_answers?` | Change the thread's options; ones left out stay as they are. They apply straight away where the harness allows, and otherwise from the next turn, and a `thread.updated` follows. `standing_answers` replaces the thread's (`[]` clears them). |
+| `rewind` | `turn_id` | Take the conversation back to before that turn: the harness forgets it and every turn after, and their items are removed. See [Sessions](#sessions). |
+| `new_session` | | The next turn starts a new conversation with the harness; the items stay. Does nothing if the thread has no session. |
+| `compact` | | Compact the harness's context now, in a turn of its own (with no `user_message`) that adds a `compaction` item. |
+
+`rewind`, `new_session` and `compact` are refused while a turn is running, and `compact` when the
+thread has no session yet: interrupt the turn, or wait for it, first.
 
 `permission_mode` is `default` (ask via the permission policy), `accept_edits` (file edits in the
 thread's `cwd` are allowed without asking), `plan` (the agent plans and changes nothing, and asks to

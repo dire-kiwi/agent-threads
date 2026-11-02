@@ -20,6 +20,7 @@ const CLAUDE_FLAGS = [
   ["--strict-mcp-config", false],
   ["--model", true],
   ["--resume", true],
+  ["--resume-session-at", true],
   ["--permission-mode", true],
 ];
 

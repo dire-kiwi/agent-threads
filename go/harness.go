@@ -147,6 +147,10 @@ type TurnEnd struct {
 	Error      string
 	Usage      *protocol.Usage
 	DurationMs *int64
+	// SessionAt is the harness's own mark for the turn, in its session: Claude Code's last message in
+	// it, Codex's id for the turn (the turn_result's session.at). Without it, the last Mark given in
+	// the turn.
+	SessionAt string
 }
 
 // Patch is a change to an item's fields: each value replaces the field's (as JSON), and a nil one
@@ -189,6 +193,10 @@ type ThreadContext interface {
 	FromHarness(runID, line string, handle func())
 	// TookIn says the harness took in the queued message with this id, and whether it was queued.
 	TookIn(id string) bool
+	// Mark is the running turn's mark (TurnEnd's SessionAt) so far, as soon as the harness gives it:
+	// kept in the thread (turn_at), so a turn lost when the backend stops still has it. It does
+	// nothing with no turn running.
+	Mark(at string)
 	// ToolOutput says an app tool returned structured output for the tool call toolCallID: it goes
 	// in the call's result.structured when the harness gives the call its result (harnesses pass on
 	// only the text).
@@ -271,6 +279,34 @@ type Session interface {
 	ConfigChanged()
 	// Close stops the harness process, if it's running, and calls done once it has.
 	Close(done func())
+}
+
+// CompactingSession is a Session that can compact the harness's context. A harness whose sessions
+// aren't refuses the compact command.
+type CompactingSession interface {
+	Session
+	// Compact says a turn started (with no messages) to compact the harness's context.
+	Compact()
+}
+
+// RetiringSession is a Session that can retire its process as the thread's session changes
+// (new_session, rewind) with no turn running. Without it, the core calls ConfigChanged.
+type RetiringSession interface {
+	Session
+	// Retire stops the running process now (its background work too), and lets nothing it says
+	// after reach the thread. The next turn starts a new one.
+	Retire()
+}
+
+// RewindingSession is a Session that can take its conversation back to before a turn. A harness
+// whose sessions aren't refuses the rewind command.
+type RewindingSession interface {
+	Session
+	// RewindPoint is where a rewind to before turn index of sessions (each turn's session, in order;
+	// nil for a turn that ended with none) takes the session: ResumeAtPoint or RevertPoint, say. It
+	// returns a *RewindError if it can't be rewound there. The core then retires the old session
+	// (Retire, or ConfigChanged), and sets the thread's session_id and resume_at.
+	RewindPoint(sessions []*protocol.TurnSession, index int) (RewindPoint, error)
 }
 
 // ControlSession is a Session that takes the app's own requests to its running process

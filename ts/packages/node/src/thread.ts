@@ -14,6 +14,8 @@ import {
   type Thread,
   type ThreadEvent,
   type ThreadRequest,
+  type TurnResult,
+  type TurnSession,
   type Usage,
   type UserMessage,
 } from "@dire-kiwi/agent-threads-protocol";
@@ -21,6 +23,7 @@ import { ancestors, inBackground, requestInBackground, type HarnessMessage, type
 import { newId } from "./ids.js";
 import { normalLaunch, sameLaunch, storedThread, type StoredThread } from "./launch.js";
 import { DONT_ASK_DENIAL, decide, modeDecision, permissionKey, standsFor, type PermissionDecision, type PermissionPolicy, type PermissionQuery, type StandingKey } from "./permissions.js";
+import { RewindError } from "./sessions.js";
 import type { Spawner } from "./spawner.js";
 import { StoreError, type RunRecord, type Store } from "./store.js";
 
@@ -30,6 +33,8 @@ type Unnumbered = ThreadEvent extends infer E ? (E extends ThreadEvent ? Omit<E,
 export interface Turn {
   id: string;
   interrupted: boolean;
+  /** The thread's session_id when it started (none: it starts a new session). */
+  session?: string;
   /**
    * How many turns in a row (this one included) are retries for messages left queued that took
    * none in: carried over from the turn before, or sent again with an explicit message.
@@ -476,7 +481,7 @@ export class ThreadRuntime implements ThreadContext {
       // Messages still queued from before weren't delivered: they go first, in this turn, and stay
       // queued until the harness takes them in. Such a turn is a retry for them.
       const left = this.queued();
-      this.turn = { id: newId("turn"), interrupted: false, ...(left.length ? { carried: 1 } : {}) };
+      this.turn = { id: newId("turn"), interrupted: false, ...this.#sessionNow(), ...(left.length ? { carried: 1 } : {}) };
       for (const m of left) this.updateItem(m.id, { turn_id: this.turn.id });
       this.addItem({ id, type: "user_message", ...userFields(message) });
       this.emit({ type: "turn.started", turn_id: this.turn.id });
@@ -487,6 +492,80 @@ export class ThreadRuntime implements ThreadContext {
     this.addItem({ id, type: "user_message", ...userFields(message), steered: true, queued: true });
     this.#queue.push(id);
     this.session!.steer(toMessage(id, message));
+  }
+
+  /** The session a turn starting now starts in, for its Turn. */
+  #sessionNow(): { session?: string } {
+    const s = this.#state.thread.session_id;
+    return s ? { session: s } : {};
+  }
+
+  /** Compacts the harness's context: a turn with no message. The caller checks one can start. */
+  compact(): void {
+    this.turn = { id: newId("turn"), interrupted: false, ...this.#sessionNow() };
+    this.emit({ type: "turn.started", turn_id: this.turn.id });
+    this.setThread({ status: "running", error: undefined });
+    this.session!.compact!();
+  }
+
+  /** The next turn starts a new session. The caller checks no turn is running. */
+  newSession(): void {
+    if (!this.#state.thread.session_id) return;
+    this.#retire();
+    this.setThread({ session_id: undefined, resume_at: undefined });
+    this.addItem({ id: newId("n"), type: "notice", level: "info", code: "session.new", text: NEW_SESSION_TEXT });
+  }
+
+  /**
+   * The harness's session changes (new_session, rewind): what's still going on in the old one
+   * stops. Its running subagents (a background one, with no turn) are stopped and its open requests
+   * cancelled (questions kept open after their turns too: an answer would go to a conversation
+   * that's gone), and its process is retired, so that nothing it says after reaches the thread (Claude
+   * would start a turn of its own when a background subagent ended, in the old session).
+   */
+  #retire(): void {
+    this.stopSubagents(this.#saved.items.filter((i) => i.type === "tool_call" && i.subagent?.status === "running").map((i) => i.id));
+    for (const id of [...this.#requests.keys()]) this.cancelRequest(id);
+    this.#cancelLate();
+    if (!this.turn && this.#state.thread.status === "waiting") this.setThread({ status: "idle" });
+    if (this.session?.retire) this.session.retire();
+    else this.session?.configChanged();
+  }
+
+  /**
+   * Takes the conversation back to before the turn `turnId`: its items and every later turn's go,
+   * and the session goes where the harness says (see sessions.ts). Throws for a turn the thread
+   * hasn't, or one the harness can't rewind to. The caller checks no turn is running.
+   */
+  rewind(turnId: string): void {
+    const items = this.#saved.items;
+    const results = items.filter((it): it is TurnResult => it.type === "turn_result" && !it.parent_id);
+    const index = results.findIndex((r) => r.turn_id === turnId);
+    if (index < 0) throw new RewindError(`there's no turn ${turnId} in the thread`);
+    if (!this.session?.rewindPoint) throw new RewindError(`${this.thread.harness} threads can't be rewound`);
+    const point = this.session.rewindPoint(
+      results.map((r): TurnSession | undefined => r.session),
+      index,
+    );
+    // The turn and those after it, in the order they ran (a message carried over to a later turn
+    // keeps its place in the items, so their order isn't the turns'). What isn't any turn's goes
+    // too, after the last turn kept and the first item of one that goes.
+    const dropped = new Set(results.slice(index).map((r) => r.turn_id));
+    const kept = index > 0 ? items.indexOf(results[index - 1]!) : -1;
+    const first = items.findIndex((it) => it.turn_id !== undefined && dropped.has(it.turn_id));
+    const indices = items.flatMap((it, i) => ((it.turn_id !== undefined ? dropped.has(it.turn_id) : i > kept && i > first) ? [i] : []));
+    const gone = indices.map((i) => items[i]!.id);
+    const goneSet = new Set(gone);
+    this.#queue = this.#queue.filter((id) => !goneSet.has(id));
+    // A rewind not yet made (resume_at) went back to before a later turn of the same session: with
+    // no mark of its own to go to, this one still needs that one made, as the turns since added
+    // nothing to the session but the ones it took back are still in it.
+    const t = this.#state.thread;
+    const resumeAt = point.resume_at ?? (point.session_id !== undefined && point.session_id === t.session_id ? t.resume_at : undefined);
+    this.emit({ type: "items.removed", item_ids: gone, indices });
+    this.#retire();
+    this.setThread({ session_id: point.session_id, resume_at: resumeAt });
+    this.addItem({ id: newId("n"), type: "notice", level: "info", code: "rewind", text: REWIND_TEXT });
   }
 
   queued(): UserMessage[] {
@@ -514,7 +593,11 @@ export class ThreadRuntime implements ThreadContext {
    * The running turn ended. Its queued messages are carried over to a new turn unless `carry` is
    * false (shutting down, or recovering a turn the backend lost), or they've been tried enough.
    */
-  endTurn(end: TurnEnd, { carry = true }: { carry?: boolean } = {}): void {
+  /**
+   * Ends the running turn. A `lost` one (its process was lost when the backend stopped) with no
+   * mark is noted as such in its session: what it left there isn't known.
+   */
+  endTurn(end: TurnEnd, { carry = true, lost = false }: { carry?: boolean; lost?: boolean } = {}): void {
     const turn = this.turn;
     if (!turn) return;
     // What a background subagent that's still running does carries on after the turn: its text
@@ -542,6 +625,8 @@ export class ThreadRuntime implements ThreadContext {
     }
     const ok = end.ok && !turn.interrupted;
     const error = !ok && !turn.interrupted ? end.error || "The turn failed." : undefined;
+    const sessionId = this.#state.thread.session_id;
+    const at = end.session_at ?? this.#state.thread.turn_at;
     this.addItem({
       id: newId("tr"),
       type: "turn_result",
@@ -550,6 +635,9 @@ export class ThreadRuntime implements ThreadContext {
       ...(error ? { error } : {}),
       ...(end.usage ? { usage: end.usage } : {}),
       ...(end.duration_ms !== undefined ? { duration_ms: end.duration_ms } : {}),
+      ...(sessionId
+        ? { session: { id: sessionId, ...(at ? { at } : {}), ...(!turn.session ? { started: true } : {}), ...(lost && !at ? { lost: true } : {}) } }
+        : {}),
     });
     this.emit({ type: "turn.completed", turn_id: turn.id });
     this.turn = null;
@@ -575,17 +663,17 @@ export class ThreadRuntime implements ThreadContext {
       (retry && turn.interrupted) ||
       (carried > 0 && !ok && !(this.session?.live() ?? false));
     if (giveUp) {
-      this.setThread({ status: error ? "error" : this.#waiting() ? "waiting" : "idle", error, usage });
+      this.setThread({ status: error ? "error" : this.#waiting() ? "waiting" : "idle", error, usage, turn_at: undefined });
       if (left.length && carry && !this.closing) this.session?.release();
       if (left.length && !this.closing) this.#undelivered(left.length);
       void this.saveSnapshot();
       return;
     }
     // The next turn starts straight away, so the thread doesn't go idle in between.
-    this.turn = { id: newId("turn"), interrupted: false, carried: carried + 1 };
+    this.turn = { id: newId("turn"), interrupted: false, ...this.#sessionNow(), carried: carried + 1 };
     for (const m of left) this.updateItem(m.id, { turn_id: this.turn.id });
     this.emit({ type: "turn.started", turn_id: this.turn.id });
-    this.setThread({ status: "running", error: undefined, usage });
+    this.setThread({ status: "running", error: undefined, usage, turn_at: undefined });
     this.session?.carryOver(left.map((m) => toMessage(m.id, m)));
   }
 
@@ -599,9 +687,13 @@ export class ThreadRuntime implements ThreadContext {
     for (const id of [...this.#streaming]) if (which(id)) this.#streaming.delete(id);
   }
 
+  mark(at: string): void {
+    if (this.turn && this.#state.thread.turn_at !== at) this.setThread({ turn_at: at });
+  }
+
   beginTurn(): void {
     if (this.turn || this.closed || this.closing) return;
-    this.turn = { id: newId("turn"), interrupted: false };
+    this.turn = { id: newId("turn"), interrupted: false, ...this.#sessionNow() };
     this.emit({ type: "turn.started", turn_id: this.turn.id });
     this.setThread({ status: "running", error: undefined });
   }
@@ -844,6 +936,10 @@ export class ThreadRuntime implements ThreadContext {
     this.#host.error(error);
   }
 }
+
+/** The notices a rewind and a new session add. */
+const REWIND_TEXT = "The conversation was rewound to here: the agent doesn't remember what came after.";
+const NEW_SESSION_TEXT = "A new conversation starts here: the agent doesn't remember what came before.";
 
 /** What the agent is told when a standing answer denies a call. */
 const STANDING_DENIAL = "The user has denied this tool for the rest of the thread.";

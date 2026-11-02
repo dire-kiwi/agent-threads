@@ -3,11 +3,10 @@
 
 use serde_json::{Map, Value, json};
 
-use super::home::Totals;
 use crate::claude::{result_text, slim};
 use crate::harness::McpServer;
 use crate::ids::unix_time;
-use crate::protocol::{PermissionMode, RateLimit, RateLimitStatus, SubagentState, SubagentStatus};
+use crate::protocol::{PermissionMode, RateLimit, RateLimitStatus, SubagentState, SubagentStatus, Usage};
 
 /// The MCP server that serves a thread's app tools when Codex can't take them as dynamic tools.
 pub(crate) const APP_SERVER: &str = "app";
@@ -293,30 +292,29 @@ pub(crate) fn child_turn_subagent(s: &SubagentState, turn: &Value, last: Option<
     next
 }
 
-/// What a turn used. Codex reports the thread's running totals (again after a resume), so it's
-/// how far they are past the thread's usage before the turn. Its input tokens include the cached
-/// ones, which (as Claude's do) `input_tokens` leaves out.
-pub(crate) fn codex_usage(total: &Totals, before: &Value) -> Value {
-    let b = |k: &str| before[k].as_i64().unwrap_or(0);
-    let cached = total.cached_input_tokens as i64 - b("cache_read_tokens");
-    let input = total.input_tokens as i64 - b("input_tokens") - b("cache_read_tokens");
-    let pos = |n: i64| n.max(0);
-    json!({
-        "input_tokens": pos(input - cached),
-        "output_tokens": pos(total.output_tokens as i64 - b("output_tokens")),
-        "cache_read_tokens": pos(cached),
-        "cache_write_tokens": pos(total.cache_write_input_tokens.unwrap_or(0) as i64 - b("cache_write_tokens")),
-    })
+/// What a model call used (a tokenUsage report's `last`), as usage: a turn used its calls' sum.
+/// Its input tokens include the cached ones, which (as Claude's do) `input_tokens` leaves out.
+pub(crate) fn call_usage(last: &Value) -> Usage {
+    let n = |k: &str| last[k].as_i64().unwrap_or(0);
+    let pos = |n: i64| n.max(0) as u64;
+    Usage {
+        input_tokens: pos(n("inputTokens") - n("cachedInputTokens")),
+        output_tokens: pos(n("outputTokens")),
+        cache_read_tokens: Some(pos(n("cachedInputTokens"))),
+        cache_write_tokens: Some(pos(n("cacheWriteInputTokens"))),
+        cost_usd: None,
+    }
 }
 
-/// Codex's totals as the usage they'd be if a turn had used them all.
-pub(crate) fn totals_as_usage(t: &Totals) -> Value {
-    json!({
-        "input_tokens": t.input_tokens as i64 - t.cached_input_tokens as i64,
-        "cache_read_tokens": t.cached_input_tokens,
-        "output_tokens": t.output_tokens,
-        "cache_write_tokens": t.cache_write_input_tokens.unwrap_or(0),
-    })
+/// No tokens used.
+pub(crate) fn no_usage() -> Usage {
+    Usage {
+        input_tokens: 0,
+        output_tokens: 0,
+        cache_read_tokens: Some(0),
+        cache_write_tokens: Some(0),
+        cost_usd: None,
+    }
 }
 
 /// requestUserInput's questions.

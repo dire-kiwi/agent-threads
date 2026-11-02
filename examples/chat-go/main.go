@@ -441,7 +441,8 @@ func (a *app) call(ctx context.Context, method string, raw json.RawMessage) (any
 	case "events_since":
 		return a.sdk.EventsSince(ctx, p.ThreadID, p.Seq, 0)
 	case "command":
-		// Commands in: send, interrupt, respond and set_options, checked and carried out by the backend.
+		// Commands in: send, interrupt, respond, set_options, rewind, new_session and compact, checked
+		// and carried out by the backend.
 		if len(p.Command) == 0 {
 			return nil, &agentthreads.CommandError{Message: "there's no command"}
 		}

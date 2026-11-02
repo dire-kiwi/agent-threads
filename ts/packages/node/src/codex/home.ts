@@ -52,8 +52,6 @@ function present(path: string): boolean {
 export interface SessionState {
   /** The dynamic tools the session was started with, which Codex keeps for it (resuming can't change them). */
   dynamicTools: { name: string; description: string; inputSchema: unknown }[];
-  /** Codex's token totals for the session after its last turn. */
-  totals: { inputTokens: number; cachedInputTokens: number; outputTokens: number; cacheWriteInputTokens?: number } | null;
 }
 
 const statePath = (home: string, session: string) => join(home, "agent-threads", "sessions", `${encodeURIComponent(session)}.json`);
@@ -62,7 +60,7 @@ const statePath = (home: string, session: string) => join(home, "agent-threads",
 export function readSessionState(home: string, session: string): SessionState | null {
   try {
     const s = JSON.parse(readFileSync(statePath(home, session), "utf8"));
-    return Array.isArray(s?.dynamicTools) ? { dynamicTools: s.dynamicTools, totals: s.totals ?? null } : null;
+    return Array.isArray(s?.dynamicTools) ? { dynamicTools: s.dynamicTools } : null;
   } catch {
     return null;
   }

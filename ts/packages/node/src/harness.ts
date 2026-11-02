@@ -12,10 +12,12 @@ import type {
   Resolution,
   SubagentState,
   Thread,
+  TurnSession,
   Usage,
   UserMessage,
 } from "@dire-kiwi/agent-threads-protocol";
 import type { PermissionDecision, PermissionQuery, StandingKey } from "./permissions.js";
+import type { RewindPoint } from "./sessions.js";
 import type { Spawner } from "./spawner.js";
 import type { RunRecord } from "./store.js";
 import type { Tool } from "./tools.js";
@@ -75,6 +77,11 @@ export interface TurnEnd {
   error?: string;
   usage?: Usage;
   duration_ms?: number;
+  /**
+   * The harness's own mark for the turn, in its session: Claude Code's last message in it, Codex's
+   * id for the turn (the turn_result's `session.at`). Without it, the last mark() given in the turn.
+   */
+  session_at?: string;
 }
 
 /** A line a thread's harness process wrote, for the app's onHarnessMessage. */
@@ -155,6 +162,12 @@ export interface ThreadContext {
   fromHarness(runId: string, line: string, message: unknown, handle: () => void): void;
   /** The harness took in the queued message with this id. Whether it was queued. */
   tookIn(id: string): boolean;
+  /**
+   * The running turn's mark (TurnEnd's session_at) so far, as soon as the harness gives it: kept
+   * in the thread (turn_at), so a turn lost when the backend stops still has it. Does nothing with
+   * no turn running.
+   */
+  mark(at: string): void;
   /**
    * An app tool returned structured output for the tool call `toolCallId`: it goes in the call's
    * `result.structured` when the harness gives the call its result (harnesses pass on only the text).
@@ -271,6 +284,14 @@ export interface HarnessSession {
   carryOver(messages: Message[]): void;
   /** Stop the running turn. */
   interrupt(): void;
+  /** A turn started (with no messages) to compact the harness's context. */
+  compact?(): void;
+  /**
+   * Where a rewind to before turn `index` of `sessions` (each turn's session, in order) takes the
+   * session (see sessions.ts). Throws a RewindError if it can't be rewound there. The core then
+   * sets the thread's session_id and resume_at, and retires the run (see retire).
+   */
+  rewindPoint?(sessions: (TurnSession | undefined)[], index: number): RewindPoint;
   /** Whether a harness process is running that has the queued messages (it was sent them). */
   live(): boolean;
   /**
@@ -285,6 +306,12 @@ export interface HarnessSession {
   optionsChanged(): void;
   /** The thread's config (tools, MCP servers, skills, system prompt) or launch options changed: the next turn needs a new process. */
   configChanged(): void;
+  /**
+   * The thread's session changed (new_session, rewind) with no turn running: stop the running
+   * process now (its background work too), and let nothing it says after reach the thread. The
+   * next turn starts a new one. Without it, the core calls configChanged().
+   */
+  retire?(): void;
   /** Stop the harness process, if it's running. */
   close(): Promise<void>;
   /**

@@ -33,6 +33,6 @@
 {"type":"delta","thread_id":"th_1","seq":30,"item_id":"a1","kind":"text","offset":0,"text":"Fixed "}
 {"type":"delta","thread_id":"th_1","seq":30,"item_id":"a1","kind":"text","offset":6,"text":"sum() "}
 {"type":"item.updated","thread_id":"th_1","seq":31,"item_id":"a1","patch":{"text":"Fixed `sum()` to start from 0, and added a vitest test for the empty list."}}
-{"type":"item.added","thread_id":"th_1","seq":32,"item":{"id":"tr1","type":"turn_result","ok":true,"usage":{"input_tokens":5200,"output_tokens":800,"cache_read_tokens":41000,"cost_usd":0.12},"duration_ms":310000,"turn_id":"t1"}}
+{"type":"item.added","thread_id":"th_1","seq":32,"item":{"id":"tr1","type":"turn_result","ok":true,"usage":{"input_tokens":5200,"output_tokens":800,"cache_read_tokens":41000,"cost_usd":0.12},"duration_ms":310000,"session":{"id":"sess_1","at":"msg_9f2c","started":true},"turn_id":"t1"}}
 {"type":"turn.completed","thread_id":"th_1","seq":33,"turn_id":"t1"}
 {"type":"thread.updated","thread_id":"th_1","seq":34,"thread":{"id":"th_1","harness":"claude","status":"idle","model":"opus","permission_mode":"default","cwd":"/work/app","session_id":"sess_1","usage":{"input_tokens":5200,"output_tokens":800,"cache_read_tokens":41000,"cost_usd":0.12},"created_at":"2026-11-01T00:00:00Z","updated_at":"2026-11-01T00:10:11Z"}}

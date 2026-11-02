@@ -137,6 +137,8 @@ type claudeRunState struct {
 	AutoTurn    string          `json:"autoTurn,omitempty"`
 	HeldUsage   *protocol.Usage `json:"heldUsage,omitempty"`
 	PluginDir   string          `json:"pluginDir,omitempty"`
+	At          string          `json:"at,omitempty"`       // the running turn's mark: the main conversation's last message in it
+	ResumeAt    string          `json:"resumeAt,omitempty"` // the thread's resume_at it was started with
 	Launched    *launched       `json:"launched,omitempty"`
 	Stale       bool            `json:"stale,omitempty"`
 	SteerAt     *int64          `json:"steerAt,omitempty"`
@@ -192,6 +194,10 @@ type claudeRun struct {
 	heldUsage *protocol.Usage
 	// pluginDir is the generated plugin with the thread's skills, for this run only.
 	pluginDir string
+	// at is the running turn's mark: the uuid of the main conversation's last message in it.
+	at string
+	// resumeAt is the message it was started to resume its session at (--resume-session-at).
+	resumeAt string
 	// launched is the thread's options it has: those it was started with, and the model and
 	// permission mode since.
 	launched *launched
@@ -224,6 +230,17 @@ func (r *claudeRun) write(msg any) {
 		return
 	}
 	r.proc.Write(string(mustJSON(msg)))
+}
+
+// sentLike says whether a message sent and not yet echoed back has this content, as Claude echoes it.
+func (r *claudeRun) sentLike(content json.RawMessage) bool {
+	echo := echoKey(content)
+	for _, sent := range r.sent {
+		if sent.Echo == echo {
+			return true
+		}
+	}
+	return false
 }
 
 // send writes a user message (of the items ids), once Claude is ready for one.
@@ -300,7 +317,7 @@ func without(list []string, x string) []string {
 }
 
 func (r *claudeRun) state() claudeRunState {
-	st := claudeRunState{V: 1, Ready: r.ready, Waiting: append([]string{}, r.waiting...), Next: r.nextRequest, Streamed: []string{}, Sent: append([]sentMessage{}, r.sent...), PluginDir: r.pluginDir, Launched: r.launched}
+	st := claudeRunState{V: 1, Ready: r.ready, Waiting: append([]string{}, r.waiting...), Next: r.nextRequest, Streamed: []string{}, Sent: append([]sentMessage{}, r.sent...), PluginDir: r.pluginDir, At: r.at, ResumeAt: r.resumeAt, Launched: r.launched}
 	st.Pending = [][2]string{}
 	for _, id := range r.pendingOrder {
 		st.Pending = append(st.Pending, [2]string{id, r.pending[id].subtype})
@@ -387,6 +404,7 @@ func (r *claudeRun) restore(st claudeRunState, answered func(subtype string) fun
 	r.agents = append([]string(nil), st.Agents...)
 	r.autoTurn, r.heldUsage = st.AutoTurn, st.HeldUsage
 	r.pluginDir = st.PluginDir
+	r.at, r.resumeAt = st.At, st.ResumeAt
 	r.launched = st.Launched
 }
 
@@ -521,6 +539,11 @@ type claudeSession struct {
 	stale      bool
 	steerTimer *loopTimer
 	stopTimer  *loopTimer
+	// marking is the turn whose marks go to the thread as they come (ThreadContext.Mark): one of a
+	// message once Claude has echoed a message of it back (what it says before then may be from
+	// before the turn: set_model's reply, say), and a compaction or a turn Claude started by itself
+	// from its start.
+	marking string
 	// tmp is a directory for the thread's generated files (skills, attached files), made when needed.
 	tmp    string
 	closed bool
@@ -580,6 +603,16 @@ func (s *claudeSession) steerAfter(run *claudeRun, d time.Duration) {
 func (s *claudeSession) clearSteer() {
 	s.steerTimer.stop()
 	s.steerTimer = nil
+}
+
+func (s *claudeSession) Compact() {
+	// Claude Code compacts when it's sent /compact, which is its turn.
+	s.ensure(true).send([]string{}, s.userMessage([]Message{{Text: "/compact"}}))
+	s.marking = s.ctx.TurnID()
+}
+
+func (s *claudeSession) RewindPoint(sessions []*protocol.TurnSession, index int) (RewindPoint, error) {
+	return ResumeAtPoint(sessions, index)
 }
 
 func (s *claudeSession) Interrupt() {
@@ -665,6 +698,20 @@ func (s *claudeSession) liveMode(run *claudeRun, mode protocol.PermissionMode) s
 		return "acceptEdits"
 	}
 	return claudeMode(mode)
+}
+
+func (s *claudeSession) Retire() {
+	s.stale = true
+	s.clearSteer()
+	s.clearStop()
+	// Stopped now, and retired: what it says on its way out is left out. It's the thread's run no
+	// more from now, so its end, whenever that comes, changes nothing.
+	if run := s.live(); run != nil {
+		s.stop(run, true, true, nil)
+		if r := s.ctx.Thread().Run; r != nil && r.ID == run.id {
+			s.ctx.SetThread(func(t *protocol.Thread) { t.Run = nil })
+		}
+	}
 }
 
 func (s *claudeSession) Live() bool { return s.live() != nil }
@@ -1150,6 +1197,14 @@ func (s *claudeSession) args(run *claudeRun) ([]string, error) {
 	if t.SessionID != "" {
 		args = append(args, "--resume", t.SessionID)
 	}
+	// After a rewind: the session as it was at the end of the turn it went back to.
+	run.resumeAt = ""
+	if t.SessionID != "" {
+		run.resumeAt = t.ResumeAt
+	}
+	if run.resumeAt != "" {
+		args = append(args, "--resume-session-at", run.resumeAt)
+	}
 	servers := map[string]any{}
 	if len(cfg.Tools) > 0 {
 		servers[appServer] = map[string]any{"type": "sdk", "name": appServer}
@@ -1240,7 +1295,7 @@ func (s *claudeSession) exited(run *claudeRun, status ExitStatus) {
 	if !run.retired && ctx.TurnID() != "" {
 		s.clearStop()
 		s.clearSteer()
-		ctx.EndTurn(TurnEnd{Error: claudeExitError(status, run.stderr)})
+		ctx.EndTurn(TurnEnd{Error: claudeExitError(status, run.stderr), SessionAt: run.at})
 	}
 	run.finish()
 }
@@ -1277,6 +1332,18 @@ func (s *claudeSession) line(run *claudeRun, line string) {
 func (s *claudeSession) message(run *claudeRun, m jmap) {
 	ctx := s.ctx
 	parent := m.str("parent_tool_use_id")
+	// The main conversation's messages (replayed ones too): the turn's last is where a rewind to after
+	// it resumes the session.
+	if typ := m.str("type"); (typ == "user" || typ == "assistant") && parent == "" && m.str("uuid") != "" {
+		run.at = m.str("uuid")
+		if typ == "user" && m.bool("isReplay") && run.sentLike(m.obj("message").raw("content")) {
+			s.marking = ctx.TurnID()
+		}
+		// A turn that has a mark already (re-attached after a restart, say) was being marked.
+		if id := ctx.TurnID(); id != "" && (s.marking == id || ctx.Thread().TurnAt != "") {
+			ctx.Mark(run.at)
+		}
+	}
 	// A message refused for the usage limit says which limit, before anything else it leads to.
 	if t := m.str("type"); (t == "assistant" || t == "user" || t == "result") && m.str("api_error") == "usage_limit_reached" {
 		if info := m.obj("api_error_params").obj("rate_limit_info"); info != nil {
@@ -1293,10 +1360,24 @@ func (s *claudeSession) message(run *claudeRun, m jmap) {
 		if m.str("subtype") == "init" && ctx.TurnID() == "" {
 			ctx.BeginTurn()
 			run.autoTurn = ctx.TurnID()
+			s.marking = ctx.TurnID()
 		}
-		sid := m.str("session_id")
-		if m.str("subtype") == "init" && sid != "" && sid != ctx.Thread().SessionID {
-			ctx.SetThread(func(t *protocol.Thread) { t.SessionID = sid })
+		if m.str("subtype") == "init" {
+			// The session it runs in; and a rewind's resume_at is done with once it has resumed there.
+			thread := ctx.Thread()
+			sid := m.str("session_id")
+			setSession := sid != "" && sid != thread.SessionID
+			doneAt := run.resumeAt != "" && thread.ResumeAt == run.resumeAt
+			if setSession || doneAt {
+				ctx.SetThread(func(t *protocol.Thread) {
+					if setSession {
+						t.SessionID = sid
+					}
+					if doneAt {
+						t.ResumeAt = ""
+					}
+				})
+			}
 		}
 		if m.str("subtype") == "api_retry" {
 			ctx.AddItem(&protocol.Notice{ID: NewID("n"), Level: protocol.NoticeLevelWarning, Code: "retry", Text: retryText(m), ParentID: parent})
@@ -1430,6 +1511,7 @@ func (s *claudeSession) message(run *claudeRun, m jmap) {
 			run.msgOfParent, run.blockCount, run.streamed = map[string]string{}, map[string]int{}, map[string]bool{}
 		}
 		if ctx.TurnID() == "" {
+			run.at = ""
 			return
 		}
 		// The end of a turn Claude made by itself (to tell the agent a background subagent ended)
@@ -1439,9 +1521,12 @@ func (s *claudeSession) message(run *claudeRun, m jmap) {
 			run.heldUsage = addUsage(run.heldUsage, claudeUsage(m))
 			return
 		}
+		// The turn's mark: its last message, the one Claude made by itself in it included.
+		at := run.at
+		run.at = ""
 		s.clearStop()
 		failed := m.bool("is_error")
-		end := TurnEnd{OK: !failed, Usage: addUsage(run.heldUsage, claudeUsage(m))}
+		end := TurnEnd{OK: !failed, Usage: addUsage(run.heldUsage, claudeUsage(m)), SessionAt: at}
 		run.heldUsage = nil
 		if failed {
 			end.Error = m.str("result")

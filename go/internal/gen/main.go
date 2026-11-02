@@ -439,12 +439,17 @@ func refName(ref string) string {
 
 var initialisms = []string{"id", "ok", "url", "usd", "json", "api", "http", "mcp"}
 
+// pluralInitialisms are initialisms' plurals, written as Go writes them (item_ids is ItemIDs).
+var pluralInitialisms = map[string]string{"ids": "IDs", "urls": "URLs"}
+
 // camel turns snake_case, kebab-case or dotted names into Go's CamelCase.
 func camel(s string) string {
 	var b strings.Builder
 	for _, part := range strings.FieldsFunc(s, func(r rune) bool { return r == '_' || r == '-' || r == '.' }) {
 		if slices.Contains(initialisms, part) {
 			b.WriteString(strings.ToUpper(part))
+		} else if p, ok := pluralInitialisms[part]; ok {
+			b.WriteString(p)
 		} else {
 			b.WriteString(strings.ToUpper(part[:1]) + part[1:])
 		}

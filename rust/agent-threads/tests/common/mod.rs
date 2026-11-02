@@ -220,3 +220,17 @@ pub fn mini_runs(log: &Path) -> Vec<MiniRun> {
     }
     out
 }
+
+/// The thread `id` as `store` holds it now (its record and events), in a store of its own: as a
+/// backend that stopped without closing left it, for another to load (the first's processes, still
+/// running, can't change it).
+pub async fn crashed(store: &dyn agent_threads::Store, id: &str) -> agent_threads::MemoryStore {
+    use agent_threads::Store;
+    let copy = agent_threads::MemoryStore::new();
+    copy.create_thread(&store.get_thread(id).await.unwrap().unwrap())
+        .await
+        .unwrap();
+    let events = store.read_events(id, 0, None).await.unwrap();
+    copy.append_events(id, &events, &[]).await.unwrap();
+    copy
+}

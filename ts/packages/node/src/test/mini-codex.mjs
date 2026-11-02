@@ -1,8 +1,8 @@
 #!/usr/bin/env node
 // A tiny scriptable `codex app-server` for the driver's tests of what the recorded fixtures don't
 // cover. It speaks the app server's JSON-RPC over stdio: initialize, thread/start and
-// thread/resume (its sessions are files in $CODEX_HOME/mini-sessions), turn/start, turn/steer,
-// turn/interrupt and thread/compact/start. A turn does what each line of its message's text says:
+// thread/resume (its sessions are files in $CODEX_HOME/mini-sessions), thread/revert (which it
+// only answers), turn/start, turn/steer, turn/interrupt and thread/compact/start. A turn does what each line of its message's text says:
 //
 //   reply <text>        an agent message, streamed a word at a time
 //   reason <text>       a reasoning item with two summary parts, streamed
@@ -455,7 +455,7 @@ async function runTurn(input, id0 = uid("turn")) {
   thread.totals.cachedInputTokens += 40;
   thread.totals.outputTokens += 10;
   save();
-  notify("thread/tokenUsage/updated", { threadId: thread.id, turnId: id, tokenUsage: { total: { ...thread.totals }, last: {} } });
+  notify("thread/tokenUsage/updated", { threadId: thread.id, turnId: id, tokenUsage: { total: { ...thread.totals }, last: { totalTokens: 110, inputTokens: 100, cachedInputTokens: 40, cacheWriteInputTokens: 0, outputTokens: 10 } } });
   turn = null;
   notify("turn/completed", { threadId: thread.id, turn: { id, status, error, durationMs: 7, items: [] } });
 }
@@ -532,6 +532,9 @@ createInterface({ input: process.stdin })
       case "thread/compact/start":
         reply({});
         return void compact();
+      case "thread/revert":
+        // Taken back: its turns aren't kept, so there's nothing to take back but to say so.
+        return reply({ thread: { id: p.threadId } });
       default:
         return fail(`unknown method ${m.method}`);
     }

@@ -102,6 +102,8 @@ type codexPlanned struct {
 	Usage      *protocol.Usage `json:"usage,omitempty"`
 	DurationMs *int64          `json:"duration_ms,omitempty"`
 	Request    string          `json:"request,omitempty"`
+	// SessionAt is the turn's mark (its session's at): its first Codex turn.
+	SessionAt string `json:"session_at,omitempty"`
 }
 
 type mcpEndpoint struct {
@@ -117,12 +119,12 @@ type codexRunState struct {
 	TurnID         string          `json:"turnId,omitempty"`
 	Starting       bool            `json:"starting"`
 	Compacting     bool            `json:"compacting"`
-	Total          *codexTotals    `json:"total"`
+	Reported       bool            `json:"reported,omitempty"`
+	Used           *protocol.Usage `json:"used,omitempty"`
 	Error          *string         `json:"error"`
 	Home           string          `json:"home"`
 	Dynamic        []toolSpec      `json:"dynamic"`
 	MCPApp         bool            `json:"mcpApp"`
-	Baseline       *codexTotals    `json:"baseline"`
 	HiddenSkills   []string        `json:"hiddenSkills"`
 	NoticedServers bool            `json:"noticedServers"`
 	SkillsDir      string          `json:"skillsDir,omitempty"`
@@ -175,8 +177,12 @@ type codexRun struct {
 	starting    bool
 	turnWaiters []func(string)
 	compacting  bool
-	// total is the thread's token totals, as Codex last reported them in this run.
-	total *codexTotals
+	// reported says Codex has reported the thread's tokens in this run (so its turns' usage is known).
+	reported bool
+	// used is what the running turn has used: each model call's tokens (tokenUsage.last), summed
+	// from its turn/started on. Codex's running totals aren't used: for a session the thread adopted
+	// they include what came before, and a revert doesn't take them back.
+	used *protocol.Usage
 	// errText is the running turn's last error that won't be retried.
 	errText *string
 	home    string
@@ -185,8 +191,6 @@ type codexRun struct {
 	dynamic []toolSpec
 	// mcpApp says some of the app's tools are on the loopback MCP server.
 	mcpApp bool
-	// baseline is Codex's token totals for the session after its last turn, when they're known.
-	baseline *codexTotals
 	// hiddenSkills is the skills Codex found that aren't the app's (the user's, the project's):
 	// they're turned off.
 	hiddenSkills   []string
@@ -320,8 +324,8 @@ func (r *codexRun) state() *codexRunState {
 		return nil
 	}
 	st := &codexRunState{
-		V: 1, ThreadID: r.threadID, TurnID: r.turnID, Starting: r.starting, Compacting: r.compacting, Total: r.total,
-		Error: r.errText, Home: r.home, Dynamic: r.dynamic, MCPApp: r.mcpApp, Baseline: r.baseline,
+		V: 1, ThreadID: r.threadID, TurnID: r.turnID, Starting: r.starting, Compacting: r.compacting, Reported: r.reported, Used: r.used,
+		Error: r.errText, Home: r.home, Dynamic: r.dynamic, MCPApp: r.mcpApp,
 		HiddenSkills: orEmptyList(r.hiddenSkills), NoticedServers: r.noticedServers, SkillsDir: r.skillsDir, MCP: r.mcpEndpoint,
 		Streamed: sortedKeys(r.streamed), MCPCalls: append([]mcpCall{}, r.mcpCalls...), RPC: r.rpc.state(), Launched: r.launched,
 		Model: r.model, Workspace: r.workspace, Sandbox: r.sandbox, Collab: r.collab, Proposed: r.proposed,
@@ -355,7 +359,7 @@ func (r *codexRun) state() *codexRunState {
 // restore takes up a checkpoint's state (all but the JSON-RPC client's, which the session restores).
 func (r *codexRun) restore(st codexRunState) {
 	r.threadID, r.turnID, r.starting, r.compacting = st.ThreadID, st.TurnID, st.Starting, st.Compacting
-	r.total, r.errText, r.home, r.dynamic, r.mcpApp, r.baseline = st.Total, st.Error, st.Home, st.Dynamic, st.MCPApp, st.Baseline
+	r.reported, r.used, r.errText, r.home, r.dynamic, r.mcpApp = st.Reported, st.Used, st.Error, st.Home, st.Dynamic, st.MCPApp
 	r.hiddenSkills, r.noticedServers, r.skillsDir, r.mcpEndpoint = st.HiddenSkills, st.NoticedServers, st.SkillsDir, st.MCP
 	for _, k := range st.Streamed {
 		r.streamed[k] = true
@@ -441,19 +445,27 @@ type codexSession struct {
 // ---------- the core's side ----------
 
 func (s *codexSession) Start(messages []Message) {
-	run := s.ensure(true)
 	if len(messages) == 1 && strings.TrimSpace(messages[0].Text) == "/compact" && len(messages[0].Attachments) == 0 {
-		run.starting, run.compacting = true, true
-		run.whenReady(func(threadID string, err error) {
-			if err != nil {
-				s.turnFailed(run, err)
-				return
-			}
-			run.rpc.request("thread/compact/start", map[string]any{"threadId": threadID}, nil, nil, func(e error) { s.turnFailed(run, e) })
-		})
+		s.Compact()
 		return
 	}
-	s.turnStart(run, messages)
+	s.turnStart(s.ensure(true), messages)
+}
+
+func (s *codexSession) Compact() {
+	run := s.ensure(true)
+	run.starting, run.compacting = true, true
+	run.whenReady(func(threadID string, err error) {
+		if err != nil {
+			s.turnFailed(run, err)
+			return
+		}
+		run.rpc.request("thread/compact/start", map[string]any{"threadId": threadID}, nil, nil, func(e error) { s.turnFailed(run, e) })
+	})
+}
+
+func (s *codexSession) RewindPoint(sessions []*protocol.TurnSession, index int) (RewindPoint, error) {
+	return RevertPoint(sessions, index)
 }
 
 func (s *codexSession) Steer(m Message) {
@@ -560,6 +572,19 @@ func (s *codexSession) OptionsChanged() {
 }
 
 func (s *codexSession) ConfigChanged() { s.stale = true }
+
+func (s *codexSession) Retire() {
+	s.stale = true
+	s.clearStop()
+	// Stopped now, and retired: what it says on its way out is left out. It's the thread's run no
+	// more from now, so its end, whenever that comes, changes nothing.
+	if run := s.live(); run != nil {
+		s.stop(run, true, true, nil)
+		if r := s.ctx.Thread().Run; r != nil && r.ID == run.id {
+			s.ctx.SetThread(func(t *protocol.Thread) { t.Run = nil })
+		}
+	}
+}
 
 func (s *codexSession) Live() bool { return s.live() != nil }
 
@@ -928,18 +953,23 @@ func (s *codexSession) turnFailed(run *codexRun, err error) {
 	if run.exited || run.retired || run != s.run {
 		return
 	}
+	at := run.turnID
 	run.turnEnded()
 	if s.ctx.TurnID() != "" {
-		s.ctx.EndTurn(withPlanned(TurnEnd{Error: err.Error()}, run.planned))
+		s.ctx.EndTurn(withPlanned(TurnEnd{Error: err.Error()}, run.planned, at))
 	}
 	run.planned = nil
 }
 
 // withPlanned is a turn's end with what its Codex turns that completed (its plans') used, for a turn
-// that ends otherwise.
-func withPlanned(end TurnEnd, planned *codexPlanned) TurnEnd {
+// that ends otherwise, and its mark: its first Codex turn (at, the one running, if it's that).
+func withPlanned(end TurnEnd, planned *codexPlanned, at string) TurnEnd {
+	end.SessionAt = at
 	if planned != nil {
 		end.Usage, end.DurationMs = planned.Usage, planned.DurationMs
+		if planned.SessionAt != "" {
+			end.SessionAt = planned.SessionAt
+		}
 	}
 	return end
 }
@@ -1062,8 +1092,9 @@ func (s *codexSession) spawn(run *codexRun) {
 		if sb := r.raw("sandbox"); jmap(r.obj("sandbox")).str("type") == "workspaceWrite" {
 			run.workspace = sb
 		}
+		// A rewind's resume_at was for the session it had, which this isn't if it couldn't be resumed.
 		if ctx.Thread().SessionID != run.threadID {
-			ctx.SetThread(func(t *protocol.Thread) { t.SessionID = run.threadID })
+			ctx.SetThread(func(t *protocol.Thread) { t.SessionID, t.ResumeAt = run.threadID, "" })
 		}
 		run.setReady(run.threadID, nil)
 	}
@@ -1151,9 +1182,9 @@ func (s *codexSession) startThread(run *codexRun, ok func(jmap), fail func(error
 	}
 	// Codex keeps the dynamic tools the session started with, and resuming can't change them.
 	if state := readSessionState(run.home, session); state != nil {
-		run.dynamic, run.baseline = state.DynamicTools, state.Totals
+		run.dynamic = state.DynamicTools
 	} else {
-		run.dynamic, run.baseline = nil, nil
+		run.dynamic = nil
 	}
 	params, err := s.threadParams(run, false)
 	if err != nil {
@@ -1162,7 +1193,21 @@ func (s *codexSession) startThread(run *codexRun, ok func(jmap), fail func(error
 	}
 	params["threadId"] = session
 	params["excludeTurns"] = true
-	run.rpc.request("thread/resume", params, nil, ok, func(e error) {
+	resumed := func(r jmap) {
+		// After a rewind: the session as it was before the turn it went back to before.
+		at := s.ctx.Thread().ResumeAt
+		if at == "" {
+			ok(r)
+			return
+		}
+		run.rpc.request("thread/revert", map[string]any{"threadId": session, "beforeTurnId": at}, nil, func(jmap) {
+			if s.ctx.Thread().ResumeAt == at {
+				s.ctx.SetThread(func(t *protocol.Thread) { t.ResumeAt = "" })
+			}
+			ok(r)
+		}, fail)
+	}
+	run.rpc.request("thread/resume", params, nil, resumed, func(e error) {
 		var re *rpcError
 		if !errors.As(e, &re) || !resumeMissing.MatchString(re.message) {
 			fail(e)
@@ -1182,9 +1227,6 @@ func (s *codexSession) newThread(run *codexRun, ok func(jmap), fail func(error))
 		}
 	}
 	started := func(r jmap) {
-		// A new session's totals start at nothing.
-		zero := int64(0)
-		run.baseline = &codexTotals{CacheWriteInputTokens: &zero}
 		s.saveState(run, r.obj("thread").str("id"))
 		ok(r)
 	}
@@ -1208,12 +1250,12 @@ func (s *codexSession) newThread(run *codexRun, ok func(jmap), fail func(error))
 	})
 }
 
-// saveState records the session's dynamic tools and totals, where they're known.
+// saveState records the session's dynamic tools, where they're known.
 func (s *codexSession) saveState(run *codexRun, session string) {
 	if run.dynamic == nil {
 		return
 	}
-	if err := writeSessionState(run.home, session, codexSessionState{DynamicTools: run.dynamic, Totals: run.baseline}); err != nil {
+	if err := writeSessionState(run.home, session, codexSessionState{DynamicTools: run.dynamic}); err != nil {
 		s.ctx.Error(err)
 	}
 }
@@ -1396,6 +1438,7 @@ func (s *codexSession) exited(run *codexRun, status ExitStatus) {
 	run.exited = true
 	run.abort()
 	run.rpc.close(errors.New(codexExitError(status, run.stderr, false)))
+	at := run.turnID
 	run.turnEnded()
 	run.mcp.close()
 	if run.skillsDir != "" {
@@ -1418,7 +1461,7 @@ func (s *codexSession) exited(run *codexRun, status ExitStatus) {
 	// A run that ends while its turn is running ends the turn (as interrupted, if it was).
 	if !run.retired && ctx.TurnID() != "" {
 		s.clearStop()
-		ctx.EndTurn(withPlanned(TurnEnd{Error: codexExitError(status, run.stderr, true)}, run.planned))
+		ctx.EndTurn(withPlanned(TurnEnd{Error: codexExitError(status, run.stderr, true)}, run.planned, at))
 	}
 	run.planned = nil
 	run.finish()
@@ -1502,6 +1545,11 @@ func (s *codexSession) notification(run *codexRun, m jmap) {
 			run.starting = true
 			run.errText = nil
 			run.setTurn(id)
+			run.used = zeroUsage()
+			// The turn's mark is its first Codex turn (one that goes on after a plan has it already).
+			if run.planned == nil {
+				s.ctx.Mark(id)
+			}
 		}
 		if !own {
 			// A child taking up work again (a follow-up sent to it): its report is to come.
@@ -1522,10 +1570,15 @@ func (s *codexSession) notification(run *codexRun, m jmap) {
 			run.workspace = sb
 		}
 	case "thread/tokenUsage/updated":
-		if total := p.obj("tokenUsage").raw("total"); own && total != nil {
-			var t codexTotals
-			if json.Unmarshal(total, &t) == nil {
-				run.total = &t
+		if !own || !p.has("tokenUsage") {
+			break
+		}
+		run.reported = true
+		// A report outside a turn (a resumed session's totals, say) isn't any turn's.
+		if last := p.obj("tokenUsage").raw("last"); run.used != nil && last != nil {
+			var t codexTokens
+			if json.Unmarshal(last, &t) == nil {
+				run.used = addUsage(run.used, callUsage(t))
 			}
 		}
 	case "account/rateLimits/updated":
@@ -1771,6 +1824,10 @@ func (s *codexSession) tookIn(run *codexRun, key string) {
 func (s *codexSession) turnCompleted(run *codexRun, turn jmap) {
 	ctx := s.ctx
 	errText := run.errText
+	at := turn.str("id")
+	if at == "" {
+		at = run.turnID
+	}
 	plan := run.proposed
 	run.proposed = nil
 	run.turnEnded()
@@ -1783,21 +1840,14 @@ func (s *codexSession) turnCompleted(run *codexRun, turn jmap) {
 			run.dropOpen(key)
 		}
 	}
-	// Codex reports the session's totals: the turn used how far they grew. (Where the session's
-	// totals before it aren't known, the thread's usage stands in for them.)
 	var usage *protocol.Usage
-	if run.total != nil {
-		before := ctx.Thread().Usage
-		if run.baseline != nil {
-			before = totalsAsUsage(*run.baseline)
-		}
-		usage = codexUsage(*run.total, before)
-		t := *run.total
-		run.baseline = &t
-		if run.threadID != "" {
-			s.saveState(run, run.threadID)
+	if run.reported {
+		usage = run.used
+		if usage == nil {
+			usage = zeroUsage()
 		}
 	}
+	run.used = nil
 	if ctx.TurnID() == "" {
 		return
 	}
@@ -1814,6 +1864,10 @@ func (s *codexSession) turnCompleted(run *codexRun, turn jmap) {
 		sum.DurationMs = &n
 	}
 	sum.Request = ""
+	// Its mark is its first Codex turn: reverting to before that takes back all of them.
+	if sum.SessionAt == "" {
+		sum.SessionAt = at
+	}
 	if plan != nil && ok && ctx.Thread().PermissionMode == protocol.PermissionModePlan && !ctx.Interrupted() {
 		// A plan: the turn goes on while the user decides whether to start on it.
 		run.planned = &sum
@@ -1821,7 +1875,7 @@ func (s *codexSession) turnCompleted(run *codexRun, turn jmap) {
 		return
 	}
 	run.planned = nil
-	end := TurnEnd{OK: ok, Usage: sum.Usage, DurationMs: sum.DurationMs}
+	end := TurnEnd{OK: ok, Usage: sum.Usage, DurationMs: sum.DurationMs, SessionAt: sum.SessionAt}
 	if turn.str("status") == "failed" {
 		end.Error = turn.obj("error").str("message")
 		if end.Error == "" && errText != nil {
@@ -1873,7 +1927,7 @@ func (s *codexSession) endPlanned(run *codexRun) {
 	if s.ctx.TurnID() == "" {
 		return
 	}
-	s.ctx.EndTurn(TurnEnd{OK: true, Usage: planned.Usage, DurationMs: planned.DurationMs})
+	s.ctx.EndTurn(TurnEnd{OK: true, Usage: planned.Usage, DurationMs: planned.DurationMs, SessionAt: planned.SessionAt})
 }
 
 // childDone says a subagent's turn ended: so did the subagent, with its last message.

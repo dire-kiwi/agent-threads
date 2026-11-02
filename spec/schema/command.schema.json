@@ -10,7 +10,10 @@
         { "$ref": "#/$defs/SendCommand" },
         { "$ref": "#/$defs/InterruptCommand" },
         { "$ref": "#/$defs/RespondCommand" },
-        { "$ref": "#/$defs/SetOptionsCommand" }
+        { "$ref": "#/$defs/SetOptionsCommand" },
+        { "$ref": "#/$defs/RewindCommand" },
+        { "$ref": "#/$defs/NewSessionCommand" },
+        { "$ref": "#/$defs/CompactCommand" }
       ]
     },
     "SendCommand": {
@@ -56,6 +59,34 @@
         "effort": { "type": "string" },
         "permission_mode": { "$ref": "thread.schema.json#/$defs/PermissionMode" },
         "standing_answers": { "type": "array", "items": { "$ref": "thread.schema.json#/$defs/StandingAnswer" }, "description": "Replaces the thread's standing answers ([] clears them)." }
+      }
+    },
+    "RewindCommand": {
+      "type": "object",
+      "description": "Take the conversation back to before a turn: the harness forgets that turn and every one after it, and their items are removed from the thread. Refused while a turn is running.",
+      "required": ["type", "thread_id", "turn_id"],
+      "properties": {
+        "type": { "const": "rewind" },
+        "thread_id": { "type": "string" },
+        "turn_id": { "type": "string", "description": "The turn to go back to before (a turn_id of the thread's items)." }
+      }
+    },
+    "NewSessionCommand": {
+      "type": "object",
+      "description": "Start a new conversation with the harness at the next turn, in the same thread: its session_id is cleared, so the agent doesn't remember the turns before. The items stay. Refused while a turn is running.",
+      "required": ["type", "thread_id"],
+      "properties": {
+        "type": { "const": "new_session" },
+        "thread_id": { "type": "string" }
+      }
+    },
+    "CompactCommand": {
+      "type": "object",
+      "description": "Compact the harness's context now: a turn of its own, with no user_message, that adds a compaction item. Refused while a turn is running, or when the thread has no session yet.",
+      "required": ["type", "thread_id"],
+      "properties": {
+        "type": { "const": "compact" },
+        "thread_id": { "type": "string" }
       }
     }
   }

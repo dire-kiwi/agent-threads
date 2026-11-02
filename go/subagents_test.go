@@ -159,16 +159,6 @@ func TestARunsSubagentsStopWithIt(t *testing.T) {
 	}
 }
 
-func turnResults(snap protocol.Snapshot) []*protocol.TurnResult {
-	var out []*protocol.TurnResult
-	for _, it := range snap.Items {
-		if r, ok := it.Value.(*protocol.TurnResult); ok {
-			out = append(out, r)
-		}
-	}
-	return out
-}
-
 func TestAUsersTurnOutlastsATurnClaudeMakesBeforeTakingItsMessageIn(t *testing.T) {
 	ctx := context.Background()
 	sdk, rec := miniClaude(t, agentthreads.Allow, map[string]string{"MINI_CLAUDE_NOTIFY_FIRST": "1"})
@@ -190,7 +180,7 @@ func TestAUsersTurnOutlastsATurnClaudeMakesBeforeTakingItsMessageIn(t *testing.T
 		}
 		return last == "hi" && snap.Thread.Status == protocol.ThreadStatusIdle
 	})
-	results := turnResults(snap)
+	results := turnResults(snap.Items)
 	if len(results) != 2 {
 		t.Fatalf("turns:\n%s", show(rec.all()))
 	}
@@ -223,7 +213,7 @@ func TestABackgroundSubagentsAppToolKeepsItsStructuredOutputPastItsTurn(t *testi
 	var snap protocol.Snapshot
 	until(t, func() bool {
 		snap, _ = sdk.Snapshot(ctx, th.ID)
-		return len(turnResults(snap)) == 2 && snap.Thread.Status == protocol.ThreadStatusIdle
+		return len(turnResults(snap.Items)) == 2 && snap.Thread.Status == protocol.ThreadStatusIdle
 	})
 	for _, c := range toolCalls(snap) {
 		if c.Name == "lookup" {
@@ -254,7 +244,7 @@ func TestALostRunStopsItsBackgroundSubagents(t *testing.T) {
 			until(t, func() bool {
 				snap := snapshotOf(t, a, id)
 				calls := toolCalls(snap)
-				return len(turnResults(snap)) == 1 && snap.Thread.Status == want && len(calls) == 2
+				return len(turnResults(snap.Items)) == 1 && snap.Thread.Status == want && len(calls) == 2
 			})
 			a.call("saved", id)
 			a.crash()
@@ -268,7 +258,7 @@ func TestALostRunStopsItsBackgroundSubagents(t *testing.T) {
 				t.Fatalf("the calls: %s", mustMarshal(calls))
 			}
 			// Its one turn had ended: it isn't ended again.
-			if snap.Thread.Status != protocol.ThreadStatusIdle || snap.Thread.Run != nil || len(protocol.OpenRequests(snap)) != 0 || len(turnResults(snap)) != 1 {
+			if snap.Thread.Status != protocol.ThreadStatusIdle || snap.Thread.Run != nil || len(protocol.OpenRequests(snap)) != 0 || len(turnResults(snap.Items)) != 1 {
 				t.Fatalf("after: %s", mustMarshal(snap))
 			}
 		})
@@ -295,7 +285,7 @@ func takesUpABackgroundSubagentsRequest(t *testing.T, asks bool) {
 	var before protocol.Snapshot
 	until(t, func() bool {
 		before = snapshotOf(t, a, id)
-		return len(turnResults(before)) == 1 && before.Thread.Status == protocol.ThreadStatusWaiting
+		return len(turnResults(before.Items)) == 1 && before.Thread.Status == protocol.ThreadStatusWaiting
 	})
 	a.call("saved", id)
 	a.call("close")
@@ -342,7 +332,7 @@ func takesUpABackgroundSubagentsRequest(t *testing.T, asks bool) {
 	b.call("stop")
 	<-b.exited
 	started, _, statuses := completed()
-	results := turnResults(snap)
+	results := turnResults(snap.Items)
 	if started != 1 || len(statuses) == 0 || statuses[0] != protocol.ThreadStatusIdle || len(results) != 2 || results[0].TurnID == results[1].TurnID {
 		t.Fatalf("started %d, statuses %v, results %s", started, statuses, mustMarshal(results))
 	}
@@ -376,7 +366,7 @@ func TestARestartKeepsAQuestionItsInterruptedTurnGaveUpOpen(t *testing.T) {
 	// The harness gave it up; the turn hasn't ended yet.
 	until(t, func() bool {
 		snap = snapshotOf(t, a, id)
-		return snap.Thread.Status == protocol.ThreadStatusRunning && len(turnResults(snap)) == 0
+		return snap.Thread.Status == protocol.ThreadStatusRunning && len(turnResults(snap.Items)) == 0
 	})
 	a.call("saved", id)
 	a.call("close")
@@ -384,14 +374,14 @@ func TestARestartKeepsAQuestionItsInterruptedTurnGaveUpOpen(t *testing.T) {
 
 	b := s.start()
 	expectRecovered(t, b, id)
-	until(t, func() bool { snap = snapshotOf(t, b, id); return len(turnResults(snap)) == 1 })
+	until(t, func() bool { snap = snapshotOf(t, b, id); return len(turnResults(snap.Items)) == 1 })
 	open := protocol.OpenRequests(snap)
 	if snap.Thread.Status != protocol.ThreadStatusIdle || len(open) != 1 || open[0].ID() != q.ID() {
 		t.Fatalf("after the restart: %s", mustMarshal(snap))
 	}
 	b.call("handle", map[string]any{"type": "respond", "thread_id": id, "request_id": q.ID(),
 		"resolution": map[string]any{"outcome": "answer", "answers": map[string]any{"Colour?": []string{"Red"}}}})
-	until(t, func() bool { snap = snapshotOf(t, b, id); return len(turnResults(snap)) == 2 })
+	until(t, func() bool { snap = snapshotOf(t, b, id); return len(turnResults(snap.Items)) == 2 })
 	b.call("stop")
 	<-b.exited
 	var last *protocol.UserMessage

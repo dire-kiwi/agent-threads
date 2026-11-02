@@ -192,10 +192,22 @@
         "error": { "type": "string" },
         "usage": { "$ref": "thread.schema.json#/$defs/Usage", "description": "Tokens the turn used." },
         "duration_ms": { "type": "integer", "minimum": 0 },
+        "session": { "$ref": "#/$defs/TurnSession", "description": "The harness session the turn ran in, when there was one: what a rewind to before it, or a later turn, goes back to." },
         "parent_id": { "type": "string", "description": "The id of the subagent tool_call this item belongs to. Absent for the main conversation." },
         "turn_id": { "type": "string", "description": "The turn the item was made in." },
         "created_at": { "type": "string", "format": "date-time" },
         "raw": { "description": "The harness's own payload this came from, for debugging. Backends can leave it out; clients mustn't depend on it." }
+      }
+    },
+    "TurnSession": {
+      "type": "object",
+      "description": "Where a turn left the harness's session.",
+      "required": ["id"],
+      "properties": {
+        "id": { "type": "string", "description": "The thread's session_id when the turn ended." },
+        "at": { "type": "string", "description": "The harness's own mark for the turn: Claude Code's last message in it (its uuid), Codex's id for the turn (its first, for a turn that went on after a plan). Absent if the harness gave none (the turn failed before it did anything)." },
+        "started": { "type": "boolean", "default": false, "description": "The turn started the session: the thread had no session_id when it began." },
+        "lost": { "type": "boolean", "default": false, "description": "The turn was lost (the backend stopped while it ran) before the harness gave its mark, so what it left in the session isn't known: a rewind that would need to know is refused." }
       }
     },
     "Attachment": {

@@ -4,7 +4,14 @@
 /**
  * A command, told apart by type.
  */
-export type Command = SendCommand | InterruptCommand | RespondCommand | SetOptionsCommand;
+export type Command =
+  | SendCommand
+  | InterruptCommand
+  | RespondCommand
+  | SetOptionsCommand
+  | RewindCommand
+  | NewSessionCommand
+  | CompactCommand;
 /**
  * default: ask (via the permission policy) for anything the harness would ask about. accept_edits: file edits in cwd are allowed without asking. plan: the agent plans and doesn't change anything. bypass: nothing is asked, and what would be is allowed. dont_ask: nothing is asked, and what would be (a question included) is denied.
  */
@@ -22,6 +29,7 @@ export type ThreadEvent =
   | TurnCompletedEvent
   | ItemAddedEvent
   | ItemUpdatedEvent
+  | ItemsRemovedEvent
   | DeltaEvent
   | RequestOpenedEvent
   | RequestResolvedEvent;
@@ -139,6 +147,31 @@ export interface StandingAnswer {
   outcome: "allow" | "deny";
 }
 /**
+ * Take the conversation back to before a turn: the harness forgets that turn and every one after it, and their items are removed from the thread. Refused while a turn is running.
+ */
+export interface RewindCommand {
+  type: "rewind";
+  thread_id: string;
+  /**
+   * The turn to go back to before (a turn_id of the thread's items).
+   */
+  turn_id: string;
+}
+/**
+ * Start a new conversation with the harness at the next turn, in the same thread: its session_id is cleared, so the agent doesn't remember the turns before. The items stay. Refused while a turn is running.
+ */
+export interface NewSessionCommand {
+  type: "new_session";
+  thread_id: string;
+}
+/**
+ * Compact the harness's context now: a turn of its own, with no user_message, that adds a compaction item. Refused while a turn is running, or when the thread has no session yet.
+ */
+export interface CompactCommand {
+  type: "compact";
+  thread_id: string;
+}
+/**
  * The thread's own state changed (status, model, usage, run...). Carries all of it.
  */
 export interface ThreadUpdatedEvent {
@@ -182,6 +215,14 @@ export interface Thread {
    * The harness's own session or thread id, used to resume it.
    */
   session_id?: string;
+  /**
+   * Where the next turn takes up session_id, after a rewind: Claude Code resumes it at this message (--resume-session-at), Codex reverts it to before this turn (thread/revert). Cleared once the harness has done it.
+   */
+  resume_at?: string;
+  /**
+   * The running turn's mark so far, as the harness gives it (its turn_result's session.at to be): kept so that a turn lost when the backend stops still has it. Absent with no turn running, or until the harness gives one.
+   */
+  turn_at?: string;
   usage?: Usage;
   /**
    * What went wrong, when status is error.
@@ -583,6 +624,7 @@ export interface TurnResult {
   error?: string;
   usage?: Usage;
   duration_ms?: number;
+  session?: TurnSession;
   /**
    * The id of the subagent tool_call this item belongs to. Absent for the main conversation.
    */
@@ -598,6 +640,27 @@ export interface TurnResult {
   raw?: unknown;
 }
 /**
+ * Where a turn left the harness's session.
+ */
+export interface TurnSession {
+  /**
+   * The thread's session_id when the turn ended.
+   */
+  id: string;
+  /**
+   * The harness's own mark for the turn: Claude Code's last message in it (its uuid), Codex's id for the turn (its first, for a turn that went on after a plan). Absent if the harness gave none (the turn failed before it did anything).
+   */
+  at?: string;
+  /**
+   * The turn started the session: the thread had no session_id when it began.
+   */
+  started?: boolean;
+  /**
+   * The turn was lost (the backend stopped while it ran) before the harness gave its mark, so what it left in the session isn't known: a rewind that would need to know is refused.
+   */
+  lost?: boolean;
+}
+/**
  * An item changed: patch's fields replace the item's, and a field set to null is removed. id and type never change.
  */
 export interface ItemUpdatedEvent {
@@ -611,6 +674,23 @@ export interface ItemUpdatedEvent {
   patch: {
     [k: string]: unknown | undefined;
   };
+  /**
+   * The harness's own payload, for debugging.
+   */
+  raw?: unknown;
+}
+/**
+ * Items were removed from the thread (a rewind took the conversation back to before them). Ids the thread doesn't have are skipped. A window's start and context move down by the removed items before them (see indices).
+ */
+export interface ItemsRemovedEvent {
+  type: "items.removed";
+  thread_id: string;
+  seq: number;
+  item_ids: string[];
+  /**
+   * The removed items' indices in the thread's whole list of items before they were removed, ascending, one for each of item_ids: what lets a window or a page placed by index move with them.
+   */
+  indices: number[];
   /**
    * The harness's own payload, for debugging.
    */

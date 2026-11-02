@@ -83,6 +83,12 @@ pub enum Command {
     Respond(RespondCommand),
     #[serde(rename = "set_options")]
     SetOptions(SetOptionsCommand),
+    #[serde(rename = "rewind")]
+    Rewind(RewindCommand),
+    #[serde(rename = "new_session")]
+    NewSession(NewSessionCommand),
+    #[serde(rename = "compact")]
+    Compact(CompactCommand),
 }
 impl ::std::convert::From<SendCommand> for Command {
     fn from(value: SendCommand) -> Self {
@@ -103,6 +109,26 @@ impl ::std::convert::From<SetOptionsCommand> for Command {
     fn from(value: SetOptionsCommand) -> Self {
         Self::SetOptions(value)
     }
+}
+impl ::std::convert::From<RewindCommand> for Command {
+    fn from(value: RewindCommand) -> Self {
+        Self::Rewind(value)
+    }
+}
+impl ::std::convert::From<NewSessionCommand> for Command {
+    fn from(value: NewSessionCommand) -> Self {
+        Self::NewSession(value)
+    }
+}
+impl ::std::convert::From<CompactCommand> for Command {
+    fn from(value: CompactCommand) -> Self {
+        Self::Compact(value)
+    }
+}
+///Compact the harness's context now: a turn of its own, with no user_message, that adds a compaction item. Refused while a turn is running, or when the thread has no session yet.
+#[derive(::serde::Deserialize, ::serde::Serialize, Clone, Debug)]
+pub struct CompactCommand {
+    pub thread_id: ::std::string::String,
 }
 ///The harness compacted the conversation's context.
 #[derive(::serde::Deserialize, ::serde::Serialize, Clone, Debug)]
@@ -364,6 +390,23 @@ pub struct ItemUpdatedEvent {
     #[serde(skip_serializing_if = "::std::option::Option::is_none")]
     pub raw: ::std::option::Option<::serde_json::Value>,
     pub seq: ::std::num::NonZeroU64,
+    pub thread_id: ::std::string::String,
+}
+///Items were removed from the thread (a rewind took the conversation back to before them). Ids the thread doesn't have are skipped. A window's start and context move down by the removed items before them (see indices).
+#[derive(::serde::Deserialize, ::serde::Serialize, Clone, Debug)]
+pub struct ItemsRemovedEvent {
+    ///The removed items' indices in the thread's whole list of items before they were removed, ascending, one for each of item_ids: what lets a window or a page placed by index move with them.
+    pub indices: ::std::vec::Vec<u64>,
+    pub item_ids: ::std::vec::Vec<::std::string::String>,
+    ///The harness's own payload, for debugging.
+    #[serde(skip_serializing_if = "::std::option::Option::is_none")]
+    pub raw: ::std::option::Option<::serde_json::Value>,
+    pub seq: ::std::num::NonZeroU64,
+    pub thread_id: ::std::string::String,
+}
+///Start a new conversation with the harness at the next turn, in the same thread: its session_id is cleared, so the agent doesn't remember the turns before. The items stay. Refused while a turn is running.
+#[derive(::serde::Deserialize, ::serde::Serialize, Clone, Debug)]
+pub struct NewSessionCommand {
     pub thread_id: ::std::string::String,
 }
 ///Something to tell the user that isn't the agent talking: an error, a retry, hook output, a run re-attached after a restart.
@@ -763,6 +806,13 @@ pub struct RespondCommand {
     pub resolution: Resolution,
     pub thread_id: ::std::string::String,
 }
+///Take the conversation back to before a turn: the harness forgets that turn and every one after it, and their items are removed from the thread. Refused while a turn is running.
+#[derive(::serde::Deserialize, ::serde::Serialize, Clone, Debug)]
+pub struct RewindCommand {
+    pub thread_id: ::std::string::String,
+    ///The turn to go back to before (a turn_id of the thread's items).
+    pub turn_id: ::std::string::String,
+}
 ///A harness process. A run started under the shim can outlive the backend: after a restart the backend re-attaches to it and sets reattached_at.
 #[derive(::serde::Deserialize, ::serde::Serialize, Clone, Debug)]
 pub struct Run {
@@ -1001,6 +1051,9 @@ pub struct Thread {
     ///The usage limits of the account the harness runs on, as it last reported them in this thread, sorted by id. Absent until it reports one.
     #[serde(default, skip_serializing_if = "::std::vec::Vec::is_empty")]
     pub rate_limits: ::std::vec::Vec<RateLimit>,
+    ///Where the next turn takes up session_id, after a rewind: Claude Code resumes it at this message (--resume-session-at), Codex reverts it to before this turn (thread/revert). Cleared once the harness has done it.
+    #[serde(skip_serializing_if = "::std::option::Option::is_none")]
+    pub resume_at: ::std::option::Option<::std::string::String>,
     ///The harness process running the thread, if one is. Absent when it's idle with no process.
     #[serde(skip_serializing_if = "::std::option::Option::is_none")]
     pub run: ::std::option::Option<Run>,
@@ -1013,6 +1066,9 @@ pub struct Thread {
     pub status: ThreadStatus,
     #[serde(skip_serializing_if = "::std::option::Option::is_none")]
     pub title: ::std::option::Option<::std::string::String>,
+    ///The running turn's mark so far, as the harness gives it (its turn_result's session.at to be): kept so that a turn lost when the backend stops still has it. Absent with no turn running, or until the harness gives one.
+    #[serde(skip_serializing_if = "::std::option::Option::is_none")]
+    pub turn_at: ::std::option::Option<::std::string::String>,
     #[serde(skip_serializing_if = "::std::option::Option::is_none")]
     pub updated_at: ::std::option::Option<::std::string::String>,
     ///Tokens used by the thread so far, over all its turns.
@@ -1033,6 +1089,8 @@ pub enum ThreadEvent {
     ItemAdded(ItemAddedEvent),
     #[serde(rename = "item.updated")]
     ItemUpdated(ItemUpdatedEvent),
+    #[serde(rename = "items.removed")]
+    ItemsRemoved(ItemsRemovedEvent),
     #[serde(rename = "delta")]
     Delta(DeltaEvent),
     #[serde(rename = "request.opened")]
@@ -1063,6 +1121,11 @@ impl ::std::convert::From<ItemAddedEvent> for ThreadEvent {
 impl ::std::convert::From<ItemUpdatedEvent> for ThreadEvent {
     fn from(value: ItemUpdatedEvent) -> Self {
         Self::ItemUpdated(value)
+    }
+}
+impl ::std::convert::From<ItemsRemovedEvent> for ThreadEvent {
+    fn from(value: ItemsRemovedEvent) -> Self {
+        Self::ItemsRemoved(value)
     }
 }
 impl ::std::convert::From<DeltaEvent> for ThreadEvent {
@@ -1432,12 +1495,30 @@ pub struct TurnResult {
     ///The harness's own payload this came from, for debugging. Backends can leave it out; clients mustn't depend on it.
     #[serde(skip_serializing_if = "::std::option::Option::is_none")]
     pub raw: ::std::option::Option<::serde_json::Value>,
+    ///The harness session the turn ran in, when there was one: what a rewind to before it, or a later turn, goes back to.
+    #[serde(skip_serializing_if = "::std::option::Option::is_none")]
+    pub session: ::std::option::Option<TurnSession>,
     ///The turn the item was made in.
     #[serde(skip_serializing_if = "::std::option::Option::is_none")]
     pub turn_id: ::std::option::Option<::std::string::String>,
     ///Tokens the turn used.
     #[serde(skip_serializing_if = "::std::option::Option::is_none")]
     pub usage: ::std::option::Option<Usage>,
+}
+///Where a turn left the harness's session.
+#[derive(::serde::Deserialize, ::serde::Serialize, Clone, Debug)]
+pub struct TurnSession {
+    ///The harness's own mark for the turn: Claude Code's last message in it (its uuid), Codex's id for the turn (its first, for a turn that went on after a plan). Absent if the harness gave none (the turn failed before it did anything).
+    #[serde(skip_serializing_if = "::std::option::Option::is_none")]
+    pub at: ::std::option::Option<::std::string::String>,
+    ///The thread's session_id when the turn ended.
+    pub id: ::std::string::String,
+    ///The turn was lost (the backend stopped while it ran) before the harness gave its mark, so what it left in the session isn't known: a rewind that would need to know is refused.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub lost: bool,
+    ///The turn started the session: the thread had no session_id when it began.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub started: bool,
 }
 ///A turn started: the agent is working on a message.
 #[derive(::serde::Deserialize, ::serde::Serialize, Clone, Debug)]

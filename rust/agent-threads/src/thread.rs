@@ -29,10 +29,11 @@ use crate::permissions::{
 };
 use crate::protocol::{
     Attachment, DeltaEventKind, Item, PermissionMode, QuestionRequest, RateLimit, Resolution, ResolutionOutcome,
-    Snapshot, StandingAnswerOutcome, SubagentState, SubagentStatus, Thread, ThreadEvent, ThreadRequest, Usage,
-    UserMessage,
+    Snapshot, StandingAnswerOutcome, SubagentState, SubagentStatus, Thread, ThreadEvent, ThreadRequest, TurnSession,
+    Usage, UserMessage,
 };
 use crate::reducer::{apply_event, open_requests, utf16_len};
+use crate::sessions::RewindError;
 use crate::spawner::Spawner;
 use crate::store::{RunRecord, Store, StoreError, StoreErrorKind};
 
@@ -53,6 +54,9 @@ type Persisted = Box<dyn FnOnce(&mut Actor, Result<(), StoreError>) + Send>;
 pub struct Turn {
     pub id: String,
     pub interrupted: bool,
+    /// The thread's session_id when it started (none: it starts a new session).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session: Option<String>,
     /// How many turns in a row (this one included) are retries for messages left queued that took
     /// none in: carried over from the turn before, or sent again with an explicit message.
     #[serde(default, skip_serializing_if = "is_zero")]
@@ -95,6 +99,7 @@ enum Effect {
     Interrupt,
     Release,
     OptionsChanged,
+    Compact,
     ConfigChanged,
 }
 
@@ -540,6 +545,7 @@ impl ThreadContext {
             let turn = Turn {
                 id: new_id("turn"),
                 interrupted: false,
+                session: self.session_now(),
                 carried: !left.is_empty() as u32,
                 progressed: false,
             };
@@ -572,6 +578,30 @@ impl ThreadContext {
         }));
     }
 
+    /// The session a turn starting now starts in, for its Turn.
+    fn session_now(&self) -> Option<String> {
+        self.state.thread.session_id.clone()
+    }
+
+    /// Compacts the harness's context: a turn with no message. The caller checks one can start.
+    pub(crate) fn compact(&mut self) {
+        let turn = Turn {
+            id: new_id("turn"),
+            interrupted: false,
+            session: self.session_now(),
+            carried: 0,
+            progressed: false,
+        };
+        let turn_id = turn.id.clone();
+        self.turn = Some(turn);
+        self.emit(json!({"type": "turn.started", "turn_id": turn_id}));
+        self.set_thread(|t| {
+            t.status = crate::protocol::ThreadStatus::Running;
+            t.error = None;
+        });
+        self.effects.push_back(Effect::Compact);
+    }
+
     pub(crate) fn interrupt(&mut self) {
         let Some(turn) = &mut self.turn else { return };
         if turn.interrupted {
@@ -596,12 +626,14 @@ impl ThreadContext {
     /// The running turn ended. `live`: whether the session has a process running that has the
     /// queued messages (HarnessSession::live).
     pub fn end_turn(&mut self, end: TurnEnd, live: bool) {
-        self.finish_turn(end, live, true);
+        self.finish_turn(end, live, true, false);
     }
 
     /// Ends the running turn. Its queued messages are carried over to a new turn unless `carry` is
     /// false (shutting down, or recovering a turn the backend lost), or they've been tried enough.
-    pub(crate) fn finish_turn(&mut self, end: TurnEnd, live: bool, carry: bool) {
+    /// A `lost` one (its process was lost when the backend stopped) with no mark is noted as such in
+    /// its session: what it left there isn't known.
+    pub(crate) fn finish_turn(&mut self, end: TurnEnd, live: bool, carry: bool, lost: bool) {
         let Some(turn) = self.turn.clone() else { return };
         // What a background subagent that's still running does carries on after the turn: its
         // text still streaming, its calls (and their structured output, still to go with their
@@ -683,6 +715,24 @@ impl ThreadContext {
         if let Some(d) = end.duration_ms {
             result["duration_ms"] = json!(d);
         }
+        if let Some(id) = &self.state.thread.session_id {
+            let mut session = json!({"id": id});
+            let at = end
+                .session_at
+                .as_ref()
+                .filter(|a| !a.is_empty())
+                .or(self.state.thread.turn_at.as_ref());
+            if let Some(at) = at {
+                session["at"] = json!(at);
+            }
+            if turn.session.is_none() {
+                session["started"] = json!(true);
+            }
+            if lost && at.is_none() {
+                session["lost"] = json!(true);
+            }
+            result["session"] = session;
+        }
         self.add_item(result);
         self.emit(json!({"type": "turn.completed", "turn_id": turn.id}));
         self.turn = None;
@@ -717,6 +767,7 @@ impl ThreadContext {
                 };
                 t.error = error.clone();
                 t.usage = usage.clone();
+                t.turn_at = None;
             });
             if !left.is_empty() && carry && !self.closing {
                 self.effects.push_back(Effect::Release);
@@ -731,6 +782,7 @@ impl ThreadContext {
         let next = Turn {
             id: new_id("turn"),
             interrupted: false,
+            session: self.session_now(),
             carried: carried + 1,
             progressed: false,
         };
@@ -744,6 +796,7 @@ impl ThreadContext {
             t.status = crate::protocol::ThreadStatus::Running;
             t.error = None;
             t.usage = usage;
+            t.turn_at = None;
         });
         self.effects
             .push_back(Effect::CarryOver(left.iter().map(queued_message).collect()));
@@ -769,6 +822,15 @@ impl ThreadContext {
         self.streaming.retain(|id| !done.contains(id));
     }
 
+    /// The running turn's mark (TurnEnd's session_at) so far, as soon as the harness gives it: kept
+    /// in the thread (turn_at), so a turn lost when the backend stops still has it. Does nothing with
+    /// no turn running.
+    pub fn mark(&mut self, at: &str) {
+        if self.turn.is_some() && self.state.thread.turn_at.as_deref() != Some(at) {
+            self.set_thread(|t| t.turn_at = Some(at.to_string()));
+        }
+    }
+
     /// The harness started a turn by itself, with no message (Claude does, to tell the agent that a
     /// background subagent has ended). Does nothing if a turn is running.
     pub fn begin_turn(&mut self) {
@@ -778,6 +840,7 @@ impl ThreadContext {
         let turn = Turn {
             id: new_id("turn"),
             interrupted: false,
+            session: self.session_now(),
             carried: 0,
             progressed: false,
         };
@@ -1454,9 +1517,128 @@ impl Actor {
                 Effect::Interrupt => s.interrupt(c),
                 Effect::Release => s.release(c),
                 Effect::OptionsChanged => s.options_changed(c),
+                Effect::Compact => s.compact(c),
                 Effect::ConfigChanged => s.config_changed(c),
             }
         }
+    }
+
+    /// Takes the conversation back to before the turn `turn_id`: its items and every later turn's
+    /// go, and the session goes where the harness says (see sessions.rs). An error for a turn the
+    /// thread hasn't, or one the harness can't rewind to. The caller checks no turn is running.
+    pub(crate) fn rewind(&mut self, turn_id: &str) -> Result<(), RewindError> {
+        let c = &mut self.core;
+        let items = &c.saved.items;
+        // The main turns' results, with their places in the items.
+        let results: Vec<(usize, &crate::protocol::TurnResult)> = items
+            .iter()
+            .enumerate()
+            .filter_map(|(i, it)| match it {
+                Item::TurnResult(r) if r.parent_id.is_none() => Some((i, r)),
+                _ => None,
+            })
+            .collect();
+        let Some(index) = results.iter().position(|(_, r)| r.turn_id.as_deref() == Some(turn_id)) else {
+            return Err(RewindError(format!("there's no turn {turn_id} in the thread")));
+        };
+        let sessions: Vec<Option<TurnSession>> = results.iter().map(|(_, r)| r.session.clone()).collect();
+        let point = match self.session.rewind_point(&sessions, index) {
+            None => {
+                return Err(RewindError(format!(
+                    "{} threads can't be rewound",
+                    c.state.thread.harness
+                )));
+            }
+            Some(p) => p?,
+        };
+        // The turn and those after it, in the order they ran (a message carried over to a later turn
+        // keeps its place in the items, so their order isn't the turns'). What isn't any turn's goes
+        // too, after the last turn kept and the first item of one that goes.
+        let dropped: HashSet<&str> = results[index..]
+            .iter()
+            .filter_map(|(_, r)| r.turn_id.as_deref())
+            .collect();
+        let kept = index.checked_sub(1).map(|k| results[k].0);
+        let first = items
+            .iter()
+            .position(|i| i.turn_id().is_some_and(|t| dropped.contains(t)));
+        let after = |i: usize, at: Option<usize>| at.is_none_or(|a| i > a);
+        let (indices, gone): (Vec<usize>, Vec<String>) = items
+            .iter()
+            .enumerate()
+            .filter(|(i, it)| match it.turn_id() {
+                Some(t) => dropped.contains(t),
+                None => after(*i, kept) && after(*i, first),
+            })
+            .map(|(i, it)| (i, it.id().to_string()))
+            .unzip();
+        c.queue.retain(|id| !gone.contains(id));
+        // A rewind not yet made (resume_at) went back to before a later turn of the same session:
+        // with no mark of its own to go to, this one still needs that one made, as the turns since
+        // added nothing to the session but the ones it took back are still in it.
+        let t = &c.state.thread;
+        let resume_at = point.resume_at.or_else(|| {
+            (point.session_id.is_some() && point.session_id == t.session_id)
+                .then(|| t.resume_at.clone())
+                .flatten()
+        });
+        c.emit(json!({"type": "items.removed", "item_ids": gone, "indices": indices}));
+        self.retire();
+        let c = &mut self.core;
+        c.set_thread(|t| {
+            t.session_id = point.session_id;
+            t.resume_at = resume_at;
+        });
+        c.add_item(
+            json!({"id": new_id("n"), "type": "notice", "level": "info", "code": "rewind", "text": REWIND_TEXT}),
+        );
+        Ok(())
+    }
+
+    /// The next turn starts a new session. The caller checks no turn is running.
+    pub(crate) fn new_session(&mut self) {
+        if self.core.state.thread.session_id.is_none() {
+            return;
+        }
+        self.retire();
+        let c = &mut self.core;
+        c.set_thread(|t| {
+            t.session_id = None;
+            t.resume_at = None;
+        });
+        c.add_item(
+            json!({"id": new_id("n"), "type": "notice", "level": "info", "code": "session.new", "text": NEW_SESSION_TEXT}),
+        );
+    }
+
+    /// The harness's session changes (new_session, rewind): what's still going on in the old one
+    /// stops. Its running subagents (a background one, with no turn) are stopped and its open
+    /// requests cancelled (questions kept open after their turns too: an answer would go to a
+    /// conversation that's gone), and its process is retired, so that nothing it says after reaches
+    /// the thread (Claude would start a turn of its own when a background subagent ended, in the old
+    /// session).
+    fn retire(&mut self) {
+        let c = &mut self.core;
+        let running: Vec<String> = c
+            .saved
+            .items
+            .iter()
+            .filter_map(|i| match i {
+                Item::ToolCall(t) if t.subagent.as_ref().is_some_and(|s| s.status == SubagentStatus::Running) => {
+                    Some(t.id.clone())
+                }
+                _ => None,
+            })
+            .collect();
+        c.stop_subagents(&running);
+        for id in c.open_request_ids() {
+            c.cancel_request(&id);
+        }
+        c.cancel_late();
+        if c.turn.is_none() && c.state.thread.status == crate::protocol::ThreadStatus::Waiting {
+            c.set_thread(|t| t.status = crate::protocol::ThreadStatus::Idle);
+        }
+        self.session.retire(c);
     }
 
     /// Answers an open request; does nothing if it isn't open.
@@ -1642,6 +1824,10 @@ fn resolution(outcome: ResolutionOutcome, message: Option<&str>) -> Resolution {
         permission_mode: None,
     }
 }
+
+/// The notices a rewind and a new session add.
+const REWIND_TEXT: &str = "The conversation was rewound to here: the agent doesn't remember what came after.";
+const NEW_SESSION_TEXT: &str = "A new conversation starts here: the agent doesn't remember what came before.";
 
 /// What the agent is told when a standing answer denies a call.
 const STANDING_DENIAL: &str = "The user has denied this tool for the rest of the thread.";

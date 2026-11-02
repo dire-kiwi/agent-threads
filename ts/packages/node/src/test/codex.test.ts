@@ -14,7 +14,7 @@ import { serveTools } from "../mcp-http.js";
 import { MemoryStore } from "../stores/memory.js";
 import type { PermissionQuery } from "../permissions.js";
 import { defineTool, type ToolContext } from "../tools.js";
-import { tempDir } from "./spec.js";
+import { crashed, tempDir } from "./spec.js";
 
 const mini = fileURLToPath(new URL("./mini-codex.mjs", import.meta.url));
 
@@ -37,11 +37,11 @@ function setup(options: Setup = {}) {
   const { codex: o, env, ...rest } = options;
   const events: ThreadEvent[] = [];
   const store = rest.store ?? new MemoryStore();
-  const make = () => {
+  const make = (into: typeof store = store) => {
     const sdk = new AgentThreads({
       permissions: "allow",
       ...rest,
-      store,
+      store: into,
       harnesses: { codex: codex({ bin: mini, env: { MINI_CODEX_LOG: log, HOME: userHome, ...env }, home, login: false, closeGraceMs: 1000, ...o }) },
       onError:
         rest.onError ??
@@ -1166,5 +1166,31 @@ describe("the loopback MCP server", () => {
     } finally {
       await srv.close();
     }
+  });
+});
+
+describe("a turn the backend lost", () => {
+  it("is reverted by the Codex turn it started, once Codex said, for a rewind to before it", async () => {
+    const store = new MemoryStore();
+    const { sdk, make, sent } = setup({ store });
+    const t = await sdk.create();
+    await sdk.send(t.id, "reply one");
+    await settle(sdk, t.id);
+    await sdk.send(t.id, "reply two\nslow");
+    const at = await until(async () => {
+      const s = await sdk.snapshot(t.id);
+      return texts(s.items).includes("two") && s.thread.turn_at;
+    });
+    const next = make(crashed(store));
+    let s = await next.snapshot(t.id);
+    const [, lost] = results(s.items);
+    expect(lost).toMatchObject({ ok: false, session: { id: s.thread.session_id, at } });
+    expect(lost!.session).not.toHaveProperty("lost");
+    await next.rewind(t.id, lost!.turn_id!);
+    expect((await next.snapshot(t.id)).thread.resume_at).toBe(at);
+    await next.send(t.id, "reply again");
+    s = await settle(next, t.id);
+    expect(texts(s.items).at(-1)).toBe("again");
+    expect(sent("thread/revert")).toEqual([expect.objectContaining({ params: { threadId: s.thread.session_id, beforeTurnId: at } })]);
   });
 });

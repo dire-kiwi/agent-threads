@@ -17,6 +17,15 @@ export const schema: { readonly $defs: { readonly [name: string]: unknown } } = 
         },
         {
           "$ref": "#/$defs/SetOptionsCommand"
+        },
+        {
+          "$ref": "#/$defs/RewindCommand"
+        },
+        {
+          "$ref": "#/$defs/NewSessionCommand"
+        },
+        {
+          "$ref": "#/$defs/CompactCommand"
         }
       ]
     },
@@ -116,6 +125,55 @@ export const schema: { readonly $defs: { readonly [name: string]: unknown } } = 
         }
       }
     },
+    "RewindCommand": {
+      "type": "object",
+      "required": [
+        "type",
+        "thread_id",
+        "turn_id"
+      ],
+      "properties": {
+        "type": {
+          "const": "rewind"
+        },
+        "thread_id": {
+          "type": "string"
+        },
+        "turn_id": {
+          "type": "string"
+        }
+      }
+    },
+    "NewSessionCommand": {
+      "type": "object",
+      "required": [
+        "type",
+        "thread_id"
+      ],
+      "properties": {
+        "type": {
+          "const": "new_session"
+        },
+        "thread_id": {
+          "type": "string"
+        }
+      }
+    },
+    "CompactCommand": {
+      "type": "object",
+      "required": [
+        "type",
+        "thread_id"
+      ],
+      "properties": {
+        "type": {
+          "const": "compact"
+        },
+        "thread_id": {
+          "type": "string"
+        }
+      }
+    },
     "ThreadEvent": {
       "oneOf": [
         {
@@ -132,6 +190,9 @@ export const schema: { readonly $defs: { readonly [name: string]: unknown } } = 
         },
         {
           "$ref": "#/$defs/ItemUpdatedEvent"
+        },
+        {
+          "$ref": "#/$defs/ItemsRemovedEvent"
         },
         {
           "$ref": "#/$defs/DeltaEvent"
@@ -270,6 +331,42 @@ export const schema: { readonly $defs: { readonly [name: string]: unknown } } = 
         "patch": {
           "type": "object",
           "additionalProperties": true
+        },
+        "raw": {}
+      }
+    },
+    "ItemsRemovedEvent": {
+      "type": "object",
+      "required": [
+        "type",
+        "thread_id",
+        "seq",
+        "item_ids",
+        "indices"
+      ],
+      "properties": {
+        "type": {
+          "const": "items.removed"
+        },
+        "thread_id": {
+          "type": "string"
+        },
+        "seq": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "item_ids": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "indices": {
+          "type": "array",
+          "items": {
+            "type": "integer",
+            "minimum": 0
+          }
         },
         "raw": {}
       }
@@ -825,6 +922,9 @@ export const schema: { readonly $defs: { readonly [name: string]: unknown } } = 
           "type": "integer",
           "minimum": 0
         },
+        "session": {
+          "$ref": "#/$defs/TurnSession"
+        },
         "parent_id": {
           "type": "string"
         },
@@ -836,6 +936,28 @@ export const schema: { readonly $defs: { readonly [name: string]: unknown } } = 
           "format": "date-time"
         },
         "raw": {}
+      }
+    },
+    "TurnSession": {
+      "type": "object",
+      "required": [
+        "id"
+      ],
+      "properties": {
+        "id": {
+          "type": "string"
+        },
+        "at": {
+          "type": "string"
+        },
+        "started": {
+          "type": "boolean",
+          "default": false
+        },
+        "lost": {
+          "type": "boolean",
+          "default": false
+        }
       }
     },
     "Attachment": {
@@ -1214,6 +1336,12 @@ export const schema: { readonly $defs: { readonly [name: string]: unknown } } = 
           "type": "string"
         },
         "session_id": {
+          "type": "string"
+        },
+        "resume_at": {
+          "type": "string"
+        },
+        "turn_at": {
           "type": "string"
         },
         "usage": {

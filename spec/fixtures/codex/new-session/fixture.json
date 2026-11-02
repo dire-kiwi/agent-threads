@@ -1,0 +1,59 @@
+{
+  "description": "A turn, then new_session: the next turn starts a new thread (thread/start) in a new app server.",
+  "recorded": {
+    "cli": "codex-cli 0.165.0",
+    "model": "gpt-5.6-luna",
+    "date": "2026-11-02"
+  },
+  "thread": {
+    "harness": "codex",
+    "model": "gpt-5.6-luna",
+    "effort": "low"
+  },
+  "permissions": "allow",
+  "steps": [
+    {
+      "command": {
+        "type": "send",
+        "text": "Remember the word pineapple. Reply with just: ok",
+        "client_id": "c1"
+      }
+    },
+    {
+      "wait": {
+        "type": "thread.updated",
+        "thread": {
+          "status": "idle"
+        }
+      }
+    },
+    {
+      "command": {
+        "type": "new_session"
+      }
+    },
+    {
+      "wait": {
+        "type": "item.added",
+        "item": {
+          "type": "notice"
+        }
+      }
+    },
+    {
+      "command": {
+        "type": "send",
+        "text": "What word did I ask you to remember? If you don't know, reply with just: unknown",
+        "client_id": "c2"
+      }
+    },
+    {
+      "wait": {
+        "type": "thread.updated",
+        "thread": {
+          "status": "idle"
+        }
+      }
+    }
+  ]
+}

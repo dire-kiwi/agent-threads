@@ -3,32 +3,33 @@
 {"type":"turn.started","thread_id":"{{thread}}","seq":3,"turn_id":"{{t1}}"}
 {"type":"thread.updated","thread_id":"{{thread}}","seq":4,"thread":{"id":"{{thread}}","harness":"codex","status":"running","model":"gpt-5.6-luna","effort":"low","permission_mode":"default","cwd":"{{cwd}}","created_at":"2026-11-01T00:00:00Z"}}
 {"type":"thread.updated","thread_id":"{{thread}}","seq":5,"thread":{"id":"{{thread}}","harness":"codex","status":"running","model":"gpt-5.6-luna","effort":"low","permission_mode":"default","cwd":"{{cwd}}","created_at":"2026-11-01T00:00:00Z","session_id":"01a19254-2f11-7793-adca-c8ed0368a30b"}}
-{"type":"item.added","thread_id":"{{thread}}","seq":6,"item":{"id":"msg_02fe9373ea263005016ae5f8e396f88191aab6087575524580","type":"assistant_message","text":"","turn_id":"{{t1}}"}}
-{"type":"delta","thread_id":"{{thread}}","seq":6,"item_id":"msg_02fe9373ea263005016ae5f8e396f88191aab6087575524580","kind":"text","offset":0,"text":"I"}
-{"type":"delta","thread_id":"{{thread}}","seq":6,"item_id":"msg_02fe9373ea263005016ae5f8e396f88191aab6087575524580","kind":"text","offset":1,"text":"’m"}
-{"type":"delta","thread_id":"{{thread}}","seq":6,"item_id":"msg_02fe9373ea263005016ae5f8e396f88191aab6087575524580","kind":"text","offset":3,"text":" running"}
-{"type":"delta","thread_id":"{{thread}}","seq":6,"item_id":"msg_02fe9373ea263005016ae5f8e396f88191aab6087575524580","kind":"text","offset":11,"text":" the"}
-{"type":"delta","thread_id":"{{thread}}","seq":6,"item_id":"msg_02fe9373ea263005016ae5f8e396f88191aab6087575524580","kind":"text","offset":15,"text":" command"}
-{"type":"delta","thread_id":"{{thread}}","seq":6,"item_id":"msg_02fe9373ea263005016ae5f8e396f88191aab6087575524580","kind":"text","offset":23,"text":" and"}
-{"type":"delta","thread_id":"{{thread}}","seq":6,"item_id":"msg_02fe9373ea263005016ae5f8e396f88191aab6087575524580","kind":"text","offset":27,"text":" will"}
-{"type":"delta","thread_id":"{{thread}}","seq":6,"item_id":"msg_02fe9373ea263005016ae5f8e396f88191aab6087575524580","kind":"text","offset":32,"text":" return"}
-{"type":"delta","thread_id":"{{thread}}","seq":6,"item_id":"msg_02fe9373ea263005016ae5f8e396f88191aab6087575524580","kind":"text","offset":39,"text":" its"}
-{"type":"delta","thread_id":"{{thread}}","seq":6,"item_id":"msg_02fe9373ea263005016ae5f8e396f88191aab6087575524580","kind":"text","offset":43,"text":" output"}
-{"type":"delta","thread_id":"{{thread}}","seq":6,"item_id":"msg_02fe9373ea263005016ae5f8e396f88191aab6087575524580","kind":"text","offset":50,"text":" once"}
-{"type":"delta","thread_id":"{{thread}}","seq":6,"item_id":"msg_02fe9373ea263005016ae5f8e396f88191aab6087575524580","kind":"text","offset":55,"text":" it"}
-{"type":"delta","thread_id":"{{thread}}","seq":6,"item_id":"msg_02fe9373ea263005016ae5f8e396f88191aab6087575524580","kind":"text","offset":58,"text":" completes"}
-{"type":"delta","thread_id":"{{thread}}","seq":6,"item_id":"msg_02fe9373ea263005016ae5f8e396f88191aab6087575524580","kind":"text","offset":68,"text":"."}
-{"type":"item.updated","thread_id":"{{thread}}","seq":7,"item_id":"msg_02fe9373ea263005016ae5f8e396f88191aab6087575524580","patch":{"text":"I’m running the command and will return its output once it completes."}}
-{"type":"item.added","thread_id":"{{thread}}","seq":8,"item":{"id":"exec-28e495c3-c328-4311-ace4-b2128f83f36f","type":"tool_call","name":"commandExecution","kind":"shell","input":{"command":"/usr/bin/bash -lc 'sleep 5 && echo first'","cwd":"/work"},"command":"sleep 5 && echo first","status":"running","turn_id":"{{t1}}"}}
-{"type":"item.added","thread_id":"{{thread}}","seq":9,"item":{"id":"{{u2}}","type":"user_message","text":"Also end your reply with the word: steered","steered":true,"queued":true,"client_id":"c2","turn_id":"{{t1}}"}}
-{"type":"item.updated","thread_id":"{{thread}}","seq":10,"item_id":"{{u2}}","patch":{"queued":null}}
-{"type":"item.updated","thread_id":"{{thread}}","seq":11,"item_id":"exec-28e495c3-c328-4311-ace4-b2128f83f36f","patch":{"status":"completed","result":{"content":"first\n","exit_code":0}}}
-{"type":"item.added","thread_id":"{{thread}}","seq":12,"item":{"id":"msg_02fe9373ea263005016ae5f8ea0fa481919c180214e9f30d55","type":"assistant_message","text":"","turn_id":"{{t1}}"}}
-{"type":"delta","thread_id":"{{thread}}","seq":12,"item_id":"msg_02fe9373ea263005016ae5f8ea0fa481919c180214e9f30d55","kind":"text","offset":0,"text":"first"}
-{"type":"delta","thread_id":"{{thread}}","seq":12,"item_id":"msg_02fe9373ea263005016ae5f8ea0fa481919c180214e9f30d55","kind":"text","offset":5,"text":"\n\n"}
-{"type":"delta","thread_id":"{{thread}}","seq":12,"item_id":"msg_02fe9373ea263005016ae5f8ea0fa481919c180214e9f30d55","kind":"text","offset":7,"text":"ste"}
-{"type":"delta","thread_id":"{{thread}}","seq":12,"item_id":"msg_02fe9373ea263005016ae5f8ea0fa481919c180214e9f30d55","kind":"text","offset":10,"text":"ered"}
-{"type":"item.updated","thread_id":"{{thread}}","seq":13,"item_id":"msg_02fe9373ea263005016ae5f8ea0fa481919c180214e9f30d55","patch":{"text":"first\n\nsteered"}}
-{"type":"item.added","thread_id":"{{thread}}","seq":14,"item":{"id":"{{tr1}}","type":"turn_result","ok":true,"usage":{"input_tokens":12694,"output_tokens":161,"cache_read_tokens":23936,"cache_write_tokens":0},"duration_ms":8781,"turn_id":"{{t1}}"}}
-{"type":"turn.completed","thread_id":"{{thread}}","seq":15,"turn_id":"{{t1}}"}
-{"type":"thread.updated","thread_id":"{{thread}}","seq":16,"thread":{"id":"{{thread}}","harness":"codex","status":"idle","model":"gpt-5.6-luna","effort":"low","permission_mode":"default","cwd":"{{cwd}}","created_at":"2026-11-01T00:00:00Z","session_id":"01a19254-2f11-7793-adca-c8ed0368a30b","usage":{"input_tokens":12694,"output_tokens":161,"cache_read_tokens":23936,"cache_write_tokens":0}}}
+{"type":"thread.updated","thread_id":"{{thread}}","seq":6,"thread":{"id":"{{thread}}","harness":"codex","status":"running","model":"gpt-5.6-luna","effort":"low","permission_mode":"default","cwd":"{{cwd}}","created_at":"2026-11-01T00:00:00Z","session_id":"01a19254-2f11-7793-adca-c8ed0368a30b","turn_at":"01a19254-3063-7250-bd9b-11227ff006e2"}}
+{"type":"item.added","thread_id":"{{thread}}","seq":7,"item":{"id":"msg_02fe9373ea263005016ae5f8e396f88191aab6087575524580","type":"assistant_message","text":"","turn_id":"{{t1}}"}}
+{"type":"delta","thread_id":"{{thread}}","seq":7,"item_id":"msg_02fe9373ea263005016ae5f8e396f88191aab6087575524580","kind":"text","offset":0,"text":"I"}
+{"type":"delta","thread_id":"{{thread}}","seq":7,"item_id":"msg_02fe9373ea263005016ae5f8e396f88191aab6087575524580","kind":"text","offset":1,"text":"’m"}
+{"type":"delta","thread_id":"{{thread}}","seq":7,"item_id":"msg_02fe9373ea263005016ae5f8e396f88191aab6087575524580","kind":"text","offset":3,"text":" running"}
+{"type":"delta","thread_id":"{{thread}}","seq":7,"item_id":"msg_02fe9373ea263005016ae5f8e396f88191aab6087575524580","kind":"text","offset":11,"text":" the"}
+{"type":"delta","thread_id":"{{thread}}","seq":7,"item_id":"msg_02fe9373ea263005016ae5f8e396f88191aab6087575524580","kind":"text","offset":15,"text":" command"}
+{"type":"delta","thread_id":"{{thread}}","seq":7,"item_id":"msg_02fe9373ea263005016ae5f8e396f88191aab6087575524580","kind":"text","offset":23,"text":" and"}
+{"type":"delta","thread_id":"{{thread}}","seq":7,"item_id":"msg_02fe9373ea263005016ae5f8e396f88191aab6087575524580","kind":"text","offset":27,"text":" will"}
+{"type":"delta","thread_id":"{{thread}}","seq":7,"item_id":"msg_02fe9373ea263005016ae5f8e396f88191aab6087575524580","kind":"text","offset":32,"text":" return"}
+{"type":"delta","thread_id":"{{thread}}","seq":7,"item_id":"msg_02fe9373ea263005016ae5f8e396f88191aab6087575524580","kind":"text","offset":39,"text":" its"}
+{"type":"delta","thread_id":"{{thread}}","seq":7,"item_id":"msg_02fe9373ea263005016ae5f8e396f88191aab6087575524580","kind":"text","offset":43,"text":" output"}
+{"type":"delta","thread_id":"{{thread}}","seq":7,"item_id":"msg_02fe9373ea263005016ae5f8e396f88191aab6087575524580","kind":"text","offset":50,"text":" once"}
+{"type":"delta","thread_id":"{{thread}}","seq":7,"item_id":"msg_02fe9373ea263005016ae5f8e396f88191aab6087575524580","kind":"text","offset":55,"text":" it"}
+{"type":"delta","thread_id":"{{thread}}","seq":7,"item_id":"msg_02fe9373ea263005016ae5f8e396f88191aab6087575524580","kind":"text","offset":58,"text":" completes"}
+{"type":"delta","thread_id":"{{thread}}","seq":7,"item_id":"msg_02fe9373ea263005016ae5f8e396f88191aab6087575524580","kind":"text","offset":68,"text":"."}
+{"type":"item.updated","thread_id":"{{thread}}","seq":8,"item_id":"msg_02fe9373ea263005016ae5f8e396f88191aab6087575524580","patch":{"text":"I’m running the command and will return its output once it completes."}}
+{"type":"item.added","thread_id":"{{thread}}","seq":9,"item":{"id":"exec-28e495c3-c328-4311-ace4-b2128f83f36f","type":"tool_call","name":"commandExecution","kind":"shell","input":{"command":"/usr/bin/bash -lc 'sleep 5 && echo first'","cwd":"/work"},"command":"sleep 5 && echo first","status":"running","turn_id":"{{t1}}"}}
+{"type":"item.added","thread_id":"{{thread}}","seq":10,"item":{"id":"{{u2}}","type":"user_message","text":"Also end your reply with the word: steered","steered":true,"queued":true,"client_id":"c2","turn_id":"{{t1}}"}}
+{"type":"item.updated","thread_id":"{{thread}}","seq":11,"item_id":"{{u2}}","patch":{"queued":null}}
+{"type":"item.updated","thread_id":"{{thread}}","seq":12,"item_id":"exec-28e495c3-c328-4311-ace4-b2128f83f36f","patch":{"status":"completed","result":{"content":"first\n","exit_code":0}}}
+{"type":"item.added","thread_id":"{{thread}}","seq":13,"item":{"id":"msg_02fe9373ea263005016ae5f8ea0fa481919c180214e9f30d55","type":"assistant_message","text":"","turn_id":"{{t1}}"}}
+{"type":"delta","thread_id":"{{thread}}","seq":13,"item_id":"msg_02fe9373ea263005016ae5f8ea0fa481919c180214e9f30d55","kind":"text","offset":0,"text":"first"}
+{"type":"delta","thread_id":"{{thread}}","seq":13,"item_id":"msg_02fe9373ea263005016ae5f8ea0fa481919c180214e9f30d55","kind":"text","offset":5,"text":"\n\n"}
+{"type":"delta","thread_id":"{{thread}}","seq":13,"item_id":"msg_02fe9373ea263005016ae5f8ea0fa481919c180214e9f30d55","kind":"text","offset":7,"text":"ste"}
+{"type":"delta","thread_id":"{{thread}}","seq":13,"item_id":"msg_02fe9373ea263005016ae5f8ea0fa481919c180214e9f30d55","kind":"text","offset":10,"text":"ered"}
+{"type":"item.updated","thread_id":"{{thread}}","seq":14,"item_id":"msg_02fe9373ea263005016ae5f8ea0fa481919c180214e9f30d55","patch":{"text":"first\n\nsteered"}}
+{"type":"item.added","thread_id":"{{thread}}","seq":15,"item":{"id":"{{tr1}}","type":"turn_result","ok":true,"usage":{"input_tokens":12694,"output_tokens":161,"cache_read_tokens":23936,"cache_write_tokens":0},"duration_ms":8781,"session":{"id":"01a19254-2f11-7793-adca-c8ed0368a30b","at":"01a19254-3063-7250-bd9b-11227ff006e2","started":true},"turn_id":"{{t1}}"}}
+{"type":"turn.completed","thread_id":"{{thread}}","seq":16,"turn_id":"{{t1}}"}
+{"type":"thread.updated","thread_id":"{{thread}}","seq":17,"thread":{"id":"{{thread}}","harness":"codex","status":"idle","model":"gpt-5.6-luna","effort":"low","permission_mode":"default","cwd":"{{cwd}}","created_at":"2026-11-01T00:00:00Z","session_id":"01a19254-2f11-7793-adca-c8ed0368a30b","usage":{"input_tokens":12694,"output_tokens":161,"cache_read_tokens":23936,"cache_write_tokens":0}}}

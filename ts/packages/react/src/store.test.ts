@@ -298,11 +298,13 @@ describe("ThreadStore", () => {
   describe("loading earlier items", () => {
     const agent = (id: string): Item => ({ id, type: "tool_call", name: "Agent", kind: "subagent", input: {}, status: "running" });
     /** A thread of m0..m9, with a subagent (s3) whose last item (b8) is in the window of 4 its store starts from. */
-    function paged(limit = 4) {
+    /** A windowed thread whose source's pages are answered by hand; with `resync`, answering resyncs from the events since the window. */
+    function paged(limit = 4, resync?: (events: ThreadEvent[], from: number) => Promise<ThreadEvent[]>) {
       const items: Item[] = Array.from({ length: 10 }, (_, i) => (i === 3 ? agent("s3") : i === 8 ? { ...msg("b8"), parent_id: "s3" } : msg(`m${i}`, `m${i}`)));
       let whole = applyEvents(initialState(thread), items.map((item, i) => added(i + 1, item)));
       const pages: { before: number; resolve: (p: ItemPage) => void; reject: (e: Error) => void }[] = [];
-      const t = testSource(snapshotWindow(whole, limit));
+      const log: ThreadEvent[] = [];
+      const t = testSource(snapshotWindow(whole, limit), resync && ((from) => resync(log, from)));
       t.source.loadEarlier = (before) => new Promise((resolve, reject) => void pages.push({ before, resolve, reject }));
       const store = new ThreadStore(t.source);
       store.connect();
@@ -310,10 +312,14 @@ describe("ThreadStore", () => {
       const answer = (n = 3) => pages.shift()!.resolve(itemPage(whole, store.getState().snapshot.start!, n));
       const change = (e: ThreadEvent) => {
         whole = applyEvent(whole, e);
+        log.push(e);
         t.emit(e);
       };
       /** Changes the thread without the store hearing of it (it misses the events). */
-      const missed = (...events: ThreadEvent[]) => void (whole = applyEvents(whole, events));
+      const missed = (...events: ThreadEvent[]) => {
+        whole = applyEvents(whole, events);
+        log.push(...events);
+      };
       return { ...t, store, pages, answer, change, missed, whole: () => whole, ids: () => store.getState().snapshot.items.map((i) => i.id) };
     }
 
@@ -428,6 +434,142 @@ describe("ThreadStore", () => {
       expect(s.requests).toEqual([{ ...p1, resolution: { outcome: "allow" } }]);
       expect(store.getState().loadingEarlier).toBe(false);
     });
+
+    it("moves the window down with removed items, and still loads the ones before it", async () => {
+      const { store, pages, answer, change, whole, ids } = paged();
+      // A rewind takes out m1, m4 and m5: the window from 6 (with s3, at 3, as context) is from 3.
+      change({ type: "items.removed", thread_id: "th", seq: 11, item_ids: ["m1", "m4", "m5"], indices: [1, 4, 5] });
+      expect(store.getState().snapshot).toMatchObject({ start: 3, context: [2], seq: 11 });
+      expect(ids()).toEqual(["s3", "m6", "m7", "b8", "m9"]);
+      const done = store.loadEarlier();
+      expect(pages.map((p) => p.before)).toEqual([3]);
+      answer(10);
+      await done;
+      expect(ids()).toEqual(["m0", "m2", "s3", "m6", "m7", "b8", "m9"]);
+      expect(store.getState().snapshot).toEqual(snapshotWindow(whole(), 100));
+      expect(store.hasEarlier()).toBe(false);
+    });
+
+    it("drops a removed context item from the window's context", async () => {
+      const { store, change, ids } = paged();
+      change({ type: "items.removed", thread_id: "th", seq: 11, item_ids: ["s3", "b8"], indices: [3, 8] });
+      const s = store.getState().snapshot;
+      expect(s.start).toBe(5);
+      expect(s).not.toHaveProperty("context");
+      expect(ids()).toEqual(["m6", "m7", "m9"]);
+    });
+
+    it("asks again for a page that was on its way when items were removed", async () => {
+      const { store, pages, change, whole } = paged();
+      const done = store.loadEarlier();
+      // The page is taken before the removal, by the old indices.
+      const stale = itemPage(whole(), 6, 3);
+      change({ type: "items.removed", thread_id: "th", seq: 11, item_ids: ["m1"], indices: [1] });
+      pages.shift()!.resolve(stale);
+      await flush();
+      expect(pages.map((p) => p.before)).toEqual([5]);
+      pages.shift()!.resolve(itemPage(whole(), 5, 3));
+      await done;
+      expect(store.getState().snapshot).toEqual(snapshotWindow(whole(), 7));
+      expect(store.getState().loadingEarlier).toBe(false);
+    });
+
+    // A page taken after a rewind, that comes before the rewind's items.removed does: the store
+    // waits for the event, and then asks for the page again by its window's new start. (One removal
+    // is m1; the other leaves gaps, as a rewind past a message carried over to a later turn does.)
+    for (const [ids, indices, again] of [
+      [["m1"], [1], 5],
+      [["m1", "m4", "m5"], [1, 4, 5], 3],
+    ] as const) {
+      it(`waits for the items.removed a page has before putting it in (removing ${ids.join(", ")})`, async () => {
+        const { store, pages, answer, missed, emit, whole } = paged();
+        const done = store.loadEarlier({ to: "m0" });
+        const removed: ThreadEvent = { type: "items.removed", thread_id: "th", seq: 11, item_ids: [...ids], indices: [...indices] };
+        // The backend applies the removal, then takes the page asked for (by the old start, 6).
+        missed(removed);
+        pages.shift()!.resolve(itemPage(whole(), 6, 3));
+        await flush();
+        expect(store.getState().snapshot.start).toBe(6);
+        expect(store.getState().loadingEarlier).toBe(true);
+        expect(pages).toEqual([]);
+        emit(removed);
+        await flush();
+        expect(pages.map((p) => p.before)).toEqual([again]);
+        answer(10);
+        await done;
+        expect(store.getState().snapshot).toEqual(snapshotWindow(whole(), 100));
+        expect(store.getState().snapshot.items.map((i) => i.id).slice(0, 3)).toEqual(["m0", "m2", "s3"]);
+      });
+    }
+
+    it("gives up a page from a later state when it disconnects before getting there, and stops loading back to an item", async () => {
+      const { store, pages, missed, whole } = paged();
+      const off = store.connect();
+      const done = store.loadEarlier({ to: "m0" });
+      missed(added(11, msg("m10", "m10")));
+      pages.shift()!.resolve(itemPage(whole(), 6, 3));
+      await flush();
+      expect(store.getState().loadingEarlier).toBe(true);
+      off();
+      await done;
+      expect(store.getState()).toMatchObject({ loadingEarlier: false, earlierError: null });
+      expect(store.getState().snapshot.start).toBe(6);
+      await flush();
+      expect(pages).toEqual([]);
+    });
+
+    it("stops loading back to an item when a page from a later state comes after it disconnected", async () => {
+      const { store, pages, missed, whole } = paged();
+      const off = store.connect();
+      const done = store.loadEarlier({ to: "m0" });
+      off();
+      missed(added(11, msg("m10", "m10")));
+      pages.shift()!.resolve(itemPage(whole(), 6, 3));
+      await done;
+      await flush();
+      expect(pages).toEqual([]);
+      expect(store.getState()).toMatchObject({ loadingEarlier: false, earlierError: null });
+      expect(store.getState().snapshot.start).toBe(6);
+    });
+
+    it("asks for the events a page from a later state has that the store missed", async () => {
+      const resync = vi.fn(async (events: ThreadEvent[], from: number) => events.filter((e) => e.seq > from));
+      const { store, pages, answer, missed, whole } = paged(4, resync);
+      await flush();
+      expect(resync).toHaveBeenCalledTimes(1);
+      const done = store.loadEarlier({ to: "m0" });
+      // The removal's event never comes by the subscription (and the thread stays idle after it).
+      missed({ type: "items.removed", thread_id: "th", seq: 11, item_ids: ["m1"], indices: [1] });
+      pages.shift()!.resolve(itemPage(whole(), 6, 3));
+      await flush();
+      expect(resync).toHaveBeenCalledTimes(2);
+      expect(resync).toHaveBeenLastCalledWith(expect.anything(), 10);
+      expect(store.getState().snapshot.seq).toBe(11);
+      expect(pages.map((p) => p.before)).toEqual([5]);
+      answer(10);
+      await done;
+      expect(store.getState().snapshot).toEqual(snapshotWindow(whole(), 100));
+      expect(store.getState()).toMatchObject({ loadingEarlier: false, earlierError: null });
+    });
+
+    for (const [how, resync, error] of [
+      ["fails", async () => Promise.reject(new Error("offline")), "offline"],
+      ["brings nothing", async () => [], "didn't come"],
+    ] as const) {
+      it(`notes a page from a later state failed when the resync for its events ${how}`, async () => {
+        const { store, pages, missed, whole } = paged(4, resync);
+        vi.spyOn(console, "error").mockImplementation(() => {});
+        vi.spyOn(console, "warn").mockImplementation(() => {});
+        await flush();
+        const done = store.loadEarlier({ to: "m0" });
+        missed({ type: "items.removed", thread_id: "th", seq: 11, item_ids: ["m1"], indices: [1] });
+        pages.shift()!.resolve(itemPage(whole(), 6, 3));
+        await done;
+        expect(pages).toEqual([]);
+        expect(store.getState().snapshot.start).toBe(6);
+        expect(store.getState()).toMatchObject({ loadingEarlier: false, earlierError: expect.stringContaining(error) });
+      });
+    }
 
     it("leaves out a page that doesn't end at the window's start, noting it failed", async () => {
       const { store, pages, whole, ids } = paged();

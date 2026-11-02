@@ -3,7 +3,7 @@
 // details, and anything that looks like a secret. The recorder runs it over every entry.
 
 import { execFileSync } from "node:child_process";
-import { hostname, homedir, userInfo } from "node:os";
+import { hostname, homedir, tmpdir, userInfo } from "node:os";
 
 /**
  * @param {Array<[string, string]>} paths [real path, what to show instead], e.g. [tmp/work, "/work"]
@@ -16,18 +16,24 @@ export function sanitizer(paths) {
     pairs.push([from.replace(/[^a-zA-Z0-9]/g, "-"), to.replace(/[^a-zA-Z0-9]/g, "-")]);
   }
   pairs.push([homedir(), "/home/user"]);
-  // The recording machine's own git email, wherever it might have leaked in.
-  try {
-    const email = execFileSync("git", ["config", "user.email"], { encoding: "utf8" }).trim();
-    if (email) pairs.push([email, "user@example.com"]);
-  } catch {}
+  // The machine's temporary directory, when it isn't /tmp (a CLI can mention it).
+  if (tmpdir() !== "/tmp") pairs.push([tmpdir(), "/tmp"]);
+  // The recording machine's own git email and name, wherever they might have leaked in (Claude Code
+  // tells the model the git user, which can end up in what it writes, e.g. a compaction summary).
+  for (const [key, to] of [["user.email", "user@example.com"], ["user.name", "User"]]) {
+    try {
+      const v = execFileSync("git", ["config", key], { encoding: "utf8" }).trim();
+      if (v) pairs.push([v, to]);
+    } catch {}
+  }
   pairs.sort((a, b) => b[0].length - a[0].length);
   const user = userInfo().username;
   const host = hostname();
 
   const str = (s) => {
     for (const [from, to] of pairs) s = s.split(from).join(to);
-    if (host.length > 3) s = s.split(host).join("host");
+    // The host name in any case (a distribution named after it, say).
+    if (host.length > 3) s = s.replace(new RegExp(host.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"), "gi"), "host");
     return s.replace(new RegExp(`\\b${user}\\b`, "g"), "user");
   };
 
@@ -71,7 +77,7 @@ export function sanitizer(paths) {
   return (entries) => {
     streams(entries);
     return entries.map((entry) => {
-      const e = walk(entry);
+      const e = walk(machineSkills(entry));
       const text = JSON.stringify(e);
       for (const re of SECRETS) {
         if (re.test(text)) throw new Error(`a recording entry still looks like it has a secret (${re}): ${text.slice(0, 300)}`);
@@ -151,3 +157,23 @@ function scrubKey(k, v) {
 }
 
 const SECRETS = [/sk-ant-[A-Za-z0-9_-]{8,}/, /\beyJ[A-Za-z0-9_-]{20,}\.[A-Za-z0-9_-]{10,}/, /Bearer [A-Za-z0-9._-]{16,}/];
+
+/**
+ * A Codex entry without the skills the recording machine has (its user's, its distribution's):
+ * skills/list's answer keeps only Codex's built-in ones, as a machine with no skills would give,
+ * and the thread/start or thread/resume config that turned the others off loses that. (The fake CLI
+ * doesn't compare either.)
+ */
+function machineSkills(entry) {
+  const m = entry?.msg;
+  if (!m || typeof m !== "object") return entry;
+  if (entry.dir === "out" && m.method === undefined && Array.isArray(m.result?.data) && m.result.data.every((d) => Array.isArray(d?.skills))) {
+    const data = m.result.data.map((d) => ({ ...d, skills: d.skills.filter((sk) => sk.scope === "system") }));
+    return { ...entry, msg: { ...m, result: { ...m.result, data } } };
+  }
+  if (entry.dir === "in" && (m.method === "thread/start" || m.method === "thread/resume") && m.params?.config?.skills) {
+    const { skills: _, ...config } = m.params.config;
+    return { ...entry, msg: { ...m, params: { ...m.params, config } } };
+  }
+  return entry;
+}

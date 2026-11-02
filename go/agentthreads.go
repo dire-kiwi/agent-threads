@@ -78,6 +78,9 @@ type CreateOptions struct {
 	Metadata map[string]any
 	// ID is the thread's id; a new one by default.
 	ID string
+	// SessionID is the harness's own session to adopt (Claude Code's session id, Codex's thread id):
+	// the thread's first turn resumes it. Its messages so far aren't made into items.
+	SessionID string
 	// StandingAnswers stand from the start (from the app's own rules, say), as answers given with
 	// "always" do.
 	StandingAnswers []protocol.StandingAnswer
@@ -222,7 +225,7 @@ func (a *AgentThreads) Create(ctx context.Context, o CreateOptions) (protocol.Th
 	}
 	thread := protocol.Thread{
 		ID: id, Harness: harness, Status: protocol.ThreadStatusIdle, Title: o.Title, Model: o.Model,
-		Effort: o.Effort, PermissionMode: mode, Cwd: cwd, CreatedAt: now(), StandingAnswers: o.StandingAnswers,
+		Effort: o.Effort, SessionID: o.SessionID, PermissionMode: mode, Cwd: cwd, CreatedAt: now(), StandingAnswers: o.StandingAnswers,
 	}
 	if len(o.Metadata) > 0 {
 		thread.Metadata = map[string]json.RawMessage{}
@@ -598,6 +601,12 @@ func (a *AgentThreads) Handle(ctx context.Context, command protocol.Command) err
 			o.StandingAnswers = append([]protocol.StandingAnswer{}, *c.StandingAnswers...)
 		}
 		return a.SetOptions(ctx, c.ThreadID, o)
+	case *protocol.RewindCommand:
+		return a.Rewind(ctx, c.ThreadID, c.TurnID)
+	case *protocol.NewSessionCommand:
+		return a.NewSession(ctx, c.ThreadID)
+	case *protocol.CompactCommand:
+		return a.Compact(ctx, c.ThreadID)
 	}
 	return commandErr("that isn't a command")
 }
@@ -703,8 +712,76 @@ func (a *AgentThreads) SetOptions(ctx context.Context, threadID string, o Thread
 	})
 }
 
+// Rewind takes the conversation back to before the turn turnID: the harness forgets it and every
+// turn after it (from the next turn, which resumes the session there), and their items are removed.
+// It's refused (with a *CommandError) while a turn is running, for a turn the thread hasn't, and
+// where the harness can't go back (a Claude Code session the thread adopted, to before its first
+// turn in it).
+func (a *AgentThreads) Rewind(ctx context.Context, threadID, turnID string) error {
+	return a.doErr(ctx, threadID, func(rt *threadRuntime) error {
+		if err := idle(rt, "rewound"); err != nil {
+			return err
+		}
+		if err := rt.rewind(turnID); err != nil {
+			var re *RewindError
+			if errors.As(err, &re) {
+				return commandErr("the thread can't be rewound to before that turn: %s", re.Message)
+			}
+			return err
+		}
+		return nil
+	})
+}
+
+// NewSession has the thread's next turn start a new conversation with the harness; the thread's
+// items stay. It does nothing if the thread has no session, and is refused while a turn is running.
+func (a *AgentThreads) NewSession(ctx context.Context, threadID string) error {
+	return a.doErr(ctx, threadID, func(rt *threadRuntime) error {
+		if err := idle(rt, "given a new session"); err != nil {
+			return err
+		}
+		rt.newSession()
+		return nil
+	})
+}
+
+// Compact compacts the harness's context now, in a turn of its own. It's refused while a turn is
+// running, and when the thread has no session yet.
+func (a *AgentThreads) Compact(ctx context.Context, threadID string) error {
+	return a.doErr(ctx, threadID, func(rt *threadRuntime) error {
+		if err := idle(rt, "compacted"); err != nil {
+			return err
+		}
+		if rt.state.Thread.SessionID == "" {
+			return commandErr("the thread has no conversation to compact yet")
+		}
+		session, ok := rt.session.(CompactingSession)
+		if !ok {
+			return commandErr("%s threads can't be compacted", rt.state.Thread.Harness)
+		}
+		rt.compact(session)
+		return nil
+	})
+}
+
+// idle refuses a command that needs the thread idle: one that's running a turn.
+func idle(rt *threadRuntime, what string) error {
+	if rt.turn != nil {
+		return commandErr("a turn is running: the thread can't be %s until it ends (interrupt it first)", what)
+	}
+	return nil
+}
+
 // do runs fn on the live thread a command is for, once the AgentThreads is known to be open.
 func (a *AgentThreads) do(ctx context.Context, threadID string, fn func(rt *threadRuntime)) error {
+	return a.doErr(ctx, threadID, func(rt *threadRuntime) error {
+		fn(rt)
+		return nil
+	})
+}
+
+// doErr is do for a command fn may refuse, with the error it returns.
+func (a *AgentThreads) doErr(ctx context.Context, threadID string, fn func(rt *threadRuntime) error) error {
 	if err := a.open(); err != nil {
 		return err
 	}
@@ -724,7 +801,7 @@ func (a *AgentThreads) do(ctx context.Context, threadID string, fn func(rt *thre
 			}
 			return
 		}
-		fn(rt)
+		refused = fn(rt)
 	}); err != nil {
 		if errors.Is(err, errLoopStopped) {
 			return commandErr("this AgentThreads is closed")
@@ -873,7 +950,7 @@ func (a *AgentThreads) stopAll(ctx context.Context, stop bool) {
 			a.closeSession(ctx, rt)
 			rt.loop.call(func() {
 				if rt.turn != nil {
-					rt.endTurn(TurnEnd{}, false)
+					rt.endTurn(TurnEnd{}, false, false)
 				}
 			})
 		}()
@@ -1048,17 +1125,34 @@ func (a *AgentThreads) fromStore(ctx context.Context, threadID string) (*threadR
 	if err != nil {
 		return nil, err
 	}
-	state := protocol.InitialState(*thread)
+	base := protocol.InitialState(*thread)
 	if snap != nil {
-		state = *snap
+		base = *snap
 	}
-	events, err := a.store.ReadEvents(ctx, threadID, state.Seq, 0)
+	events, err := a.store.ReadEvents(ctx, threadID, base.Seq, 0)
 	if err != nil {
 		return nil, err
 	}
-	state = protocol.ApplyEvents(state, events)
+	state := protocol.ApplyEvents(base, events)
 	if state.Seq == 0 {
 		state = protocol.InitialState(*thread)
+	}
+	// The turn that was running, if one was (a compaction may have no items yet), and the session it
+	// started in: what a turn rebuilt here is.
+	running := state.Thread.Status == protocol.ThreadStatusRunning || state.Thread.Status == protocol.ThreadStatusWaiting
+	lost := lostTurn{Session: state.Thread.SessionID}
+	if running {
+		open, found := runningTurn(base, events)
+		if !found {
+			all, err := a.store.ReadEvents(ctx, threadID, 0, 0)
+			if err != nil {
+				return nil, err
+			}
+			open, found = runningTurn(protocol.InitialState(*thread), all)
+		}
+		if found {
+			lost = open
+		}
 	}
 	// The run it had, read first: a store that can't say leaves the thread to be loaded again later,
 	// rather than taking a run that may still be going for lost.
@@ -1078,18 +1172,17 @@ func (a *AgentThreads) fromStore(ctx context.Context, threadID string) (*threadR
 	}
 	var abandon *RunRecord
 	rt.loop.call(func() {
-		ok, stop := a.reattach(rt, record)
+		ok, stop := a.reattach(rt, record, lost)
 		if ok {
 			return
 		}
 		abandon = stop
 		// The process that ran its turn went with the backend before this one, or can't be followed.
-		s := rt.state.Thread.Status
-		if s == protocol.ThreadStatusRunning || s == protocol.ThreadStatusWaiting || rt.state.Thread.Run != nil {
+		if running || rt.state.Thread.Run != nil {
 			if rt.state.Thread.Run != nil {
 				rt.lostRun = rt.state.Thread.Run.ID
 			}
-			recoverLost(rt)
+			recoverLost(rt, lost)
 		} else {
 			// Questions kept open after their turns ended are taken up again (or cancelled, if they
 			// can't be any more).
@@ -1104,9 +1197,9 @@ func (a *AgentThreads) fromStore(ctx context.Context, threadID string) (*threadR
 
 // reattach re-attaches a thread just loaded to its run (record), if it has one that outlived the
 // backend before: its turn and open requests are as they were when the run was last saved, and the
-// session carries on reading the run from there. It says whether it did; if it couldn't, it returns
-// the run, to be stopped.
-func (a *AgentThreads) reattach(rt *threadRuntime, record *RunRecord) (bool, *RunRecord) {
+// session carries on reading the run from there (a turn the run data hasn't is rebuilt as lost). It
+// says whether it did; if it couldn't, it returns the run, to be stopped.
+func (a *AgentThreads) reattach(rt *threadRuntime, record *RunRecord, lost lostTurn) (bool, *RunRecord) {
 	if record == nil {
 		return false, nil
 	}
@@ -1120,8 +1213,8 @@ func (a *AgentThreads) reattach(rt *threadRuntime, record *RunRecord) (bool, *Ru
 		var t turnState
 		switch {
 		case len(data.Turn) == 0:
-			// A run saved before runs had their turn has the last one.
-			rt.turn = &turnState{ID: lastTurn(rt.state.Items)}
+			// A run saved before runs had their turn has the one the events have open.
+			rt.turn = lost.turn(rt.state.Items)
 		case string(data.Turn) == "null" || json.Unmarshal(data.Turn, &t) != nil:
 			// Saved with no turn running: it may be waiting only on a background subagent's request.
 			rt.turn = nil
@@ -1162,13 +1255,43 @@ func (a *AgentThreads) reattach(rt *threadRuntime, record *RunRecord) (bool, *Ru
 	return true, nil
 }
 
-func lastTurn(items []protocol.Item) string {
-	for i := len(items) - 1; i >= 0; i-- {
-		if t := items[i].TurnID(); t != "" {
-			return t
-		}
+// lostTurn is a turn that was running when the thread was loaded: its id ("" if it isn't known),
+// and the session it started in.
+type lostTurn struct {
+	ID      string
+	Session string
+}
+
+// turn is the turn rebuilt for it: with no id, the latest turn's (of the last item that has one), or
+// a new one.
+func (l lostTurn) turn(items []protocol.Item) *turnState {
+	id := l.ID
+	for i := len(items) - 1; i >= 0 && id == ""; i-- {
+		id = items[i].TurnID()
 	}
-	return NewID("turn")
+	if id == "" {
+		id = NewID("turn")
+	}
+	return &turnState{ID: id, Session: l.Session}
+}
+
+// runningTurn is the turn that's still running in events folded onto from (the last turn.started
+// with no turn.completed after it), with the thread's session_id when it started (a session the turn
+// starts is set after its turn.started); found is false if there's none in them.
+func runningTurn(from protocol.Snapshot, events []protocol.ThreadEvent) (open lostTurn, found bool) {
+	state := from
+	for _, e := range events {
+		switch ev := e.Value.(type) {
+		case *protocol.TurnStartedEvent:
+			open, found = lostTurn{ID: ev.TurnID, Session: state.Thread.SessionID}, true
+		case *protocol.TurnCompletedEvent:
+			if found && ev.TurnID == open.ID {
+				open, found = lostTurn{}, false
+			}
+		}
+		state = protocol.ApplyEvent(state, e)
+	}
+	return open, found
 }
 
 // openTurn is the turn a thread's items say is still running: its last, if it has no turn_result
@@ -1186,17 +1309,21 @@ func openTurn(items []protocol.Item) string {
 	return last
 }
 
-// recoverLost ends a turn whose process was lost when the backend stopped, and stops the subagents
-// that went with it (a background one may be running with no turn).
-func recoverLost(rt *threadRuntime) {
+// recoverLost ends a turn whose process was lost when the backend stopped (lost, the one its events
+// have open, which a compaction with no items yet is too; or the one its items have open), and stops
+// the subagents that went with it (a background one may be running with no turn).
+func recoverLost(rt *threadRuntime, lost lostTurn) {
 	s := rt.state.Thread.Status
-	open := openTurn(rt.state.Items)
+	open := lost.ID
+	if open == "" {
+		open = openTurn(rt.state.Items)
+	}
 	turn := s == protocol.ThreadStatusRunning || (s == protocol.ThreadStatusWaiting && open != "")
 	if turn {
 		if open == "" {
 			open = NewID("turn")
 		}
-		rt.turn = &turnState{ID: open}
+		rt.turn = &turnState{ID: open, Session: lost.Session}
 	}
 	var running []string
 	for _, it := range rt.state.Items {
@@ -1213,7 +1340,8 @@ func recoverLost(rt *threadRuntime) {
 			Text: "The backend stopped while this turn was running, and couldn't pick its run up again.",
 		})
 		// Not carried over: loading a thread starts no process. Its queued messages go with the next.
-		rt.endTurn(TurnEnd{Error: "The backend stopped while this turn was running."}, false)
+		// Its mark is the last the harness gave (turn_at); with none, it's lost.
+		rt.endTurn(TurnEnd{Error: "The backend stopped while this turn was running."}, false, true)
 	} else if rt.state.Thread.Status == protocol.ThreadStatusWaiting {
 		rt.SetThread(func(t *protocol.Thread) { t.Status = protocol.ThreadStatusIdle })
 	}

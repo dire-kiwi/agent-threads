@@ -32,20 +32,20 @@ use crate::mcp_http::{LoopbackMcp, ToolServer, serve_tools};
 use crate::permissions::{Decided, PermissionDecision, PermissionQuery, mode_after_plan, permission_key};
 use crate::protocol::{
     DeltaEventKind, Item, PermissionMode, Resolution, ResolutionOutcome, SubagentState, SubagentStatus, ToolKind,
-    ToolStatus, Usage,
+    ToolStatus, TurnSession, Usage,
 };
+use crate::sessions::{RewindError, RewindPoint, revert_point};
 use crate::skills::write_skills;
 use crate::spawner::{ExitStatus, HarnessProcess, ProcessEvent, Signal, SpawnOptions};
 use crate::store::RunRecord;
 use crate::thread::{SECRET, SessionJob, ThreadContext, Timer, add_usage, running_in_background};
 use crate::tools::{Cancellation, Tool, ToolContext, ToolOutput, run_tool};
 use home::{
-    SessionState, Totals, default_codex_home, prepare_codex_home, read_session_state, user_codex_home,
-    write_session_state,
+    SessionState, default_codex_home, prepare_codex_home, read_session_state, user_codex_home, write_session_state,
 };
 use translate::{
-    APP_SERVER, child_turn_subagent, codex_done, codex_policy, codex_rate_limits, codex_tool, codex_usage,
-    collab_subagent, is_tool_item, mcp_server_config, questions, sandbox_policy, spawn_done, todos, totals_as_usage,
+    APP_SERVER, call_usage, child_turn_subagent, codex_done, codex_policy, codex_rate_limits, codex_tool,
+    collab_subagent, is_tool_item, mcp_server_config, no_usage, questions, sandbox_policy, spawn_done, todos,
 };
 
 /// How the app's tools reach Codex.
@@ -224,18 +224,22 @@ struct Planned {
     duration_ms: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     request: Option<String>,
+    /// The turn's mark (its session's `at`): its first Codex turn.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    session_at: Option<String>,
 }
 
 /// A turn's end with what its Codex turns that completed (its plans') used, for a turn that ends
-/// otherwise.
-fn with_planned(end: TurnEnd, planned: Option<Planned>) -> TurnEnd {
+/// otherwise, and its mark: its first Codex turn (`at`, the one running, if it's that).
+fn with_planned(end: TurnEnd, planned: Option<Planned>, at: Option<String>) -> TurnEnd {
     match planned {
         Some(p) => TurnEnd {
             usage: p.usage,
             duration_ms: p.duration_ms,
+            session_at: p.session_at.or(at),
             ..end
         },
-        None => end,
+        None => TurnEnd { session_at: at, ..end },
     }
 }
 
@@ -268,12 +272,14 @@ struct RunState {
     turn_id: Option<String>,
     starting: bool,
     compacting: bool,
-    total: Option<Totals>,
+    #[serde(default)]
+    reported: bool,
+    #[serde(default)]
+    used: Option<Usage>,
     error: Option<String>,
     home: String,
     dynamic: Option<Vec<Value>>,
     mcp_app: bool,
-    baseline: Option<Totals>,
     hidden_skills: Vec<String>,
     noticed_servers: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -341,8 +347,12 @@ struct Run {
     turn_waiters: Vec<TurnFn>,
     /// The running turn is a compaction.
     compacting: bool,
-    /// The thread's token totals, as Codex last reported them in this run.
-    total: Option<Totals>,
+    /// Codex has reported the thread's tokens in this run (so its turns' usage is known).
+    reported: bool,
+    /// What the running turn has used: each model call's tokens (tokenUsage.last), summed from its
+    /// turn/started on. Codex's running totals aren't used: for a session the thread adopted they
+    /// include what came before, and a revert doesn't take them back.
+    used: Option<Usage>,
     /// The running turn's last error that won't be retried.
     error: Option<String>,
     /// The CODEX_HOME it runs with.
@@ -352,8 +362,6 @@ struct Run {
     dynamic: Option<Vec<Value>>,
     /// Some of the app's tools are on the loopback MCP server.
     mcp_app: bool,
-    /// Codex's token totals for the session after its last turn, when they're known.
-    baseline: Option<Totals>,
     /// Skills Codex found that aren't the app's (the user's, the project's): they're turned off.
     hidden_skills: Vec<String>,
     noticed_servers: bool,
@@ -409,12 +417,12 @@ impl Run {
             starting: false,
             turn_waiters: Vec::new(),
             compacting: false,
-            total: None,
+            reported: false,
+            used: None,
             error: None,
             home: String::new(),
             dynamic: None,
             mcp_app: false,
-            baseline: None,
             hidden_skills: Vec::new(),
             noticed_servers: false,
             mcp: None,
@@ -496,12 +504,12 @@ impl Run {
             turn_id: self.turn_id.clone(),
             starting: self.starting,
             compacting: self.compacting,
-            total: self.total.clone(),
+            reported: self.reported,
+            used: self.used.clone(),
             error: self.error.clone(),
             home: self.home.clone(),
             dynamic: self.dynamic.clone(),
             mcp_app: self.mcp_app,
-            baseline: self.baseline.clone(),
             hidden_skills: self.hidden_skills.clone(),
             noticed_servers: self.noticed_servers,
             skills_dir: self.skills_dir.as_ref().map(|d| d.to_string_lossy().into()),
@@ -546,12 +554,12 @@ impl Run {
         self.turn_id = st.turn_id.clone();
         self.starting = st.starting;
         self.compacting = st.compacting;
-        self.total = st.total.clone();
+        self.reported = st.reported;
+        self.used = st.used.clone();
         self.error = st.error.clone();
         self.home = st.home.clone();
         self.dynamic = st.dynamic.clone();
         self.mcp_app = st.mcp_app;
-        self.baseline = st.baseline.clone();
         self.hidden_skills = st.hidden_skills.clone();
         self.noticed_servers = st.noticed_servers;
         self.skills_dir = st.skills_dir.as_ref().map(PathBuf::from);
@@ -1023,6 +1031,7 @@ impl CodexSession {
         if self.runs.get(run).is_none_or(|r| r.exited || r.retired) || self.current.as_deref() != Some(run) {
             return;
         }
+        let at = self.runs.get(run).and_then(|r| r.turn_id.clone());
         self.turn_ended(ctx, run);
         let planned = self.run(run).unwrap().planned.take();
         if ctx.turn_id().is_some() {
@@ -1035,6 +1044,7 @@ impl CodexSession {
                         ..Default::default()
                     },
                     planned,
+                    at,
                 ),
                 live,
             );
@@ -1311,8 +1321,7 @@ impl CodexSession {
         let r = self.run(run).unwrap();
         // Codex keeps the dynamic tools the session started with, and resuming can't change them.
         let state = read_session_state(Path::new(&r.home), &session);
-        r.dynamic = state.as_ref().map(|s| s.dynamic_tools.clone());
-        r.baseline = state.and_then(|s| s.totals);
+        r.dynamic = state.map(|s| s.dynamic_tools);
         let mut params = match self.thread_params(ctx, run, false) {
             Ok(p) => p,
             Err(e) => return self.start_failed(ctx, run, e),
@@ -1326,7 +1335,7 @@ impl CodexSession {
             params,
             None,
             Box::new(|s, ctx, run, r| match r {
-                Ok(r) => s.thread_started(ctx, run, &r),
+                Ok(r) => s.resumed(ctx, run, r),
                 Err(e) => {
                     let m = e.message.to_lowercase();
                     if !["not found", "no rollout", "unknown thread", "does not exist"].iter().any(|x| m.contains(x)) {
@@ -1338,6 +1347,30 @@ impl CodexSession {
                     );
                     s.notice(ctx, &text);
                     s.new_thread(ctx, run);
+                }
+            }),
+        );
+    }
+
+    /// The session was resumed: after a rewind, it's reverted to before the turn it went back to
+    /// before, first.
+    fn resumed(&mut self, ctx: &mut ThreadContext, run: &str, r: Value) {
+        let (Some(at), Some(session)) = (ctx.thread().resume_at.clone(), ctx.thread().session_id.clone()) else {
+            return self.thread_started(ctx, run, &r);
+        };
+        self.request(
+            ctx,
+            run,
+            "thread/revert",
+            json!({"threadId": session, "beforeTurnId": at}),
+            None,
+            Box::new(move |s, ctx, run, reverted| match reverted {
+                Err(e) => s.start_failed(ctx, run, e.message),
+                Ok(_) => {
+                    if ctx.thread().resume_at.as_deref() == Some(at.as_str()) {
+                        ctx.set_thread(|t| t.resume_at = None);
+                    }
+                    s.thread_started(ctx, run, &r);
                 }
             }),
         );
@@ -1395,12 +1428,9 @@ impl CodexSession {
     }
 
     fn new_thread_started(&mut self, ctx: &mut ThreadContext, run: &str, r: &Value) {
-        let Some(rs) = self.run(run) else { return };
-        // A new session's totals start at nothing.
-        rs.baseline = Some(Totals {
-            cache_write_input_tokens: Some(0),
-            ..Default::default()
-        });
+        if !self.runs.contains_key(run) {
+            return;
+        }
         if let Some(t) = r["thread"]["id"].as_str() {
             self.save_state(ctx, run, t);
         }
@@ -1419,9 +1449,13 @@ impl CodexSession {
         if r["sandbox"]["type"] == "workspaceWrite" {
             rs.workspace = Some(r["sandbox"].clone());
         }
+        // A rewind's resume_at was for the session it had, which this isn't if it couldn't be resumed.
         if ctx.thread().session_id.as_deref() != Some(thread_id.as_str()) {
             let sid = thread_id.clone();
-            ctx.set_thread(|t| t.session_id = Some(sid));
+            ctx.set_thread(|t| {
+                t.session_id = Some(sid);
+                t.resume_at = None;
+            });
         }
         self.set_ready(ctx, run, Ok(thread_id));
     }
@@ -1447,13 +1481,12 @@ impl CodexSession {
         self.set_ready(ctx, run, Err(error));
     }
 
-    /// Records the session's dynamic tools and totals, where they're known.
+    /// Records the session's dynamic tools, where they're known.
     fn save_state(&self, ctx: &ThreadContext, run: &str, session: &str) {
         let Some(r) = self.runs.get(run) else { return };
         let Some(dynamic) = &r.dynamic else { return };
         let state = SessionState {
             dynamic_tools: dynamic.clone(),
-            totals: r.baseline.clone(),
         };
         if let Err(e) = write_session_state(Path::new(&r.home), session, &state) {
             ctx.error(Error::Other(format!("Codex's session state couldn't be saved: {e}")));
@@ -1594,6 +1627,7 @@ impl CodexSession {
         }
         let retired = run.retired;
         let error = exit_error(&status, &run.stderr, true);
+        let at = run.turn_id.clone();
         let mut children: Vec<String> = run.children.values().cloned().collect();
         children.sort();
         self.turn_ended(ctx, id);
@@ -1623,6 +1657,7 @@ impl CodexSession {
                         ..Default::default()
                     },
                     planned,
+                    at,
                 ),
                 live,
             );
@@ -1785,7 +1820,12 @@ impl CodexSession {
                     let r = self.run(run).unwrap();
                     r.starting = true;
                     r.error = None;
+                    r.used = Some(no_usage());
                     self.set_turn(ctx, run, t.to_string());
+                    // The turn's mark is its first Codex turn (one that goes on after a plan has it already).
+                    if self.run(run).is_some_and(|r| r.planned.is_none()) {
+                        ctx.mark(t);
+                    }
                 }
                 // A child taking up work again (a follow-up sent to it): its report is to come.
                 if let Some(call) = parent.as_deref() {
@@ -1821,11 +1861,13 @@ impl CodexSession {
                 }
             }
             "thread/tokenUsage/updated" => {
-                if own
-                    && !p["tokenUsage"]["total"].is_null()
-                    && let Ok(t) = serde_json::from_value(p["tokenUsage"]["total"].clone())
-                {
-                    self.run(run).unwrap().total = Some(t);
+                if own && p["tokenUsage"].is_object() {
+                    let r = self.run(run).unwrap();
+                    r.reported = true;
+                    // A report outside a turn (a resumed session's totals, say) isn't any turn's.
+                    if r.used.is_some() && p["tokenUsage"]["last"].is_object() {
+                        r.used = add_usage(r.used.as_ref(), Some(&call_usage(&p["tokenUsage"]["last"])));
+                    }
                 }
             }
             "warning" => {
@@ -2114,6 +2156,7 @@ impl CodexSession {
         let r = self.run(run).unwrap();
         let error = r.error.clone();
         let plan = r.proposed.take();
+        let at = turn["id"].as_str().map(String::from).or_else(|| r.turn_id.clone());
         self.turn_ended(ctx, run);
         let r = self.run(run).unwrap();
         r.error = None;
@@ -2129,21 +2172,8 @@ impl CodexSession {
             .collect();
         let r = self.run(run).unwrap();
         r.open = kept;
-        // Codex reports the session's totals: the turn used how far they grew. (Where the
-        // session's totals before it aren't known, the thread's usage stands in for them.)
-        let usage = r.total.as_ref().map(|total| {
-            let before = match &r.baseline {
-                Some(b) => totals_as_usage(b),
-                None => serde_json::to_value(&ctx.thread().usage).unwrap_or_default(),
-            };
-            codex_usage(total, &before)
-        });
-        if let Some(total) = r.total.clone() {
-            r.baseline = Some(total);
-            if let Some(t) = r.thread_id.clone() {
-                self.save_state(ctx, run, &t);
-            }
-        }
+        let used = r.used.take();
+        let usage = r.reported.then(|| used.unwrap_or_else(no_usage));
         if ctx.turn_id().is_none() {
             return;
         }
@@ -2152,12 +2182,15 @@ impl CodexSession {
         // The thread's turn is all of its Codex turns, the plans' included.
         let r = self.run(run).unwrap();
         let mut sum = r.planned.take().unwrap_or_default();
-        let usage: Option<Usage> = usage.and_then(|u| serde_json::from_value(u).ok());
         sum.usage = add_usage(sum.usage.as_ref(), usage.as_ref());
         if let Some(d) = turn["durationMs"].as_f64() {
             sum.duration_ms = Some(sum.duration_ms.unwrap_or(0) + d as u64);
         }
         sum.request = None;
+        // Its mark is its first Codex turn: reverting to before that takes back all of them.
+        if sum.session_at.is_none() {
+            sum.session_at = at;
+        }
         if let Some(plan) = plan
             && ok
             && ctx.thread().permission_mode == Some(PermissionMode::Plan)
@@ -2186,6 +2219,7 @@ impl CodexSession {
             }),
             usage: sum.usage,
             duration_ms: sum.duration_ms,
+            session_at: sum.session_at,
         };
         let live = self.live_id().is_some();
         ctx.end_turn(end, live);
@@ -2239,6 +2273,7 @@ impl CodexSession {
                 error: None,
                 usage: planned.usage,
                 duration_ms: planned.duration_ms,
+                session_at: planned.session_at,
             },
             live,
         );
@@ -2965,33 +3000,45 @@ fn turn_started(sent: Option<Sent>, before: Option<Before>) -> Then {
 
 impl HarnessSession for CodexSession {
     fn start(&mut self, ctx: &mut ThreadContext, messages: Vec<Message>) {
-        let run = self.ensure(ctx, true);
         if messages.len() == 1 && messages[0].text.trim() == "/compact" && messages[0].attachments.is_empty() {
-            let r = self.run(&run).unwrap();
-            r.starting = true;
-            r.compacting = true;
-            self.when_ready(
-                ctx,
-                &run.clone(),
-                Box::new(move |s, ctx, ready| match ready {
-                    Err(e) => s.turn_failed(ctx, &run, &e),
-                    Ok(thread_id) => s.request(
-                        ctx,
-                        &run,
-                        "thread/compact/start",
-                        json!({"threadId": thread_id}),
-                        None,
-                        Box::new(|s, ctx, run, r| {
-                            if let Err(e) = r {
-                                s.turn_failed(ctx, run, &e.message);
-                            }
-                        }),
-                    ),
-                }),
-            );
-            return;
+            return self.compact(ctx);
         }
+        let run = self.ensure(ctx, true);
         self.turn_start(ctx, &run, &messages);
+    }
+
+    fn can_compact(&self) -> bool {
+        true
+    }
+
+    fn compact(&mut self, ctx: &mut ThreadContext) {
+        let run = self.ensure(ctx, true);
+        let r = self.run(&run).unwrap();
+        r.starting = true;
+        r.compacting = true;
+        self.when_ready(
+            ctx,
+            &run.clone(),
+            Box::new(move |s, ctx, ready| match ready {
+                Err(e) => s.turn_failed(ctx, &run, &e),
+                Ok(thread_id) => s.request(
+                    ctx,
+                    &run,
+                    "thread/compact/start",
+                    json!({"threadId": thread_id}),
+                    None,
+                    Box::new(|s, ctx, run, r| {
+                        if let Err(e) = r {
+                            s.turn_failed(ctx, run, &e.message);
+                        }
+                    }),
+                ),
+            }),
+        );
+    }
+
+    fn rewind_point(&self, sessions: &[Option<TurnSession>], index: usize) -> Option<Result<RewindPoint, RewindError>> {
+        Some(revert_point(sessions, index))
     }
 
     fn steer(&mut self, ctx: &mut ThreadContext, message: Message) {
@@ -3116,6 +3163,19 @@ impl HarnessSession for CodexSession {
 
     fn config_changed(&mut self, _ctx: &mut ThreadContext) {
         self.stale = true;
+    }
+
+    fn retire(&mut self, ctx: &mut ThreadContext) {
+        self.stale = true;
+        self.clear_stop();
+        // Stopped now, and retired: what it says on its way out is left out. It's the thread's run
+        // no more from now, so its end, whenever that comes, changes nothing.
+        if let Some(id) = self.live_id() {
+            self.stop(ctx, &id, true, true);
+            if ctx.thread().run.as_ref().is_some_and(|r| r.id == id) {
+                ctx.set_thread(|t| t.run = None);
+            }
+        }
     }
 
     fn close(&mut self, ctx: &mut ThreadContext) -> BoxFuture<()> {

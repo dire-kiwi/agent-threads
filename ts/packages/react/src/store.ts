@@ -72,12 +72,20 @@ export class ThreadStore {
    */
   private asked: "none" | "answer" | "events" = "none";
   private connected = false;
-  /** The page of earlier items being loaded, if one is. */
-  private paging: Promise<void> | null = null;
+  /** The page of earlier items being loaded, if one is: it resolves false if it was given up (see page). */
+  private paging: Promise<boolean> | null = null;
   /** The saved events applied while a page loads, to apply to its items too (see loadEarlier). */
   private recorded: ThreadEvent[] | null = null;
-  /** Counts the snapshots a resync has put in place of the state, which make a page on its way stale. */
+  /**
+   * Counts what makes a page on its way stale: the snapshots a resync has put in place of the
+   * state, and the items.removed applied (which move the window's start, by which a page is placed).
+   */
   private snapshots = 0;
+  /**
+   * Pages from a later state than the store's, waiting for it to get there: told true once it has,
+   * false if the store disconnects first, or why not if the resync asked for their events didn't bring them.
+   */
+  private waiting: { seq: number; done: (reached: Reached) => void }[] = [];
 
   constructor(readonly source: ThreadSource) {
     const snapshot = source.snapshot;
@@ -111,6 +119,7 @@ export class ThreadStore {
       this.connected = false;
       this.attempt++;
       this.asked = "none";
+      this.unreached(false);
       off();
     };
   }
@@ -138,9 +147,11 @@ export class ThreadStore {
       if (this.paging) return this.paging;
       // It's the load under way before the source is asked, so one that fails straight away (the
       // source throws) is done with by the time it returns, and the next is asked for afresh.
-      let done!: () => void;
-      const paging = (this.paging = new Promise<void>((r) => (done = r)));
+      let done!: (more: boolean) => void;
+      const paging = (this.paging = new Promise<boolean>((r) => (done = r)));
+      let more = true;
       void this.page()
+        .then((m) => void (more = m))
         .catch((e) => {
           // It threw after the page came (putting it in, or a listener): it failed, so isn't stuck
           // loading. Unless what threw had started the next load, which is under way.
@@ -153,7 +164,7 @@ export class ThreadStore {
         })
         .finally(() => {
           if (this.paging === paging) this.paging = null;
-          done();
+          done(more);
         });
       return paging;
     };
@@ -162,18 +173,21 @@ export class ThreadStore {
       return;
     }
     while (this.hasEarlier() && !this.isLoaded(to)) {
-      await next();
-      if (this.state.earlierError) return;
+      // Given up (the store disconnected while its page waited) or failed: asking again would get
+      // the same, so it stops.
+      if (!(await next()) || this.state.earlierError) return;
     }
   }
 
   /**
-   * Loads the page before the window's start and puts it in. A resync that brings a fresh snapshot
-   * meanwhile makes the page stale (its items may be older than the snapshot's, and events the
+   * Loads the page before the window's start and puts it in, once the state has the events the page
+   * has (a page can be from a later state). A resync that brings a fresh snapshot, or an
+   * items.removed (which moves the window's start), meanwhile makes the page stale (its items may be older than the snapshot's, and events the
    * snapshot has in weren't applied, so can't be applied to the page): it's left out, and the page
-   * before the new snapshot's start is asked for instead.
+   * before the new snapshot's start is asked for instead. Resolves false if it gave the page up, as
+   * the store disconnected before getting to the page's state.
    */
-  private async page(): Promise<void> {
+  private async page(): Promise<boolean> {
     while (this.hasEarlier()) {
       const before = this.state.snapshot.start!;
       const epoch = this.snapshots;
@@ -184,7 +198,23 @@ export class ThreadStore {
         page = await this.source.loadEarlier!(before);
       } catch (e) {
         this.pageFailed(e);
-        return;
+        return true;
+      }
+      // A page from a later state than the store's waits for the store to get there: an
+      // items.removed it already has (taken after a rewind whose event hasn't come yet) would
+      // otherwise move the window's start again once it comes, past the page's items.
+      if (page.seq > this.state.snapshot.seq) {
+        const reached = await this.reach(page.seq);
+        if (reached !== true) {
+          if (reached) {
+            this.pageFailed(reached);
+            return true;
+          }
+          this.recorded = null;
+          this.paging = null;
+          if (this.state.loadingEarlier) this.update({ ...this.state, loadingEarlier: false });
+          return false;
+        }
       }
       const recorded = this.recorded;
       this.recorded = null;
@@ -206,7 +236,7 @@ export class ThreadStore {
       // failure, not done, so loading back to an item doesn't ask for the same page forever.
       if (snapshot === s) {
         this.pageFailed(new Error(`the page of items before ${before} doesn't fit the thread's window`));
-        return;
+        return true;
       }
       this.update({
         ...this.state,
@@ -214,10 +244,11 @@ export class ThreadStore {
         view: buildView(snapshot.items, snapshot.requests, this.state.view),
         loadingEarlier: false,
       });
-      return;
+      return true;
     }
     this.paging = null;
     if (this.state.loadingEarlier) this.update({ ...this.state, loadingEarlier: false });
+    return true;
   }
 
   /** Notes that loading earlier items failed, and why. */
@@ -300,6 +331,8 @@ export class ThreadStore {
     }
     this.update(next);
     if (next.resyncing && this.connected) this.gap();
+    // A page waiting for events this resync was asked for after (see reach) won't get them.
+    else this.unreached(new Error(`the thread's events up to the page's seq didn't come (resyncing from seq ${before} got to ${next.snapshot.seq})`));
   }
 
   private failed(n: number, e: unknown) {
@@ -308,6 +341,7 @@ export class ThreadStore {
     // The next saved event to come tries again.
     this.asked = "none";
     this.update(this.drain(this.state));
+    this.unreached(e instanceof Error ? e : new Error(String(e)));
   }
 
   /** `state` with the held events that follow on from it applied; with `force`, past any gap. */
@@ -328,6 +362,7 @@ export class ThreadStore {
   /** `state` with `event` applied: the snapshot, what's streaming, and the view. */
   private apply(state: ThreadState, event: ThreadEvent): ThreadState {
     const snapshot = applyEvent(state.snapshot, event);
+    if (event.type === "items.removed" && snapshot !== state.snapshot) this.snapshots++;
     if (this.recorded && event.type !== "delta" && snapshot.seq !== state.snapshot.seq) this.recorded.push(event);
     const streaming = streamingAfter(state.streaming, event, snapshot);
     if (snapshot === state.snapshot && streaming === state.streaming) return state;
@@ -341,9 +376,37 @@ export class ThreadStore {
   private update(next: ThreadState) {
     if (next === this.state) return;
     this.state = next;
+    if (this.waiting.length) {
+      const seq = next.snapshot.seq;
+      for (const w of this.waiting.filter((w) => w.seq <= seq)) w.done(true);
+      this.waiting = this.waiting.filter((w) => w.seq > seq);
+    }
     for (const l of this.listeners) l();
   }
+
+  /**
+   * Resolves true once the state has the events up to `seq`; false if the store disconnects first;
+   * or why not, if the resync it asks for doesn't bring them. The events are on their way, or were
+   * missed (a gap the store had no saved event after to notice): it asks the source for them
+   * (taking over a resync under way, which may have been asked before they were saved). A source
+   * without resync can only send them.
+   */
+  private reach(seq: number): Promise<Reached> {
+    if (this.state.snapshot.seq >= seq) return Promise.resolve(true);
+    if (!this.connected) return Promise.resolve(false);
+    const reached = new Promise<Reached>((done) => this.waiting.push({ seq, done }));
+    if (this.source.resync) this.gap();
+    return reached;
+  }
+
+  /** Tells the pages waiting for a state the store hasn't got to that it won't (see reach). */
+  private unreached(why: false | Error) {
+    for (const w of this.waiting.splice(0)) w.done(why);
+  }
 }
+
+/** What a page waiting for the store to get to its state is told (see reach). */
+type Reached = boolean | Error;
 
 /**
  * Whether item `id` is in `snapshot` with everything after it: it's in its window, not one of the
@@ -365,6 +428,8 @@ function streamingAfter(streaming: ReadonlySet<string>, event: ThreadEvent, snap
       return "text" in event.patch ? without(streaming, event.item_id) : streaming;
     case "item.added":
       return without(streaming, event.item.id);
+    case "items.removed":
+      return event.item_ids.reduce(without, streaming);
     case "turn.completed":
       return streaming.size ? NO_IDS : streaming;
     default:

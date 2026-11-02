@@ -24,8 +24,9 @@ use crate::harness::{
 use crate::ids::{new_id, now_iso, now_ms, private_temp_dir};
 use crate::permissions::{Decided, PermissionDecision, PermissionQuery, StandingKey, mode_after_plan, permission_key};
 use crate::protocol::{
-    DeltaEventKind, Item, PermissionMode, Resolution, ResolutionOutcome, ToolKind, ToolStatus, Usage,
+    DeltaEventKind, Item, PermissionMode, Resolution, ResolutionOutcome, ToolKind, ToolStatus, TurnSession, Usage,
 };
+use crate::sessions::{RewindError, RewindPoint, resume_at_point};
 use crate::skills::write_skills;
 use crate::spawner::{ExitStatus, HarnessProcess, ProcessEvent, Signal, SpawnOptions};
 use crate::store::RunRecord;
@@ -181,6 +182,12 @@ struct RunState {
     held_usage: Option<Usage>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     plugin_dir: Option<String>,
+    /// The running turn's mark: the main conversation's last message in it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    at: Option<String>,
+    /// The message it was started to resume its session at (the thread's resume_at then).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    resume_at: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     launched: Option<Launched>,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
@@ -233,6 +240,10 @@ struct Run {
     held_usage: Option<Usage>,
     /// The generated plugin with the thread's skills, for this run only.
     plugin_dir: Option<PathBuf>,
+    /// The running turn's mark: the uuid of the main conversation's last message in it.
+    at: Option<String>,
+    /// The message it was started to resume its session at (--resume-session-at).
+    resume_at: Option<String>,
     /// The thread's options it has: those it was started with, and the model and permission mode
     /// since.
     launched: Option<Launched>,
@@ -268,6 +279,8 @@ impl Run {
             auto_turn: None,
             held_usage: None,
             plugin_dir: None,
+            at: None,
+            resume_at: None,
             launched: None,
             detached: false,
         }
@@ -386,6 +399,8 @@ impl Run {
             auto_turn: self.auto_turn.clone(),
             held_usage: self.held_usage.clone(),
             plugin_dir: self.plugin_dir.as_ref().map(|p| p.to_string_lossy().into()),
+            at: self.at.clone(),
+            resume_at: self.resume_at.clone(),
             launched: self.launched.clone(),
             stale: false,
             steer_at: None,
@@ -410,6 +425,8 @@ impl Run {
         self.auto_turn = st.auto_turn.clone();
         self.held_usage = st.held_usage.clone();
         self.plugin_dir = st.plugin_dir.as_ref().map(PathBuf::from);
+        self.at = st.at.clone();
+        self.resume_at = st.resume_at.clone();
         self.launched = st.launched.clone();
     }
 
@@ -451,6 +468,11 @@ pub(crate) struct ClaudeSession {
     /// The options or config changed since the run started, in a way it can't take as it runs: the
     /// next turn starts a new one.
     stale: bool,
+    /// The turn whose marks go to the thread as they come (ThreadContext::mark): one of a message
+    /// once Claude has echoed a message of it back (what it says before then may be from before the
+    /// turn: set_model's reply, say), and a compaction or a turn Claude started by itself from its
+    /// start.
+    marking: Option<String>,
     steer_timer: Option<Timer>,
     stop_timer: Option<Timer>,
     /// When those go off (ms since the epoch), for a checkpoint.
@@ -469,6 +491,7 @@ impl ClaudeSession {
             current: None,
             last: None,
             stale: false,
+            marking: None,
             steer_timer: None,
             stop_timer: None,
             steer_at: None,
@@ -759,6 +782,14 @@ impl ClaudeSession {
         if let Some(s) = &t.session_id {
             args.extend(["--resume".into(), s.clone()]);
         }
+        // After a rewind: the session as it was at the end of the turn it went back to.
+        let resume_at = t.session_id.as_ref().and(t.resume_at.clone());
+        if let Some(at) = &resume_at {
+            args.extend(["--resume-session-at".into(), at.clone()]);
+        }
+        if let Some(r) = self.runs.get_mut(id) {
+            r.resume_at = resume_at;
+        }
         let mut servers = Map::new();
         if !config.tools.is_empty() {
             servers.insert(APP_SERVER.into(), json!({"type": "sdk", "name": APP_SERVER}));
@@ -841,6 +872,7 @@ impl ClaudeSession {
         let retired = run.retired;
         let agents = run.agents.clone();
         let error = exit_error(&status, &run.stderr);
+        let at = run.at.clone();
         if self.current.as_deref() == Some(id) {
             self.current = None;
             if let Some(last) = self.last.replace(id.to_string())
@@ -863,6 +895,7 @@ impl ClaudeSession {
                 TurnEnd {
                     ok: false,
                     error: Some(error),
+                    session_at: at,
                     ..Default::default()
                 },
                 live,
@@ -993,6 +1026,27 @@ impl ClaudeSession {
             }
             item
         };
+        // The main conversation's messages (replayed ones too): the turn's last is where a rewind to
+        // after it resumes the session.
+        if matches!(m["type"].as_str(), Some("user" | "assistant"))
+            && parent.is_none()
+            && let Some(uuid) = m["uuid"].as_str()
+        {
+            let run = self.run(id).unwrap();
+            run.at = Some(uuid.to_string());
+            if m["type"] == "user"
+                && m["isReplay"].as_bool().unwrap_or(false)
+                && run.sent.iter().any(|s| s.echo == echo_key(&m["message"]["content"]))
+            {
+                self.marking = ctx.turn_id().map(String::from);
+            }
+            // A turn that has a mark already (re-attached after a restart, say) was being marked.
+            if let Some(turn) = ctx.turn_id()
+                && (self.marking.as_deref() == Some(turn) || ctx.thread().turn_at.is_some())
+            {
+                ctx.mark(uuid);
+            }
+        }
         // A message refused for the usage limit says which limit, before anything else it leads to.
         if matches!(m["type"].as_str(), Some("assistant" | "user" | "result"))
             && m["api_error"] == "usage_limit_reached"
@@ -1012,7 +1066,28 @@ impl ClaudeSession {
                 if m["subtype"] == "init" && ctx.turn_id().is_none() {
                     ctx.begin_turn();
                     let turn = ctx.turn_id().map(String::from);
-                    self.run(id).unwrap().auto_turn = turn;
+                    self.run(id).unwrap().auto_turn = turn.clone();
+                    self.marking = turn;
+                }
+                if m["subtype"] == "init" {
+                    // The session it runs in; and a rewind's resume_at is done with once it has
+                    // resumed there.
+                    let sid = m["session_id"]
+                        .as_str()
+                        .filter(|s| !s.is_empty() && ctx.thread().session_id.as_deref() != Some(*s))
+                        .map(String::from);
+                    let resumed = self.run(id).unwrap().resume_at.clone();
+                    let done = resumed.is_some() && ctx.thread().resume_at == resumed;
+                    if sid.is_some() || done {
+                        ctx.set_thread(|t| {
+                            if let Some(sid) = sid {
+                                t.session_id = Some(sid);
+                            }
+                            if done {
+                                t.resume_at = None;
+                            }
+                        });
+                    }
                 }
                 if m["subtype"] == "api_retry" {
                     let n = json!({"id": new_id("n"), "type": "notice", "level": "warning", "code": "retry", "text": retry_text(m)});
@@ -1028,13 +1103,6 @@ impl ClaudeSession {
                 }
                 if m["subtype"].as_str().is_some_and(|s| s.starts_with("task_")) {
                     self.task(ctx, id, m);
-                }
-                if m["subtype"] == "init"
-                    && let Some(sid) = m["session_id"].as_str().filter(|s| !s.is_empty())
-                    && ctx.thread().session_id.as_deref() != Some(sid)
-                {
-                    let sid = sid.to_string();
-                    ctx.set_thread(|t| t.session_id = Some(sid));
                 }
                 if m["subtype"] == "compact_boundary" {
                     let meta = &m["compact_metadata"];
@@ -1166,6 +1234,7 @@ impl ClaudeSession {
                     run.streamed.clear();
                 }
                 if ctx.turn_id().is_none() {
+                    run.at = None;
                     return;
                 }
                 // The end of a turn Claude made by itself (to tell the agent a background subagent
@@ -1177,6 +1246,8 @@ impl ClaudeSession {
                     run.held_usage = add_usage(run.held_usage.as_ref(), usage.as_ref());
                     return;
                 }
+                // The turn's mark: its last message, the one Claude made by itself in it included.
+                let at = run.at.take();
                 let usage = add_usage(run.held_usage.take().as_ref(), usage.as_ref());
                 self.clear_stop();
                 let failed = m["is_error"].as_bool().unwrap_or(false);
@@ -1201,6 +1272,7 @@ impl ClaudeSession {
                     error,
                     usage,
                     duration_ms: m["duration_ms"].as_f64().map(|d| d as u64),
+                    session_at: at,
                 };
                 let live = self.live_id().is_some();
                 ctx.end_turn(end, live);
@@ -1776,6 +1848,27 @@ impl HarnessSession for ClaudeSession {
         self.run(&id).unwrap().send(vec![message.id], msg);
     }
 
+    fn can_compact(&self) -> bool {
+        true
+    }
+
+    fn compact(&mut self, ctx: &mut ThreadContext) {
+        // Claude Code compacts when it's sent /compact, which is its turn.
+        let id = self.ensure(ctx, true);
+        let message = Message {
+            id: String::new(),
+            text: "/compact".into(),
+            attachments: Vec::new(),
+        };
+        let msg = self.user_message(ctx, &[message]);
+        self.run(&id).unwrap().send(Vec::new(), msg);
+        self.marking = ctx.turn_id().map(String::from);
+    }
+
+    fn rewind_point(&self, sessions: &[Option<TurnSession>], index: usize) -> Option<Result<RewindPoint, RewindError>> {
+        Some(resume_at_point(sessions, index))
+    }
+
     fn carry_over(&mut self, ctx: &mut ThreadContext, messages: Vec<Message>) {
         let live = self.live_id();
         match live {
@@ -1866,6 +1959,20 @@ impl HarnessSession for ClaudeSession {
 
     fn config_changed(&mut self, _ctx: &mut ThreadContext) {
         self.stale = true;
+    }
+
+    fn retire(&mut self, ctx: &mut ThreadContext) {
+        self.stale = true;
+        self.clear_steer();
+        self.clear_stop();
+        // Stopped now, and retired: what it says on its way out is left out. It's the thread's run
+        // no more from now, so its end, whenever that comes, changes nothing.
+        if let Some(id) = self.live_id() {
+            self.stop(ctx, &id, true, true);
+            if ctx.thread().run.as_ref().is_some_and(|r| r.id == id) {
+                ctx.set_thread(|t| t.run = None);
+            }
+        }
     }
 
     fn close(&mut self, ctx: &mut ThreadContext) -> BoxFuture<()> {

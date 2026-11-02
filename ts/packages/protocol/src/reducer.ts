@@ -70,6 +70,18 @@ function apply(state: Snapshot, event: Exclude<ThreadEvent, { type: "delta" }>):
     }
     case "item.updated":
       return withItem(state, event.item_id, (item) => patched(item, event.patch));
+    case "items.removed": {
+      const gone = new Set(event.item_ids);
+      const items = state.items.filter((i) => !gone.has(i.id));
+      if (!state.start) return items.length === state.items.length ? state : { ...state, items };
+      // A window: its start, and the indices of its context items left, go down by the removed
+      // items before them.
+      const removed = new Set(event.indices);
+      const below = (at: number) => event.indices.filter((i) => i < at).length;
+      const context = (state.context ?? []).filter((i) => !removed.has(i)).map((i) => i - below(i));
+      const { context: _c, ...rest } = state;
+      return { ...rest, items, start: state.start - below(state.start), ...(context.length ? { context } : {}) };
+    }
     case "request.opened": {
       const at = indexOf(state.requests, event.request.id);
       return {

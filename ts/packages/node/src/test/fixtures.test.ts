@@ -21,7 +21,7 @@ import { defineTool } from "../tools.js";
 import { readJsonl, shimPath, specDir, tempDir } from "./spec.js";
 
 interface Fixture {
-  thread: { harness: string; model?: string; effort?: string; permission_mode?: Thread["permission_mode"] };
+  thread: { harness: string; model?: string; effort?: string; permission_mode?: Thread["permission_mode"]; session_id?: string };
   permissions?: "allow" | "ask";
   tools?: { name: string; description: string; input: { [k: string]: unknown }; result: string }[];
   mcp_servers?: { [name: string]: McpServer };
@@ -116,6 +116,13 @@ describe.each(scenarios)("%s", (scenario) => {
           const requests = openRequests(await sdk.snapshot(thread.id));
           expect(requests, where).toHaveLength(1);
           command.request_id = requests[0]!.id;
+        }
+        if (command.type === "rewind") {
+          // {{tN}}: the thread's Nth turn.
+          const n = Number(/^\{\{t(\d+)\}\}$/.exec(command.turn_id)?.[1]);
+          const turns = events.flatMap((e) => (e.type === "turn.started" ? [e.turn_id] : []));
+          expect(turns.length, where).toBeGreaterThanOrEqual(n);
+          command.turn_id = turns[n - 1]!;
         }
         from = events.length;
         await sdk.handle(command);

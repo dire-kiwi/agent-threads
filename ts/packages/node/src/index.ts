@@ -6,6 +6,7 @@ export { claudeCode, type ClaudeCodeOptions } from "./claude/driver.js";
 export { codex, type CodexOptions } from "./codex/driver.js";
 export type { Harness, HarnessMessage, HarnessSession, LaunchOptions, McpServer, Message, NewItem, NewRequest, RunCheckpoint, Skill, ThreadConfig, ThreadContext, TurnEnd } from "./harness.js";
 export { DONT_ASK_DENIAL, type PermissionContext, type PermissionDecision, type PermissionPolicy, type PermissionQuery, type StandingKey } from "./permissions.js";
+export { resumeAtPoint, revertPoint, RewindError, type RewindPoint } from "./sessions.js";
 export { RUN_FORMAT, shim, type ShimOptions, type ShimRunData } from "./shim.js";
 export { direct, type ExitStatus, type HarnessProcess, type ProcessHandlers, type SpawnOptions, type Spawner } from "./spawner.js";
 export { StoreError, type ReadOptions, type RunRecord, type Store, type StoreErrorKind } from "./store.js";

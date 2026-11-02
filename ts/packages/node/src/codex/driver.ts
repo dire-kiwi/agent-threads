@@ -10,7 +10,7 @@
 import { mkdtempSync, realpathSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { isAbsolute, join, resolve, sep } from "node:path";
-import type { PermissionMode, Resolution, SubagentState, ToolCall, Usage } from "@dire-kiwi/agent-threads-protocol";
+import type { PermissionMode, Resolution, SubagentState, ToolCall, TurnSession, Usage } from "@dire-kiwi/agent-threads-protocol";
 import { messageParts } from "../attachments.js";
 import { title } from "../claude/translate.js";
 import { CommandError, ControlError } from "../errors.js";
@@ -19,12 +19,13 @@ import { newId } from "../ids.js";
 import { applyLaunchEnv, launchedOf, launchFromStored, sameLaunch, withEnv, type Launched } from "../launch.js";
 import { serveTools, type LoopbackMcp } from "../mcp-http.js";
 import { modeAfterPlan, permissionKey, type PermissionDecision, type PermissionQuery } from "../permissions.js";
+import { revertPoint, type RewindPoint } from "../sessions.js";
 import { writeSkills } from "../skills.js";
 import type { ExitStatus, HarnessProcess, ProcessHandlers } from "../spawner.js";
 import type { RunRecord } from "../store.js";
 import { addUsage, SECRET } from "../thread.js";
 import { runTool, type Tool } from "../tools.js";
-import { defaultCodexHome, prepareCodexHome, readSessionState, userCodexHome, writeSessionState, type SessionState } from "./home.js";
+import { defaultCodexHome, prepareCodexHome, readSessionState, userCodexHome, writeSessionState } from "./home.js";
 import type {
   CommandExecutionRequestApprovalParams,
   DynamicToolCallParams,
@@ -36,7 +37,6 @@ import type {
   ThreadItem,
   ThreadStartParams,
   ThreadStartResponse,
-  TokenUsageBreakdown,
   ToolRequestUserInputParams,
   ToolRequestUserInputResponse,
   Turn,
@@ -50,12 +50,12 @@ import type {
 import { Rpc, RpcError, type Incoming, type PendingRequest, type RequestId } from "./rpc.js";
 import {
   APP_SERVER,
+  callUsage,
   childTurnSubagent,
   codexDone,
   codexPolicy,
   codexRateLimits,
   codexTool,
-  codexUsage,
   collabSubagent,
   isToolItem,
   mcpServerConfig,
@@ -135,6 +135,8 @@ const IMPLEMENT = "Implement the plan.";
 interface Planned {
   usage?: Usage;
   duration_ms?: number;
+  /** The turn's mark (its session's `at`): its first Codex turn. */
+  session_at?: string;
   request?: string;
 }
 
@@ -148,12 +150,14 @@ interface RunState {
   turnId?: string;
   starting: boolean;
   compacting: boolean;
-  total: TokenUsageBreakdown | null;
+  /** Codex has reported the thread's tokens in this run. */
+  reported?: boolean;
+  /** What the running turn has used so far, since its turn/started. */
+  used?: Usage | null;
   error: string | null;
   home: string;
   dynamic: ToolSpec[] | null;
   mcpApp: boolean;
-  baseline: Totals | null;
   hiddenSkills: string[];
   noticedServers: boolean;
   skillsDir?: string;
@@ -204,8 +208,14 @@ class Run {
   #turnWaiters: ((id: string | undefined) => void)[] = [];
   /** The running turn is a compaction. */
   compacting = false;
-  /** The thread's token totals, as Codex last reported them in this run. */
-  total: TokenUsageBreakdown | null = null;
+  /** Codex has reported the thread's tokens in this run (so its turns' usage is known). */
+  reported = false;
+  /**
+   * What the running turn has used: each model call's tokens (tokenUsage.last), summed from its
+   * turn/started on. Codex's running totals aren't used: for a session the thread adopted they
+   * include what came before, and a revert doesn't take them back.
+   */
+  used: Usage | null = null;
   /** The running turn's last error that won't be retried. */
   error: string | null = null;
   /** The CODEX_HOME it runs with. */
@@ -217,8 +227,6 @@ class Run {
   dynamic: Map<string, ToolSpec> | null = null;
   /** Some of the app's tools are on the loopback MCP server (those the session hasn't as dynamic tools). */
   mcpApp = false;
-  /** Codex's token totals for the session after its last turn, when they're known. */
-  baseline: Totals | null = null;
   /** Skills Codex found that aren't the app's (the user's, the project's): they're turned off. */
   hiddenSkills: string[] = [];
   /** Notices about the thread's MCP servers were given. */
@@ -278,12 +286,12 @@ class Run {
       ...(this.turnId ? { turnId: this.turnId } : {}),
       starting: this.starting,
       compacting: this.compacting,
-      total: this.total,
+      reported: this.reported,
+      used: this.used,
       error: this.error,
       home: this.home,
       dynamic: this.dynamic ? [...this.dynamic.values()] : null,
       mcpApp: this.mcpApp,
-      baseline: this.baseline,
       hiddenSkills: this.hiddenSkills,
       noticedServers: this.noticedServers,
       ...(this.skillsDir ? { skillsDir: this.skillsDir } : {}),
@@ -314,12 +322,12 @@ class Run {
     this.turnId = st.turnId;
     this.starting = st.starting;
     this.compacting = st.compacting;
-    this.total = st.total;
+    this.reported = st.reported ?? false;
+    this.used = st.used ?? null;
     this.error = st.error;
     this.home = st.home;
     this.dynamic = st.dynamic ? new Map(st.dynamic.map((t) => [t.name, t])) : null;
     this.mcpApp = st.mcpApp;
-    this.baseline = st.baseline;
     this.hiddenSkills = st.hiddenSkills;
     this.noticedServers = st.noticedServers;
     if (st.skillsDir) this.skillsDir = st.skillsDir;
@@ -390,16 +398,21 @@ class CodexSession implements HarnessSession {
   // ---------- the core's side ----------
 
   start(messages: Message[]): void {
+    if (messages.length === 1 && messages[0]!.text.trim() === "/compact" && !messages[0]!.attachments?.length) return this.compact();
+    this.#turnStart(this.#ensure(true), messages);
+  }
+
+  compact(): void {
     const run = this.#ensure(true);
-    if (messages.length === 1 && messages[0]!.text.trim() === "/compact" && !messages[0]!.attachments?.length) {
-      run.starting = true;
-      run.compacting = true;
-      void run.ready
-        .then((threadId) => run.rpc.request("thread/compact/start", { threadId }))
-        .catch((e) => this.#turnFailed(run, e));
-      return;
-    }
-    this.#turnStart(run, messages);
+    run.starting = true;
+    run.compacting = true;
+    void run.ready
+      .then((threadId) => run.rpc.request("thread/compact/start", { threadId }))
+      .catch((e) => this.#turnFailed(run, e));
+  }
+
+  rewindPoint(sessions: (TurnSession | undefined)[], index: number): RewindPoint {
+    return revertPoint(sessions, index);
   }
 
   steer(message: Message): void {
@@ -481,6 +494,17 @@ class CodexSession implements HarnessSession {
 
   configChanged(): void {
     this.#stale = true;
+  }
+
+  retire(): void {
+    this.#stale = true;
+    this.#clearStop();
+    const run = this.#live();
+    if (!run) return;
+    // Stopped now, and retired: what it says on its way out is left out. It's the thread's run no
+    // more from now, so its end, whenever that comes, changes nothing.
+    void this.#stop(run, true, true);
+    if (this.#ctx.thread.run?.id === run.id) this.#ctx.setThread({ run: undefined });
   }
 
   live(): boolean {
@@ -718,15 +742,20 @@ class CodexSession implements HarnessSession {
   /** A turn couldn't be started: it ends with the error. */
   #turnFailed(run: Run, e: unknown): void {
     if (run.exited || run.retired || run !== this.#run) return;
+    const at = run.turnId;
     run.turnEnded();
-    if (this.#ctx.turnId) this.#ctx.endTurn({ ok: false, error: e instanceof Error ? e.message : String(e), ...this.#plannedSoFar(run) });
+    if (this.#ctx.turnId) this.#ctx.endTurn({ ok: false, error: e instanceof Error ? e.message : String(e), ...this.#plannedSoFar(run, at) });
     run.planned = undefined;
   }
 
-  /** What the turn's Codex turns that completed (its plans') used, for a turn that ends otherwise. */
-  #plannedSoFar(run: Run): { usage?: Usage; duration_ms?: number } {
+  /**
+   * What the turn's Codex turns that completed (its plans') used, for a turn that ends otherwise,
+   * and its mark: its first Codex turn (`at`, the one running, if it's that).
+   */
+  #plannedSoFar(run: Run, at: string | undefined): { usage?: Usage; duration_ms?: number; session_at?: string } {
     const p = run.planned;
-    return { ...(p?.usage ? { usage: p.usage } : {}), ...(p?.duration_ms !== undefined ? { duration_ms: p.duration_ms } : {}) };
+    const session_at = p?.session_at ?? at;
+    return { ...(p?.usage ? { usage: p.usage } : {}), ...(p?.duration_ms !== undefined ? { duration_ms: p.duration_ms } : {}), ...(session_at ? { session_at } : {}) };
   }
 
   // ---------- the process ----------
@@ -845,7 +874,8 @@ class CodexSession implements HarnessSession {
       run.threadId = r.thread.id;
       if (r.model) run.model = r.model;
       if (r.sandbox?.type === "workspaceWrite") run.workspace = r.sandbox;
-      if (ctx.thread.session_id !== run.threadId) ctx.setThread({ session_id: run.threadId });
+      // A rewind's resume_at was for the session it had, which this isn't if it couldn't be resumed.
+      if (ctx.thread.session_id !== run.threadId) ctx.setThread({ session_id: run.threadId, resume_at: undefined });
       return run.threadId;
     } catch (e) {
       // The thread can't run: the process is stopped (and its end ends nothing), and the turn ends
@@ -885,12 +915,21 @@ class CodexSession implements HarnessSession {
       // Codex keeps the dynamic tools the session started with, and resuming can't change them.
       const state = readSessionState(run.home, session);
       run.dynamic = state ? new Map(state.dynamicTools.map((t) => [t.name, t])) : null;
-      run.baseline = state?.totals ?? null;
+      let r: ThreadStartResponse | undefined;
       try {
-        return await run.rpc.request<ThreadStartResponse>("thread/resume", { threadId: session, ...(await this.#threadParams(run, false)), excludeTurns: true });
+        r = await run.rpc.request<ThreadStartResponse>("thread/resume", { threadId: session, ...(await this.#threadParams(run, false)), excludeTurns: true });
       } catch (e) {
         if (!(e instanceof RpcError) || !/not found|no rollout|unknown thread|does not exist/i.test(e.message)) throw e;
         this.#notice(`Codex couldn't resume its session (${e.message}), so this is a new one: it doesn't remember the thread so far.`);
+      }
+      if (r) {
+        // After a rewind: the session as it was before the turn it went back to before.
+        const at = this.#ctx.thread.resume_at;
+        if (at) {
+          await run.rpc.request("thread/revert", { threadId: session, beforeTurnId: at });
+          if (this.#ctx.thread.resume_at === at) this.#ctx.setThread({ resume_at: undefined });
+        }
+        return r;
       }
     }
     return this.#newThread(run);
@@ -909,17 +948,15 @@ class CodexSession implements HarnessSession {
       run.dynamic = new Map();
       r = await run.rpc.request<ThreadStartResponse>("thread/start", await this.#threadParams(run, true));
     }
-    // A new session's totals start at nothing.
-    run.baseline = { inputTokens: 0, cachedInputTokens: 0, outputTokens: 0, cacheWriteInputTokens: 0 };
     this.#saveState(run, r.thread.id);
     return r;
   }
 
-  /** Records the session's dynamic tools and totals, where they're known. */
+  /** Records the session's dynamic tools, where they're known. */
   #saveState(run: Run, session: string): void {
     if (!run.dynamic) return;
     try {
-      writeSessionState(run.home, session, { dynamicTools: [...run.dynamic.values()], totals: run.baseline });
+      writeSessionState(run.home, session, { dynamicTools: [...run.dynamic.values()] });
     } catch (e) {
       this.#ctx.error(e);
     }
@@ -1002,6 +1039,7 @@ class CodexSession implements HarnessSession {
     run.exited = true;
     run.abort.abort();
     run.rpc?.close(new Error(exitError(status, run.stderr, false)));
+    const at = run.turnId;
     run.turnEnded();
     void run.mcp?.close();
     if (run.skillsDir) rmSync(run.skillsDir, { recursive: true, force: true });
@@ -1016,7 +1054,7 @@ class CodexSession implements HarnessSession {
     // A run that ends while its turn is running ends the turn (as interrupted, if it was).
     if (!run.retired && ctx.turnId) {
       this.#clearStop();
-      ctx.endTurn({ ok: false, error: exitError(status, run.stderr, true), ...this.#plannedSoFar(run) });
+      ctx.endTurn({ ok: false, error: exitError(status, run.stderr, true), ...this.#plannedSoFar(run, at) });
     }
     run.planned = undefined;
     run.finish();
@@ -1086,6 +1124,9 @@ class CodexSession implements HarnessSession {
           run.starting = true;
           run.error = null;
           run.setTurn(p.turn.id);
+          run.used = { input_tokens: 0, output_tokens: 0, cache_read_tokens: 0, cache_write_tokens: 0 };
+          // The turn's mark is its first Codex turn (one that goes on after a plan has it already).
+          if (!run.planned) this.#ctx.mark(p.turn.id);
         }
         // A child taking up work again (a follow-up sent to it): its report is to come.
         if (!own) {
@@ -1103,7 +1144,10 @@ class CodexSession implements HarnessSession {
         return;
       }
       case "thread/tokenUsage/updated":
-        if (own && p.tokenUsage?.total) run.total = p.tokenUsage.total;
+        if (!own || !p.tokenUsage) return;
+        run.reported = true;
+        // A report outside a turn (a resumed session's totals, say) isn't any turn's.
+        if (run.used && p.tokenUsage.last) run.used = addUsage(run.used, callUsage(p.tokenUsage.last))!;
         return;
       case "account/rateLimits/updated":
         if (p.rateLimits && typeof p.rateLimits === "object") ctx.rateLimits(codexRateLimits(p.rateLimits));
@@ -1227,6 +1271,7 @@ class CodexSession implements HarnessSession {
   #turnCompleted(run: Run, turn: Turn): void {
     const ctx = this.#ctx;
     const error = run.error;
+    const at = turn?.id ?? run.turnId;
     const plan = run.proposed;
     run.proposed = undefined;
     run.turnEnded();
@@ -1236,18 +1281,15 @@ class CodexSession implements HarnessSession {
     for (const [id, open] of run.open) {
       if (!this.#inBackground(this.#parent(run, open.msg.params?.threadId) ?? undefined)) run.open.delete(id);
     }
-    // Codex reports the session's totals: the turn used how far they grew. (Where the session's
-    // totals before it aren't known, the thread's usage stands in for them.)
-    const usage = run.total ? codexUsage(run.total, run.baseline ? totalsAsUsage(run.baseline) : ctx.thread.usage) : undefined;
-    if (run.total) {
-      run.baseline = run.total;
-      if (run.threadId) this.#saveState(run, run.threadId);
-    }
+    const usage = run.reported ? (run.used ?? { input_tokens: 0, output_tokens: 0, cache_read_tokens: 0, cache_write_tokens: 0 }) : undefined;
+    run.used = null;
     if (!ctx.turnId) return;
     this.#clearStop();
     const ok = turn?.status === "completed";
     // The thread's turn is all of its Codex turns, the plans' included.
     const sum: Planned = { ...run.planned };
+    // Its mark is its first Codex turn: reverting to before that takes back all of them.
+    sum.session_at ??= at;
     sum.usage = addUsage(sum.usage, usage);
     if (typeof turn?.durationMs === "number") sum.duration_ms = (sum.duration_ms ?? 0) + turn.durationMs;
     delete sum.request;
@@ -1263,6 +1305,7 @@ class CodexSession implements HarnessSession {
       ...(turn?.status === "failed" ? { error: turn.error?.message ?? error ?? "The turn failed." } : {}),
       ...(sum.usage ? { usage: sum.usage } : {}),
       ...(sum.duration_ms !== undefined ? { duration_ms: sum.duration_ms } : {}),
+      ...(sum.session_at ? { session_at: sum.session_at } : {}),
     });
   }
 
@@ -1295,6 +1338,7 @@ class CodexSession implements HarnessSession {
       ok: true,
       ...(planned.usage ? { usage: planned.usage } : {}),
       ...(planned.duration_ms !== undefined ? { duration_ms: planned.duration_ms } : {}),
+      ...(planned.session_at ? { session_at: planned.session_at } : {}),
     });
   }
 
@@ -1611,7 +1655,6 @@ class CodexSession implements HarnessSession {
 }
 
 type ToolSpec = { name: string; description: string; inputSchema: unknown };
-type Totals = NonNullable<SessionState["totals"]>;
 
 /** Where Codex's sandbox lets the agent write besides the working directory (a dotted config key). */
 const WRITABLE_ROOTS = "sandbox_workspace_write.writable_roots";
@@ -1633,10 +1676,6 @@ function toolSpec(t: Tool): ToolSpec {
   return { name: t.name, description: t.description, inputSchema: t.input };
 }
 
-/** Codex's totals as the usage they'd be if a turn had used them all. */
-function totalsAsUsage(t: Totals): Usage {
-  return { input_tokens: t.inputTokens - t.cachedInputTokens, cache_read_tokens: t.cachedInputTokens, output_tokens: t.outputTokens, cache_write_tokens: t.cacheWriteInputTokens ?? 0 };
-}
 
 /** A path with its symlinks resolved, where it exists. */
 function canonicalPath(path: string): string {

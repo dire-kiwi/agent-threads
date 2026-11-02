@@ -61,6 +61,32 @@ describe("applyEvent", () => {
     expect(next.seq).toBe(4);
   });
 
+  it("removes items, keeping the others and skipping ids it doesn't have", () => {
+    const s = started();
+    const next = applyEvent(s, { type: "items.removed", thread_id: "th", seq: 4, item_ids: ["tc1", "nope"], indices: [1, 3] });
+    expect(next.items).toEqual([user, reply]);
+    expect(next.items[0]).toBe(s.items[0]);
+    expect(next.seq).toBe(4);
+    const none = applyEvent(next, { type: "items.removed", thread_id: "th", seq: 5, item_ids: ["nope"], indices: [3] });
+    expect(none.items).toBe(next.items);
+    expect(none.seq).toBe(5);
+  });
+
+  it("moves a window's start and context down by the removed items before them", () => {
+    const item = (id: string, parent_id?: string): Item => ({ id, type: "assistant_message", text: id, ...(parent_id ? { parent_id } : {}) });
+    // The thread is a0..a9, with a2 a subagent call a8 belongs to; the window is from 7, with a2 as context.
+    const call: Item = { id: "a2", type: "tool_call", name: "Agent", kind: "subagent", input: {}, status: "running" };
+    const w: Snapshot = { thread, items: [call, item("a7"), item("a8", "a2"), item("a9")], requests: [], seq: 5, start: 7, context: [2] };
+    const next = applyEvent(w, { type: "items.removed", thread_id: "th", seq: 6, item_ids: ["a1", "a5", "a6", "a9"], indices: [1, 5, 6, 9] });
+    expect(next).toMatchObject({ start: 4, context: [1], seq: 6 });
+    expect(next.items.map((i) => i.id)).toEqual(["a2", "a7", "a8"]);
+    // Its context item removed too, and everything before it: it starts at 0, with no context.
+    const all = applyEvent(w, { type: "items.removed", thread_id: "th", seq: 6, item_ids: ["a0", "a1", "a2", "a3", "a4", "a5", "a6"], indices: [0, 1, 2, 3, 4, 5, 6] });
+    expect(all.start).toBe(0);
+    expect(all).not.toHaveProperty("context");
+    expect(all.items.map((i) => i.id)).toEqual(["a7", "a8", "a9"]);
+  });
+
   it("counts an update to an item it doesn't have", () => {
     const s = started();
     const next = applyEvent(s, { type: "item.updated", thread_id: "th", seq: 4, item_id: "nope", patch: { text: "x" } });

@@ -81,7 +81,14 @@ async function record(harnessName, scenarioName, scenario, mod) {
   const ctx = {
     work,
     tmp,
-    spawn(args, onMessage) {
+    /** What the scenario adds to the session's meta line (e.g. the thread options it was made with). */
+    meta: {},
+    /**
+     * Starts the CLI. A `setup` run (one that makes the session a scenario starts from, as an app
+     * would have before it created the thread) isn't recorded.
+     */
+    spawn(args, onMessage, { setup = false } = {}) {
+      if (setup) return new Proc({ run: 0, bin: h.bin, args, cwd: work, env, record: () => {}, onMessage });
       return new Proc({ run: ++runs, bin: h.bin, args, cwd: work, env, record: (e) => entries.push(e), onMessage });
     },
   };
@@ -100,6 +107,7 @@ async function record(harnessName, scenarioName, scenario, mod) {
       cli: h.version(),
       model: scenario.model ?? mod.MODEL,
       recorded: new Date().toISOString().slice(0, 10),
+      ...ctx.meta,
     };
     const lines = clean([meta, ...entries]).map((e) => JSON.stringify(e));
     writeFileSync(join(dir, "session.jsonl"), lines.join("\n") + "\n");

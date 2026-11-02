@@ -13,7 +13,9 @@ codex-cli 0.165.0 (model `gpt-5.6-luna`, effort `low`), by `spec/tools/record.mj
 
 The Codex sessions' `skills/list` exchange was added afterwards (on 2026-11-01), with the response
 codex-cli 0.165.0 gives in a fresh CODEX_HOME and a working directory and home with no skills;
-`spec/tools/scenarios/codex.mjs` records it from now on.
+`spec/tools/scenarios/codex.mjs` records it from now on. The `adopt`, `rewind`, `new-session` and
+`compact` scenarios were recorded on 2026-11-02, with the same CLIs and models (and their
+`skills/list` answer has only Codex's built-in skills, as the sanitizer now leaves it).
 
 The `plan` and `set-options` scenarios were recorded on 2026-11-02 with the same CLIs. Their Codex
 sessions' `skills/list` response is the one the others have: the machine they were recorded on has
@@ -57,6 +59,10 @@ Each fixture is a directory `spec/fixtures/<harness>/<scenario>/`:
 | `interrupt` | Stopping a turn while a command runs | `control_request` interrupt | `turn/interrupt` |
 | `resume` | A turn, a backend restart, then a turn in a new process | `--resume <session_id>` | `thread/resume` |
 | `compaction` | A turn, then `/compact` | sent as a message | sent as `thread/compact/start` |
+| `compact` | A turn, then the `compact` command | `/compact` sent as a message | `thread/compact/start` |
+| `adopt` | A thread created with the `session_id` of a conversation made before (by a setup run that isn't recorded), then a turn | `--resume <session_id>` | `thread/resume` |
+| `rewind` | Two turns, a `rewind` to before the second, then a turn that shows the agent forgot it | a new process with `--resume <session_id> --resume-session-at <uuid>` | a new process, `thread/resume`, then `thread/revert` |
+| `new-session` | A turn, `new_session`, then a turn in a new conversation | a new process without `--resume` | a new process, `thread/start` |
 | `error` | A turn that fails (the model doesn't exist) | an error result | a failed turn, after a warning |
 | `plan` | Plan mode: a plan the user sends back with feedback, then one they approve in `accept_edits`, which the agent carries out without asking | `--permission-mode plan`, ExitPlanMode via `can_use_tool`, approved with `updatedPermissions` `setMode` | `collaborationMode` `plan`, the turn's `plan` item; the feedback and "Implement the plan." are `turn/start`s |
 | `set-options` | `set_options` between turns, changing the model and the permission mode (`accept_edits`), so the next turn's edit isn't asked about, in the same process | `set_model` and `set_permission_mode` control requests | `turn/start`'s `model` and `approvalPolicy` (the sandbox is the same) |
@@ -82,12 +88,13 @@ What a backend's conformance test does with each fixture:
    `allow` allows every tool without asking, `ask` asks the user (opens a request) for every one.
    If the fixture has `"raw": true`, turn the SDK's `raw` option on, and give it a harness message
    handler that keeps what it's called with.
-2. **Create the thread** with `thread`'s options (`harness`, `model`, `effort`...) and the working
-   directory, and collect every event the SDK sends for it, deltas included.
+2. **Create the thread** with `thread`'s options (`harness`, `model`, `effort`, `session_id`...) and
+   the working directory, and collect every event the SDK sends for it, deltas included.
 3. **Run the steps** in order:
    - `{"command": {...}}`: send the command, with the thread's id as `thread_id`. A `respond`
      leaves out `request_id`: fill in the id of the thread's open request (the fixtures only ever
-     have one open).
+     have one open). A `rewind`'s `turn_id` is a placeholder `{{tN}}`: fill in the id of the
+     thread's Nth turn (in the order of its `turn.started` events).
    - `{"wait": {...}}`: wait for an event that matches the pattern: it has every field the pattern
      has, with the same value (objects are matched field by field, so `{"thread": {"status":
      "idle"}}` matches any thread.updated whose thread is idle). Only events after the previous
@@ -125,18 +132,20 @@ backend drives each CLI:
 - **Process lifetime.** The CLI is started at the thread's first `send`, not when it's created: one
   process per thread, kept between turns until the SDK is closed, which closes its stdin (or kills
   it, once it has sent everything). After a restart, the next `send` starts a new process that
-  resumes the session.
+  resumes the session. After a `rewind` or `new_session`, the next turn starts a new process too
+  (once the old one, whose stdin is closed then, has exited).
 - **Claude Code.** Arguments `-p --output-format stream-json --verbose --include-partial-messages
   --input-format stream-json --replay-user-messages --permission-prompt-tool stdio
   --strict-mcp-config --forward-subagent-text --include-hook-events --model <model>` (the fake CLI
   doesn't check `--include-hook-events`, which the recordings don't have; it makes Claude Code
-  report hooks, for their notices), plus `--resume <session_id>`, and
+  report hooks, for their notices), plus `--resume <session_id>` (and `--resume-session-at
+  <resume_at>` after a rewind), and
   `--mcp-config` with the thread's MCP servers (stdio ones as `type: stdio`) and, when it has app
   tools, an in-process server named `app` (`{"type": "sdk", "name": "app"}`). It sends a
   `control_request` `initialize` first (with `sdkMcpServers: ["app"]` when there are app tools),
   and waits for its response before the first user message. User messages are
   `{"type":"user","message":{"role":"user","content":[{"type":"text","text":...}]},"parent_tool_use_id":null}`.
-  It answers `can_use_tool` with `behavior: allow` (and `updatedInput`; for AskUserQuestion, the
+  The `compact` command is the user message `/compact`. It answers `can_use_tool` with `behavior: allow` (and `updatedInput`; for AskUserQuestion, the
   input plus `answers`, keyed by question text, with the labels joined by `", "`; for an approved
   ExitPlanMode, `updatedPermissions: [{type: "setMode", mode, destination: "session"}]` with the mode
   the thread carries on in) or `deny` with a `message`, and the `app` server's `mcp_message`s as an
@@ -147,7 +156,8 @@ backend drives each CLI:
   `initialized`, then `skills/list` (with `forceReload`) for the skills Codex finds in the working
   directory and the user's home, which a CODEX_HOME of the app's own doesn't keep out, and turns off
   each one that isn't the app's or Codex's built-in (`system`) with a `skills.config` entry
-  (`{path, enabled: false}`) in the thread's config. Then `thread/start` (or `thread/resume` with the thread's `session_id`) with the
+  (`{path, enabled: false}`) in the thread's config. Then `thread/start` (or `thread/resume` with the thread's `session_id`, followed after a rewind by
+  `thread/revert` with its `resume_at` as `beforeTurnId`) with the
   model, the permission mode's `approvalPolicy` (`untrusted` for `default`) and `sandbox:
   workspace-write` whatever the mode (Codex says what that sandbox is, with all its config, and the
   first turn/start's `sandboxPolicy` puts the thread in its mode's), and a config with `features.default_mode_request_user_input = true` (so the agent can ask
@@ -157,7 +167,7 @@ backend drives each CLI:
   thread/start (each on its own: a `sandboxPolicy` replaces all of the sandbox's settings, so a
   workspace-write one is the one Codex last reported for the thread), and in permission mode `plan` a `collaborationMode` of `plan` (then `default`, on
   the first turn after it); one sent during a turn is
-  `turn/steer`; `/compact` is `thread/compact/start`; an interrupt is `turn/interrupt`. It answers
+  `turn/steer`; `/compact`, and the `compact` command, are `thread/compact/start`; an interrupt is `turn/interrupt`. It answers
   approvals with `accept` or `decline`, MCP elicitations with `accept`, `requestUserInput` with
   `{answers: {<question id>: {answers: [labels]}}}`, and `item/tool/call` with the tool's text as
   `inputText` and `success: true`.
@@ -194,6 +204,28 @@ backend drives each CLI:
   background subagent that's still running, which carry on; then a `turn_result` item is added,
   `turn.completed` is sent, and a `thread.updated` sets the thread `idle` (`waiting` while such a
   request is open, or `error`, with the turn's `error`) and adds the turn's usage to the thread's.
+  The `turn_result`'s `session` has the thread's `session_id` (if it has one), the harness's mark
+  for the turn as `at` (below), and `started` if the thread had no `session_id` when the turn
+  started. The thread.updated that ends it leaves out `turn_at`.
+- **The turn's mark so far**: each time the harness gives a new one (below) while a turn runs, a
+  `thread.updated` sets the thread's `turn_at` to it.
+- **A thread created with a `session_id`** has it in its first `thread.updated`.
+- **`compact`** starts a turn as `send` does, but with no `user_message`: `turn.started` and a
+  `thread.updated` that's `running`. The harness's compaction is its `compaction` item.
+- **`new_session`**, when the thread has a session: a `thread.updated` without `session_id` (or
+  `resume_at`), then a `notice` (`level: info`, `code: session.new`, with the text "A new
+  conversation starts here: the agent doesn't remember what came before.").
+- **`rewind`** to before turn T: an `items.removed` with (as `item_ids`, and their places in the
+  list before as `indices`), in the items' order, the items of T and of
+  every turn after it (by `turn_id`; the turns' order is their `turn_result`s', since a message
+  carried over to a later turn keeps its place among the items), and the items with no `turn_id`
+  after both the last kept turn's `turn_result` and the first item of a turn that goes; then a
+  `thread.updated` with the `session_id` and `resume_at` the rules in
+  [PROTOCOL.md](../PROTOCOL.md#sessions) give (or without them; a `resume_at` already there for the
+  same session stays when they give none); then a `notice` (`level: info`,
+  `code: rewind`, "The conversation was rewound to here: the agent doesn't remember what came
+  after."). Once the harness has gone back there (Claude Code's `init`, Codex's `thread/revert`
+  response), a `thread.updated` clears `resume_at`.
 - **An interrupt** sends nothing itself. Its turn's `turn_result` has `ok: false` and
   `interrupted: true`, and the calls it cut short are `cancelled`.
 - An `item.updated` is only sent when it changes something, and a `thread.updated` only when the
@@ -209,7 +241,12 @@ backend drives each CLI:
   `assistant_message` or `reasoning` with the id `<message id>:<block index>` (Claude Code sends
   each block of a message as its own `assistant` message, in order). A `compact_boundary` is a
   `compaction` with its `uuid` as id, `trigger`, and `pre_tokens` as `tokens_before`; the next
-  synthetic user message is its `summary`.
+  synthetic user message is its `summary`. A turn's mark (`session.at`) is the `uuid` of its last
+  `user` or `assistant` message without a `parent_tool_use_id` (replayed ones included). It's
+  kept in `turn_at` as each such message comes, from the echo of one of the turn's messages on
+  (before that, what comes may be from before the turn: a `set_model`'s reply, say), or from the
+  start for a compaction (`/compact` isn't echoed) or a turn Claude started by itself. The
+  `init` that follows a rewind clears `resume_at` in the same `thread.updated` as its `session_id`.
 - **Tools**: Bash is `shell` (`command`); Read `read` (`path`); Edit, MultiEdit, Write and
   NotebookEdit `edit` (`changes: [{path, op: update}]`, and when it ends the `diff`, made from the
   result's `structuredPatch` as `@@ -a,b +c,d @@` hunks); Glob and Grep `search`; WebFetch and
@@ -295,7 +332,9 @@ backend drives each CLI:
   an `edit` call; `mcpToolCall` an `mcp` call named by its tool, with `server`; `dynamicToolCall`
   an `app` call; `collabAgentToolCall` with `spawnAgent` a `subagent` call (its `title` is the
   prompt), and other collab calls (`wait`...) aren't items; `contextCompaction` a `compaction`
-  (`trigger: manual`). A `userMessage` item takes in a queued steered message.
+  (`trigger: manual`). A `userMessage` item takes in a queued steered message. A turn's mark
+  (`session.at`) is its `turn/completed` turn's `id`: the first one's, for a turn that went on after
+  a plan. It's kept in `turn_at` at that turn's `turn/started`.
 - **Statuses**: `completed`, `failed`, `declined` (which is `denied`). A command's `result` is its
   `aggregatedOutput` (`""` when it's `null`) with `exit_code`.
 - **Subagents**: a `spawnAgent` call's `receiverThreadIds` are its child threads. Their items have
@@ -338,9 +377,12 @@ backend drives each CLI:
   on past it) and `allowed` otherwise; `resetsAt` (Unix seconds) is `resets_at`, as `YYYY-MM-DDTHH:MM:SSZ`;
   `windowDurationMins` is `window_minutes`. The thread's `rate_limits` take them in as
   [PROTOCOL.md](../PROTOCOL.md#threads) says, with a `thread.updated` if that changes them.
-- **Usage**: Codex reports the thread's running totals, so a turn's usage is how far the last
-  totals in the turn are past the thread's usage before it. `input_tokens` leaves out the cached
-  ones (`cache_read_tokens`), as Claude's do. `duration_ms` is the turn's `durationMs`.
+- **Usage**: a turn used what its model calls did: the sum of the `last` of each of the thread's
+  own `thread/tokenUsage/updated` from its `turn/started` to its `turn/completed` (none, if Codex
+  hasn't reported tokens in the process at all). Not Codex's running totals: a session the thread
+  adopted has them from before, a resumed one reports them before its turn starts, and
+  `thread/revert` doesn't take them back. `input_tokens` leaves out the cached ones
+  (`cache_read_tokens`), as Claude's do. `duration_ms` is the turn's `durationMs`.
 
 ## Comparing events
 

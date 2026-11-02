@@ -13,7 +13,7 @@ A transport carries four things. Every backend has all four:
 | | Node | Go | Rust |
 | --- | --- | --- | --- |
 | **Events out**: every thread's events, deltas included | `sdk.subscribe(fn)` | `sdk.Subscribe(fn)`, or `sdk.Events(ctx)` | `sdk.subscribe()` (a tokio `broadcast::Receiver`) |
-| **Commands in**: `send`, `interrupt`, `respond`, `set_options` | `sdk.handle(command)` | `sdk.HandleJSON(ctx, data)`, or `sdk.Handle(ctx, command)` | `sdk.handle_json(value)`, or `sdk.handle(command)` |
+| **Commands in**: `send`, `interrupt`, `respond`, `set_options`, `rewind`, `new_session`, `compact` | `sdk.handle(command)` | `sdk.HandleJSON(ctx, data)`, or `sdk.Handle(ctx, command)` | `sdk.handle_json(value)`, or `sdk.handle(command)` |
 | **A snapshot**, for a client that's just connected | `sdk.snapshot(id)` | `sdk.Snapshot(ctx, id)` | `sdk.snapshot(&id)` |
 | **Events after a `seq`**, for a client catching up | `sdk.eventsSince(id, seq)` | `sdk.EventsSince(ctx, id, seq, 0)` | `sdk.events_since(&id, seq, None)` |
 

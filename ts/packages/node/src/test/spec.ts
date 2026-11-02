@@ -6,6 +6,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { afterAll } from "vitest";
+import { MemoryState, MemoryStore } from "../stores/memory.js";
 
 export const specDir = fileURLToPath(new URL("../../../../../spec/", import.meta.url));
 
@@ -43,4 +44,17 @@ export function shimPath(): string {
   const bin = join(dir, "target", "debug", "agent-threads-shim");
   if (!existsSync(bin)) execFileSync("cargo", ["build", "--quiet", "--manifest-path", join(dir, "Cargo.toml")], { stdio: "inherit" });
   return (shimBin = bin);
+}
+
+/**
+ * What `store` holds now, in a store of its own: as a backend that stopped without closing left
+ * it, for another to load (the first's processes, still running, can't change it).
+ */
+export function crashed(store: MemoryStore): MemoryStore {
+  const copy = new MemoryState();
+  copy.threads = structuredClone(store.state.threads);
+  copy.events = structuredClone(store.state.events);
+  copy.snapshots = structuredClone(store.state.snapshots);
+  copy.runs = structuredClone(store.state.runs);
+  return new MemoryStore(copy);
 }

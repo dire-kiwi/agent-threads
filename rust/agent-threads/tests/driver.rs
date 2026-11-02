@@ -1194,11 +1194,10 @@ async fn lost_run_after_a_message(unlinked: bool) {
     .await;
     env.sdk.events_since(&t.id, 0, None).await.unwrap(); // saved
     // As if the backend died with the run.
-    let crashed = MemoryStore::new();
-    copy_store(&MemoryStore::with_state(state), &crashed, &t.id).await;
+    let copy = common::crashed(&MemoryStore::with_state(state), &t.id).await;
     env.sdk.close(false).await.unwrap();
 
-    let again = make(crashed);
+    let again = make(copy);
     let s = serde_json::to_value(again.sdk.snapshot(&t.id).await.unwrap()).unwrap();
     assert!(open(&s).is_empty(), "unlinked: {unlinked}: {s}");
     assert_eq!(resolution_of(&again.sdk, &t.id, &q).await, json!({"outcome": "cancel"}));
@@ -1334,6 +1333,77 @@ async fn keeps_a_background_subagents_calls_and_requests_after_its_turn_and_runs
             .iter()
             .any(|m| m["response"]["response"]["behavior"] == "allow")
     );
+}
+
+/// new_session or rewind changes the session while a background subagent runs: the process is
+/// stopped, so the turn Claude would start when it ends can't bring the old session back.
+async fn stops_the_process_when_the_session_changes(rewind: bool) {
+    let mut env = setup(Setup::default());
+    let t = env.sdk.create(create()).await.unwrap();
+    env.sdk
+        .send(&t.id, "background 500 apple", SendOptions::default())
+        .await
+        .unwrap();
+    until(5, || {
+        let done = env.events().iter().any(|e| matches!(e, ThreadEvent::TurnCompleted(_)));
+        async move { done.then_some(()) }
+    })
+    .await;
+    let s = serde_json::to_value(env.sdk.snapshot(&t.id).await.unwrap()).unwrap();
+    assert!(s["thread"]["session_id"].is_string());
+    let agent = items(&s, "tool_call")
+        .into_iter()
+        .find(|c| c["name"] == "Agent")
+        .unwrap()
+        .clone();
+    assert_eq!(agent["subagent"]["status"], "running");
+    if rewind {
+        let turn = results(&s)[0]["turn_id"].as_str().unwrap().to_string();
+        env.sdk.rewind(&t.id, &turn).await.unwrap();
+    } else {
+        env.sdk.new_session(&t.id).await.unwrap();
+    }
+    // Long enough for the subagent to have ended, and Claude's turn about it to have come.
+    tokio::time::sleep(Duration::from_millis(1000)).await;
+    let s = serde_json::to_value(env.sdk.snapshot(&t.id).await.unwrap()).unwrap();
+    assert!(s["thread"].get("session_id").is_none(), "{}", s["thread"]);
+    assert_eq!(s["thread"]["status"], "idle");
+    let last = s["items"].as_array().unwrap().last().unwrap();
+    assert_eq!(
+        (&last["type"], &last["code"]),
+        (&json!("notice"), &json!(if rewind { "rewind" } else { "session.new" }))
+    );
+    assert!(!texts(&s).contains(&"the subagent said apple".to_string()));
+    if !rewind {
+        let call = s["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|i| i["id"] == agent["id"])
+            .unwrap();
+        assert_eq!(call["subagent"]["status"], "stopped");
+    }
+    assert_eq!(env.runs().len(), 1);
+    // The next message starts a new process, in a new session.
+    env.sdk
+        .send(&t.id, "reply fresh", SendOptions::default())
+        .await
+        .unwrap();
+    let s = settle(&env.sdk, &t.id).await;
+    assert_eq!(texts(&s).last().unwrap(), "fresh");
+    assert!(!env.runs()[1].argv.iter().any(|a| a == "--resume"));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn stops_the_process_when_new_session_changes_the_session_so_a_background_subagents_turn_cant_bring_the_old_one_back()
+ {
+    stops_the_process_when_the_session_changes(false).await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn stops_the_process_when_rewind_changes_the_session_so_a_background_subagents_turn_cant_bring_the_old_one_back()
+{
+    stops_the_process_when_the_session_changes(true).await;
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -1885,8 +1955,7 @@ async fn ends_a_turn_that_was_running_when_the_backend_stopped() {
     .await;
     env.sdk.events_since(&t.id, 0, None).await.unwrap(); // saved
     // As if the backend died: nothing is closed, and the thread is left running in the store.
-    let crashed = MemoryStore::new();
-    copy_store(&MemoryStore::with_state(state), &crashed, &t.id).await;
+    let crashed = common::crashed(&MemoryStore::with_state(state), &t.id).await;
     env.sdk.close(false).await.unwrap();
 
     let again = env.make(Arc::new(crashed));
@@ -1899,12 +1968,51 @@ async fn ends_a_turn_that_was_running_when_the_backend_stopped() {
     assert_eq!(r[0]["ok"], false);
 }
 
-async fn copy_store(from: &MemoryStore, to: &MemoryStore, id: &str) {
-    to.create_thread(&from.get_thread(id).await.unwrap().unwrap())
+#[tokio::test(flavor = "multi_thread")]
+async fn keeps_the_mark_claude_gave_a_turn_the_backend_lost_so_a_rewind_past_it_resumes_after_it() {
+    let store = Arc::new(MemoryStore::new());
+    let env = setup(Setup {
+        store: Some(store.clone()),
+        ..Default::default()
+    });
+    let t = env.sdk.create(create()).await.unwrap();
+    env.sdk.send(&t.id, "reply one", SendOptions::default()).await.unwrap();
+    let s = settle(&env.sdk, &t.id).await;
+    let first = results(&s)[0]["session"]["at"].clone();
+    env.sdk
+        .send(&t.id, "streamhang cut short", SendOptions::default())
         .await
         .unwrap();
-    let events = from.read_events(id, 0, None).await.unwrap();
-    to.append_events(id, &events, &[]).await.unwrap();
+    // It has the message (its echo is the turn's mark so far), and is answering.
+    let at = until(5, || async {
+        let x = serde_json::to_value(env.sdk.snapshot(&t.id).await.unwrap()).unwrap();
+        let at = x["thread"].get("turn_at").cloned();
+        texts(&x).iter().any(|t| t == "cut short ").then_some(at).flatten()
+    })
+    .await;
+    assert_ne!(at, first);
+    env.sdk.events_since(&t.id, 0, None).await.unwrap(); // saved
+    let crashed = common::crashed(store.as_ref(), &t.id).await;
+    env.sdk.close(false).await.unwrap();
+
+    let next = env.make(Arc::new(crashed));
+    let s = serde_json::to_value(next.snapshot(&t.id).await.unwrap()).unwrap();
+    let lost = results(&s)[1];
+    assert_eq!(lost["ok"], false);
+    assert_eq!(lost["session"], json!({"id": s["thread"]["session_id"], "at": at}));
+    next.send(&t.id, "reply three", SendOptions::default()).await.unwrap();
+    let s = settle(&next, &t.id).await;
+    let third = results(&s)[2]["turn_id"].as_str().unwrap().to_string();
+    next.rewind(&t.id, &third).await.unwrap();
+    let thread = serde_json::to_value(next.snapshot(&t.id).await.unwrap()).unwrap()["thread"].clone();
+    assert_eq!(
+        (&thread["session_id"], &thread["resume_at"]),
+        (&s["thread"]["session_id"], &at)
+    );
+    next.send(&t.id, "reply four", SendOptions::default()).await.unwrap();
+    settle(&next, &t.id).await;
+    let argv = env.runs().last().unwrap().argv.clone();
+    assert!(has(&argv, "--resume-session-at", at.as_str().unwrap()), "{argv:?}");
 }
 
 /// A store whose appends fail when it's told to.
@@ -2949,4 +3057,67 @@ async fn starts_claude_under_the_shim_with_the_threads_launch_options() {
     assert_eq!(run.config_dir.as_deref(), Some("/profile"));
     assert_eq!(run.env, json!({"AT_SET": "x y"}));
     env.sdk.close(true).await.unwrap();
+}
+
+/// A question kept open after its turn belongs to the conversation that asked it: a rewind or a new
+/// session cancels it, and answering it then starts nothing, before a restart or after.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_session_change_cancels_a_question_kept_open_after_its_turn() {
+    for change in ["rewind", "new_session"] {
+        let state = MemoryState::new();
+        let late = || Setup {
+            store: Some(Arc::new(MemoryStore::with_state(state.clone()))),
+            late_answers: true,
+            ..asking(PermissionPolicy::ask())
+        };
+        let mut env = setup(late());
+        let t = env.sdk.create(create()).await.unwrap();
+        env.sdk.send(&t.id, "reply one", SendOptions::default()).await.unwrap();
+        settle(&env.sdk, &t.id).await;
+        env.sdk
+            .send(
+                &t.id,
+                &format!("asking AskUserQuestion {QUESTION}"),
+                SendOptions::default(),
+            )
+            .await
+            .unwrap();
+        let q = open_request(&env.sdk, &t.id, "question", None).await;
+        env.sdk.interrupt(&t.id).await.unwrap();
+        let s = settle(&env.sdk, &t.id).await;
+        assert_eq!(open(&s).len(), 1, "{change}");
+        if change == "rewind" {
+            let turn = results(&s)[1]["turn_id"].as_str().unwrap().to_string();
+            env.sdk.rewind(&t.id, &turn).await.unwrap();
+        } else {
+            env.sdk.new_session(&t.id).await.unwrap();
+        }
+        let s = serde_json::to_value(env.sdk.snapshot(&t.id).await.unwrap()).unwrap();
+        assert!(open(&s).is_empty(), "{change}: {s}");
+        let last = env
+            .events_json()
+            .into_iter()
+            .rfind(|e| e["type"] == "request.resolved")
+            .unwrap();
+        assert_eq!(
+            (last["request_id"].clone(), last["resolution"]["outcome"].clone()),
+            (q["id"].clone(), json!("cancel")),
+            "{change}"
+        );
+        let respond = json!({"type": "respond", "thread_id": t.id, "request_id": q["id"],
+            "resolution": {"outcome": "answer", "answers": {"Colour?": ["Blue"]}}});
+        let before = items(&s, "user_message").len();
+        let _ = env.sdk.handle_json(respond.clone()).await;
+        let s = settle(&env.sdk, &t.id).await;
+        assert_eq!(items(&s, "user_message").len(), before, "{change}: {s}");
+        env.sdk.close(false).await.unwrap();
+
+        let env = setup(late());
+        let s = serde_json::to_value(env.sdk.snapshot(&t.id).await.unwrap()).unwrap();
+        assert!(open(&s).is_empty(), "{change} after a restart: {s}");
+        let _ = env.sdk.handle_json(respond).await;
+        let s = settle(&env.sdk, &t.id).await;
+        assert_eq!(items(&s, "user_message").len(), before, "{change} after a restart: {s}");
+        env.sdk.close(false).await.unwrap();
+    }
 }

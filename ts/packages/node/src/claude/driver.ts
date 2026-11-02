@@ -7,13 +7,14 @@
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import type { Resolution, Usage } from "@dire-kiwi/agent-threads-protocol";
+import type { Resolution, TurnSession, Usage } from "@dire-kiwi/agent-threads-protocol";
 import { messageParts, pathText } from "../attachments.js";
 import { CommandError, ControlError } from "../errors.js";
 import { inBackground, parseLine, runningInBackground, type Harness, type HarnessSession, type Message, type RunCheckpoint, type Skill, type ThreadContext } from "../harness.js";
 import { newId } from "../ids.js";
 import { applyLaunchEnv, launchedNow, launchedOf, withEnv, type Launched } from "../launch.js";
 import { modeAfterPlan, permissionKey, type PermissionDecision } from "../permissions.js";
+import { resumeAtPoint, type RewindPoint } from "../sessions.js";
 import { writeSkills } from "../skills.js";
 import type { ExitStatus, HarnessProcess, ProcessHandlers } from "../spawner.js";
 import type { RunRecord } from "../store.js";
@@ -107,6 +108,10 @@ interface RunState {
   autoTurn?: string;
   heldUsage?: Usage;
   pluginDir?: string;
+  /** The running turn's mark: the main conversation's last message in it. */
+  at?: string;
+  /** The message it was started to resume its session at (the thread's resume_at then). */
+  resumeAt?: string;
   /** The thread's options it has: those it was started with, and the model and permission mode since. */
   launched?: Launched;
   /** The thread's options or config have changed since, so the next turn starts a new process. */
@@ -153,6 +158,10 @@ class Run {
   heldUsage: Usage | undefined;
   /** The generated plugin with the thread's skills, for this run only. */
   pluginDir: string | undefined;
+  /** The running turn's mark: the uuid of the main conversation's last message in it. */
+  at: string | undefined;
+  /** The message it was started to resume its session at (--resume-session-at). */
+  resumeAt: string | undefined;
   launched: Launched | undefined;
 
   /** Left running when the backend shut down: nothing more is read or written. */
@@ -214,6 +223,8 @@ class Run {
       ...(this.autoTurn ? { autoTurn: this.autoTurn } : {}),
       ...(this.heldUsage ? { heldUsage: this.heldUsage } : {}),
       ...(this.pluginDir ? { pluginDir: this.pluginDir } : {}),
+      ...(this.at ? { at: this.at } : {}),
+      ...(this.resumeAt ? { resumeAt: this.resumeAt } : {}),
       ...(this.launched ? { launched: this.launched } : {}),
     };
   }
@@ -236,6 +247,8 @@ class Run {
     this.autoTurn = st.autoTurn;
     this.heldUsage = st.heldUsage;
     if (st.pluginDir) this.pluginDir = st.pluginDir;
+    this.at = st.at;
+    this.resumeAt = st.resumeAt;
     if (st.launched) this.launched = { ...st.launched };
   }
 
@@ -261,6 +274,12 @@ class ClaudeSession implements HarnessSession {
   #stopping: Promise<void> | null = null;
   /** The options changed since the run started: the next turn starts a new one. */
   #stale = false;
+  /**
+   * The turn whose marks go to the thread as they come (ThreadContext.mark): one of a message once
+   * Claude has echoed a message of it back (what it says before then may be from before the turn:
+   * set_model's reply, say), and a compaction or a turn Claude started by itself from its start.
+   */
+  #marking: string | undefined;
   #steerTimer: NodeJS.Timeout | undefined;
   #stopTimer: NodeJS.Timeout | undefined;
   /** When those go off, for a checkpoint. */
@@ -317,6 +336,16 @@ class ClaudeSession implements HarnessSession {
   #clearSteer(): void {
     clearTimeout(this.#steerTimer);
     this.#steerAt = undefined;
+  }
+
+  compact(): void {
+    // Claude Code compacts when it's sent /compact, which is its turn.
+    this.#ensure(true).send([], this.#userMessage([{ id: "", text: "/compact" }]));
+    this.#marking = this.#ctx.turnId;
+  }
+
+  rewindPoint(sessions: (TurnSession | undefined)[], index: number): RewindPoint {
+    return resumeAtPoint(sessions, index);
   }
 
   interrupt(): void {
@@ -376,6 +405,18 @@ class ClaudeSession implements HarnessSession {
 
   configChanged(): void {
     this.#stale = true;
+  }
+
+  retire(): void {
+    this.#stale = true;
+    this.#clearSteer();
+    this.#clearStop();
+    const run = this.#live();
+    if (!run) return;
+    // Stopped now, and retired: what it says on its way out is left out. It's the thread's run no
+    // more from now, so its end, whenever that comes, changes nothing.
+    void this.#stop(run, true, true);
+    if (this.#ctx.thread.run?.id === run.id) this.#ctx.setThread({ run: undefined });
   }
 
   /**
@@ -685,6 +726,9 @@ class ClaudeSession implements HarnessSession {
     const mode = claudePermissionMode(t.permission_mode);
     if (mode) args.push("--permission-mode", mode);
     if (t.session_id) args.push("--resume", t.session_id);
+    // After a rewind: the session as it was at the end of the turn it went back to.
+    run.resumeAt = t.session_id ? t.resume_at : undefined;
+    if (run.resumeAt) args.push("--resume-session-at", run.resumeAt);
     const servers: Json = {};
     if (tools.length) servers[APP_SERVER] = { type: "sdk", name: APP_SERVER };
     for (const [name, s] of Object.entries(mcpServers)) {
@@ -726,7 +770,7 @@ class ClaudeSession implements HarnessSession {
     if (!run.retired && ctx.turnId) {
       this.#clearStop();
       this.#clearSteer();
-      ctx.endTurn({ ok: false, error: exitError(status, run.stderr) });
+      ctx.endTurn({ ok: false, error: exitError(status, run.stderr), ...(run.at ? { session_at: run.at } : {}) });
     }
     run.finish();
   }
@@ -759,6 +803,14 @@ class ClaudeSession implements HarnessSession {
   #message(run: Run, m: Json): void {
     const ctx = this.#ctx;
     const parent: string | undefined = m.parent_tool_use_id ?? undefined;
+    // The main conversation's messages (replayed ones too): the turn's last is where a rewind to
+    // after it resumes the session.
+    if ((m.type === "user" || m.type === "assistant") && !parent && typeof m.uuid === "string") {
+      run.at = m.uuid;
+      if (m.type === "user" && m.isReplay && run.sent.some((s) => s.echo === echoKey(m.message?.content))) this.#marking = ctx.turnId;
+      // A turn that has a mark already (re-attached after a restart, say) was being marked.
+      if (ctx.turnId && (this.#marking === ctx.turnId || ctx.thread.turn_at !== undefined)) ctx.mark(m.uuid);
+    }
     // A message refused for the usage limit says which limit, before anything else it leads to.
     if ((m.type === "assistant" || m.type === "user" || m.type === "result") && m.api_error === "usage_limit_reached") {
       const info = m.api_error_params?.rate_limit_info;
@@ -773,8 +825,15 @@ class ClaudeSession implements HarnessSession {
         if (m.subtype === "init" && !ctx.turnId) {
           ctx.beginTurn();
           run.autoTurn = ctx.turnId;
+          this.#marking = ctx.turnId;
         }
-        if (m.subtype === "init" && m.session_id && m.session_id !== ctx.thread.session_id) ctx.setThread({ session_id: m.session_id });
+        if (m.subtype === "init") {
+          // The session it runs in; and a rewind's resume_at is done with once it has resumed there.
+          const patch: { session_id?: string; resume_at?: undefined } = {};
+          if (m.session_id && m.session_id !== ctx.thread.session_id) patch.session_id = m.session_id;
+          if (run.resumeAt && ctx.thread.resume_at === run.resumeAt) patch.resume_at = undefined;
+          if (Object.keys(patch).length) ctx.setThread(patch);
+        }
         if (m.subtype === "api_retry") ctx.addItem({ id: newId("n"), type: "notice", level: "warning", code: "retry", text: retryText(m), ...(parent ? { parent_id: parent } : {}) });
         if (m.subtype === "hook_response") {
           const n = hookNotice(m);
@@ -857,7 +916,10 @@ class ClaudeSession implements HarnessSession {
           run.blockCount.clear();
           run.streamed.clear();
         }
-        if (!ctx.turnId) break;
+        if (!ctx.turnId) {
+          run.at = undefined;
+          break;
+        }
         // The end of a turn Claude made by itself (to tell the agent a background subagent ended)
         // while a turn of the user's waited for it: the user's goes on to its own result, which
         // gets this one's usage too.
@@ -865,6 +927,9 @@ class ClaudeSession implements HarnessSession {
           run.heldUsage = sumUsage(run.heldUsage, claudeUsage(m));
           break;
         }
+        // The turn's mark: its last message, the one Claude made by itself in it included.
+        const at = run.at;
+        run.at = undefined;
         this.#clearStop();
         const failed = !!m.is_error;
         const usage = sumUsage(run.heldUsage, claudeUsage(m));
@@ -874,6 +939,7 @@ class ClaudeSession implements HarnessSession {
           ...(failed ? { error: m.result || (Array.isArray(m.errors) ? m.errors.join("\n") : "") || m.subtype } : {}),
           usage,
           ...(typeof m.duration_ms === "number" ? { duration_ms: m.duration_ms } : {}),
+          ...(at ? { session_at: at } : {}),
         });
         break;
       }

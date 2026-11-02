@@ -152,8 +152,8 @@ func codexDone(item jmap, denied bool) Patch {
 	return patch
 }
 
-// codexTotals is Codex's token totals for a thread.
-type codexTotals struct {
+// codexTokens is a Codex token count report (a tokenUsage report's last or total).
+type codexTokens struct {
 	InputTokens           int64  `json:"inputTokens"`
 	CachedInputTokens     int64  `json:"cachedInputTokens"`
 	OutputTokens          int64  `json:"outputTokens"`
@@ -231,27 +231,20 @@ func childTurnSubagent(s protocol.SubagentState, turn jmap, last string) protoco
 	return s
 }
 
-// codexUsage is what a turn used. Codex reports the thread's running totals (again after a
-// resume), so it's how far they are past the thread's usage before the turn. Its input tokens
-// include the cached ones, which (as Claude's do) input_tokens leaves out.
-func codexUsage(total codexTotals, before *protocol.Usage) *protocol.Usage {
-	b := protocol.Usage{}
-	if before != nil {
-		b = *before
-	}
-	cached := total.CachedInputTokens - deref(b.CacheReadTokens)
-	input := total.InputTokens - b.InputTokens - deref(b.CacheReadTokens)
+// callUsage is what a model call used (a tokenUsage report's last), as usage: a turn used its
+// calls' sum. Its input tokens include the cached ones, which (as Claude's do) input_tokens leaves
+// out.
+func callUsage(last codexTokens) *protocol.Usage {
 	pos := func(n int64) int64 { return max(0, n) }
-	read := pos(cached)
-	write := pos(deref(total.CacheWriteInputTokens) - deref(b.CacheWriteTokens))
-	return &protocol.Usage{InputTokens: pos(input - cached), OutputTokens: pos(total.OutputTokens - b.OutputTokens), CacheReadTokens: &read, CacheWriteTokens: &write}
+	read := pos(last.CachedInputTokens)
+	write := pos(deref(last.CacheWriteInputTokens))
+	return &protocol.Usage{InputTokens: pos(last.InputTokens - last.CachedInputTokens), OutputTokens: pos(last.OutputTokens), CacheReadTokens: &read, CacheWriteTokens: &write}
 }
 
-// totalsAsUsage is Codex's totals as the usage they'd be if a turn had used them all.
-func totalsAsUsage(t codexTotals) *protocol.Usage {
-	read := t.CachedInputTokens
-	write := deref(t.CacheWriteInputTokens)
-	return &protocol.Usage{InputTokens: t.InputTokens - t.CachedInputTokens, CacheReadTokens: &read, OutputTokens: t.OutputTokens, CacheWriteTokens: &write}
+// zeroUsage is a usage of nothing.
+func zeroUsage() *protocol.Usage {
+	var read, write int64
+	return &protocol.Usage{CacheReadTokens: &read, CacheWriteTokens: &write}
 }
 
 // codexQuestions is requestUserInput's questions.

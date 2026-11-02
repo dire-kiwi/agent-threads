@@ -3,6 +3,7 @@
 // transport.
 
 import {
+  applyEvent,
   applyEvents,
   initialState,
   itemPage,
@@ -27,6 +28,7 @@ import type { Harness, HarnessMessage, LaunchOptions, McpServer, Skill, ThreadCo
 import { newId } from "./ids.js";
 import { splitStored, storedThread } from "./launch.js";
 import type { PermissionPolicy } from "./permissions.js";
+import { RewindError } from "./sessions.js";
 import { direct, type Spawner } from "./spawner.js";
 import type { RunRecord, Store } from "./store.js";
 import { MemoryStore } from "./stores/memory.js";
@@ -94,6 +96,11 @@ export interface CreateOptions extends Capabilities {
   standing_answers?: StandingAnswer[];
   /** The thread's id; a new one by default. */
   id?: string;
+  /**
+   * The harness's own session to adopt (Claude Code's session id, Codex's thread id): the thread's
+   * first turn resumes it. Its messages so far aren't made into items.
+   */
+  session_id?: string;
   /**
    * How its harness process is started (args, environment, directories, config directory), on top
    * of the harness's options. They're stored with the thread, but not sent to clients.
@@ -164,6 +171,7 @@ export class AgentThreads {
       ...(options.title ? { title: options.title } : {}),
       ...(options.model ? { model: options.model } : {}),
       ...(options.effort ? { effort: options.effort } : {}),
+      ...(options.session_id ? { session_id: options.session_id } : {}),
       permission_mode: options.permission_mode ?? "default",
       cwd: options.cwd ?? process.cwd(),
       ...(options.metadata ? { metadata: options.metadata } : {}),
@@ -354,6 +362,12 @@ export class AgentThreads {
           ...(standing_answers !== undefined ? { standing_answers } : {}),
         });
       }
+      case "rewind":
+        return this.rewind(command.thread_id, command.turn_id);
+      case "new_session":
+        return this.newSession(command.thread_id);
+      case "compact":
+        return this.compact(command.thread_id);
     }
   }
 
@@ -393,6 +407,42 @@ export class AgentThreads {
     if (optionsOf(rt.thread) !== before) rt.session?.optionsChanged();
     if (launch) rt.setLaunch(launch);
     rt.settle();
+  }
+
+  /**
+   * Takes the conversation back to before the turn `turnId`: the harness forgets it and every turn
+   * after it (from the next turn, which resumes the session there), and their items are removed.
+   * Refused while a turn is running, for a turn the thread hasn't, and where the harness can't go
+   * back (a Claude Code session the thread adopted, to before its first turn in it).
+   */
+  async rewind(threadId: string, turnId: string): Promise<void> {
+    const rt = await this.#ready({ type: "rewind", thread_id: threadId, turn_id: turnId });
+    idle(rt, "rewound");
+    try {
+      rt.rewind(turnId);
+    } catch (e) {
+      if (e instanceof RewindError) throw new CommandError(`the thread can't be rewound to before that turn: ${e.message}`);
+      throw e;
+    }
+  }
+
+  /** The next turn starts a new conversation with the harness; the thread's items stay. */
+  async newSession(threadId: string): Promise<void> {
+    const rt = await this.#ready({ type: "new_session", thread_id: threadId });
+    idle(rt, "given a new session");
+    rt.newSession();
+  }
+
+  /**
+   * Compacts the harness's context now, in a turn of its own. Refused while a turn is running, and
+   * when the thread has no session yet.
+   */
+  async compact(threadId: string): Promise<void> {
+    const rt = await this.#ready({ type: "compact", thread_id: threadId });
+    idle(rt, "compacted");
+    if (!rt.thread.session_id) throw new CommandError("the thread has no conversation to compact yet");
+    if (!rt.session?.compact) throw new CommandError(`${rt.thread.harness} threads can't be compacted`);
+    rt.compact();
   }
 
   /**
@@ -534,12 +584,16 @@ export class AgentThreads {
     let state = applyEvents(snap ?? initialState(thread), events);
     if (state.seq === 0) state = initialState(thread);
     const rt = this.#runtime(state, launch);
-    if (await this.#reattach(rt)) return rt;
+    // The turn that was running, if one was (a compaction may have no items yet), and the session it
+    // started in: what a turn rebuilt here is.
+    const running = rt.thread.status === "running" || rt.thread.status === "waiting";
+    const open = running ? (runningTurn(snap ?? initialState(thread), events) ?? (await this.#runningTurn(thread))) : undefined;
+    const lost: LostTurn = open ?? (rt.thread.session_id ? { session: rt.thread.session_id } : {});
+    if (await this.#reattach(rt, lost)) return rt;
     // The process that ran its turn went with the backend before this one, or can't be followed.
-    const s = rt.thread.status;
-    if (s === "running" || s === "waiting" || rt.thread.run) {
+    if (running || rt.thread.run) {
       if (rt.thread.run) rt.lostRun = rt.thread.run.id;
-      recoverLost(rt);
+      recoverLost(rt, lost);
     } else {
       // Questions kept open after their turns ended are taken up again (or cancelled, if they
       // can't be any more).
@@ -548,12 +602,17 @@ export class AgentThreads {
     return rt;
   }
 
+  /** The turn that was running, from all the thread's events (see runningTurn). */
+  async #runningTurn(thread: Thread): Promise<LostTurn | undefined> {
+    return runningTurn(initialState(thread), await this.store.readEvents(thread.id, { after: 0 }));
+  }
+
   /**
    * Re-attaches a thread just loaded to its run, if it has one that outlived the backend before:
    * its turn and open requests are as they were when the run was last saved, and the session
    * carries on reading the run from there. Whether it did; if it couldn't, the run is stopped.
    */
-  async #reattach(rt: ThreadRuntime): Promise<boolean> {
+  async #reattach(rt: ThreadRuntime, lost: LostTurn): Promise<boolean> {
     const run = rt.thread.run;
     if (!run || run.spawner === "direct") return false;
     const record = await this.store.getRun(run.id);
@@ -561,10 +620,9 @@ export class AgentThreads {
     const data = (record.data ?? {}) as { turn?: Turn | null };
     const s = rt.thread.status;
     if (s === "running" || s === "waiting") {
-      const last = [...rt.snapshot.items].reverse().find((i) => i.turn_id)?.turn_id;
       // A run saved with no turn running (null) had none: it may be waiting only on a background
-      // subagent's request. A run saved before runs had their turn has the last one.
-      rt.turn = data.turn ? { ...data.turn } : "turn" in data ? null : { id: last ?? newId("turn"), interrupted: false };
+      // subagent's request. A run saved before runs had their turn has the one the events have open.
+      rt.turn = data.turn ? { ...data.turn } : "turn" in data ? null : { id: lost.id ?? latestTurn(rt) ?? newId("turn"), interrupted: false, ...(lost.session ? { session: lost.session } : {}) };
     }
     rt.adoptRun(record);
     const session = rt.session;
@@ -609,6 +667,38 @@ export class AgentThreads {
   }
 }
 
+/** Refuses a command that needs the thread idle: one that's running a turn. */
+function idle(rt: ThreadRuntime, what: string): void {
+  if (rt.turn) throw new CommandError(`a turn is running: the thread can't be ${what} until it ends (interrupt it first)`);
+}
+
+/** A turn that was running when the thread was loaded: its id, and the session it started in. */
+interface LostTurn {
+  id?: string;
+  session?: string;
+}
+
+/**
+ * The turn that's still running in `events` folded onto `from` (the last turn.started with no
+ * turn.completed after it), with the thread's session_id when it started (a session the turn
+ * starts is set after its turn.started); undefined if there's none in them.
+ */
+function runningTurn(from: Snapshot, events: ThreadEvent[]): LostTurn | undefined {
+  let state = from;
+  let open: LostTurn | undefined;
+  for (const e of events) {
+    if (e.type === "turn.started") open = { id: e.turn_id, ...(state.thread.session_id ? { session: state.thread.session_id } : {}) };
+    else if (e.type === "turn.completed" && e.turn_id === open?.id) open = undefined;
+    state = applyEvent(state, e);
+  }
+  return open;
+}
+
+/** The id of the thread's latest turn, from its items, for a lost turn whose id isn't known. */
+function latestTurn(rt: ThreadRuntime): string | undefined {
+  return [...rt.snapshot.items].reverse().find((i) => i.turn_id)?.turn_id;
+}
+
 /**
  * The turn a thread's items say is still running: its last, if it has no turn_result. (A thread
  * waiting with none running is waiting on a background subagent's request.)
@@ -619,15 +709,16 @@ function openTurn(items: readonly Item[]): string | undefined {
 }
 
 /**
- * Ends a turn whose process was lost when the backend stopped, and stops the subagents that went
- * with it (a background one may be running with no turn).
+ * Ends a turn whose process was lost when the backend stopped (`lost`, the one its events have
+ * open, which a compaction with no items yet is too; or the one its items have open), and stops the
+ * subagents that went with it (a background one may be running with no turn).
  */
-function recoverLost(rt: ThreadRuntime): void {
+function recoverLost(rt: ThreadRuntime, lost: LostTurn): void {
   const s = rt.thread.status;
   const items = rt.snapshot.items;
-  const open = openTurn(items);
+  const open = lost.id ?? openTurn(items);
   const turn = s === "running" || (s === "waiting" && open !== undefined);
-  if (turn) rt.turn = { id: open ?? newId("turn"), interrupted: false };
+  if (turn) rt.turn = { id: open ?? newId("turn"), interrupted: false, ...(lost.session ? { session: lost.session } : {}) };
   rt.stopSubagents(items.filter((i) => i.type === "tool_call" && i.subagent?.status === "running").map((i) => i.id));
   // Its open requests can't be answered now (but for questions that can be answered late).
   rt.takeUpRequests(true);
@@ -640,7 +731,8 @@ function recoverLost(rt: ThreadRuntime): void {
       text: "The backend stopped while this turn was running, and couldn't pick its run up again.",
     });
     // Not carried over: loading a thread starts no process. Its queued messages go with the next.
-    rt.endTurn({ ok: false, error: "The backend stopped while this turn was running." }, { carry: false });
+    // Its mark is the last the harness gave (turn_at); with none, it's lost.
+    rt.endTurn({ ok: false, error: "The backend stopped while this turn was running." }, { carry: false, lost: true });
   } else if (rt.thread.status === "waiting") rt.setThread({ status: "idle" });
   rt.setThread({ run: undefined });
 }

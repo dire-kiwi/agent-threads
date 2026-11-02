@@ -1,0 +1,32 @@
+{
+  "description": "A thread created with the id of a Codex thread the app already had (made by a setup run, not recorded): its first turn resumes it with thread/resume.",
+  "recorded": {
+    "cli": "codex-cli 0.165.0",
+    "model": "gpt-5.6-luna",
+    "date": "2026-11-02"
+  },
+  "thread": {
+    "harness": "codex",
+    "model": "gpt-5.6-luna",
+    "effort": "low",
+    "session_id": "01a19a49-5744-70a2-a9a7-4e77e5920475"
+  },
+  "permissions": "allow",
+  "steps": [
+    {
+      "command": {
+        "type": "send",
+        "text": "What word did I ask you to remember? Reply with just the word.",
+        "client_id": "c1"
+      }
+    },
+    {
+      "wait": {
+        "type": "thread.updated",
+        "thread": {
+          "status": "idle"
+        }
+      }
+    }
+  ]
+}

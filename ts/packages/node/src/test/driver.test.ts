@@ -17,7 +17,7 @@ import { FileStore } from "../stores/file.js";
 import { MemoryStore } from "../stores/memory.js";
 import { SqliteStore } from "../stores/sqlite.js";
 import { defineTool, type ToolContext } from "../tools.js";
-import { shimPath, tempDir } from "./spec.js";
+import { crashed, shimPath, tempDir } from "./spec.js";
 
 const mini = fileURLToPath(new URL("./mini-claude.mjs", import.meta.url));
 
@@ -419,6 +419,33 @@ describe("the Claude driver", () => {
     expect(texts((await make(store).snapshot(t.id)).items)).toEqual(["half a thought "]);
   });
 
+  it("keeps the mark Claude gave a turn the backend lost, so a rewind past it resumes after it", async () => {
+    const store = new MemoryStore();
+    const { sdk, make, runs } = setup({ store });
+    const t = await sdk.create();
+    await sdk.send(t.id, "reply one");
+    let s = await settle(sdk, t.id);
+    const first = results(s.items)[0]!.session!.at;
+    await sdk.send(t.id, "streamhang cut short");
+    // It has the message (its echo is the turn's mark so far), and is answering.
+    const at = await until(async () => {
+      const x = await sdk.snapshot(t.id);
+      return texts(x.items).includes("cut short ") && x.thread.turn_at;
+    });
+    expect(at).not.toBe(first);
+    const next = make(crashed(store));
+    s = await next.snapshot(t.id);
+    expect(results(s.items)[1]).toMatchObject({ ok: false, session: { id: s.thread.session_id, at } });
+    await next.send(t.id, "reply three");
+    s = await settle(next, t.id);
+    await next.rewind(t.id, results(s.items)[2]!.turn_id!);
+    expect((await next.snapshot(t.id)).thread).toMatchObject({ session_id: s.thread.session_id, resume_at: at });
+    await next.send(t.id, "reply four");
+    await settle(next, t.id);
+    const argv = runs().at(-1)!.argv;
+    expect(argv.slice(argv.indexOf("--resume-session-at"))[1]).toBe(at);
+  });
+
   it("keeps the text streamed so far when the backend shuts down mid-message", async () => {
     const store = new MemoryStore();
     const { sdk, make } = setup({ store });
@@ -538,6 +565,35 @@ describe("the Claude driver", () => {
     expect(texts(s.items).at(-1)).toBe("the subagent said apple");
     expectTracked(events, runs());
   });
+
+  for (const change of ["new_session", "rewind"] as const) {
+    it(`stops the process when ${change} changes the session, so a background subagent's turn can't bring the old one back`, async () => {
+      const { sdk, events, runs } = setup();
+      const t = await sdk.create({ model: "mini" });
+      await sdk.send(t.id, "background 500 apple");
+      await until(() => events.some((e) => e.type === "turn.completed"));
+      let s = await sdk.snapshot(t.id);
+      expect(s.thread.session_id).toBeTruthy();
+      const agent = s.items.find((i): i is ToolCall => i.type === "tool_call" && i.name === "Agent")!;
+      expect(agent.subagent?.status).toBe("running");
+      if (change === "new_session") await sdk.newSession(t.id);
+      else await sdk.rewind(t.id, results(s.items)[0]!.turn_id!);
+      // Long enough for the subagent to have ended, and Claude's turn about it to have come.
+      await new Promise((r) => setTimeout(r, 1000));
+      s = await sdk.snapshot(t.id);
+      expect(s.thread.session_id).toBeUndefined();
+      expect(s.thread.status).toBe("idle");
+      expect(s.items.at(-1)).toMatchObject({ type: "notice", code: change === "new_session" ? "session.new" : "rewind" });
+      expect(texts(s.items)).not.toContain("the subagent said apple");
+      if (change === "new_session") expect(s.items.find((i) => i.id === agent.id)).toMatchObject({ subagent: { status: "stopped" } });
+      expect(runs()).toHaveLength(1);
+      // The next message starts a new process, in a new session.
+      await sdk.send(t.id, "reply fresh");
+      s = await settle(sdk, t.id);
+      expect(texts(s.items).at(-1)).toBe("fresh");
+      expect(runs()[1]!.argv).not.toContain("--resume");
+    });
+  }
 
   it("keeps a turn of the user's going past a turn Claude makes by itself before taking the user's message in", async () => {
     const { sdk, events } = setup({ env: { MINI_CLAUDE_NOTIFY_FIRST: "1" } });
@@ -950,6 +1006,41 @@ describe("the Claude driver", () => {
     s = await settle(again, t.id);
     expect(s.items.filter((i) => i.type === "user_message")).toHaveLength(before);
   });
+
+  for (const change of ["rewind", "new_session"] as const) {
+    it(`cancels a question kept open after its turn on ${change}, whose conversation it belonged to`, async () => {
+      const store = new MemoryStore();
+      const { sdk, make } = setup({ store, permissions: "ask", lateAnswers: true });
+      const t = await sdk.create();
+      await sdk.send(t.id, "reply one");
+      await settle(sdk, t.id);
+      await sdk.send(t.id, `asking AskUserQuestion ${QUESTION}`);
+      const q = await openRequest(sdk, t.id, "question");
+      await sdk.interrupt(t.id);
+      let s = await settle(sdk, t.id);
+      expect(openRequests(s).map((r) => r.id)).toEqual([q.id]);
+      if (change === "rewind") await sdk.rewind(t.id, results(s.items)[1]!.turn_id!);
+      else await sdk.newSession(t.id);
+      s = await sdk.snapshot(t.id);
+      expect(openRequests(s)).toEqual([]);
+      expect(await resolutionOf(sdk, t.id, q)).toEqual({ outcome: "cancel" });
+      // Answering it starts nothing, before a restart or after.
+      const before = s.items.filter((i) => i.type === "user_message").length;
+      await sdk.respond(t.id, q.id, { outcome: "answer", answers: { "Colour?": ["Blue"] } });
+      s = await settle(sdk, t.id);
+      expect(s.items.filter((i) => i.type === "user_message")).toHaveLength(before);
+      expect(results(s.items)).toHaveLength(change === "rewind" ? 1 : 2);
+      await sdk.close();
+      open = open.filter((x) => x !== sdk);
+      const again = make(store);
+      s = await again.snapshot(t.id);
+      expect(openRequests(s)).toEqual([]);
+      await again.respond(t.id, q.id, { outcome: "answer", answers: { "Colour?": ["Blue"] } });
+      s = await settle(again, t.id);
+      expect(s.items.filter((i) => i.type === "user_message")).toHaveLength(before);
+      expect(s.thread.status).toBe("idle");
+    });
+  }
 
   /** Asks a question, and interrupts its turn: the harness cancels it, and it's kept open. Doesn't wait for the turn to end. */
   async function interruptedQuestion(sdk: AgentThreads, id: string): Promise<ThreadRequest> {

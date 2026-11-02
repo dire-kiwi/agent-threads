@@ -69,6 +69,14 @@ export class Proc {
     this.child.stdin.write(JSON.stringify(msg) + "\n");
   }
 
+  /**
+   * Note a command the app sent its backend here (rewind, new_session, compact...), which the CLI
+   * isn't sent as such: it's how draft-expected.mjs knows what the backend was asked to do.
+   */
+  note(command) {
+    this.#entry({ dir: "command", command });
+  }
+
   /** Close stdin, as a backend does when it's done with the process. */
   close() {
     this.#entry({ dir: "close" });
