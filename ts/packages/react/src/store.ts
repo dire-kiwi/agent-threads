@@ -81,6 +81,8 @@ export class ThreadStore {
    * state, and the items.removed applied (which move the window's start, by which a page is placed).
    */
   private snapshots = 0;
+  /** Pages from a later state than the store's, waiting for it to get there: true once it has, false if it disconnects. */
+  private waiting: { seq: number; done: (reached: boolean) => void }[] = [];
 
   constructor(readonly source: ThreadSource) {
     const snapshot = source.snapshot;
@@ -114,6 +116,7 @@ export class ThreadStore {
       this.connected = false;
       this.attempt++;
       this.asked = "none";
+      for (const w of this.waiting.splice(0)) w.done(false);
       off();
     };
   }
@@ -171,8 +174,9 @@ export class ThreadStore {
   }
 
   /**
-   * Loads the page before the window's start and puts it in. A resync that brings a fresh snapshot,
-   * or an items.removed (which moves the window's start), meanwhile makes the page stale (its items may be older than the snapshot's, and events the
+   * Loads the page before the window's start and puts it in, once the state has the events the page
+   * has (a page can be from a later state). A resync that brings a fresh snapshot, or an
+   * items.removed (which moves the window's start), meanwhile makes the page stale (its items may be older than the snapshot's, and events the
    * snapshot has in weren't applied, so can't be applied to the page): it's left out, and the page
    * before the new snapshot's start is asked for instead.
    */
@@ -187,6 +191,15 @@ export class ThreadStore {
         page = await this.source.loadEarlier!(before);
       } catch (e) {
         this.pageFailed(e);
+        return;
+      }
+      // A page from a later state than the store's waits for the store to get there: an
+      // items.removed it already has (taken after a rewind whose event hasn't come yet) would
+      // otherwise move the window's start again once it comes, past the page's items.
+      if (page.seq > this.state.snapshot.seq && !(await this.reach(page.seq))) {
+        this.recorded = null;
+        this.paging = null;
+        if (this.state.loadingEarlier) this.update({ ...this.state, loadingEarlier: false });
         return;
       }
       const recorded = this.recorded;
@@ -345,7 +358,19 @@ export class ThreadStore {
   private update(next: ThreadState) {
     if (next === this.state) return;
     this.state = next;
+    if (this.waiting.length) {
+      const seq = next.snapshot.seq;
+      for (const w of this.waiting.filter((w) => w.seq <= seq)) w.done(true);
+      this.waiting = this.waiting.filter((w) => w.seq > seq);
+    }
     for (const l of this.listeners) l();
+  }
+
+  /** Resolves true once the state has the events up to `seq`, or false if the store disconnects first. */
+  private reach(seq: number): Promise<boolean> {
+    if (this.state.snapshot.seq >= seq) return Promise.resolve(true);
+    if (!this.connected) return Promise.resolve(false);
+    return new Promise((done) => this.waiting.push({ seq, done }));
   }
 }
 

@@ -468,6 +468,48 @@ describe("ThreadStore", () => {
       expect(store.getState().loadingEarlier).toBe(false);
     });
 
+    // A page taken after a rewind, that comes before the rewind's items.removed does: the store
+    // waits for the event, and then asks for the page again by its window's new start. (One removal
+    // is m1; the other leaves gaps, as a rewind past a message carried over to a later turn does.)
+    for (const [ids, indices, again] of [
+      [["m1"], [1], 5],
+      [["m1", "m4", "m5"], [1, 4, 5], 3],
+    ] as const) {
+      it(`waits for the items.removed a page has before putting it in (removing ${ids.join(", ")})`, async () => {
+        const { store, pages, answer, missed, emit, whole } = paged();
+        const done = store.loadEarlier({ to: "m0" });
+        const removed: ThreadEvent = { type: "items.removed", thread_id: "th", seq: 11, item_ids: [...ids], indices: [...indices] };
+        // The backend applies the removal, then takes the page asked for (by the old start, 6).
+        missed(removed);
+        pages.shift()!.resolve(itemPage(whole(), 6, 3));
+        await flush();
+        expect(store.getState().snapshot.start).toBe(6);
+        expect(store.getState().loadingEarlier).toBe(true);
+        expect(pages).toEqual([]);
+        emit(removed);
+        await flush();
+        expect(pages.map((p) => p.before)).toEqual([again]);
+        answer(10);
+        await done;
+        expect(store.getState().snapshot).toEqual(snapshotWindow(whole(), 100));
+        expect(store.getState().snapshot.items.map((i) => i.id).slice(0, 3)).toEqual(["m0", "m2", "s3"]);
+      });
+    }
+
+    it("gives up a page from a later state when it disconnects before getting there", async () => {
+      const { store, pages, missed, whole } = paged();
+      const off = store.connect();
+      const done = store.loadEarlier();
+      missed(added(11, msg("m10", "m10")));
+      pages.shift()!.resolve(itemPage(whole(), 6, 3));
+      await flush();
+      expect(store.getState().loadingEarlier).toBe(true);
+      off();
+      await done;
+      expect(store.getState()).toMatchObject({ loadingEarlier: false, earlierError: null });
+      expect(store.getState().snapshot.start).toBe(6);
+    });
+
     it("leaves out a page that doesn't end at the window's start, noting it failed", async () => {
       const { store, pages, whole, ids } = paged();
       const err = vi.spyOn(console, "error").mockImplementation(() => {});

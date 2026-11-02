@@ -295,9 +295,9 @@ Events apply to a window as to any state (an event about an item or request it d
 advances `seq`), and leave `start` and `context` as they are, but for `items.removed`: its items
 the window has go (context ones too), `start` goes down by the number of its `indices` below it,
 and each index left in `context` by the number below that one. A page asked for before an
-`items.removed` the client has applied since is left out (it's placed by indices that may have
-changed, either side of the removal) and the page before the window's new `start` asked for
-instead. A client puts a page into its window
+`items.removed` the client has applied since (by the time the page is put in: see below) is left out
+(it's placed by indices that may have changed, either side of the removal) and the page before the
+window's new `start` asked for instead. A client puts a page into its window
 by putting the page's items in front of its own (`withPage` in `@dire-kiwi/agent-threads-protocol`):
 the context items of both, ordered by index (the page's version of one they share), those of them
 the page's own items include dropped, then the page's items from its `start`, then its own from its
@@ -307,8 +307,11 @@ it has replacing it in place. (So a window with pages put in it may not have its
 state's order: a resolved request from a page can come before an open one the window had. A UI
 places resolved requests by their anchor.)
 
-A page may be taken from a later state than the client's (its `seq` is higher), and that's fine:
-events the client applies after it set what they set again. One taken from an earlier state can't
+A page may be taken from a later state than the client's (its `seq` is higher): the client keeps it
+until it has applied the events up to the page's `seq` (they're on their way, as the page was taken
+after them), and then puts it in, with what events it applied since setting what they set again;
+unless one of those was an `items.removed`, which leaves it out as below, since the page's indices
+already have the removal its window doesn't have yet. One taken from an earlier state can't
 be: the backend takes it after the client asked for it, so it has every event the client had then.
 A client applies the saved events it applies while it waits for the page (those with a `seq` above
 the page's) to the page's items and requests too, before putting it in, leaving out events that
