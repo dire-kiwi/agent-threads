@@ -149,6 +149,7 @@ export function runs(data: string, source: ProcessSource = SOURCE) {
      * A pid isn't given to a new process while it's still a session's or a group's id. So a process
      * that has the shim's pid but isn't the shim means the run's session has gone, and all that's in
      * a session with that id now is another's; and likewise for the program's pid and its group.
+     * Even if it has exited: one that isn't reaped yet still has its ids, and its start.
      */
     const left = (): number[] | undefined => {
       const shim = pidFile("shim.pid");
@@ -159,14 +160,16 @@ export function runs(data: string, source: ProcessSource = SOURCE) {
       const before = (p: Proc, at: number) => p.start <= at + SLACK_MS;
       const leader = all.find((p) => p.pid === shim.pid);
       if (leader && !(leader.sid === shim.pid && since(leader, shim.at) && before(leader, shim.at))) return [];
-      const ours = leader ? [leader.pid] : [];
+      const running = (ps: Proc[]) => ps.filter((p) => !p.exited).map((p) => p.pid);
+      const ours = running(leader ? [leader] : []);
       const program = pidFile("pid");
       if (!program || program.pid === shim.pid) return ours;
+      const inSession = (p: Proc) => p.sid === shim.pid && since(p, shim.at);
       const group = all.filter((p) => p.pgrp === program.pid);
       const head = group.find((p) => p.pid === program.pid);
-      if (head && !before(head, program.at)) return ours;
+      if (head && !(inSession(head) && before(head, program.at))) return ours;
       // The program, if it's still there, and what it started that's still in its group.
-      return [...ours, ...group.filter((p) => p.sid === shim.pid && since(p, shim.at)).map((p) => p.pid)];
+      return [...ours, ...running(group.filter(inSession))];
     };
     return {
       id,
@@ -218,11 +221,13 @@ interface Proc {
   sid: number;
   /** When it started, in ms since the epoch: to the jiffy from /proc, to the second from ps. */
   start: number;
+  /** It has exited, but isn't reaped yet (a zombie): it's not running, but its ids are still its. */
+  exited: boolean;
 }
 
 /**
- * The processes that are running (not zombies), with their process group, session and start: from
- * /proc, or from ps. Undefined if ps doesn't give them (macOS's has no session ids).
+ * The processes there are, with their process group, session and start, and whether they've exited
+ * (zombies): from /proc, or from ps. Undefined if ps doesn't give them (macOS's has no session ids).
  */
 function processes(source: ProcessSource): Proc[] | undefined {
   if (source === "ps") {
@@ -239,9 +244,9 @@ function processes(source: ProcessSource): Proc[] | undefined {
     const all: Proc[] = [];
     for (const line of out.trim().split("\n")) {
       const [pid, pgrp, sid, stat, ...lstart] = line.trim().split(/\s+/);
-      const p = { pid: Number(pid), pgrp: Number(pgrp), sid: Number(sid), start: Date.parse(`${lstart.join(" ")} UTC`) };
+      const p = { pid: Number(pid), pgrp: Number(pgrp), sid: Number(sid), start: Date.parse(`${lstart.join(" ")} UTC`), exited: /^[ZX]/.test(stat ?? "") };
       if (![p.pid, p.pgrp, p.sid, p.start].every(Number.isFinite)) return undefined;
-      if (!/^[ZX]/.test(stat ?? "")) all.push(p);
+      all.push(p);
     }
     return all;
   }
@@ -258,8 +263,8 @@ function processes(source: ProcessSource): Proc[] | undefined {
     // ppid, pgrp, session, ... starttime (field 22, in clock ticks since the machine started).
     const fields = stat.slice(stat.lastIndexOf(")") + 2).split(" ");
     const [state, , pgrp, sid] = fields;
-    if (state === "Z" || state === "X") continue;
-    all.push({ pid: Number(name), pgrp: Number(pgrp), sid: Number(sid), start: bootTime() + (Number(fields[19]) / clockTicks()) * 1000 });
+    const start = bootTime() + (Number(fields[19]) / clockTicks()) * 1000;
+    all.push({ pid: Number(name), pgrp: Number(pgrp), sid: Number(sid), start, exited: state === "Z" || state === "X" });
   }
   return all;
 }

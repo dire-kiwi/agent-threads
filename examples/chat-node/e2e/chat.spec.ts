@@ -283,7 +283,92 @@ for (const source of ["proc", "ps"] as const) {
       for (const pid of pids) if (exists(pid)) process.kill(pid, "SIGKILL");
     }
   });
+
+  test(`a run whose pids have since gone to leaders that have exited but aren't reaped takes nothing of their session's or group's (${source})`, async () => {
+    test.skip(spawnSync("python3", ["-c", ""]).status !== 0, "there's no python3");
+    for (const zombie of ["session", "group"] as const) {
+      const data = mkdtempSync(join(tmpdir(), "chat-e2e-"));
+      const dir = join(data, "runs", "run_stale");
+      mkdirSync(dir, { recursive: true });
+      const out = join(data, "leaders.json");
+      // A session, written to shim.pid as a shim does, with a group of its own whose leader exits and
+      // leaves one it started. Either the session's leader exits too, or it waits on the group's
+      // without reaping it; and its parent doesn't reap it.
+      const leaders = spawn("python3", ["-c", LEADERS, zombie, join(dir, "shim.pid"), out], { stdio: "ignore" });
+      let them: { session: number; group: number; left: number } | undefined;
+      try {
+        await expect.poll(() => (them = existsSync(out) ? JSON.parse(readFileSync(out, "utf8")) : undefined)).toBeTruthy();
+        const { session, group, left } = them!;
+        const ago = new Date(Date.now() - 60_000);
+        const write = (name: string, content: string) => {
+          writeFileSync(join(dir, name), content);
+          utimesSync(join(dir, name), ago, ago);
+        };
+        write("exit", '{"code":0,"signal":null}');
+        write("pid", String(group));
+        if (zombie === "session") {
+          // Written a minute ago, before the session started: nothing in it is the run's.
+          utimesSync(join(dir, "shim.pid"), ago, ago);
+          expect(runs(data, source)[0]!.left()).toEqual([]);
+          expect(await stopRuns(data, source)).toEqual([]);
+        } else {
+          // Its shim's the session's leader, but the group's leader started after `pid` was written.
+          expect(runs(data, source)[0]!.left()).toEqual([session]);
+        }
+        // Nothing was sent to it: it would have gone on SIGTERM.
+        expect(exists(left)).toBe(true);
+      } finally {
+        for (const pid of [them?.left, them?.session]) if (pid !== undefined && exists(pid)) process.kill(pid, "SIGKILL");
+        leaders.kill("SIGKILL");
+      }
+    }
+  });
 }
+
+/**
+ * Forks a session leader (which writes its pid to argv[2]), which forks a group's leader, which
+ * forks one more and exits. With argv[1] "session" the session's leader reaps the group's and exits,
+ * and with "group" it waits for it without reaping it. Once that's so, says their pids in argv[3]
+ * (as JSON), and waits, reaping nothing.
+ */
+const LEADERS = `
+import json, os, sys, time
+zombie, shim_pid, out = sys.argv[1:4]
+r, w = os.pipe()
+def say(what, pid):
+    os.write(w, ("%s %d\\n" % (what, pid)).encode())
+session = os.fork()
+if session == 0:
+    os.setsid()
+    with open(shim_pid, "w") as f:
+        f.write(str(os.getpid()))
+    group = os.fork()
+    if group == 0:
+        os.setpgid(0, 0)
+        if os.fork() == 0:
+            say("left", os.getpid())
+            while True:
+                time.sleep(1)
+        os._exit(0)
+    if zombie == "session":
+        os.waitpid(group, 0)
+        say("group", group)
+        os._exit(0)
+    os.waitid(os.P_PID, group, os.WEXITED | os.WNOWAIT)
+    say("group", group)
+    while True:
+        time.sleep(1)
+os.close(w)
+told = os.fdopen(r)
+them = dict(told.readline().split() for _ in range(2))
+if zombie == "session":
+    os.waitid(os.P_PID, session, os.WEXITED | os.WNOWAIT)
+with open(out + ".new", "w") as f:
+    json.dump({"session": session, "group": int(them["group"]), "left": int(them["left"])}, f)
+os.rename(out + ".new", out)
+while True:
+    time.sleep(1)
+`;
 
 function exists(pid: number): boolean {
   try {
