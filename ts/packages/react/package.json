@@ -2,6 +2,8 @@
   "name": "@dire-kiwi/agent-threads-react",
   "version": "0.0.0",
   "description": "React hooks and components for agent-threads.",
+  "license": "MIT",
+  "repository": "github:dire-kiwi/agent-threads",
   "type": "module",
   "exports": {
     ".": {
