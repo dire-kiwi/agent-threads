@@ -311,7 +311,10 @@ A page may be taken from a later state than the client's (its `seq` is higher): 
 until it has applied the events up to the page's `seq` (they're on their way, as the page was taken
 after them), and then puts it in, with what events it applied since setting what they set again;
 unless one of those was an `items.removed`, which leaves it out as below, since the page's indices
-already have the removal its window doesn't have yet. One taken from an earlier state can't
+already have the removal its window doesn't have yet. The page shows the client is behind, so it
+also catches up as under Reconnecting (the events may have been missed, with no later one to show the
+gap); if that doesn't bring the client to the page's `seq`, the load fails. A client that disconnects
+while it waits gives the page up, and stops loading. One taken from an earlier state can't
 be: the backend takes it after the client asked for it, so it has every event the client had then.
 A client applies the saved events it applies while it waits for the page (those with a `seq` above
 the page's) to the page's items and requests too, before putting it in, leaving out events that
