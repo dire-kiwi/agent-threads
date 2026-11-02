@@ -136,6 +136,16 @@ impl Backend {
     }
 }
 
+/// A snapshot's open requests (those without a resolution), as JSON.
+fn open_requests(snap: &Value) -> Vec<&Value> {
+    snap["requests"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|r| r.get("resolution").is_none())
+        .collect()
+}
+
 fn matches(v: &Value, p: &Value) -> bool {
     match p {
         Value::Object(p) => v.is_object() && p.iter().all(|(k, x)| matches(v.get(k).unwrap_or(&Value::Null), x)),
@@ -349,8 +359,10 @@ async fn while_waiting(h: &str, shut_down: bool) {
     let snap = b.call("snapshot", json!(id)).await;
     assert_eq!(snap["thread"]["status"], "waiting");
     assert!(snap["thread"]["run"]["reattached_at"].is_string());
-    assert_eq!(snap["requests"].as_array().unwrap().len(), 1);
-    let respond = json!({"type": "respond", "thread_id": id, "request_id": snap["requests"][0]["id"], "resolution": {"outcome": "allow"}});
+    let open = open_requests(&snap);
+    assert_eq!(open.len(), 1);
+    let respond =
+        json!({"type": "respond", "thread_id": id, "request_id": open[0]["id"], "resolution": {"outcome": "allow"}});
     b.call("handle", respond).await;
     b.wait_for(&json!({"type": "thread.updated", "thread": {"status": "idle"}}))
         .await;
@@ -969,7 +981,7 @@ async fn doesnt_ask_again(harness: &str, opening_saved: bool, text: &str, answer
     // The tool's still running: nothing's asked of the user, and the turn runs on.
     tokio::time::sleep(Duration::from_millis(500)).await;
     let snap = b.call("snapshot", json!(id)).await;
-    assert_eq!(snap["requests"], json!([]));
+    assert_eq!(open_requests(&snap), Vec::<&Value>::new());
     assert_eq!(snap["thread"]["status"], "running");
     let events = b.events.lock().unwrap().clone();
     assert!(!events.iter().any(|e| e["type"] == "request.opened"));
@@ -1082,7 +1094,8 @@ async fn stops_a_lost_runs_background_subagent(waiting: bool) {
     assert_eq!(calls[1]["status"], "cancelled", "{snap}");
     assert_eq!(snap["thread"]["status"], "idle");
     assert!(snap["thread"].get("run").is_none());
-    assert_eq!(snap["requests"], json!([]));
+    // None is still open (the subagent's was cancelled with it).
+    assert!(open_requests(&snap).is_empty(), "{snap}");
     assert_eq!(of_type(&snap, "turn_result").len(), 1);
 }
 
@@ -1125,8 +1138,11 @@ async fn takes_up_a_background_subagents_request_after_a_restart_with_no_turn_ru
     );
     let snap = b.call("snapshot", json!(id)).await;
     assert_eq!(snap["thread"]["status"], "waiting");
+    let open = open_requests(&snap);
+    assert_eq!(open.len(), 1, "{snap}");
     let from = b.events.lock().unwrap().len();
-    let respond = json!({"type": "respond", "thread_id": id, "request_id": snap["requests"][0]["id"], "resolution": {"outcome": "allow"}});
+    let respond =
+        json!({"type": "respond", "thread_id": id, "request_id": open[0]["id"], "resolution": {"outcome": "allow"}});
     b.call("handle", respond).await;
     // Answered with no turn running, the thread is idle; then Claude's report is a turn of its own.
     let events = b.events.clone();

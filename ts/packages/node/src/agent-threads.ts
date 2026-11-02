@@ -5,10 +5,14 @@
 import {
   applyEvents,
   initialState,
+  itemPage,
+  openRequests,
+  snapshotWindow,
   validate,
   type Attachment,
   type Command,
   type Item,
+  type ItemPage,
   type PermissionMode,
   type Resolution,
   type Snapshot,
@@ -17,8 +21,9 @@ import {
 } from "@dire-kiwi/agent-threads-protocol";
 import { claudeCode } from "./claude/driver.js";
 import { codex } from "./codex/driver.js";
-import type { Harness, McpServer, Skill, ThreadConfig } from "./harness.js";
+import type { Harness, LaunchOptions, McpServer, Skill, ThreadConfig } from "./harness.js";
 import { newId } from "./ids.js";
+import { splitStored, storedThread } from "./launch.js";
 import type { PermissionPolicy } from "./permissions.js";
 import { direct, type Spawner } from "./spawner.js";
 import type { RunRecord, Store } from "./store.js";
@@ -64,6 +69,25 @@ export interface CreateOptions extends Capabilities {
   metadata?: { [k: string]: unknown };
   /** The thread's id; a new one by default. */
   id?: string;
+  /**
+   * How its harness process is started (args, environment, directories, config directory), on top
+   * of the harness's options. They're stored with the thread, but not sent to clients.
+   */
+  launch?: LaunchOptions;
+}
+
+/** A thread's options, for setOptions(). */
+export interface ThreadOptions {
+  /** "" clears it. */
+  model?: string;
+  /** "" clears it. */
+  effort?: string;
+  permission_mode?: PermissionMode;
+  /**
+   * Replaces how the thread's harness process is started, in full. Only the app sets it: the
+   * `set_options` command doesn't.
+   */
+  launch?: LaunchOptions;
 }
 
 /** What recover() did. */
@@ -125,8 +149,9 @@ export class AgentThreads {
     };
     const { tools, mcpServers, skills, permissions, systemPrompt } = options;
     this.#configs.set(thread.id, { tools, mcpServers, skills, permissions, systemPrompt });
-    await this.store.createThread(thread);
-    const rt = this.#runtime(initialState(thread));
+    const launch = options.launch ?? {};
+    await this.store.createThread(storedThread(thread, launch));
+    const rt = this.#runtime(initialState(thread), launch);
     rt.emit({ type: "thread.updated", thread });
     await rt.saved();
     return thread;
@@ -153,12 +178,15 @@ export class AgentThreads {
 
   /** The thread, or null. */
   async get(threadId: string): Promise<Thread | null> {
-    return this.#threads.get(threadId)?.thread ?? (await this.store.getThread(threadId));
+    const live = this.#threads.get(threadId)?.thread;
+    if (live) return live;
+    const stored = await this.store.getThread(threadId);
+    return stored && splitStored(stored).thread;
   }
 
   async list(): Promise<Thread[]> {
     const threads = await this.store.listThreads();
-    return threads.map((t) => this.#threads.get(t.id)?.thread ?? t);
+    return threads.map((t) => this.#threads.get(t.id)?.thread ?? splitStored(t).thread);
   }
 
   /** Deletes a thread, stopping its harness first. Whether there was one. */
@@ -174,10 +202,24 @@ export class AgentThreads {
     return this.store.deleteThread(threadId);
   }
 
-  /** The thread's state now, including text streamed so far. */
-  async snapshot(threadId: string): Promise<Snapshot> {
+  /**
+   * The thread's state now, including text streamed so far. With a `limit`, a window of it: its
+   * last `limit` items and what they need from before them, for a client that loads earlier ones
+   * with itemsBefore (spec/PROTOCOL.md, "Windows").
+   */
+  async snapshot(threadId: string, options?: { limit?: number }): Promise<Snapshot> {
     this.#open();
-    return structuredClone((await this.#load(threadId)).snapshot);
+    return structuredClone(snapshotWindow((await this.#load(threadId)).snapshot, options?.limit));
+  }
+
+  /**
+   * The thread's items before index `before` (a window's `start`), at most `limit` of them, with
+   * the subagent calls they belong to and the requests they have: a page for a client that has a
+   * window to load earlier items into.
+   */
+  async itemsBefore(threadId: string, before: number, limit: number): Promise<ItemPage> {
+    this.#open();
+    return structuredClone(itemPage((await this.#load(threadId)).snapshot, before, limit));
   }
 
   /** The thread's saved events after `seq`, for a client catching up. */
@@ -262,8 +304,13 @@ export class AgentThreads {
       case "respond":
         return this.respond(command.thread_id, command.request_id, command.resolution);
       case "set_options": {
-        const { type: _t, thread_id, ...options } = command;
-        return this.setOptions(thread_id, options);
+        // Only the thread's options a client may change: not its launch options.
+        const { thread_id, model, effort, permission_mode } = command;
+        return this.setOptions(thread_id, {
+          ...(model !== undefined ? { model } : {}),
+          ...(effort !== undefined ? { effort } : {}),
+          ...(permission_mode !== undefined ? { permission_mode } : {}),
+        });
       }
     }
   }
@@ -284,9 +331,10 @@ export class AgentThreads {
     (await this.#ready({ type: "respond", thread_id: threadId, request_id: requestId, resolution })).respond(requestId, resolution);
   }
 
-  /** Changes the thread's model, effort or permission mode, from its next turn. */
-  async setOptions(threadId: string, options: { model?: string; effort?: string; permission_mode?: PermissionMode }): Promise<void> {
-    const rt = await this.#ready({ type: "set_options", thread_id: threadId, ...options });
+  /** Changes the thread's model, effort, permission mode or launch options, from its next turn. */
+  async setOptions(threadId: string, options: ThreadOptions): Promise<void> {
+    const { launch, ...rest } = options;
+    const rt = await this.#ready({ type: "set_options", thread_id: threadId, ...rest });
     const patch: Partial<Thread> = {};
     if (options.model !== undefined) patch.model = options.model || undefined;
     if (options.effort !== undefined) patch.effort = options.effort || undefined;
@@ -294,6 +342,7 @@ export class AgentThreads {
     const before = JSON.stringify(rt.thread);
     rt.setThread(patch);
     if (JSON.stringify(rt.thread) !== before) rt.session?.optionsChanged();
+    if (launch) rt.setLaunch(launch);
   }
 
   /**
@@ -387,7 +436,7 @@ export class AgentThreads {
     return this.#configs.get(threadId)?.permissions ?? this.#options.permissions ?? "ask";
   }
 
-  #runtime(state: Snapshot): ThreadRuntime {
+  #runtime(state: Snapshot, launch: LaunchOptions): ThreadRuntime {
     const id = state.thread.id;
     const host = {
       store: this.store,
@@ -395,7 +444,7 @@ export class AgentThreads {
       publish: (e: ThreadEvent) => this.#publish(e),
       error: (e: unknown) => this.#error(e),
     };
-    const rt = new ThreadRuntime(host, state, this.#config(id), this.#policy(id));
+    const rt = new ThreadRuntime(host, state, this.#config(id), launch, this.#policy(id));
     const harness = this.harnesses[state.thread.harness];
     if (!harness) throw new CommandError(`thread ${id} runs on ${state.thread.harness}, which isn't configured`);
     rt.session = harness.open(rt);
@@ -416,13 +465,14 @@ export class AgentThreads {
   }
 
   async #fromStore(threadId: string): Promise<ThreadRuntime> {
-    const thread = await this.store.getThread(threadId);
-    if (!thread) throw new CommandError(`there's no thread ${threadId}`);
+    const stored = await this.store.getThread(threadId);
+    if (!stored) throw new CommandError(`there's no thread ${threadId}`);
+    const { thread, launch } = splitStored(stored);
     const snap = await this.store.loadSnapshot(threadId);
     const events = await this.store.readEvents(threadId, { after: snap?.seq ?? 0 });
     let state = applyEvents(snap ?? initialState(thread), events);
     if (state.seq === 0) state = initialState(thread);
-    const rt = this.#runtime(state);
+    const rt = this.#runtime(state, launch);
     if (await this.#reattach(rt)) return rt;
     // The process that ran its turn went with the backend before this one, or can't be followed.
     const s = rt.thread.status;
@@ -460,7 +510,7 @@ export class AgentThreads {
     }
     // Requests the session didn't take up again can't be answered.
     const open = new Set(rt.openRequests.map((r) => r.id));
-    for (const r of rt.snapshot.requests) if (!open.has(r.id)) rt.emit({ type: "request.resolved", request_id: r.id, resolution: { outcome: "cancel" } });
+    for (const r of openRequests(rt.snapshot)) if (!open.has(r.id)) rt.emit({ type: "request.resolved", request_id: r.id, resolution: { outcome: "cancel" } });
     // With none left (one answered before the restart is closed, say), the turn runs on, or the
     // thread is idle if none was running.
     if (!open.size && rt.thread.status === "waiting") rt.setThread({ status: rt.turn ? "running" : "idle" });
@@ -513,8 +563,8 @@ function recoverLost(rt: ThreadRuntime): void {
   const turn = s === "running" || (s === "waiting" && open !== undefined);
   if (turn) rt.turn = { id: open ?? newId("turn"), interrupted: false };
   rt.stopSubagents(items.filter((i) => i.type === "tool_call" && i.subagent?.status === "running").map((i) => i.id));
-  // Its requests can't be answered now.
-  for (const r of [...rt.snapshot.requests]) {
+  // Its open requests can't be answered now.
+  for (const r of openRequests(rt.snapshot)) {
     rt.emit({ type: "request.resolved", request_id: r.id, resolution: { outcome: "cancel" } });
   }
   if (turn) {

@@ -77,13 +77,25 @@ type sentMessage struct {
 
 // launched is the thread's options a process is started with: a different one needs another.
 type launched struct {
-	Model          string `json:"model,omitempty"`
-	Effort         string `json:"effort,omitempty"`
-	PermissionMode string `json:"permission_mode,omitempty"`
+	Model          string         `json:"model,omitempty"`
+	Effort         string         `json:"effort,omitempty"`
+	PermissionMode string         `json:"permission_mode,omitempty"`
+	Launch         *LaunchOptions `json:"launch,omitempty"`
 }
 
-func launchedOf(t protocol.Thread) *launched {
-	return &launched{Model: t.Model, Effort: t.Effort, PermissionMode: string(t.PermissionMode)}
+func launchedOf(ctx ThreadContext) *launched {
+	t := ctx.Thread()
+	l := &launched{Model: t.Model, Effort: t.Effort, PermissionMode: string(t.PermissionMode)}
+	if launch := ctx.Launch(); !launch.IsEmpty() {
+		l.Launch = &launch
+	}
+	return l
+}
+
+// stale says whether a process started with l (as its checkpoint says) has other options than the
+// thread's now.
+func (l *launched) stale(ctx ThreadContext) bool {
+	return l == nil || !sameJSONValue(l, launchedOf(ctx))
 }
 
 // claudeRunState is what a run's checkpoint holds (see DurableSession.Checkpoint): what's needed to
@@ -644,9 +656,7 @@ func (s *claudeSession) Reattach(record RunRecord) bool {
 	}
 	run.proc = proc
 	// A process started with other options than the thread's now is replaced at the next turn.
-	t := s.ctx.Thread()
-	l := st.Launched
-	s.stale = st.Stale || l == nil || *l != *launchedOf(t)
+	s.stale = st.Stale || st.Launched.stale(s.ctx)
 	// Claude's requests that were open: the user's questions are taken up again, and the rest (a
 	// policy that hadn't decided, a tool that was running) are dealt with again. One answered before
 	// the restart, though that wasn't saved, is closed: Claude has its answer.
@@ -856,9 +866,14 @@ func (s *claudeSession) spawn(run *claudeRun) {
 		s.exited(run, ExitStatus{Err: err})
 		return
 	}
-	env := mergeEnv(os.Environ(), s.o.Env)
-	if s.o.ConfigDir != "" {
-		env = mergeEnv(env, map[string]string{"CLAUDE_CONFIG_DIR": s.o.ConfigDir})
+	launch := ctx.Launch()
+	env := launch.applyEnv(mergeEnv(os.Environ(), s.o.Env))
+	configDir := launch.ConfigDir
+	if configDir == "" {
+		configDir = s.o.ConfigDir
+	}
+	if configDir != "" {
+		env = mergeEnv(env, map[string]string{"CLAUDE_CONFIG_DIR": configDir})
 	}
 	proc, err := ctx.Spawner().Spawn(SpawnOptions{
 		Command: bin, Args: append(append([]string{}, s.o.BinArgs...), args...), Cwd: thread.Cwd, Env: env,
@@ -869,7 +884,7 @@ func (s *claudeSession) spawn(run *claudeRun) {
 		return
 	}
 	run.proc = proc
-	run.launched = launchedOf(thread)
+	run.launched = launchedOf(ctx)
 	ctx.SetThread(func(t *protocol.Thread) {
 		t.Run = &protocol.Run{ID: run.id, Spawner: protocol.RunSpawner(ctx.Spawner().Name()), StartedAt: now()}
 	})
@@ -1007,7 +1022,12 @@ func (s *claudeSession) args(run *claudeRun) ([]string, error) {
 	if cfg.SystemPrompt != "" {
 		args = append(args, "--append-system-prompt", cfg.SystemPrompt)
 	}
-	return append(args, s.o.Args...), nil
+	launch := s.ctx.Launch()
+	for _, d := range launch.AddDirs {
+		args = append(args, "--add-dir", d)
+	}
+	args = append(args, s.o.Args...)
+	return append(args, launch.Args...), nil
 }
 
 func orEmptyList(s []string) []string {

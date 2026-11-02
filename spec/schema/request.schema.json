@@ -2,10 +2,10 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://github.com/dire-kiwi/agent-threads/spec/schema/request.schema.json",
   "title": "Request",
-  "description": "Things the agent is waiting on the user for. A request is open from request.opened until request.resolved, and is answered with a respond command.",
+  "description": "Things the agent is waiting on the user for. A request is open from request.opened until request.resolved, and is answered with a respond command. A thread's state keeps it once it's resolved, with its resolution.",
   "$defs": {
     "ThreadRequest": {
-      "description": "An open request, told apart by type.",
+      "description": "A request, told apart by type: open, or resolved (with its resolution).",
       "oneOf": [
         { "$ref": "#/$defs/PermissionRequest" },
         { "$ref": "#/$defs/QuestionRequest" }
@@ -25,6 +25,7 @@
         "title": { "type": "string", "description": "A short summary of what's asked, e.g. the command line." },
         "reason": { "type": "string", "description": "Why the harness asks, when it says." },
         "parent_id": { "type": "string", "description": "The subagent tool_call that's asking, if one is." },
+        "resolution": { "$ref": "#/$defs/Resolution", "description": "How it was resolved, once it is (request.resolved): the state keeps resolved requests with this set. Absent while it's open." },
         "turn_id": { "type": "string" },
         "created_at": { "type": "string", "format": "date-time" },
         "raw": { "description": "The harness's own payload, for debugging." }
@@ -40,6 +41,7 @@
         "questions": { "type": "array", "minItems": 1, "items": { "$ref": "#/$defs/Question" } },
         "tool_call_id": { "type": "string", "description": "The tool_call item it's for, when there is one." },
         "parent_id": { "type": "string", "description": "The subagent tool_call that's asking, if one is." },
+        "resolution": { "$ref": "#/$defs/Resolution", "description": "How it was resolved, once it is (request.resolved): the state keeps resolved requests with this set. Absent while it's open." },
         "turn_id": { "type": "string" },
         "created_at": { "type": "string", "format": "date-time" },
         "raw": { "description": "The harness's own payload, for debugging." }

@@ -1,11 +1,14 @@
 import { applyEvent, applyEvents, initialState, type Item, type ThreadRequest, type ToolCall } from "@dire-kiwi/agent-threads-protocol";
 import { describe, expect, it } from "vitest";
 import { fixtureEvents, fixtureThread } from "./test/helpers.js";
-import { buildView, groupRows, lineage, type ToolGroup } from "./view.js";
+import { buildView, groupRows, lineage, rowKey, type Row, type ToolGroup } from "./view.js";
 
 const call = (id: string, extra: Partial<ToolCall> = {}): ToolCall => ({ id, type: "tool_call", name: "Bash", kind: "shell", input: {}, status: "running", ...extra });
 const text = (id: string, t: string, parent_id?: string): Item => ({ id, type: "assistant_message", text: t, ...(parent_id ? { parent_id } : {}) });
 const user: Item = { id: "u1", type: "user_message", text: "hi" };
+const show = (r: Row) => (r.type === "tool_group" ? r.calls.map((c) => c.id).join("+") : r.type === "request" ? `[${r.request.id}]` : r.id);
+const asked = (id: string, extra: Partial<ThreadRequest>): ThreadRequest =>
+  ({ id, type: "permission", name: "Bash", kind: "shell", input: {}, resolution: { outcome: "allow" }, ...extra }) as ThreadRequest;
 
 describe("buildView", () => {
   it("splits the items into the main thread's and each subagent's", () => {
@@ -39,6 +42,21 @@ describe("buildView", () => {
     const v = buildView([sub, call("c1", { parent_id: "s1", status: "pending" })], [req]);
     expect(v.requestsByCall.get("c1")).toBe(req);
     expect(v.subagents.get("s1")!.waiting).toBe(true);
+    expect(v.answered.size).toBe(0);
+  });
+
+  it("puts answered requests by the list they're drawn in, not with the open ones", () => {
+    const sub = call("s1", { name: "Agent", kind: "subagent" });
+    const items = [sub, call("c1", { parent_id: "s1" }), call("c2")];
+    const p1: ThreadRequest = { id: "p1", type: "permission", name: "Bash", kind: "shell", input: {}, tool_call_id: "c1", parent_id: "s1", resolution: { outcome: "allow" } };
+    const p2: ThreadRequest = { id: "p2", type: "permission", name: "Bash", kind: "shell", input: {}, tool_call_id: "c2", resolution: { outcome: "deny" } };
+    const v = buildView(items, [p1, p2]);
+    expect(v.requestsByCall.size).toBe(0);
+    expect(v.subagents.get("s1")!.waiting).toBe(false);
+    expect(v.answered.get("s1")).toEqual([p1]);
+    expect(v.answered.get("")).toEqual([p2]);
+    const again = buildView(items, [p1, p2], v);
+    expect(again.answered).toBe(v.answered);
   });
 
   it("gives a subagent's status from its call's", () => {
@@ -67,7 +85,7 @@ describe("buildView", () => {
 describe("groupRows", () => {
   it("groups tool calls in a row, and leaves out messages with no text yet", () => {
     const rows = groupRows([user, call("c1"), text("m0", ""), call("c2"), text("m1", "hi"), call("c3")]);
-    expect(rows.map((r) => (r.type === "tool_group" ? r.calls.map((c) => c.id).join("+") : r.id))).toEqual(["u1", "c1+c2", "m1", "c3"]);
+    expect(rows.map(show)).toEqual(["u1", "c1+c2", "m1", "c3"]);
   });
 
   it("shows the calls `alone` picks by themselves", () => {
@@ -89,6 +107,68 @@ describe("groupRows", () => {
     expect(done[1]).not.toBe(rows[1]);
     expect((done[1] as ToolGroup).calls[1]).toBe(items[2]);
     expect(done[2]).toBe(rows[2]);
+  });
+});
+
+describe("groupRows with answered requests", () => {
+  it("draws a permission before its call, a question in its call's place, and others after their turn", () => {
+    const question: ThreadRequest = { id: "q1", type: "question", questions: [{ id: "a", question: "?" }], tool_call_id: "ask", resolution: { outcome: "answer" } };
+    const items: Item[] = [
+      { ...user, turn_id: "t1" },
+      call("c1", { turn_id: "t1" }),
+      call("c2", { turn_id: "t1" }),
+      call("ask", { name: "AskUserQuestion", kind: "other", turn_id: "t1" }),
+      call("c3", { turn_id: "t1" }),
+      { ...text("m1", "done"), turn_id: "t1" },
+      { ...text("m2", "next"), turn_id: "t2" },
+    ];
+    const answered = [asked("p1", { tool_call_id: "c2" }), question, asked("p2", { turn_id: "t1" }), asked("p3", { turn_id: "t9" })];
+    expect(groupRows(items, undefined, undefined, answered).map(show)).toEqual(["u1", "c1", "[p1]", "c2", "[q1]", "c3", "m1", "[p2]", "m2", "[p3]"]);
+    // With no items, they're all there is.
+    expect(groupRows([], undefined, undefined, [asked("p4", {})]).map(show)).toEqual(["[p4]"]);
+  });
+
+  it("keeps a request's row while its request is the same", () => {
+    const items = [call("c1"), call("c2")];
+    const p1 = asked("p1", { tool_call_id: "c2" });
+    const rows = groupRows(items, undefined, undefined, [p1]);
+    expect(groupRows(items.slice(), rows, undefined, [p1])).toBe(rows);
+    const changed = groupRows(items, rows, undefined, [{ ...p1, resolution: { outcome: "deny" } }]);
+    expect(changed[1]).not.toBe(rows[1]);
+    expect(changed[0]).toBe(rows[0]);
+    expect(rowKey(changed[1]!)).toBe("r:p1");
+  });
+});
+
+describe("groupRows' keys", () => {
+  it("keeps a group's key when earlier calls are put in front of it", () => {
+    const c3 = call("c3");
+    const c4 = call("c4");
+    const rows = groupRows([user, c3, c4]);
+    expect(rowKey(rows[1]!)).toBe("g:c3");
+    // An earlier page brings c1 and c2, in the same run of calls.
+    const next = groupRows([user, call("c1"), call("c2"), c3, c4], rows);
+    expect(next.map(show)).toEqual(["u1", "c1+c2+c3+c4"]);
+    expect(rowKey(next[1]!)).toBe("g:c3");
+    // And it stays that way as more come.
+    const more = groupRows([call("c0"), user, call("c1"), call("c2"), c3, c4, call("c5")], next);
+    expect(more.map(rowKey)).toEqual(["g:c0", "u1", "g:c3"]);
+  });
+
+  it("gives a group split in two its key for the first part, and the second its own", () => {
+    const items = [call("c1"), call("c2"), call("c3")];
+    const rows = groupRows(items);
+    const split = groupRows(items, rows, undefined, [asked("p1", { tool_call_id: "c3" })]);
+    expect(split.map(rowKey)).toEqual(["g:c1", "r:p1", "g:c3"]);
+    const both = groupRows([call("c0"), ...items], split, undefined, [asked("p1", { tool_call_id: "c3" })]);
+    expect(both.map(rowKey)).toEqual(["g:c1", "r:p1", "g:c3"]);
+  });
+
+  it("keeps keys unique when two groups were one", () => {
+    const items = [call("c1"), call("c2"), call("c3"), call("c4")];
+    const rows = groupRows(items);
+    const next = groupRows([items[0]!, user, ...items.slice(1)], rows);
+    expect(next.map(rowKey)).toEqual(["g:c1", "u1", "g:c2"]);
   });
 });
 

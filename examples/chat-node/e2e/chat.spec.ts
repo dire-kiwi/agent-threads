@@ -80,6 +80,36 @@ test("Codex: a command asks first, and runs once the user allows it", async ({ p
   await start(page, "Run this shell command: touch allowed.txt — then reply with just: created", "Codex");
   await page.getByRole("button", { name: "Allow", exact: true }).click();
   await expect(page.getByText("created", { exact: true })).toBeVisible();
+  // The answered request stays where it was asked, with its answer, after a reload too.
+  for (const again of [false, true]) {
+    if (again) await page.reload();
+    const card = page.getByRole("group", { name: /Permission for/ });
+    await expect(card).toContainText("Allowed");
+    await expect(card.getByRole("button")).toHaveCount(0);
+  }
+});
+
+test("a thread opens at a window of its latest items, and loads the earlier ones", async ({ page }) => {
+  server = await startServer({ CHAT_FAKE_CLAUDE: join(FIXTURES, "claude/app-tool") });
+  await page.goto(server.url);
+  await start(page, LOOKUP);
+  await expect(page.getByTestId("order-card")).toContainText("Shipped");
+  // Two items at a time: the snapshot is a window, and the pages before it come as it's at the top.
+  const pages: { before: number; limit: number }[] = [];
+  page.on("websocket", (ws) =>
+    ws.on("framesent", (f) => {
+      const m = JSON.parse(String(f.payload));
+      if (m.method === "items_before") pages.push(m.params);
+    }),
+  );
+  const url = new URL(page.url());
+  url.searchParams.set("page", "2");
+  await page.goto(url.href);
+  await expect(page.getByText(LOOKUP)).toBeVisible();
+  await expect(page.getByTestId("order-card")).toContainText("Shipped");
+  await expect(page.getByRole("button", { name: "Load earlier messages" })).toHaveCount(0);
+  expect(pages.length).toBeGreaterThan(0);
+  expect(pages.every((p) => p.limit === 2)).toBe(true);
 });
 
 test("Codex: the app's tool as a dynamic tool", async ({ page }) => {

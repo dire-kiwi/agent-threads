@@ -10,7 +10,7 @@ import { join } from "node:path";
 import { createInterface } from "node:readline";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { beforeAll, describe, expect, it } from "vitest";
-import { applyEvents, initialState, type Command, type Snapshot, type ThreadEvent } from "@dire-kiwi/agent-threads-protocol";
+import { applyEvents, initialState, openRequests, type Command, type Snapshot, type ThreadEvent } from "@dire-kiwi/agent-threads-protocol";
 import { FileStore } from "../stores/file.js";
 import { shim } from "../shim.js";
 import { readJsonl, shimPath, specDir, tempDir } from "./spec.js";
@@ -162,8 +162,8 @@ describe.skipIf(process.platform === "win32")("a backend restart", () => {
       const snap = await b.call<Snapshot>("snapshot", thread.id);
       expect(snap.thread.status).toBe("waiting");
       expect(snap.thread.run?.reattached_at).toBeDefined();
-      expect(snap.requests).toHaveLength(1);
-      await b.call("handle", { type: "respond", thread_id: thread.id, request_id: snap.requests[0]!.id, resolution: { outcome: "allow" } } satisfies Command);
+      expect(openRequests(snap)).toHaveLength(1);
+      await b.call("handle", { type: "respond", thread_id: thread.id, request_id: openRequests(snap)[0]!.id, resolution: { outcome: "allow" } } satisfies Command);
       await b.waitFor({ type: "thread.updated", thread: { status: "idle" } });
       await b.call("close", { stop: true });
       await b.exited;
@@ -240,7 +240,7 @@ describe.skipIf(process.platform === "win32")("a backend restart", () => {
       const b = s.start();
       expect(await b.call("recover")).toEqual({ reattached: [thread.id], lost: [] });
       const snap = await b.call<Snapshot>("snapshot", thread.id);
-      await b.call("handle", { type: "respond", thread_id: thread.id, request_id: snap.requests[0]!.id, resolution: { outcome: "allow" } } satisfies Command);
+      await b.call("handle", { type: "respond", thread_id: thread.id, request_id: openRequests(snap)[0]!.id, resolution: { outcome: "allow" } } satisfies Command);
       await b.waitFor({ type: "thread.updated", thread: { status: "idle" } });
       await b.call("close", { stop: true });
       await b.exited;
@@ -313,7 +313,8 @@ describe.skipIf(process.platform === "win32")("a backend restart", () => {
       const [agent, bash] = snap.items.filter((i) => i.type === "tool_call");
       expect(agent).toMatchObject({ status: "completed", subagent: { status: "stopped", background: true } });
       expect(bash).toMatchObject({ status: "cancelled", parent_id: agent!.id });
-      expect(snap.requests).toEqual([]);
+      // None is still open (the subagent's was cancelled with it).
+      expect(openRequests(snap)).toEqual([]);
       expect(snap.thread).toMatchObject({ status: "idle" });
       expect(snap.thread.run).toBeUndefined();
       // Its one turn had ended: it isn't ended again.
@@ -337,7 +338,7 @@ describe.skipIf(process.platform === "win32")("a backend restart", () => {
     let snap = await b.call<Snapshot>("snapshot", thread.id);
     expect(snap.thread.status).toBe("waiting");
     const from = b.events.length;
-    await b.call("handle", { type: "respond", thread_id: thread.id, request_id: snap.requests[0]!.id, resolution: { outcome: "allow" } } satisfies Command);
+    await b.call("handle", { type: "respond", thread_id: thread.id, request_id: openRequests(snap)[0]!.id, resolution: { outcome: "allow" } } satisfies Command);
     // Answered with no turn running, the thread is idle; then Claude's report is a turn of its own.
     await until(() => b.events.slice(from).filter((e) => e.type === "turn.completed").length === 1);
     snap = await b.call<Snapshot>("snapshot", thread.id);
@@ -574,7 +575,7 @@ describe.skipIf(process.platform === "win32")("a backend restart", () => {
     // The tool's still running: nothing's asked of the user, and the turn runs on.
     await sleep(500);
     const snap = await b.call<Snapshot>("snapshot", thread.id);
-    expect(snap.requests).toEqual([]);
+    expect(openRequests(snap)).toEqual([]);
     expect(snap.thread.status).toBe("running");
     expect(b.events.some((e) => e.type === "request.opened")).toBe(false);
     if (opening === "saved") {

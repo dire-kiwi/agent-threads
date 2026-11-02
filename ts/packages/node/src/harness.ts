@@ -25,6 +25,32 @@ export type McpServer =
 /** A skill: a directory with a SKILL.md (and anything it refers to), or a SKILL.md's text. */
 export type Skill = string | { name: string; content: string };
 
+/**
+ * How a thread's harness process is started, on top of the harness's own options: stored with the
+ * thread (but not sent to clients), so a run started after a restart has them too. A change
+ * applies from the next process the thread starts, as a model change does.
+ */
+export interface LaunchOptions {
+  /**
+   * More arguments, after the harness's (and its options' `args`): for Claude Code, say,
+   * `--allowedTools`, `--disallowedTools` or `--settings`; for Codex, `-c key=value`.
+   */
+  args?: string[];
+  /** Changes to the environment, after the harness options' `env`: a value sets a variable, null removes it. */
+  env?: { [k: string]: string | null };
+  /**
+   * More directories the agent may use besides the working directory: `--add-dir` for Claude
+   * Code, writable roots (`sandbox_workspace_write.writable_roots`) for Codex.
+   */
+  addDirs?: string[];
+  /**
+   * The harness's config directory, in place of the harness options': CLAUDE_CONFIG_DIR for
+   * Claude Code, CODEX_HOME for Codex (used as it is, with its own login and config). The harness
+   * keeps its sessions there, so a thread that changes it can't resume what it had.
+   */
+  configDir?: string;
+}
+
 /** What a thread runs with: the instance's settings with the thread's own on top. */
 export interface ThreadConfig {
   tools: Tool[];
@@ -59,6 +85,11 @@ export interface ThreadContext {
   readonly threadId: string;
   readonly thread: Thread;
   readonly config: ThreadConfig;
+  /**
+   * How the thread's harness process is started: its args, environment, directories and config
+   * directory (only the fields that are set).
+   */
+  readonly launch: LaunchOptions;
   readonly spawner: Spawner;
   /** The running turn's id, if one is running. */
   readonly turnId: string | undefined;
@@ -181,7 +212,7 @@ export interface HarnessSession {
    * process that has them). They're sent again with the next turn's start().
    */
   release(): void;
-  /** The thread's options (model, effort, permission mode) or config changed. */
+  /** The thread's options (model, effort, permission mode, launch options) or config changed. */
   optionsChanged(): void;
   /** Stop the harness process, if it's running. */
   close(): Promise<void>;
