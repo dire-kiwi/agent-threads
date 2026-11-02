@@ -9,9 +9,8 @@ says. [examples/chat-go](../examples/chat-go) is a WebSocket server that chat-no
 talks to.
 
 It needs Go 1.26+, and no cgo. Nothing is published yet: `go get
-github.com/dire-kiwi/agent-threads/go@main` takes a commit as a pseudo-version (with `GOPRIVATE`
-set, the repository being private), or use a checkout with a `replace` directive
-([how](../README.md#go-module)).
+github.com/dire-kiwi/agent-threads/go@main` takes a commit as a pseudo-version, or use a checkout
+with a `replace` directive ([how](../README.md#go-module)).
 
 ```go
 import (

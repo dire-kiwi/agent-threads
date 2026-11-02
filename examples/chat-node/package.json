@@ -3,6 +3,8 @@
   "private": true,
   "version": "0.0.0",
   "description": "A minimal chat app on agent-threads: a Node server with its own WebSocket, and a React frontend.",
+  "license": "MIT",
+  "repository": "github:dire-kiwi/agent-threads",
   "type": "module",
   "scripts": {
     "dev": "node server/dev.ts",
