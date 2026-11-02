@@ -2,9 +2,9 @@
 
 A library for apps to run threads of agents on **Claude Code** (`claude -p`, stream-json) and
 **Codex** (`codex app-server`): start a thread, send messages, steer it while it runs, approve its
-tool calls, answer its questions, watch its subagents, and resume it later. It has native backends
-in **Go**, **Rust** and **TypeScript (Node)**, with the same model and behaviour, and **React**
-components to draw a thread.
+tool calls, answer its questions, watch its subagents, resume it later, and rewind or compact its
+conversation. It has native backends in **Go**, **Rust** and **TypeScript (Node)**, with the same
+model and behaviour, and **React** components to draw a thread.
 
 There's no network layer. A backend sends JSON **events** and takes JSON **commands**, and the app
 carries them between its backend and its frontend over whatever it already has: a WebSocket, SSE,

@@ -25,7 +25,8 @@ hand. The wire format is specified in [spec/PROTOCOL.md](../spec/PROTOCOL.md) an
 
 - Worktrees, git, diffs/changes views, commits, PRs, the kanban board, tasks and statuses.
 - Transport, auth and multi-host relaying (Huntaway's hub, broker and tunnel).
-- Rewind/checkpoints, usage/rate-limit dashboards and terminals. They could come later.
+- Checkpoints of files (and rewinding them), usage/rate-limit dashboards and terminals. They could
+  come later. Rewinding the conversation is in (AT-22): the `rewind` command.
 - Moving Huntaway onto the SDK. That's a follow-up once the TS or Rust backend is stable.
 
 ## Decisions
