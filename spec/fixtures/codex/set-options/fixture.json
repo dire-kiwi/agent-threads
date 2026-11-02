@@ -1,0 +1,61 @@
+{
+  "description": "Options changed between turns while the process runs: the next turn/start overrides the model and the policy (accept_edits), so its edit isn't asked about.",
+  "recorded": {
+    "cli": "codex-cli 0.165.0",
+    "model": "gpt-5.6-luna",
+    "date": "2026-11-02"
+  },
+  "thread": {
+    "harness": "codex",
+    "model": "gpt-5.6-luna",
+    "effort": "low"
+  },
+  "permissions": "ask",
+  "steps": [
+    {
+      "command": {
+        "type": "send",
+        "text": "Reply with just: one",
+        "client_id": "c1"
+      }
+    },
+    {
+      "wait": {
+        "type": "thread.updated",
+        "thread": {
+          "status": "idle"
+        }
+      }
+    },
+    {
+      "command": {
+        "type": "set_options",
+        "model": "gpt-6-luna",
+        "permission_mode": "accept_edits"
+      }
+    },
+    {
+      "wait": {
+        "type": "thread.updated",
+        "thread": {
+          "status": "idle"
+        }
+      }
+    },
+    {
+      "command": {
+        "type": "send",
+        "text": "Edit notes.txt with apply_patch to change the line apple to apricot. Then reply with just: done",
+        "client_id": "c2"
+      }
+    },
+    {
+      "wait": {
+        "type": "thread.updated",
+        "thread": {
+          "status": "idle"
+        }
+      }
+    }
+  ]
+}

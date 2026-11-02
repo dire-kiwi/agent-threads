@@ -484,7 +484,7 @@ impl AgentThreads {
             h.call(move |a| {
                 a.core.config = config;
                 a.core.policy = policy;
-                a.core.options_changed();
+                a.core.config_changed();
                 // A run that outlives the backend is saved knowing it, without an event to save it
                 // with.
                 a.core.request_save();
@@ -806,9 +806,10 @@ impl AgentThreads {
             .await
     }
 
-    /// Changes the thread's model, effort, permission mode or launch options, from its next turn, or
-    /// its standing answers. Open permission requests the new mode or standing answers answer
-    /// (bypass allows them, dont_ask denies them) are answered at once.
+    /// Changes the thread's model, effort, permission mode or launch options, or its standing
+    /// answers: the model and permission mode straight away where the harness takes them in its
+    /// running process, and otherwise from the next turn. Open permission requests the new mode or
+    /// standing answers answer (bypass allows them, dont_ask denies them) are answered at once.
     pub async fn set_options(&self, thread_id: &str, options: ThreadOptions) -> Result<()> {
         self.ready(thread_id)
             .await?

@@ -159,4 +159,5 @@ AGENT_THREADS_LIVE=1 go test -run Live .   # against the real claude and codex (
 Every fixture in `spec/fixtures` runs with the direct spawner and under the shim, its events
 compared with `expected.jsonl` by `spec/tools/check-events.mjs`; the restart tests kill a backend (a
 process of its own) partway through a turn, and check the next one finishes it with exactly the
-fixture's events.
+fixture's events. What the recordings don't cover (option changes in a running process, plans sent
+back or talked over) runs against the Node backend's scriptable `mini-claude.mjs` and `mini-codex.mjs`.

@@ -1,0 +1,65 @@
+{
+  "description": "Plan mode: the agent presents a plan with ExitPlanMode, which the user sends back with feedback; it presents another, which the user approves, switching the session to acceptEdits, and it makes the edit without asking.",
+  "recorded": {
+    "cli": "2.1.312 (Claude Code)",
+    "model": "haiku",
+    "date": "2026-11-02"
+  },
+  "thread": {
+    "harness": "claude",
+    "model": "haiku",
+    "permission_mode": "plan"
+  },
+  "permissions": "ask",
+  "steps": [
+    {
+      "command": {
+        "type": "send",
+        "text": "Plan this change: in notes.txt, change the line apple to apricot. Read notes.txt, then present a short plan (two or three lines) with the ExitPlanMode tool. Once a plan is approved, make the change with the Edit tool and reply with just: done",
+        "client_id": "c1"
+      }
+    },
+    {
+      "wait": {
+        "type": "thread.updated",
+        "thread": {
+          "status": "waiting"
+        }
+      }
+    },
+    {
+      "command": {
+        "type": "respond",
+        "resolution": {
+          "outcome": "deny",
+          "message": "Also change the line banana to blueberry."
+        }
+      }
+    },
+    {
+      "wait": {
+        "type": "thread.updated",
+        "thread": {
+          "status": "waiting"
+        }
+      }
+    },
+    {
+      "command": {
+        "type": "respond",
+        "resolution": {
+          "outcome": "allow",
+          "permission_mode": "accept_edits"
+        }
+      }
+    },
+    {
+      "wait": {
+        "type": "thread.updated",
+        "thread": {
+          "status": "idle"
+        }
+      }
+    }
+  ]
+}

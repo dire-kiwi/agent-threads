@@ -995,6 +995,9 @@
         },
         {
           "$ref": "#/$defs/QuestionRequest"
+        },
+        {
+          "$ref": "#/$defs/PlanRequest"
         }
       ]
     },
@@ -1112,6 +1115,49 @@
         }
       }
     },
+    "PlanRequest": {
+      "type": "object",
+      "description": "The agent has made a plan and asks to start on it (Claude's ExitPlanMode; a proposed plan from Codex in plan mode). Answered with outcome allow, to start on it in the resolution's permission_mode, or deny, to keep planning, with the message as the user's feedback.",
+      "required": [
+        "id",
+        "type",
+        "plan"
+      ],
+      "properties": {
+        "id": {
+          "type": "string"
+        },
+        "type": {
+          "const": "plan"
+        },
+        "plan": {
+          "type": "string",
+          "description": "The plan, as Markdown."
+        },
+        "tool_call_id": {
+          "type": "string",
+          "description": "The tool_call item it's for, when there is one."
+        },
+        "parent_id": {
+          "type": "string",
+          "description": "The subagent tool_call that's asking, if one is."
+        },
+        "resolution": {
+          "$ref": "#/$defs/Resolution",
+          "description": "How it was resolved, once it is (request.resolved): the state keeps resolved requests with this set. Absent while it's open."
+        },
+        "turn_id": {
+          "type": "string"
+        },
+        "created_at": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "raw": {
+          "description": "The harness's own payload, for debugging."
+        }
+      }
+    },
     "Question": {
       "type": "object",
       "required": [
@@ -1184,16 +1230,20 @@
             "answer",
             "cancel"
           ],
-          "description": "allow, deny: for a permission. answer: for a question. cancel: for either, when the user dismisses it or the turn ends first."
+          "description": "allow, deny: for a permission or a plan. answer: for a question. cancel: for any, when the user dismisses it or the turn ends first."
         },
         "always": {
           "type": "boolean",
           "default": false,
-          "description": "allow, deny: apply the same answer to matching calls for the rest of the thread, without asking. It's kept in the thread's standing_answers."
+          "description": "allow, deny, for a permission: apply the same answer to matching calls for the rest of the thread, without asking. It's kept in the thread's standing_answers."
         },
         "message": {
           "type": "string",
-          "description": "deny: why, which the agent is told. answer: a note with the answers."
+          "description": "deny: why, which the agent is told (for a plan, the user's feedback on it). answer: a note with the answers."
+        },
+        "permission_mode": {
+          "$ref": "#/$defs/PermissionMode",
+          "description": "allow, for a plan: the permission mode the thread carries on in, which it's set to. Left out (or plan), it's the thread's mode, or default if that's plan."
         },
         "answers": {
           "type": "object",

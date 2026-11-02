@@ -197,3 +197,13 @@ pub(crate) fn mode_decision(mode: Option<PermissionMode>, d: PermissionDecision)
         (_, d) => d,
     }
 }
+
+/// The permission mode a thread carries on in once its plan is approved: the one the user picked,
+/// or else its own, or default if that's plan.
+pub(crate) fn mode_after_plan(current: Option<PermissionMode>, picked: Option<PermissionMode>) -> PermissionMode {
+    match (picked, current) {
+        (Some(p), _) if p != PermissionMode::Plan => p,
+        (_, Some(c)) if c != PermissionMode::Plan => c,
+        _ => PermissionMode::Default,
+    }
+}

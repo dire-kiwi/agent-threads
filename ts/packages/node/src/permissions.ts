@@ -81,3 +81,12 @@ export function decide(policy: PermissionPolicy, query: PermissionQuery, ctx: Pe
     return { deny: `The permission policy failed: ${e instanceof Error ? e.message : e}` };
   }
 }
+
+/**
+ * The permission mode a thread carries on in once its plan is approved: the one the user picked,
+ * or else its own, or default if that's plan.
+ */
+export function modeAfterPlan(current: PermissionMode | undefined, picked: PermissionMode | undefined): PermissionMode {
+  if (picked && picked !== "plan") return picked;
+  return current && current !== "plan" ? current : "default";
+}

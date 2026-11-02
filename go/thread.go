@@ -769,7 +769,8 @@ func (rt *threadRuntime) setLaunch(launch LaunchOptions) {
 	rt.launch = clone(launch)
 	rt.threadChanged = true
 	rt.flushQueued = true
-	rt.session.OptionsChanged()
+	// Its process is started with them: the next turn needs another.
+	rt.session.ConfigChanged()
 }
 
 func sameJSONValue(a, b any) bool {
@@ -1177,8 +1178,11 @@ func (rt *threadRuntime) Ask(request protocol.ThreadRequestValue, toolCallID str
 	if r := rt.settled(question, standing); r != nil {
 		res := *r
 		rt.loop.post(func() { answered(res) })
-		if question {
+		switch request.(type) {
+		case *protocol.QuestionRequest:
 			return NewID("q")
+		case *protocol.PlanRequest:
+			return NewID("plan")
 		}
 		return NewID("perm")
 	}
@@ -1203,6 +1207,9 @@ func (rt *threadRuntime) Ask(request protocol.ThreadRequestValue, toolCallID str
 		r.ID, r.TurnID, r.ToolCallID, r.ParentID = id, turnID, toolCallID, parent
 		users := int64(rt.userMessages())
 		r.UserMessages = &users
+	case *protocol.PlanRequest:
+		id = NewID("plan")
+		r.ID, r.TurnID, r.ToolCallID, r.ParentID = id, turnID, toolCallID, parent
 	}
 	req := protocol.ThreadRequest{Value: request}
 	rt.addRequest(id, &openRequest{request: req, answered: answered, standing: standing})

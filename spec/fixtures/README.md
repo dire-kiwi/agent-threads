@@ -15,6 +15,15 @@ The Codex sessions' `skills/list` exchange was added afterwards (on 2026-11-01),
 codex-cli 0.165.0 gives in a fresh CODEX_HOME and a working directory and home with no skills;
 `spec/tools/scenarios/codex.mjs` records it from now on.
 
+The `plan` and `set-options` scenarios were recorded on 2026-11-02 with the same CLIs. Their Codex
+sessions' `skills/list` response is the one the others have: the machine they were recorded on has
+skills of its own, which were taken out (with the `skills.config` entries thread/start had for them). Since, the
+Codex `plan` session's thread/start asks for the workspace-write sandbox (and its response says so)
+and its first turn/start for the read-only one, as backends do now; Codex was recorded starting the
+thread read-only, which comes to the same, since nothing ran before that turn. The `set-options`
+session's second turn/start had a `sandboxPolicy` that didn't change the sandbox, which backends
+don't send, and it was taken out.
+
 The `pass-through` sessions (2026-11-02) are made by hand from the `plain-reply` recordings, since
 what they add (an API retry, hooks, a usage limit that's been reached, rate limit windows, the
 answers to control requests) can't be recorded on demand: their messages are shaped as Claude Code
@@ -49,6 +58,8 @@ Each fixture is a directory `spec/fixtures/<harness>/<scenario>/`:
 | `resume` | A turn, a backend restart, then a turn in a new process | `--resume <session_id>` | `thread/resume` |
 | `compaction` | A turn, then `/compact` | sent as a message | sent as `thread/compact/start` |
 | `error` | A turn that fails (the model doesn't exist) | an error result | a failed turn, after a warning |
+| `plan` | Plan mode: a plan the user sends back with feedback, then one they approve in `accept_edits`, which the agent carries out without asking | `--permission-mode plan`, ExitPlanMode via `can_use_tool`, approved with `updatedPermissions` `setMode` | `collaborationMode` `plan`, the turn's `plan` item; the feedback and "Implement the plan." are `turn/start`s |
+| `set-options` | `set_options` between turns, changing the model and the permission mode (`accept_edits`), so the next turn's edit isn't asked about, in the same process | `set_model` and `set_permission_mode` control requests | `turn/start`'s `model` and `approvalPolicy` (the sandbox is the same) |
 | `pass-through` | What the protocol leaves out ([PROTOCOL.md](../PROTOCOL.md#pass-through)): `raw`, the harness message handler and control requests, plus rate limits and notices | `api_retry` and `hook_response` notices, a rejected `rate_limit_event`, a line the driver doesn't know, and `get_context_usage` (and one Claude refuses) | `account/rateLimits/updated` windows, `account/rateLimits/read`, a method answered with a `null` result, and one Codex refuses |
 
 Some things the recordings show that a backend has to deal with: Claude Code echoes the backend's
@@ -126,18 +137,26 @@ backend drives each CLI:
   and waits for its response before the first user message. User messages are
   `{"type":"user","message":{"role":"user","content":[{"type":"text","text":...}]},"parent_tool_use_id":null}`.
   It answers `can_use_tool` with `behavior: allow` (and `updatedInput`; for AskUserQuestion, the
-  input plus `answers`, keyed by question text, with the labels joined by `", "`) or `deny` with a
-  `message`, and the `app` server's `mcp_message`s as an MCP server would. It interrupts with a
-  `control_request` `interrupt`.
+  input plus `answers`, keyed by question text, with the labels joined by `", "`; for an approved
+  ExitPlanMode, `updatedPermissions: [{type: "setMode", mode, destination: "session"}]` with the mode
+  the thread carries on in) or `deny` with a `message`, and the `app` server's `mcp_message`s as an
+  MCP server would. It interrupts with a `control_request` `interrupt`. A thread's new model or
+  permission mode goes to its running process as a `set_model` or `set_permission_mode` control
+  request (`--permission-mode` at the start: `acceptEdits`, `plan`, `bypassPermissions`).
 - **Codex.** Arguments `app-server`. It sends `initialize` (with `capabilities.experimentalApi`) and
   `initialized`, then `skills/list` (with `forceReload`) for the skills Codex finds in the working
   directory and the user's home, which a CODEX_HOME of the app's own doesn't keep out, and turns off
   each one that isn't the app's or Codex's built-in (`system`) with a `skills.config` entry
   (`{path, enabled: false}`) in the thread's config. Then `thread/start` (or `thread/resume` with the thread's `session_id`) with the
-  model, `approvalPolicy: untrusted` and `sandbox: workspace-write` (permission mode `default`),
-  and a config with `features.default_mode_request_user_input = true` (so the agent can ask
+  model, the permission mode's `approvalPolicy` (`untrusted` for `default`) and `sandbox:
+  workspace-write` whatever the mode (Codex says what that sandbox is, with all its config, and the
+  first turn/start's `sandboxPolicy` puts the thread in its mode's), and a config with `features.default_mode_request_user_input = true` (so the agent can ask
   questions outside plan mode), the MCP servers in `mcp_servers`, and app tools as `dynamicTools`.
-  A message is `turn/start` with the text and the thread's `effort`; one sent during a turn is
+  A message is `turn/start` with the text and the thread's `effort`, and the options the process
+  doesn't have yet: `model`, `approvalPolicy` and `sandboxPolicy` when they changed since
+  thread/start (each on its own: a `sandboxPolicy` replaces all of the sandbox's settings, so a
+  workspace-write one is the one Codex last reported for the thread), and in permission mode `plan` a `collaborationMode` of `plan` (then `default`, on
+  the first turn after it); one sent during a turn is
   `turn/steer`; `/compact` is `thread/compact/start`; an interrupt is `turn/interrupt`. It answers
   approvals with `accept` or `decline`, MCP elicitations with `accept`, `requestUserInput` with
   `{answers: {<question id>: {answers: [labels]}}}`, and `item/tool/call` with the tool's text as
@@ -168,6 +187,8 @@ backend drives each CLI:
   and an `item.updated` that sets the call `running` (or `denied`). A denied call's later result only sets its `result`. With the `allow` policy, nothing
   of this is sent.
 - **A question**: the same, with a `question` request.
+- **A plan**: the same, with a `plan` request, whatever the policy. When the user approves it, the
+  `thread.updated` that's `running` is followed by one with the thread's new `permission_mode`.
 - **The end of a turn**: calls still `running` or `pending` become `cancelled` (and a running
   subagent of one `stopped`) and open requests are resolved with `cancel`, except those of a
   background subagent that's still running, which carry on; then a `turn_result` item is added,
@@ -227,6 +248,10 @@ backend drives each CLI:
   only if one was running (a thread can be `waiting` on a background subagent's request with none).
 - **Questions**: AskUserQuestion's `can_use_tool` is always a question (whatever the policy). Each
   question's `id` is its text, and `allow_other` is set (Claude Code always offers "Other").
+- **Plans**: ExitPlanMode's `can_use_tool` is always a `plan` request, with its input's `plan`. A
+  plan sent back is `denied`, as a denied permission is.
+- **Options**: `set_options` sends the control requests and nothing else; Claude Code's echo of
+  `set_model` (a replayed user message) is left out.
 - **Notices**: a `system` message `api_retry` is a `notice` with `level: warning` and `code:
   retry`, whose `text` is `API request failed (<error>, status <error_status>); retrying in <n>s
   (attempt <attempt> of <max_retries>).`, where `n` is `retry_delay_ms` divided by 1000 and rounded
@@ -280,6 +305,14 @@ backend drives each CLI:
   running call on that server). `item/tool/requestUserInput` adds a `tool_call` named
   `request_user_input` (`other`, `pending`) for it before the question; the answer completes it
   with one `<id>: <labels>` line per question.
+- **Plans**: a `plan` item is an `assistant_message`, as an `agentMessage` is (its deltas are
+  `item/plan/delta`). When a turn in plan mode completes with one, the thread's turn doesn't end:
+  a `plan` request is opened with its text. Approving it starts a Codex turn with Codex's own
+  "Implement the plan." in collaboration mode `default` and the new permission mode's policy;
+  denying it with a message starts one, in plan mode, with the message; either way the turn goes on.
+  Denying it with no message, or cancelling it, ends the turn. The turn's usage and `duration_ms`
+  are its Codex turns', summed. A message sent while a plan waits cancels the request and goes to
+  a new Codex turn in plan mode.
 - **Notices**: a `warning` notification is a `notice` with `level: warning`; an `error` that will
   be retried is a `notice` with `code: retry`. One that won't is the turn's `error`.
 - **Rate limits**: an `account/rateLimits/updated` notification's `rateLimits` reports a limit for

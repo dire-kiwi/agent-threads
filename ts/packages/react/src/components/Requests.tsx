@@ -1,16 +1,17 @@
-// The thread's requests, as cards: a permission to allow or deny, and questions to answer. Open
-// ones are at the end of the thread (OpenRequests); once one's resolved, its card is drawn where it
-// was asked (see groupRows), greyed out, with how it was answered.
+// The thread's requests, as cards: a permission to allow or deny, questions to answer, and a plan
+// to approve or send back. Open ones are at the end of the thread (OpenRequests); once one's
+// resolved, its card is drawn where it was asked (see groupRows), greyed out, with how it was
+// answered.
 
-import type { PermissionRequest, Question, QuestionRequest, Resolution, ThreadRequest, ToolCall } from "@dire-kiwi/agent-threads-protocol";
+import type { PermissionMode, PermissionRequest, PlanRequest, Question, QuestionRequest, Resolution, ThreadRequest, ToolCall } from "@dire-kiwi/agent-threads-protocol";
 import { memo, useEffect, useRef, useState, type ReactNode, type RefObject } from "react";
 import { useRespond, useReveal, useThreadConfig, useThreadState } from "../hooks.js";
 import type { ThreadState } from "../store.js";
-import { BotIcon, CheckIcon, QuestionIcon, SendIcon, ShieldIcon, XIcon } from "../icons.js";
+import { BotIcon, CheckIcon, MapIcon, QuestionIcon, SendIcon, ShieldIcon, XIcon } from "../icons.js";
 import { subagentTitle } from "./Subagent.js";
-import { toolMeta } from "../toolMeta.js";
+import { planTitle, toolMeta } from "../toolMeta.js";
 import { permissionBody, toolRenderer } from "./ToolCall.js";
-import { Button, cx } from "./ui.js";
+import { Button, cx, Markdown } from "./ui.js";
 
 const NO_REQUESTS: readonly ThreadRequest[] = [];
 
@@ -21,20 +22,32 @@ export const OpenRequests = memo(function OpenRequests({ parentId, className }: 
   if (!shown.length) return null;
   return (
     <div className={cx("at-requests", className)}>
-      {shown.map((r) => (r.type === "permission" ? <PermissionCard key={r.id} request={r} /> : <QuestionCard key={r.id} request={r} />))}
+      {shown.map((r) =>
+        r.type === "permission" ? <PermissionCard key={r.id} request={r} /> : r.type === "plan" ? <PlanCard key={r.id} request={r} /> : <QuestionCard key={r.id} request={r} />,
+      )}
     </div>
   );
 });
 
-/** A request's card: a permission's or questions', open or answered. */
+/** A request's card: a permission's, questions' or plan's, open or answered. */
 export function RequestCard({ request, className }: { request: ThreadRequest; className?: string }) {
-  return request.type === "permission" ? <PermissionCard request={request} className={className} /> : <QuestionCard request={request} className={className} />;
+  return request.type === "permission" ? (
+    <PermissionCard request={request} className={className} />
+  ) : request.type === "plan" ? (
+    <PlanCard request={request} className={className} />
+  ) : (
+    <QuestionCard request={request} className={className} />
+  );
 }
 
-/** How a resolved request was answered, as a badge. */
-function Outcome({ resolution }: { resolution: Resolution }) {
+/** How a resolved request was answered, as a badge (a plan's: approved, or sent back). */
+function Outcome({ resolution, plan }: { resolution: Resolution; plan?: boolean }) {
   const [text, tone] =
-    resolution.outcome === "allow"
+    plan && resolution.outcome === "allow"
+      ? ["Approved", "good"]
+      : plan && resolution.outcome === "deny"
+        ? ["Kept planning", "plain"]
+        : resolution.outcome === "allow"
       ? [resolution.always ? "Always allowed" : "Allowed", "good"]
       : resolution.outcome === "deny"
         ? [resolution.always ? "Always denied" : "Denied", "bad"]
@@ -182,6 +195,106 @@ export const PermissionCard = memo(function PermissionCard({ request, className 
         )}
         {error && <span className="at-error">{error}</span>}
       </div>
+    </div>
+  );
+});
+
+// ---------- plans ----------
+
+/** The modes a plan can be approved into. */
+const AFTER_PLAN: { mode: PermissionMode; label: string }[] = [
+  { mode: "default", label: "asking as usual" },
+  { mode: "accept_edits", label: "accepting edits" },
+  { mode: "bypass", label: "asking nothing" },
+];
+
+/**
+ * The agent's plan: approve it, and the agent starts on it in the mode picked (the thread's own, or
+ * the default if that's plan); or keep planning, with feedback for the agent.
+ */
+export const PlanCard = memo(function PlanCard({ request, className }: { request: PlanRequest; className?: string }) {
+  const respond = useRespond();
+  const harness = useThreadState((s) => s.snapshot.thread.harness);
+  const current = useThreadState((s) => s.snapshot.thread.permission_mode);
+  const [mode, setMode] = useState<PermissionMode>(current && current !== "plan" ? current : "default");
+  // The feedback being written, once the user's chosen to keep planning.
+  const [feedback, setFeedback] = useState<string | null>(null);
+  const { busy, error, run } = useSending();
+  const title = planTitle(request.plan);
+  if (request.resolution)
+    return (
+      <div className={cx("at-card", "at-plan-card", "at-card-done", className)} role="group" aria-label={`Plan from ${asker(harness)}`}>
+        <div className="at-card-head">
+          <MapIcon size={15} className="at-faint" />
+          <span>
+            {asker(harness)}'s plan{title && <span className="at-plan-title">: {title}</span>}
+          </span>
+          <Outcome resolution={request.resolution} plan />
+        </div>
+        {request.resolution.message && <div className="at-card-note">{request.resolution.message}</div>}
+      </div>
+    );
+  const approve = () => run(() => respond(request.id, { outcome: "allow", permission_mode: mode }));
+  const keepPlanning = () => run(() => respond(request.id, { outcome: "deny", ...(feedback?.trim() ? { message: feedback.trim() } : {}) }));
+  return (
+    <div className={cx("at-card", "at-plan-card", className)} role="group" aria-label={`Plan from ${asker(harness)}`}>
+      <div className="at-card-head">
+        <MapIcon size={15} className="at-attention" />
+        <span>
+          {asker(harness)} has a plan{title && <span className="at-plan-title">: {title}</span>}
+        </span>
+        <From parentId={request.parent_id} />
+      </div>
+      <div className="at-plan-scroll">{request.plan ? <Markdown text={request.plan} className="at-plan" /> : <span className="at-faint">(The plan is empty.)</span>}</div>
+      {feedback === null ? (
+        <div className="at-card-actions">
+          <Button variant="primary" disabled={busy} onClick={approve}>
+            <CheckIcon size={13} /> Approve
+          </Button>
+          <label className="at-plan-mode">
+            and carry on
+            <select className="at-select" value={mode} disabled={busy} aria-label="The mode to carry on in" onChange={(e) => setMode(e.target.value as PermissionMode)}>
+              {AFTER_PLAN.map((m) => (
+                <option key={m.mode} value={m.mode}>
+                  {m.label}
+                </option>
+              ))}
+            </select>
+          </label>
+          <Button disabled={busy} onClick={() => setFeedback("")}>
+            Keep planning
+          </Button>
+          {error && <span className="at-error">{error}</span>}
+        </div>
+      ) : (
+        <>
+          <textarea
+            className="at-input at-textarea"
+            aria-label="Feedback on the plan"
+            placeholder="What should the plan do differently? (optional)"
+            value={feedback}
+            disabled={busy}
+            autoFocus
+            rows={3}
+            onChange={(e) => setFeedback(e.target.value)}
+            onKeyDown={(e) => {
+              if (e.key === "Enter" && !e.shiftKey && !e.nativeEvent.isComposing) {
+                e.preventDefault();
+                keepPlanning();
+              }
+            }}
+          />
+          <div className="at-card-actions">
+            <Button variant="primary" disabled={busy} onClick={keepPlanning}>
+              <SendIcon size={13} /> Keep planning
+            </Button>
+            <Button disabled={busy} onClick={() => setFeedback(null)}>
+              Back
+            </Button>
+            {error && <span className="at-error">{error}</span>}
+          </div>
+        </>
+      )}
     </div>
   );
 });

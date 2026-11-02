@@ -109,6 +109,11 @@ export interface Launched {
   effort?: string;
   permission_mode?: string;
   launch?: StoredLaunch;
+  /**
+   * Claude Code was started in bypass mode, so it can be switched to it (it refuses otherwise). The
+   * model and permission mode are those it has now: it takes new ones as it runs.
+   */
+  bypass?: boolean;
 }
 
 /** The options a process started for the thread now has. */

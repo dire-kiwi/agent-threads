@@ -10,7 +10,7 @@ import { ShieldIcon, SpinnerIcon, XIcon } from "../icons.js";
 import { toolMeta } from "../toolMeta.js";
 import type { ToolGroup as ToolGroupRow } from "../view.js";
 import { Subagent } from "./Subagent.js";
-import { Chevron, CodeBlock, cx } from "./ui.js";
+import { Chevron, CodeBlock, cx, Markdown } from "./ui.js";
 
 type Input = Record<string, unknown>;
 const inputOf = (call: ToolCallItem): Input => (call.input && typeof call.input === "object" ? (call.input as Input) : {});
@@ -20,7 +20,7 @@ const str = (x: unknown): string => (typeof x === "string" ? x : "");
 export function toolRenderer(config: ThreadConfig, call: Pick<ToolCallItem, "name" | "kind">): ToolRenderer {
   const byName = config.tools?.[call.name];
   const byKind = config.toolKinds?.[call.kind];
-  const builtin = builtinToolRenderers[call.kind] ?? builtinToolRenderers.other;
+  const builtin = (call.name === "ExitPlanMode" ? planRenderer : undefined) ?? builtinToolRenderers[call.kind] ?? builtinToolRenderers.other;
   return byName || byKind ? { ...builtin, ...byKind, ...byName } : builtin;
 }
 
@@ -267,6 +267,20 @@ function TodoBody({ call }: ToolBodyProps) {
     </ul>
   );
 }
+
+/** Claude's ExitPlanMode: the plan, and what the agent was told (approved, or the user's feedback). */
+function PlanBody({ call }: ToolBodyProps) {
+  const plan = str(inputOf(call).plan);
+  if (!plan) return <GenericBody call={call} />;
+  return (
+    <>
+      <Markdown text={plan} className="at-plan" />
+      {call.status === "denied" && <ToolResultView call={call} />}
+    </>
+  );
+}
+
+const planRenderer: ToolRenderer = { Body: PlanBody };
 
 /** The built-in renderers, by kind. */
 export const builtinToolRenderers: Record<ToolKind, ToolRenderer> = {

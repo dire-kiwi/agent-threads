@@ -385,7 +385,8 @@ export class ThreadRuntime implements ThreadContext {
     this.#launch = normalLaunch(launch);
     this.#threadChanged = true;
     this.#scheduleFlush();
-    this.session?.optionsChanged();
+    // Its process is started with them: the next turn needs another.
+    this.session?.configChanged();
   }
 
   item(id: string): Item | undefined {
@@ -681,12 +682,13 @@ export class ThreadRuntime implements ThreadContext {
 
   ask(request: NewRequest, toolCallId: string | undefined, answered: (resolution: Resolution) => void, standing?: StandingKey): string {
     const question = request.type === "question";
+    const id = newId(question ? "q" : request.type === "plan" ? "plan" : "perm");
     const settled = this.#settled(question, standing);
     if (settled) {
       queueMicrotask(() => answered(settled));
-      return newId(question ? "q" : "perm");
+      return id;
     }
-    const r = { ...request, id: newId(question ? "q" : "perm") } as ThreadRequest;
+    const r = { ...request, id } as ThreadRequest;
     if (!question && standing?.server) (r as { server?: string }).server = standing.server;
     if (this.turn) r.turn_id = this.turn.id;
     if (r.type === "question") r.user_messages = this.#userMessages();

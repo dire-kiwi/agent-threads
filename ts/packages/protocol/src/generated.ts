@@ -44,7 +44,7 @@ export type SubagentStatus = "running" | "completed" | "failed" | "stopped";
 /**
  * A request, told apart by type: open, or resolved (with its resolution).
  */
-export type ThreadRequest = PermissionRequest | QuestionRequest;
+export type ThreadRequest = PermissionRequest | QuestionRequest | PlanRequest;
 
 /**
  * Send the agent a message. It starts a turn if none is running, and steers the running one if one is.
@@ -90,17 +90,18 @@ export interface RespondCommand {
  */
 export interface Resolution {
   /**
-   * allow, deny: for a permission. answer: for a question. cancel: for either, when the user dismisses it or the turn ends first.
+   * allow, deny: for a permission or a plan. answer: for a question. cancel: for any, when the user dismisses it or the turn ends first.
    */
   outcome: "allow" | "deny" | "answer" | "cancel";
   /**
-   * allow, deny: apply the same answer to matching calls for the rest of the thread, without asking. It's kept in the thread's standing_answers.
+   * allow, deny, for a permission: apply the same answer to matching calls for the rest of the thread, without asking. It's kept in the thread's standing_answers.
    */
   always?: boolean;
   /**
-   * deny: why, which the agent is told. answer: a note with the answers.
+   * deny: why, which the agent is told (for a plan, the user's feedback on it). answer: a note with the answers.
    */
   message?: string;
+  permission_mode?: PermissionMode;
   /**
    * answer: for each question id, the chosen option labels or the free text.
    */
@@ -753,6 +754,32 @@ export interface QuestionOption {
    */
   label: string;
   description?: string;
+}
+/**
+ * The agent has made a plan and asks to start on it (Claude's ExitPlanMode; a proposed plan from Codex in plan mode). Answered with outcome allow, to start on it in the resolution's permission_mode, or deny, to keep planning, with the message as the user's feedback.
+ */
+export interface PlanRequest {
+  id: string;
+  type: "plan";
+  /**
+   * The plan, as Markdown.
+   */
+  plan: string;
+  /**
+   * The tool_call item it's for, when there is one.
+   */
+  tool_call_id?: string;
+  /**
+   * The subagent tool_call that's asking, if one is.
+   */
+  parent_id?: string;
+  resolution?: Resolution;
+  turn_id?: string;
+  created_at?: string;
+  /**
+   * The harness's own payload, for debugging.
+   */
+  raw?: unknown;
 }
 /**
  * A request was answered or cancelled, and is no longer open.

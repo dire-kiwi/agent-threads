@@ -16,15 +16,15 @@ import (
 
 const question = `{"questions":[{"question":"Colour?","options":[{"label":"Blue"},{"label":"Red"}]}]}`
 
-// newMini is an AgentThreads that runs mini-claude as Claude, on store, asking the user about
+// newAsking is an AgentThreads that runs mini-claude as Claude, on store, asking the user about
 // every call.
-func newMini(t *testing.T, store agentthreads.Store, late bool) *agentthreads.AgentThreads {
+func newAsking(t *testing.T, store agentthreads.Store, late bool) *agentthreads.AgentThreads {
 	t.Helper()
-	return newMiniWith(t, store, late, nil)
+	return newAskingWith(t, store, late, nil)
 }
 
-// newMiniWith is newMini with more of mini-claude's environment.
-func newMiniWith(t *testing.T, store agentthreads.Store, late bool, env map[string]string) *agentthreads.AgentThreads {
+// newAskingWith is newAsking with more of mini-claude's environment.
+func newAskingWith(t *testing.T, store agentthreads.Store, late bool, env map[string]string) *agentthreads.AgentThreads {
 	t.Helper()
 	bin := filepath.Join(specDir, "..", "ts", "packages", "node", "src", "test", "mini-claude.mjs")
 	e := map[string]string{"MINI_CLAUDE_LOG": filepath.Join(t.TempDir(), "log.jsonl")}
@@ -146,7 +146,7 @@ func countEvents(t *testing.T, sdk *agentthreads.AgentThreads, id, ty string) in
 func TestStandingAnswersAreKeptWithTheThreadAndTheAppSeedsAndClearsThem(t *testing.T) {
 	ctx := context.Background()
 	state := agentthreads.NewMemoryState()
-	sdk := newMini(t, agentthreads.NewMemoryStoreOn(state), false)
+	sdk := newAsking(t, agentthreads.NewMemoryStoreOn(state), false)
 	th, err := sdk.Create(ctx, agentthreads.CreateOptions{
 		Cwd:             t.TempDir(),
 		StandingAnswers: []protocol.StandingAnswer{{Kind: protocol.ToolKindWeb, Name: "WebFetch", Outcome: protocol.StandingAnswerOutcomeDeny}},
@@ -172,7 +172,7 @@ func TestStandingAnswersAreKeptWithTheThreadAndTheAppSeedsAndClearsThem(t *testi
 	}
 
 	// Kept with the thread: a backend that starts again has them.
-	sdk = newMini(t, agentthreads.NewMemoryStoreOn(state), false)
+	sdk = newAsking(t, agentthreads.NewMemoryStoreOn(state), false)
 	got, _ := sdk.Get(ctx, th.ID)
 	if jsonOf(got.StandingAnswers) != standing {
 		t.Fatalf("got %s", jsonOf(got))
@@ -205,7 +205,7 @@ func TestStandingAnswersAreKeptWithTheThreadAndTheAppSeedsAndClearsThem(t *testi
 
 func TestAnAnswerGivenAlwaysAnswersTheOpenRequestsForTheSameTool(t *testing.T) {
 	ctx := context.Background()
-	sdk := newMini(t, nil, false)
+	sdk := newAsking(t, nil, false)
 	th, _ := sdk.Create(ctx, agentthreads.CreateOptions{Cwd: t.TempDir()})
 	// Two at once (as from parallel subagents).
 	send(t, sdk, th.ID, `twice Bash {"command":"ls"}`)
@@ -231,7 +231,7 @@ func TestAnAnswerGivenAlwaysAnswersTheOpenRequestsForTheSameTool(t *testing.T) {
 
 func TestAModeChangeAnswersOpenPermissionRequestsAndDecidesLaterOnes(t *testing.T) {
 	ctx := context.Background()
-	sdk := newMini(t, nil, false)
+	sdk := newAsking(t, nil, false)
 	th, _ := sdk.Create(ctx, agentthreads.CreateOptions{Cwd: t.TempDir()})
 	mode := func(m protocol.PermissionMode) {
 		t.Helper()
@@ -291,7 +291,7 @@ func TestAModeChangeAnswersOpenPermissionRequestsAndDecidesLaterOnes(t *testing.
 func TestAQuestionLeftOpenWhenItsTurnEndsIsAnsweredWithAMessage(t *testing.T) {
 	ctx := context.Background()
 	state := agentthreads.NewMemoryState()
-	sdk := newMini(t, agentthreads.NewMemoryStoreOn(state), true)
+	sdk := newAsking(t, agentthreads.NewMemoryStoreOn(state), true)
 	th, _ := sdk.Create(ctx, agentthreads.CreateOptions{Cwd: t.TempDir()})
 	send(t, sdk, th.ID, "asking AskUserQuestion "+question)
 	q := openRequest(t, sdk, th.ID, "question", "")
@@ -305,7 +305,7 @@ func TestAQuestionLeftOpenWhenItsTurnEndsIsAnsweredWithAMessage(t *testing.T) {
 	}
 
 	// Still open after a restart; the answer goes to the agent as the next message.
-	sdk = newMini(t, agentthreads.NewMemoryStoreOn(state), true)
+	sdk = newAsking(t, agentthreads.NewMemoryStoreOn(state), true)
 	if s, _ := sdk.Snapshot(ctx, th.ID); len(protocol.OpenRequests(s)) != 1 || protocol.OpenRequests(s)[0].ID() != q.ID() {
 		t.Fatalf("got %s", jsonOf(s))
 	}
@@ -379,7 +379,7 @@ func resolutionOf(t *testing.T, sdk *agentthreads.AgentThreads, id string, q pro
 
 func TestAQuestionIsntKeptOpenOnceTheUserSendsAMessageDuringItsTurn(t *testing.T) {
 	ctx := context.Background()
-	sdk := newMiniWith(t, nil, true, map[string]string{"MINI_CLAUDE_INTERRUPT_DELAY": "300"})
+	sdk := newAskingWith(t, nil, true, map[string]string{"MINI_CLAUDE_INTERRUPT_DELAY": "300"})
 	th, _ := sdk.Create(ctx, agentthreads.CreateOptions{Cwd: t.TempDir()})
 	cancelled := protocol.Resolution{Outcome: protocol.ResolutionOutcomeCancel}
 
@@ -413,7 +413,7 @@ func TestAQuestionIsntKeptOpenOnceTheUserSendsAMessageDuringItsTurn(t *testing.T
 func TestDontAskDismissesQuestionsKeptOpenAfterTheirTurnsBeforeAndAfterARestart(t *testing.T) {
 	ctx := context.Background()
 	state := agentthreads.NewMemoryState()
-	sdk := newMini(t, agentthreads.NewMemoryStoreOn(state), true)
+	sdk := newAsking(t, agentthreads.NewMemoryStoreOn(state), true)
 	th, _ := sdk.Create(ctx, agentthreads.CreateOptions{Cwd: t.TempDir()})
 	sdk.Close(ctx)
 	mode := func(sdk *agentthreads.AgentThreads, m protocol.PermissionMode) {
@@ -423,7 +423,7 @@ func TestDontAskDismissesQuestionsKeptOpenAfterTheirTurnsBeforeAndAfterARestart(
 		}
 	}
 	for _, restart := range []bool{false, true} {
-		sdk := newMini(t, agentthreads.NewMemoryStoreOn(state), true)
+		sdk := newAsking(t, agentthreads.NewMemoryStoreOn(state), true)
 		mode(sdk, protocol.PermissionModeDefault)
 		q := interruptedQuestion(t, sdk, th.ID)
 		if s := settledQueue(t, sdk, th.ID); len(protocol.OpenRequests(s)) != 1 || protocol.OpenRequests(s)[0].ID() != q.ID() {
@@ -433,7 +433,7 @@ func TestDontAskDismissesQuestionsKeptOpenAfterTheirTurnsBeforeAndAfterARestart(
 			if err := sdk.Close(ctx); err != nil {
 				t.Fatal(err)
 			}
-			sdk = newMini(t, agentthreads.NewMemoryStoreOn(state), true)
+			sdk = newAsking(t, agentthreads.NewMemoryStoreOn(state), true)
 		}
 		results := len(func() []string {
 			s, _ := sdk.Snapshot(ctx, th.ID)
@@ -476,7 +476,7 @@ func TestATypedSetOptionsCommandCanClearStandingAnswers(t *testing.T) {
 	if got := jsonOf(protocol.SetOptionsCommand{ThreadID: "t"}); strings.Contains(got, "standing_answers") {
 		t.Fatalf("got %s", got)
 	}
-	sdk := newMini(t, nil, false)
+	sdk := newAsking(t, nil, false)
 	seeded := []protocol.StandingAnswer{{Kind: protocol.ToolKindShell, Name: "Bash", Outcome: protocol.StandingAnswerOutcomeAllow}}
 	th, _ := sdk.Create(ctx, agentthreads.CreateOptions{Cwd: t.TempDir(), StandingAnswers: seeded})
 	roundTrip := func(c protocol.SetOptionsCommand) []protocol.StandingAnswer {
@@ -497,7 +497,7 @@ func TestATypedSetOptionsCommandCanClearStandingAnswers(t *testing.T) {
 
 func TestWithoutLateAnswersATurnThatEndsCancelsItsQuestions(t *testing.T) {
 	ctx := context.Background()
-	sdk := newMini(t, nil, false)
+	sdk := newAsking(t, nil, false)
 	th, _ := sdk.Create(ctx, agentthreads.CreateOptions{Cwd: t.TempDir()})
 	send(t, sdk, th.ID, "asking AskUserQuestion "+question)
 	openRequest(t, sdk, th.ID, "question", "")
@@ -527,7 +527,7 @@ func lostRunAfterAMessage(t *testing.T, unlinked bool) {
 	if unlinked {
 		env = map[string]string{"MINI_CLAUDE_UNLINKED": "1"}
 	}
-	sdk := newMiniWith(t, agentthreads.NewMemoryStoreOn(state), true, env)
+	sdk := newAskingWith(t, agentthreads.NewMemoryStoreOn(state), true, env)
 	th, err := sdk.Create(ctx, agentthreads.CreateOptions{Cwd: t.TempDir()})
 	if err != nil {
 		t.Fatal(err)
@@ -568,7 +568,7 @@ func lostRunAfterAMessage(t *testing.T, unlinked bool) {
 	}
 	sdk.Stop(ctx)
 
-	again := newMiniWith(t, crashed, true, env)
+	again := newAskingWith(t, crashed, true, env)
 	s, err := again.Snapshot(ctx, th.ID)
 	if err != nil {
 		t.Fatal(err)
@@ -585,7 +585,7 @@ func lostRunAfterAMessage(t *testing.T, unlinked bool) {
 // the question: the conversation hasn't moved on from it.
 func TestKeepsAQuestionOpenAfterAMessageTakenInBeforeItWasAsked(t *testing.T) {
 	ctx := context.Background()
-	sdk := newMiniWith(t, nil, true, map[string]string{"MINI_CLAUDE_ASK_DELAY": "500"})
+	sdk := newAskingWith(t, nil, true, map[string]string{"MINI_CLAUDE_ASK_DELAY": "500"})
 	th, _ := sdk.Create(ctx, agentthreads.CreateOptions{Cwd: t.TempDir()})
 	send(t, sdk, th.ID, "asking AskUserQuestion "+question)
 	until(t, func() bool {

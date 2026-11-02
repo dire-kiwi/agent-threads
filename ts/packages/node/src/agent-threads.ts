@@ -193,7 +193,7 @@ export class AgentThreads {
     if (rt) {
       rt.config = this.#config(threadId);
       rt.policy = this.#policy(threadId);
-      rt.session?.optionsChanged();
+      rt.session?.configChanged();
       // A run that outlives the backend is saved knowing it, without an event to save it with.
       rt.persist().catch(() => {}); // A store that fails has said so.
     }
@@ -374,9 +374,10 @@ export class AgentThreads {
   }
 
   /**
-   * Changes the thread's model, effort, permission mode or launch options, from its next turn, or
-   * its standing answers (`[]` clears them). Open permission requests the new mode or standing
-   * answers answer (bypass allows them, dont_ask denies them) are answered at once.
+   * Changes the thread's model, effort, permission mode or launch options, or its standing answers
+   * (`[]` clears them): the model and permission mode straight away where the harness takes them in
+   * its running process, and otherwise from the next turn. Open permission requests the new mode or
+   * standing answers answer (bypass allows them, dont_ask denies them) are answered at once.
    */
   async setOptions(threadId: string, options: ThreadOptions): Promise<void> {
     const { launch, ...rest } = options;

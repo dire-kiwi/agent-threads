@@ -95,6 +95,7 @@ enum Effect {
     Interrupt,
     Release,
     OptionsChanged,
+    ConfigChanged,
 }
 
 /// Something waiting for the next save.
@@ -578,6 +579,10 @@ impl ThreadContext {
         self.effects.push_back(Effect::OptionsChanged);
     }
 
+    pub(crate) fn config_changed(&mut self) {
+        self.effects.push_back(Effect::ConfigChanged);
+    }
+
     /// The running turn ended. `live`: whether the session has a process running that has the
     /// queued messages (HarnessSession::live).
     pub fn end_turn(&mut self, end: TurnEnd, live: bool) {
@@ -939,7 +944,11 @@ impl ThreadContext {
         standing: Option<StandingKey>,
     ) -> String {
         let question = request["type"] == "question";
-        let id = new_id(if question { "q" } else { "perm" });
+        let id = new_id(match request["type"].as_str() {
+            Some("question") => "q",
+            Some("plan") => "plan",
+            _ => "perm",
+        });
         if let Some(r) = self.settled(question, standing.as_ref()) {
             let _ = self.tx.send(Box::new(move |a: &mut Actor| answered(a, r)));
             return id;
@@ -1412,6 +1421,7 @@ impl Actor {
                 Effect::Interrupt => s.interrupt(c),
                 Effect::Release => s.release(c),
                 Effect::OptionsChanged => s.options_changed(c),
+                Effect::ConfigChanged => s.config_changed(c),
             }
         }
     }
@@ -1596,6 +1606,7 @@ fn resolution(outcome: ResolutionOutcome, message: Option<&str>) -> Resolution {
         answers: Default::default(),
         message: message.map(String::from),
         outcome,
+        permission_mode: None,
     }
 }
 
@@ -1729,7 +1740,8 @@ impl ThreadContext {
         self.launch = launch;
         self.thread_changed = true;
         self.flush_queued = true;
-        self.options_changed();
+        // Its process is started with them: the next turn needs another.
+        self.config_changed();
     }
 
     /// Saves the thread's run (with a durable spawner) though no event changed.

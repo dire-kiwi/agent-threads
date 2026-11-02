@@ -45,4 +45,5 @@ export const LayersIcon = icon("LayersIcon", <><path d="m12 3 9 5-9 5-9-5z" /><p
 export const BrainIcon = icon("BrainIcon", <><path d="M9 4a3 3 0 0 0-3 3 3 3 0 0 0-2 5 3 3 0 0 0 2 5 3 3 0 0 0 6 1V5a3 3 0 0 0-3-1z" /><path d="M15 4a3 3 0 0 1 3 3 3 3 0 0 1 2 5 3 3 0 0 1-2 5 3 3 0 0 1-6 1" /></>);
 export const AlertIcon = icon("AlertIcon", <><circle cx="12" cy="12" r="9" /><path d="M12 8v4M12 16h.01" /></>);
 export const ClockIcon = icon("ClockIcon", <><circle cx="12" cy="12" r="9" /><path d="M12 7v5l3 2" /></>);
+export const MapIcon = icon("MapIcon", <><path d="M9 4 3 6v14l6-2 6 2 6-2V4l-6 2z" /><path d="M9 4v14M15 6v14" /></>);
 export const SendIcon = icon("SendIcon", <><path d="M22 2 11 13" /><path d="M22 2 15 22l-4-9-9-4z" /></>);
