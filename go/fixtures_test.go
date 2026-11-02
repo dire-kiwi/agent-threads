@@ -3,12 +3,14 @@ package agentthreads_test
 // Every fixture in spec/fixtures (Claude Code and Codex), run as spec/fixtures/README.md says: the
 // SDK drives the fake CLI (which replays the recording and checks what it's sent), and its events
 // must match expected.jsonl by spec/tools/check-events.mjs's rules. Its snapshot must be its events,
-// folded.
+// folded. The pass-through fixtures' control requests, harness messages and raw payloads are checked
+// too.
 
 import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -46,7 +48,16 @@ type fixture struct {
 		Command json.RawMessage `json:"command"`
 		Wait    json.RawMessage `json:"wait"`
 		Restart bool            `json:"restart"`
+		Control json.RawMessage `json:"control"`
+		Result  json.RawMessage `json:"result"`
+		Error   *string         `json:"error"`
 	} `json:"steps"`
+	Raw             bool              `json:"raw"`
+	HarnessMessages []json.RawMessage `json:"harness_messages"`
+	RawChecks       []struct {
+		Event json.RawMessage `json:"event"`
+		Raw   json.RawMessage `json:"raw"`
+	} `json:"raw_checks"`
 }
 
 // recorder collects an SDK's events.
@@ -208,6 +219,16 @@ func runFixture(t *testing.T, scenario, spawnerName string) {
 	if fx.Permissions == "ask" {
 		policy = agentthreads.Ask
 	}
+	var messagesMu sync.Mutex
+	var messages []agentthreads.HarnessMessage
+	var onMessage func(agentthreads.HarnessMessage)
+	if fx.Raw {
+		onMessage = func(m agentthreads.HarnessMessage) {
+			messagesMu.Lock()
+			messages = append(messages, m)
+			messagesMu.Unlock()
+		}
+	}
 	make := func() *agentthreads.AgentThreads {
 		sdk := agentthreads.New(agentthreads.Options{
 			Store: store,
@@ -215,9 +236,11 @@ func runFixture(t *testing.T, scenario, spawnerName string) {
 				"claude": agentthreads.ClaudeCode(agentthreads.ClaudeOptions{Bin: fakeCLI, Env: env}),
 				"codex":  agentthreads.Codex(agentthreads.CodexOptions{Bin: fakeCLI, Env: env, Home: codexHome, NoLogin: true}),
 			},
-			Capabilities: agentthreads.Capabilities{Tools: tools, MCPServers: fx.MCPServers, Permissions: policy},
-			Spawner:      spawner,
-			OnError:      func(err error) { t.Errorf("OnError: %v", err) },
+			Capabilities:     agentthreads.Capabilities{Tools: tools, MCPServers: fx.MCPServers, Permissions: policy},
+			Spawner:          spawner,
+			OnError:          func(err error) { t.Errorf("OnError: %v", err) },
+			Raw:              fx.Raw,
+			OnHarnessMessage: onMessage,
 		})
 		sdk.Subscribe(rec.add)
 		return sdk
@@ -245,6 +268,18 @@ func runFixture(t *testing.T, scenario, spawnerName string) {
 			}
 			sdk = make()
 			from = rec.len()
+		case step.Control != nil:
+			result, err := sdk.Control(ctx, thread.ID, step.Control)
+			if step.Error != nil {
+				var ce *agentthreads.ControlError
+				if !errors.As(err, &ce) || !strings.Contains(err.Error(), *step.Error) {
+					t.Fatalf("%s: got %s, %v; want a ControlError with %q", where, result, err, *step.Error)
+				}
+			} else if err != nil {
+				t.Fatalf("%s: %v", where, err)
+			} else if !sameJSON(result, step.Result) {
+				t.Fatalf("%s: got %s, want %s", where, result, step.Result)
+			}
 		case step.Command != nil:
 			var cmd map[string]any
 			json.Unmarshal(step.Command, &cmd)
@@ -318,6 +353,78 @@ func runFixture(t *testing.T, scenario, spawnerName string) {
 
 	// The events match expected.jsonl.
 	checkEvents(t, filepath.Join(dir, "expected.jsonl"), all)
+
+	// What the protocol leaves out came through.
+	messagesMu.Lock()
+	got := append([]agentthreads.HarnessMessage(nil), messages...)
+	messagesMu.Unlock()
+	for _, m := range got {
+		if m.ThreadID != thread.ID || m.Harness != fx.Thread.Harness || m.RunID == "" {
+			t.Errorf("a harness message for another thread or run: %+v", m)
+		}
+		if m.Message != nil && !json.Valid(m.Message) {
+			t.Errorf("a harness message that isn't JSON: %s", m.Message)
+		}
+	}
+	for _, pattern := range fx.HarnessMessages {
+		var p any
+		json.Unmarshal(pattern, &p)
+		found := false
+		for _, m := range got {
+			var v any
+			if m.Message != nil && json.Unmarshal(m.Message, &v) == nil && matches(v, p) {
+				found = true
+				break
+			}
+		}
+		if !found {
+			t.Errorf("no harness message like %s", pattern)
+		}
+	}
+	for _, c := range fx.RawChecks {
+		var event, want any
+		json.Unmarshal(c.Event, &event)
+		json.Unmarshal(c.Raw, &want)
+		n := 0
+		for _, e := range all {
+			var v any
+			json.Unmarshal(mustMarshal(e), &v)
+			if !matches(v, event) {
+				continue
+			}
+			n++
+			raw := e.Raw()
+			switch x := e.Value.(type) {
+			case *protocol.ItemAddedEvent:
+				raw = x.Item.Raw()
+			case *protocol.RequestOpenedEvent:
+				raw = x.Request.Raw()
+			}
+			line := string(mustMarshal(e))
+			if len(line) > 300 {
+				line = line[:300]
+			}
+			if want == nil {
+				if raw != nil {
+					t.Errorf("%s has a raw: %.300s", line, raw)
+				}
+				continue
+			}
+			var r any
+			if raw == nil || json.Unmarshal(raw, &r) != nil || !matches(r, want) {
+				t.Errorf("%s doesn't have a raw like %s: %.300s", line, c.Raw, raw)
+			}
+		}
+		if n == 0 {
+			t.Errorf("no event like %s", c.Event)
+		}
+	}
+}
+
+// sameJSON says whether two JSON values are equal (objects whatever their keys' order).
+func sameJSON(a, b json.RawMessage) bool {
+	var x, y any
+	return json.Unmarshal(a, &x) == nil && json.Unmarshal(b, &y) == nil && reflect.DeepEqual(x, y)
 }
 
 // checkEvents compares events with an expected.jsonl, by spec/tools/check-events.mjs.

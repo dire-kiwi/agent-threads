@@ -16,6 +16,8 @@ type loop struct {
 	tasks   []task
 	wake    chan struct{}
 	stopped bool
+	// stoppedCh is closed by stop.
+	stoppedCh chan struct{}
 	// after runs after each task (to save what it did).
 	after   func()
 	onPanic func(error)
@@ -27,7 +29,7 @@ type task struct {
 }
 
 func newLoop(after func(), onPanic func(error)) *loop {
-	l := &loop{wake: make(chan struct{}, 1), after: after, onPanic: onPanic}
+	l := &loop{wake: make(chan struct{}, 1), stoppedCh: make(chan struct{}), after: after, onPanic: onPanic}
 	go l.run()
 	return l
 }
@@ -132,6 +134,7 @@ func (l *loop) stop() {
 		return
 	}
 	l.stopped = true
+	close(l.stoppedCh)
 	pending := l.tasks
 	l.tasks = nil
 	l.mu.Unlock()

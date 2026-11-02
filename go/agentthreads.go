@@ -46,6 +46,15 @@ type Options struct {
 	// OnError is called with errors that aren't any command's: a store that fails, a subscriber that
 	// panics. They're logged by default.
 	OnError func(error)
+	// Raw fills in raw on events, items and requests: the harness message each came from. It's off
+	// by default; it's saved with the events, so they take more room.
+	Raw bool
+	// OnHarnessMessage is called with every line a thread's harness process writes, once its driver
+	// has dealt with it: for what the protocol leaves out (Claude Code's system messages and rate
+	// limit events, Codex's token usage...). It runs on the thread's goroutine as the output is read,
+	// so it should be quick, and mustn't call the AgentThreads and wait. A panic is reported to
+	// OnError.
+	OnHarnessMessage func(HarnessMessage)
 }
 
 // CreateOptions are a new thread's.
@@ -97,6 +106,16 @@ func (e *CommandError) Error() string { return e.Message }
 func commandErr(format string, args ...any) error {
 	return &CommandError{Message: fmt.Sprintf(format, args...)}
 }
+
+// ControlError is a control request (Control) the harness refused, or didn't answer: its process
+// exited first, or the backend closed. Data is the harness's own error, when it gave one (Claude
+// Code's error text, as a JSON string, or Codex's JSON-RPC error object).
+type ControlError struct {
+	Message string
+	Data    json.RawMessage
+}
+
+func (e *ControlError) Error() string { return e.Message }
 
 // pruneEvery is how often the shim spawner's finished runs are pruned.
 const pruneEvery = time.Hour
@@ -644,6 +663,52 @@ func (a *AgentThreads) do(ctx context.Context, threadID string, fn func(rt *thre
 		return err
 	}
 	return refused
+}
+
+// Control sends the thread's running harness process a request of the app's own, and returns its
+// answer: for Claude Code a control request's request (e.g. {"subtype": "get_context_usage"}),
+// answered with the control response's response; for Codex {"method": ..., "params": ...}, answered
+// with the JSON-RPC result. It returns a *CommandError if the thread has no running process or its
+// harness takes no requests, a *ControlError if the harness refuses it or its process exits (or the
+// backend closes) before it answers, and ctx's error if ctx is done first. It mustn't be used for
+// what the driver does itself (starting turns, answering the harness's requests...).
+func (a *AgentThreads) Control(ctx context.Context, threadID string, request json.RawMessage) (json.RawMessage, error) {
+	type answer struct {
+		result json.RawMessage
+		err    error
+	}
+	answers := make(chan answer, 1)
+	var refused error
+	var rt *threadRuntime
+	err := a.do(ctx, threadID, func(r *threadRuntime) {
+		rt = r
+		cs, ok := r.session.(ControlSession)
+		if !ok {
+			refused = commandErr("thread %s runs on %s, which doesn't take control requests", threadID, r.state.Thread.Harness)
+			return
+		}
+		refused = cs.Control(request, func(result json.RawMessage, err error) { answers <- answer{result, err} })
+	})
+	if err != nil {
+		return nil, err
+	}
+	if refused != nil {
+		return nil, refused
+	}
+	select {
+	case a := <-answers:
+		return a.result, a.err
+	case <-rt.loop.stoppedCh:
+		// The thread let go of its process without saying (it was closed).
+		select {
+		case a := <-answers:
+			return a.result, a.err
+		default:
+			return nil, &ControlError{Message: "the backend closed before the harness answered"}
+		}
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
 }
 
 // Close stops every harness process, saves everything, and returns once the subscribers have had
