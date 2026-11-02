@@ -199,8 +199,10 @@ is the whole state) has:
   `start` to the end.
 - `context`: the indices of the items from before `start` the window needs, ascending: the
   `parent_id` of each of its items, and of each open request, and the request's `tool_call_id`, and
-  then each of those items' own `parent_id`, and so on (the subagent calls they belong to, however
-  nested), where they're before `start`. `items` starts with these, in that order, followed by the
+  each subagent call (a `tool_call` of kind `subagent`) that's still `pending` or `running` (it may
+  add items to the window later, which would have no call to belong to), and then each of those
+  items' own `parent_id`, and so on (the subagent calls they belong to, however nested), where
+  they're before `start`. `items` starts with these, in that order, followed by the
   window's items. Left out when there are none.
 - `requests`: the open requests, and the resolved requests whose **anchor** is at `start` or after,
   or that have none, in the state's order. A request's anchor is the index of its `tool_call_id`'s

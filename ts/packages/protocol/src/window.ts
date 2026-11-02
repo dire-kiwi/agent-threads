@@ -7,7 +7,8 @@ import type { Item, ItemPage, Snapshot, ThreadRequest } from "./generated.js";
 
 /**
  * The window of `state` with its last `limit` items, and what they need from before them: the
- * subagent calls they and the open requests belong to, and the open requests' tool calls. Without
+ * subagent calls they and the open requests belong to, the open requests' tool calls, and the
+ * subagents still running (which may go on adding items to the window), with their own. Without
  * a limit, or with one it's within, it's the state itself. `state` must be whole (not a window).
  */
 export function snapshotWindow(state: Snapshot, limit?: number): Snapshot {
@@ -22,6 +23,8 @@ export function snapshotWindow(state: Snapshot, limit?: number): Snapshot {
     need.add(r.parent_id ?? "");
     need.add(r.tool_call_id ?? "");
   }
+  // A subagent that's quiet now may go on: its items would come with no call to hang them from.
+  for (let i = 0; i < start; i++) if (isRunningSubagent(items[i]!)) need.add(items[i]!.id);
   const context = contextOf(items, at, need, start);
   return {
     thread: state.thread,
@@ -117,6 +120,9 @@ function anchor(items: readonly Item[], at: Map<string, number>, r: ThreadReques
   if (r.turn_id) for (let i = items.length - 1; i >= 0; i--) if (items[i]!.turn_id === r.turn_id) return i;
   return -1;
 }
+
+const isRunningSubagent = (item: Item): boolean =>
+  item.type === "tool_call" && item.kind === "subagent" && (item.status === "pending" || item.status === "running");
 
 function indices(items: readonly Item[]): Map<string, number> {
   const at = new Map<string, number>();

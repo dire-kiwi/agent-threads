@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"os"
 	"reflect"
+	"slices"
 	"testing"
 
 	"github.com/dire-kiwi/agent-threads/go/protocol"
@@ -18,9 +19,9 @@ func windowState(t *testing.T) protocol.Snapshot {
 	var s protocol.Snapshot
 	data := `{"thread":{"id":"th","harness":"claude","status":"waiting","created_at":"2026-11-01T00:00:00Z"},"seq":20,"items":[
 		{"id":"m0","type":"assistant_message","text":"m0","turn_id":"t1"},
-		{"id":"sa","type":"tool_call","name":"Agent","kind":"subagent","input":{},"status":"running","turn_id":"t1"},
+		{"id":"sa","type":"tool_call","name":"Agent","kind":"subagent","input":{},"status":"completed","turn_id":"t1"},
 		{"id":"m2","type":"assistant_message","text":"m2","turn_id":"t1"},
-		{"id":"sb","type":"tool_call","name":"Agent","kind":"subagent","input":{},"status":"running","turn_id":"t1","parent_id":"sa"},
+		{"id":"sb","type":"tool_call","name":"Agent","kind":"subagent","input":{},"status":"completed","turn_id":"t1","parent_id":"sa"},
 		{"id":"m4","type":"assistant_message","text":"m4","turn_id":"t1"},
 		{"id":"b1","type":"assistant_message","text":"b1","turn_id":"t1","parent_id":"sb"},
 		{"id":"m6","type":"assistant_message","text":"m6","turn_id":"t1"},
@@ -146,15 +147,36 @@ func TestWithPageOrdersContext(t *testing.T) {
 	same(t, ids(next.Items), []string{"sa", "sb", "m4", "b1", "m6", "tc", "m8", "m9"})
 }
 
+func TestSnapshotWindowBringsRunningSubagents(t *testing.T) {
+	// sb (sa's) is running but quiet: none of its items, nor a request of its, is in the window.
+	quiet := func(status protocol.ToolStatus) protocol.Snapshot {
+		s := windowState(t)
+		s.Requests = nil
+		items := slices.Clone(s.Items)
+		c := *items[3].Value.(*protocol.ToolCall)
+		c.Status = status
+		items[3] = protocol.Item{Value: &c}
+		s.Items = items
+		return s
+	}
+	w := protocol.SnapshotWindow(quiet(protocol.ToolStatusRunning), 2)
+	same(t, w.Context, []int64{1, 3})
+	same(t, ids(w.Items), []string{"sa", "sb", "m8", "m9"})
+	same(t, protocol.SnapshotWindow(quiet(protocol.ToolStatusPending), 2).Context, []int64{1, 3})
+	if c := protocol.SnapshotWindow(quiet(protocol.ToolStatusCancelled), 2).Context; c != nil {
+		t.Fatalf("an ended subagent in context: %v", c)
+	}
+}
+
 func TestWithPageTakesThePagesVersion(t *testing.T) {
 	whole := windowState(t)
 	w := protocol.SnapshotWindow(whole, 2)
-	later := protocol.ApplyEvent(whole, event(t, `{"type":"item.updated","thread_id":"th","seq":21,"item_id":"sa","patch":{"status":"completed"}}`))
+	later := protocol.ApplyEvent(whole, event(t, `{"type":"item.updated","thread_id":"th","seq":21,"item_id":"sa","patch":{"status":"failed"}}`))
 	next := protocol.WithPage(w, protocol.ItemsBefore(later, 8, 1))
-	if next.Items[0].ID() != "sa" || next.Items[0].Value.(*protocol.ToolCall).Status != protocol.ToolStatusCompleted || next.Seq != 20 {
+	if next.Items[0].ID() != "sa" || next.Items[0].Value.(*protocol.ToolCall).Status != protocol.ToolStatusFailed || next.Seq != 20 {
 		t.Fatalf("got %s", asJSON(t, next))
 	}
-	if w.Items[0].Value.(*protocol.ToolCall).Status != protocol.ToolStatusRunning {
+	if w.Items[0].Value.(*protocol.ToolCall).Status != protocol.ToolStatusCompleted {
 		t.Fatal("the window before changed")
 	}
 }

@@ -76,6 +76,8 @@ export class ThreadStore {
   private paging: Promise<void> | null = null;
   /** The saved events applied while a page loads, to apply to its items too (see loadEarlier). */
   private recorded: ThreadEvent[] | null = null;
+  /** Counts the snapshots a resync has put in place of the state, which make a page on its way stale. */
+  private snapshots = 0;
 
   constructor(readonly source: ThreadSource) {
     const snapshot = source.snapshot;
@@ -132,7 +134,18 @@ export class ThreadStore {
    * it's done, or failed (`earlierError` says why). A load under way is joined, not repeated.
    */
   async loadEarlier({ to }: LoadEarlierOptions = {}): Promise<void> {
-    const next = () => (this.paging ??= this.page());
+    const next = () => {
+      if (this.paging) return this.paging;
+      // It's the load under way before the source is asked, so one that fails straight away (the
+      // source throws) is done with by the time it returns, and the next is asked for afresh.
+      let done!: () => void;
+      const paging = (this.paging = new Promise<void>((r) => (done = r)));
+      void this.page().finally(() => {
+        if (this.paging === paging) this.paging = null;
+        done();
+      });
+      return paging;
+    };
     if (to === undefined) {
       if (this.hasEarlier()) await next();
       return;
@@ -143,43 +156,56 @@ export class ThreadStore {
     }
   }
 
+  /**
+   * Loads the page before the window's start and puts it in. A resync that brings a fresh snapshot
+   * meanwhile makes the page stale (its items may be older than the snapshot's, and events the
+   * snapshot has in weren't applied, so can't be applied to the page): it's left out, and the page
+   * before the new snapshot's start is asked for instead.
+   */
   private async page(): Promise<void> {
-    const before = this.state.snapshot.start!;
-    this.recorded = [];
-    this.update({ ...this.state, loadingEarlier: true, earlierError: null });
-    let page: ItemPage;
-    try {
-      page = await this.source.loadEarlier!(before);
-    } catch (e) {
+    while (this.hasEarlier()) {
+      const before = this.state.snapshot.start!;
+      const epoch = this.snapshots;
+      this.recorded = [];
+      this.update({ ...this.state, loadingEarlier: true, earlierError: null });
+      let page: ItemPage;
+      try {
+        page = await this.source.loadEarlier!(before);
+      } catch (e) {
+        this.recorded = null;
+        // Done before it says so, so what that sets off can load the next.
+        this.paging = null;
+        console.error("agent-threads: loading earlier items failed", e);
+        this.update({ ...this.state, loadingEarlier: false, earlierError: e instanceof Error ? e.message : String(e) });
+        return;
+      }
+      const recorded = this.recorded;
       this.recorded = null;
-      // Done before it says so, so what that sets off can load the next.
+      if (epoch !== this.snapshots) continue;
       this.paging = null;
-      console.error("agent-threads: loading earlier items failed", e);
-      this.update({ ...this.state, loadingEarlier: false, earlierError: e instanceof Error ? e.message : String(e) });
+      const s = this.state.snapshot;
+      // The page is from when the backend got the request, so it has every event applied before
+      // then; events applied since that it doesn't have apply to its items too. Those that would
+      // add an item or request it doesn't have are for the window (they're in it already).
+      let theirs: Snapshot = { thread: s.thread, items: page.items, requests: page.requests, seq: page.seq };
+      for (const e of recorded) {
+        if (e.seq <= theirs.seq) continue;
+        if (e.type === "item.added" && !theirs.items.some((i) => i.id === e.item.id)) continue;
+        if (e.type === "request.opened" && !theirs.requests.some((r) => r.id === e.request.id)) continue;
+        theirs = applyEvent(theirs, e);
+      }
+      const snapshot = withPage(s, { ...page, items: theirs.items, requests: theirs.requests });
+      if (snapshot === s) console.warn(`agent-threads: the page of items before ${before} doesn't fit the thread's window any more; left out`);
+      this.update({
+        ...this.state,
+        snapshot,
+        view: snapshot === s ? this.state.view : buildView(snapshot.items, snapshot.requests, this.state.view),
+        loadingEarlier: false,
+      });
       return;
     }
-    const recorded = this.recorded;
-    this.recorded = null;
     this.paging = null;
-    const s = this.state.snapshot;
-    // The page is from when the backend got the request, so it has every event applied before
-    // then; events applied since that it doesn't have apply to its items too. Those that would add
-    // an item or request it doesn't have are for the window (they're in it already).
-    let theirs: Snapshot = { thread: s.thread, items: page.items, requests: page.requests, seq: page.seq };
-    for (const e of recorded) {
-      if (e.seq <= theirs.seq) continue;
-      if (e.type === "item.added" && !theirs.items.some((i) => i.id === e.item.id)) continue;
-      if (e.type === "request.opened" && !theirs.requests.some((r) => r.id === e.request.id)) continue;
-      theirs = applyEvent(theirs, e);
-    }
-    const snapshot = withPage(s, { ...page, items: theirs.items, requests: theirs.requests });
-    if (snapshot === s) console.warn(`agent-threads: the page of items before ${before} doesn't fit the thread's window any more; left out`);
-    this.update({
-      ...this.state,
-      snapshot,
-      view: snapshot === s ? this.state.view : buildView(snapshot.items, snapshot.requests, this.state.view),
-      loadingEarlier: false,
-    });
+    if (this.state.loadingEarlier) this.update({ ...this.state, loadingEarlier: false });
   }
 
   /** Takes one of the thread's events (as the source's subscription does). */
@@ -241,6 +267,8 @@ export class ThreadStore {
       for (const event of r)
         if (event.type !== "delta" && event.thread_id === next.snapshot.thread.id && event.seq > before) this.held.set(event.seq, event);
     } else if (r && r.thread.id === next.snapshot.thread.id && r.seq >= next.snapshot.seq) {
+      // A page on its way is from before it: it's asked for again (see page).
+      this.snapshots++;
       next = { ...next, snapshot: r, streaming: NO_IDS, view: buildView(r.items, r.requests, next.view) };
     }
     next = this.drain(next);

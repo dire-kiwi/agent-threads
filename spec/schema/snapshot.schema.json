@@ -13,7 +13,7 @@
         "requests": { "type": "array", "items": { "$ref": "request.schema.json#/$defs/ThreadRequest" }, "description": "The thread's requests, oldest first: the open ones, and the resolved ones with their resolution. A window has the open ones, and the resolved ones its items have (see PROTOCOL.md, Windows)." },
         "seq": { "type": "integer", "minimum": 0, "description": "The seq of the last saved event it includes; 0 for none." },
         "start": { "type": "integer", "minimum": 0, "description": "A window: the index, in the thread's whole list of items, of the first item of the window. The items before it are left out, but for those in context. Absent (or 0): items has them all." },
-        "context": { "type": "array", "items": { "type": "integer", "minimum": 0 }, "description": "A window: the indices, in the thread's whole list of items, of the items from before start it has anyway because the window needs them (the subagent calls its items and open requests belong to, and their open requests' tool calls). They're the first context.length of items, in order; the rest are the thread's items from start on." }
+        "context": { "type": "array", "items": { "type": "integer", "minimum": 0 }, "description": "A window: the indices, in the thread's whole list of items, of the items from before start it has anyway because the window needs them (the subagent calls its items and open requests belong to, the open requests' tool calls, and the subagents still running, with the subagents those belong to). They're the first context.length of items, in order; the rest are the thread's items from start on." }
       }
     },
     "ItemPage": {

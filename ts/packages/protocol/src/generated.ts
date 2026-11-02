@@ -692,7 +692,7 @@ export interface Snapshot {
    */
   start?: number;
   /**
-   * A window: the indices, in the thread's whole list of items, of the items from before start it has anyway because the window needs them (the subagent calls its items and open requests belong to, and their open requests' tool calls). They're the first context.length of items, in order; the rest are the thread's items from start on.
+   * A window: the indices, in the thread's whole list of items, of the items from before start it has anyway because the window needs them (the subagent calls its items and open requests belong to, the open requests' tool calls, and the subagents still running, with the subagents those belong to). They're the first context.length of items, in order; the rest are the thread's items from start on.
    */
   context?: number[];
 }

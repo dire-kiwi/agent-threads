@@ -744,7 +744,7 @@ pub struct SetOptionsCommand {
 ///A thread's state as of seq: what applying its events, in order, from the start gives. A window (a snapshot taken with a limit) has only its last items, and what they need from before them (start, context).
 #[derive(::serde::Deserialize, ::serde::Serialize, Clone, Debug)]
 pub struct Snapshot {
-    ///A window: the indices, in the thread's whole list of items, of the items from before start it has anyway because the window needs them (the subagent calls its items and open requests belong to, and their open requests' tool calls). They're the first context.length of items, in order; the rest are the thread's items from start on.
+    ///A window: the indices, in the thread's whole list of items, of the items from before start it has anyway because the window needs them (the subagent calls its items and open requests belong to, the open requests' tool calls, and the subagents still running, with the subagents those belong to). They're the first context.length of items, in order; the rest are the thread's items from start on.
     #[serde(default, skip_serializing_if = "::std::vec::Vec::is_empty")]
     pub context: ::std::vec::Vec<u64>,
     pub items: ::std::vec::Vec<Item>,

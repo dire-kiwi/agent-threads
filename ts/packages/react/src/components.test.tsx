@@ -394,6 +394,25 @@ describe("a window of a long thread", () => {
   });
 });
 
+describe("a window over a quiet subagent", () => {
+  it("has its call, so what it does after the snapshot is drawn under it", () => {
+    // A running subagent at 0, with nothing of its own since, then two messages: a window of two.
+    const items: Item[] = [
+      { id: "sa", type: "tool_call", name: "Agent", kind: "subagent", input: { description: "Dig in" }, status: "running", title: "Dig in" },
+      { id: "m1", type: "assistant_message", text: "message 1" },
+      { id: "m2", type: "assistant_message", text: "message 2" },
+    ];
+    const whole = applyEvents(initialState(thread), items.map((item, i): ThreadEvent => ({ type: "item.added", thread_id: "th", seq: i + 1, item })));
+    const t = testSource(snapshotWindow(whole, 2));
+    const { container } = render(<Thread source={t.source} onCommand={() => {}} />);
+    act(() => t.emit({ type: "item.added", thread_id: "th", seq: 4, item: { id: "b4", type: "assistant_message", text: "it goes on", parent_id: "sa" } }));
+    const row = container.querySelector('[data-subagent="sa"]') as HTMLElement;
+    expect(row).not.toBeNull();
+    fireEvent.click(within(row).getByRole("button", { name: /Dig in/ }));
+    expect(row.textContent).toContain("it goes on");
+  });
+});
+
 describe("themes", () => {
   const css = readFileSync(join(dirname(fileURLToPath(import.meta.url)), "styles.css"), "utf8");
   /** The --at-* variables a block of styles.css (from `selector {` to its closing brace) sets. */

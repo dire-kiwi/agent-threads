@@ -1898,8 +1898,9 @@ type Snapshot struct {
 
 	// A window: the indices, in the thread's whole list of items, of the items from before start it has
 	// anyway because the window needs them (the subagent calls its items and open requests belong to,
-	// and their open requests' tool calls). They're the first context.length of items, in order; the
-	// rest are the thread's items from start on.
+	// the open requests' tool calls, and the subagents still running, with the subagents those belong
+	// to). They're the first context.length of items, in order; the rest are the thread's items from
+	// start on.
 	Context []int64 `json:"context,omitempty"`
 
 	// Extra has the fields the spec doesn't name, as they came, so that they're written again

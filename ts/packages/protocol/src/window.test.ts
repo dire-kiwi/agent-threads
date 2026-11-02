@@ -12,7 +12,7 @@ const agent = (id: string, parent_id?: string): Item => ({
   name: "Agent",
   kind: "subagent",
   input: {},
-  status: "running",
+  status: "completed",
   turn_id: "t1",
   ...(parent_id ? { parent_id } : {}),
 });
@@ -74,6 +74,21 @@ describe("snapshotWindow", () => {
     expect(ids(w.items)).toEqual(["sa", "sb", "b1", "m6", "tc", "m8", "m9"]);
   });
 
+  it("brings the subagents still running, with theirs, for the items they'll go on to add", () => {
+    // sb (sa's) is running but quiet: none of its items, nor a request of its, is in the window.
+    const s = state();
+    const quiet = { ...s, items: s.items.map((i) => (i.id === "sb" ? { ...i, status: "running" as const } : i)), requests: [] };
+    const w = snapshotWindow(quiet, 2);
+    expect(w.context).toEqual([1, 3]);
+    expect(ids(w.items)).toEqual(["sa", "sb", "m8", "m9"]);
+    // It goes on: its new item has its call to belong to.
+    const next = applyEvent(w, { type: "item.added", thread_id: "th", seq: 21, item: msg("b10", "sb") });
+    expect(next.items.find((i) => i.id === "sb")).toMatchObject({ status: "running" });
+    // Pending counts as running; one that's ended doesn't.
+    expect(snapshotWindow({ ...quiet, items: quiet.items.map((i) => (i.id === "sb" ? { ...i, status: "pending" as const } : i)) }, 2).context).toEqual([1, 3]);
+    expect(snapshotWindow({ ...quiet, items: quiet.items.map((i) => (i.id === "sb" ? { ...i, status: "cancelled" as const } : i)) }, 2)).not.toHaveProperty("context");
+  });
+
   it("leaves context out when it needs nothing from before it", () => {
     const w = snapshotWindow({ ...state(), requests: [] }, 1);
     expect(w).toEqual({ thread, items: [msg("m9", undefined, "t2")], requests: [], seq: 20, start: 9 });
@@ -130,9 +145,9 @@ describe("withPage", () => {
   it("takes the page's version of an item or request it has", () => {
     const whole = state();
     const w = snapshotWindow(whole, 2);
-    const later = applyEvent(whole, { type: "item.updated", thread_id: "th", seq: 21, item_id: "sa", patch: { status: "completed" } });
+    const later = applyEvent(whole, { type: "item.updated", thread_id: "th", seq: 21, item_id: "sa", patch: { status: "failed" } });
     const next = withPage(w, itemPage(later, 8, 1));
-    expect(next.items[0]).toMatchObject({ id: "sa", status: "completed" });
+    expect(next.items[0]).toMatchObject({ id: "sa", status: "failed" });
     expect(next.seq).toBe(20);
   });
 

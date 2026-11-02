@@ -141,7 +141,7 @@ fn msg(id: &str, parent: Option<&str>, turn: &str) -> Value {
 }
 
 fn agent(id: &str, parent: Option<&str>) -> Value {
-    let mut a = json!({"id": id, "type": "tool_call", "name": "Agent", "kind": "subagent", "input": {}, "status": "running", "turn_id": "t1"});
+    let mut a = json!({"id": id, "type": "tool_call", "name": "Agent", "kind": "subagent", "input": {}, "status": "completed", "turn_id": "t1"});
     if let Some(p) = parent {
         a["parent_id"] = json!(p);
     }
@@ -291,7 +291,7 @@ fn with_page_takes_the_pages_version_of_an_item_or_request_it_has() {
     apply_event(
         &mut later,
         &event(
-            json!({"type": "item.updated", "thread_id": "th", "seq": 21, "item_id": "sa", "patch": {"status": "completed"}}),
+            json!({"type": "item.updated", "thread_id": "th", "seq": 21, "item_id": "sa", "patch": {"status": "failed"}}),
         ),
     );
     let mut page = item_page(&later, 8, 1);
@@ -304,7 +304,7 @@ fn with_page_takes_the_pages_version_of_an_item_or_request_it_has() {
     let w = value(&w);
     assert_eq!(
         (&w["items"][0]["id"], &w["items"][0]["status"]),
-        (&json!("sa"), &json!("completed"))
+        (&json!("sa"), &json!("failed"))
     );
     assert_eq!(w["seq"], 20);
     assert_eq!(ids(&w["requests"]), ["p-sa", "p-new", "p-turn", "p-none"]);
@@ -326,6 +326,22 @@ fn with_page_ignores_a_page_for_another_thread_or_that_doesnt_end_at_its_start()
     let mut y = whole.clone();
     assert!(!with_page(&mut y, item_page(&whole, 0, 2)));
     assert_eq!(value(&y), value(&whole));
+}
+
+#[test]
+fn a_window_brings_the_subagents_still_running_with_theirs() {
+    // sb (sa's) is running but quiet: none of its items, nor a request of its, is in the window.
+    let quiet = |status: &str| {
+        let mut s = value(state());
+        s["requests"] = json!([]);
+        s["items"][3]["status"] = json!(status);
+        from::<Snapshot>(s)
+    };
+    let w = value(snapshot_window(&quiet("running"), 2));
+    assert_eq!(w["context"], json!([1, 3]));
+    assert_eq!(ids(&w["items"]), ["sa", "sb", "m8", "m9"]);
+    assert_eq!(value(snapshot_window(&quiet("pending"), 2))["context"], json!([1, 3]));
+    assert!(value(snapshot_window(&quiet("cancelled"), 2)).get("context").is_none());
 }
 
 #[test]

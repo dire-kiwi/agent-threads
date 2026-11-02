@@ -30,6 +30,12 @@ func SnapshotWindow(state Snapshot, limit int) Snapshot {
 			need = append(need, r.ParentID(), r.ToolCallID())
 		}
 	}
+	// A subagent that's quiet now may go on: its items would come with no call to hang them from.
+	for _, item := range items[:start] {
+		if isRunningSubagent(item) {
+			need = append(need, item.ID())
+		}
+	}
 	context := contextOf(items, at, need, start)
 	w := Snapshot{
 		Thread:   state.Thread,
@@ -186,6 +192,12 @@ func indices(items []Item) map[string]int {
 		at[item.ID()] = i
 	}
 	return at
+}
+
+// isRunningSubagent is whether item is a subagent's call that hasn't finished.
+func isRunningSubagent(item Item) bool {
+	c, ok := item.Value.(*ToolCall)
+	return ok && c.Kind == ToolKindSubagent && (c.Status == ToolStatusPending || c.Status == ToolStatusRunning)
 }
 
 // contextOf is the indices before start of the items with an id in need, and of their parents,

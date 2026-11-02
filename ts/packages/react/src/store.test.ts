@@ -312,7 +312,9 @@ describe("ThreadStore", () => {
         whole = applyEvent(whole, e);
         t.emit(e);
       };
-      return { ...t, store, pages, answer, change, whole: () => whole, ids: () => store.getState().snapshot.items.map((i) => i.id) };
+      /** Changes the thread without the store hearing of it (it misses the events). */
+      const missed = (...events: ThreadEvent[]) => void (whole = applyEvents(whole, events));
+      return { ...t, store, pages, answer, change, missed, whole: () => whole, ids: () => store.getState().snapshot.items.map((i) => i.id) };
     }
 
     it("puts a page in front of the window, and notes while it's loading", async () => {
@@ -398,17 +400,64 @@ describe("ThreadStore", () => {
       expect(s).toEqual(snapshotWindow(whole(), 8));
     });
 
-    it("leaves out a page that doesn't fit the window any more", async () => {
-      const { store, pages, whole } = paged();
+    it("asks again for a page that was on its way when a resync brought a fresh snapshot", async () => {
+      const { store, pages, missed, whole } = paged();
+      const done = store.loadEarlier();
+      // The page is taken at seq 10, with the subagent running.
+      const stale = itemPage(whole(), 6, 3);
+      // Meanwhile the subagent ends, and a permission for m5 is asked and allowed: the store misses
+      // these, and a resync brings a window of the same start with them in (seq 13).
+      const p1 = { id: "p1", type: "permission" as const, name: "Bash", kind: "shell" as const, input: {}, tool_call_id: "m5" };
+      missed(
+        updated(11, "s3", { status: "completed" }),
+        { type: "request.opened", thread_id: "th", seq: 12, request: p1 },
+        { type: "request.resolved", thread_id: "th", seq: 13, request_id: "p1", resolution: { outcome: "allow" } },
+      );
+      (store as unknown as { caughtUp(r: Snapshot): void }).caughtUp(snapshotWindow(whole(), 4));
+      expect(store.getState().snapshot).toMatchObject({ seq: 13, start: 6 });
+      pages.shift()!.resolve(stale);
+      await flush();
+      // The stale page is left out, and the page before the fresh snapshot's start asked for.
+      expect(pages.map((p) => p.before)).toEqual([6]);
+      expect(store.getState().loadingEarlier).toBe(true);
+      pages.shift()!.resolve(itemPage(whole(), 6, 3));
+      await done;
+      const s = store.getState().snapshot;
+      expect(s).toEqual(snapshotWindow(whole(), 7));
+      expect(s.items.find((i) => i.id === "s3")).toMatchObject({ status: "completed" });
+      expect(s.requests).toEqual([{ ...p1, resolution: { outcome: "allow" } }]);
+      expect(store.getState().loadingEarlier).toBe(false);
+    });
+
+    it("leaves out a page that doesn't end at the window's start", async () => {
+      const { store, pages, whole, ids } = paged();
       const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
       const done = store.loadEarlier();
-      const page = itemPage(whole(), 6, 3);
-      // A resync brings a new window meanwhile.
-      (store as unknown as { caughtUp(r: Snapshot): void }).caughtUp(snapshotWindow(whole(), 2));
-      pages.shift()!.resolve(page);
+      pages.shift()!.resolve(itemPage(whole(), 5, 3));
       await done;
-      expect(store.getState().snapshot.start).toBe(8);
+      expect(store.getState().snapshot.start).toBe(6);
+      expect(ids()).toEqual(["s3", "m6", "m7", "b8", "m9"]);
       expect(warn).toHaveBeenCalled();
+    });
+
+    it("asks the source again after it threw rather than failed a promise", async () => {
+      const items = Array.from({ length: 5 }, (_, i) => msg(`m${i}`));
+      const whole = applyEvents(initialState(thread), items.map((item, i) => added(i + 1, item)));
+      const t = testSource(snapshotWindow(whole, 2));
+      let calls = 0;
+      t.source.loadEarlier = (before) => {
+        if (++calls === 1) throw new Error("offline");
+        return Promise.resolve(itemPage(whole, before, 10));
+      };
+      vi.spyOn(console, "error").mockImplementation(() => {});
+      const store = new ThreadStore(t.source);
+      store.connect();
+      await store.loadEarlier();
+      expect(store.getState()).toMatchObject({ loadingEarlier: false, earlierError: "offline" });
+      await store.loadEarlier();
+      expect(calls).toBe(2);
+      expect(store.getState().earlierError).toBeNull();
+      expect(store.getState().snapshot).toEqual(whole);
     });
 
     it("has nothing to load without the source's loadEarlier", async () => {

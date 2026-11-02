@@ -6,7 +6,7 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
-use crate::protocol::{Item, ItemPage, Snapshot, ThreadRequest};
+use crate::protocol::{Item, ItemPage, Snapshot, ThreadRequest, ToolKind, ToolStatus};
 
 /// The window of `state` with its last `limit` items, and what they need from before them: the
 /// subagent calls they and the open requests belong to, and the open requests' tool calls. With a
@@ -23,6 +23,8 @@ pub fn snapshot_window(state: &Snapshot, limit: usize) -> Snapshot {
         need.extend(r.parent_id());
         need.extend(r.tool_call_id());
     }
+    // A subagent that's quiet now may go on: its items would come with no call to hang them from.
+    need.extend(items[..start].iter().filter(|i| is_running_subagent(i)).map(Item::id));
     let context = context_of(items, &at, need, start);
     Snapshot {
         thread: state.thread.clone(),
@@ -148,6 +150,11 @@ fn anchor(items: &[Item], at: &HashMap<&str, usize>, r: &ThreadRequest) -> Optio
 /// Each item's index by its id (the last, should two share one).
 fn indices(items: &[Item]) -> HashMap<&str, usize> {
     items.iter().enumerate().map(|(i, item)| (item.id(), i)).collect()
+}
+
+/// Whether `item` is a subagent's call that hasn't finished.
+fn is_running_subagent(item: &Item) -> bool {
+    matches!(item, Item::ToolCall(c) if c.kind == ToolKind::Subagent && matches!(c.status, ToolStatus::Pending | ToolStatus::Running))
 }
 
 /// The indices before `start` of the items with an id in `need`, and of their parents, however
