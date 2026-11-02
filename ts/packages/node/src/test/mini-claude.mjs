@@ -13,6 +13,7 @@
 //                         went, and ends the turn
 //   asking <tool> <json>  calls a tool as `tool` does, but an interrupt while it's asking cancels the
 //                         request (as Claude does) and ends the turn as interrupted
+//                         (MINI_CLAUDE_INTERRUPT_DELAY=<ms> after cancelling it)
 //   slow                  waits for an interrupt, then ends the turn as interrupted
 //   stubborn              ignores interrupts, and a closed stdin (saying "not stopping"), until
 //                         it's signalled
@@ -188,6 +189,7 @@ async function step(text) {
     if (wasInterrupted) {
       waiting.delete(request_id);
       out({ type: "control_cancel_request", request_id });
+      await sleep(Number(process.env.MINI_CLAUDE_INTERRUPT_DELAY ?? 0));
       return;
     }
     const allowed = r.response.behavior === "allow";

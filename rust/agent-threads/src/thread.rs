@@ -75,8 +75,11 @@ struct OpenRequest {
     /// The tool it's about (permission_key), for an answer given `always`.
     standing: Option<StandingKey>,
     /// A question kept open after its turn ended (Options::late_answers): its answer is sent as
-    /// the next message, unless a turn starts first.
+    /// the next message, unless the user sends one first.
     late: bool,
+    /// How many messages the user had sent when it was opened: one sent since means the
+    /// conversation has moved on, and it isn't kept open after its turn.
+    users: usize,
 }
 
 /// What the core asks of the session, once the job that asked is done with it.
@@ -429,9 +432,9 @@ impl ThreadContext {
     /// Sends a message: starts a turn, or steers the running one.
     pub(crate) fn send(&mut self, message: Outgoing) {
         let id = new_id("um");
+        // The conversation moves on: questions kept open after their turns can't be answered.
+        self.cancel_late();
         if self.turn.is_none() {
-            // The conversation moves on: questions kept open after their turns can't be answered.
-            self.cancel_late();
             // Messages still queued from before weren't delivered: they go first, in this turn, and
             // stay queued until the harness takes them in. Such a turn is a retry for them.
             let left = self.queued();
@@ -533,10 +536,18 @@ impl ThreadContext {
         for id in cut {
             self.update_item(&id, json!({"status": "cancelled"}));
         }
+        // Questions are kept open after the turn (some may be already: see cancel_request()), unless
+        // messages are left queued, which a turn carries over or the next message sends: the
+        // conversation has moved on.
         for (id, open) in std::mem::take(&mut self.requests) {
-            if open.late || open.request.turn_id().is_some_and(|t| t != turn.id) {
+            let keep = if open.late {
+                self.queue.is_empty()
+            } else {
+                open.request.turn_id().is_some_and(|t| t != turn.id)
+            };
+            if keep {
                 self.requests.push((id, open));
-            } else if !self.keep_late(&id, &open.request) {
+            } else if open.late || !self.keep_late(&id, &open.request, Some(open.users)) {
                 self.emit_resolved(&id, &cancel());
             }
         }
@@ -739,6 +750,7 @@ impl ThreadContext {
                 return id;
             }
         };
+        let users = self.user_messages();
         self.requests.push((
             id.clone(),
             OpenRequest {
@@ -746,6 +758,7 @@ impl ThreadContext {
                 answered,
                 standing,
                 late: false,
+                users,
             },
         ));
         self.emit(json!({"type": "request.opened", "request": request}));
@@ -767,6 +780,7 @@ impl ThreadContext {
         let Some(request) = open_requests(&self.state).find(|r| r.id() == request_id).cloned() else {
             return Err(answered);
         };
+        let users = self.user_messages();
         self.requests.push((
             request_id.to_string(),
             OpenRequest {
@@ -774,6 +788,7 @@ impl ThreadContext {
                 answered,
                 standing,
                 late: false,
+                users,
             },
         ));
         Ok(())
@@ -807,7 +822,7 @@ impl ThreadContext {
             return;
         };
         let (_, open) = self.requests.remove(at);
-        if !(self.interrupted() && self.keep_late(id, &open.request)) {
+        if !(self.interrupted() && self.keep_late(id, &open.request, Some(open.users))) {
             self.emit_resolved(id, &cancel());
         }
         if !self.waiting() && self.turn.is_some() {
@@ -835,15 +850,22 @@ impl ThreadContext {
     }
 
     /// Keeps a question open after its turn ended, with late_answers, if it can be: not a secret one
-    /// (its answer would be shown, as a message), and not when messages are queued (the
-    /// conversation has moved on). Whether it did.
-    fn keep_late(&mut self, id: &str, request: &ThreadRequest) -> bool {
+    /// (its answer would be shown, as a message), not under dont_ask (which dismisses questions),
+    /// and not when the conversation has moved on: messages are queued, or the user sent one since
+    /// it was opened (when there were `users`). Whether it did.
+    fn keep_late(&mut self, id: &str, request: &ThreadRequest, users: Option<usize>) -> bool {
         let ThreadRequest::Question(q) = request else {
             return false;
         };
-        if !self.host.late_answers || !self.queue.is_empty() || q.questions.iter().any(|q| q.secret) {
+        let moved_on = !self.queue.is_empty() || users.is_some_and(|n| self.user_messages() > n);
+        if !self.host.late_answers
+            || moved_on
+            || q.questions.iter().any(|q| q.secret)
+            || self.state.thread.permission_mode == Some(PermissionMode::DontAsk)
+        {
             return false;
         }
+        let users = self.user_messages();
         self.requests.push((
             id.to_string(),
             OpenRequest {
@@ -851,9 +873,19 @@ impl ThreadContext {
                 answered: late_answered(q.clone()),
                 standing: None,
                 late: true,
+                users,
             },
         ));
         true
+    }
+
+    /// How many messages the user has sent.
+    fn user_messages(&self) -> usize {
+        self.saved
+            .items
+            .iter()
+            .filter(|i| matches!(i, Item::UserMessage(_)))
+            .count()
     }
 
     /// Cancels the questions kept open after their turns.
@@ -887,7 +919,7 @@ impl ThreadContext {
             .collect();
         for r in open {
             let id = r.id().to_string();
-            if !self.keep_late(&id, &r) {
+            if !self.keep_late(&id, &r, None) {
                 self.emit_resolved(&id, &cancel());
             }
         }
@@ -1188,13 +1220,13 @@ impl Actor {
     }
 
     /// Answers the open requests the thread's standing answers or permission mode now answer (see
-    /// ThreadContext::settled), after either changed.
+    /// ThreadContext::settled), after either changed: questions kept open after their turns
+    /// included, which dont_ask dismisses (and which then send nothing).
     pub(crate) fn settle(&mut self) {
         let c = &self.core;
         let settled: Vec<(String, Resolution)> = c
             .requests
             .iter()
-            .filter(|(_, o)| !o.late)
             .filter_map(|(id, o)| {
                 let question = matches!(o.request, ThreadRequest::Question(_));
                 c.settled(question, o.standing.as_ref()).map(|r| (id.clone(), r))
