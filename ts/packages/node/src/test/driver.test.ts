@@ -1007,6 +1007,41 @@ describe("the Claude driver", () => {
     expect(s.items.filter((i) => i.type === "user_message")).toHaveLength(before);
   });
 
+  for (const change of ["rewind", "new_session"] as const) {
+    it(`cancels a question kept open after its turn on ${change}, whose conversation it belonged to`, async () => {
+      const store = new MemoryStore();
+      const { sdk, make } = setup({ store, permissions: "ask", lateAnswers: true });
+      const t = await sdk.create();
+      await sdk.send(t.id, "reply one");
+      await settle(sdk, t.id);
+      await sdk.send(t.id, `asking AskUserQuestion ${QUESTION}`);
+      const q = await openRequest(sdk, t.id, "question");
+      await sdk.interrupt(t.id);
+      let s = await settle(sdk, t.id);
+      expect(openRequests(s).map((r) => r.id)).toEqual([q.id]);
+      if (change === "rewind") await sdk.rewind(t.id, results(s.items)[1]!.turn_id!);
+      else await sdk.newSession(t.id);
+      s = await sdk.snapshot(t.id);
+      expect(openRequests(s)).toEqual([]);
+      expect(await resolutionOf(sdk, t.id, q)).toEqual({ outcome: "cancel" });
+      // Answering it starts nothing, before a restart or after.
+      const before = s.items.filter((i) => i.type === "user_message").length;
+      await sdk.respond(t.id, q.id, { outcome: "answer", answers: { "Colour?": ["Blue"] } });
+      s = await settle(sdk, t.id);
+      expect(s.items.filter((i) => i.type === "user_message")).toHaveLength(before);
+      expect(results(s.items)).toHaveLength(change === "rewind" ? 1 : 2);
+      await sdk.close();
+      open = open.filter((x) => x !== sdk);
+      const again = make(store);
+      s = await again.snapshot(t.id);
+      expect(openRequests(s)).toEqual([]);
+      await again.respond(t.id, q.id, { outcome: "answer", answers: { "Colour?": ["Blue"] } });
+      s = await settle(again, t.id);
+      expect(s.items.filter((i) => i.type === "user_message")).toHaveLength(before);
+      expect(s.thread.status).toBe("idle");
+    });
+  }
+
   /** Asks a question, and interrupts its turn: the harness cancels it, and it's kept open. Doesn't wait for the turn to end. */
   async function interruptedQuestion(sdk: AgentThreads, id: string): Promise<ThreadRequest> {
     await sdk.send(id, `asking AskUserQuestion ${QUESTION}`);

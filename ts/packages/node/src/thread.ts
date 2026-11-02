@@ -519,12 +519,14 @@ export class ThreadRuntime implements ThreadContext {
   /**
    * The harness's session changes (new_session, rewind): what's still going on in the old one
    * stops. Its running subagents (a background one, with no turn) are stopped and its open requests
-   * cancelled, and its process is retired, so that nothing it says after reaches the thread (Claude
+   * cancelled (questions kept open after their turns too: an answer would go to a conversation
+   * that's gone), and its process is retired, so that nothing it says after reaches the thread (Claude
    * would start a turn of its own when a background subagent ended, in the old session).
    */
   #retire(): void {
     this.stopSubagents(this.#saved.items.filter((i) => i.type === "tool_call" && i.subagent?.status === "running").map((i) => i.id));
     for (const id of [...this.#requests.keys()]) this.cancelRequest(id);
+    this.#cancelLate();
     if (!this.turn && this.#state.thread.status === "waiting") this.setThread({ status: "idle" });
     if (this.session?.retire) this.session.retire();
     else this.session?.configChanged();

@@ -186,8 +186,9 @@ or the turn to revert to before. The harness goes back there at the start of the
 new process, and `resume_at` is cleared once it has.
 
 A rewind or `new_session` is the end of what was still going on in the old session: the thread's
-running subagents (a background one goes on after its turn) are `stopped`, its open requests are
-resolved with `cancel`, and its harness process is stopped at once, and nothing it says after
+running subagents (a background one goes on after its turn) are `stopped`, its open requests
+(questions kept open after their turns included: their answers would go to a conversation that's
+gone) are resolved with `cancel`, and its harness process is stopped at once, and nothing it says after
 reaches the thread (Claude Code would otherwise start a turn of its own, in the old session, when
 a background subagent ended).
 

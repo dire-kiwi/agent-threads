@@ -1034,7 +1034,8 @@ func (rt *threadRuntime) newSession() {
 
 // retire stops what's still going on in the harness's old session as it changes (new_session,
 // rewind): its running subagents (a background one, with no turn) are stopped and its open requests
-// cancelled, and its process is retired, so that nothing it says after reaches the thread (Claude
+// cancelled (questions kept open after their turns too: an answer would go to a conversation that's
+// gone), and its process is retired, so that nothing it says after reaches the thread (Claude
 // would start a turn of its own when a background subagent ended, in the old session).
 func (rt *threadRuntime) retire() {
 	var running []string
@@ -1047,6 +1048,7 @@ func (rt *threadRuntime) retire() {
 	for _, id := range append([]string(nil), rt.requestOrder...) {
 		rt.CancelRequest(id)
 	}
+	rt.cancelLate()
 	if rt.turn == nil && rt.state.Thread.Status == protocol.ThreadStatusWaiting {
 		rt.SetThread(func(t *protocol.Thread) { t.Status = protocol.ThreadStatusIdle })
 	}

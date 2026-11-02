@@ -625,3 +625,59 @@ func TestKeepsAQuestionOpenAfterAMessageTakenInBeforeItWasAsked(t *testing.T) {
 	})
 	settledQueue(t, sdk, th.ID)
 }
+
+// A question kept open after its turn belongs to the conversation that asked it: a rewind or a new
+// session cancels it, and answering it then starts nothing, before a restart or after.
+func TestASessionChangeCancelsAQuestionKeptOpenAfterItsTurn(t *testing.T) {
+	for _, change := range []string{"rewind", "new_session"} {
+		t.Run(change, func(t *testing.T) {
+			ctx := context.Background()
+			state := agentthreads.NewMemoryState()
+			sdk := newAsking(t, agentthreads.NewMemoryStoreOn(state), true)
+			th, _ := sdk.Create(ctx, agentthreads.CreateOptions{Cwd: t.TempDir()})
+			send(t, sdk, th.ID, "reply one")
+			settledQueue(t, sdk, th.ID)
+			send(t, sdk, th.ID, "asking AskUserQuestion "+question)
+			q := openRequest(t, sdk, th.ID, "question", "")
+			sdk.Interrupt(ctx, th.ID)
+			s := settledQueue(t, sdk, th.ID)
+			if len(protocol.OpenRequests(s)) != 1 {
+				t.Fatalf("got %s", jsonOf(s))
+			}
+			var err error
+			if change == "rewind" {
+				err = sdk.Rewind(ctx, th.ID, turnResults(s.Items)[1].TurnID)
+			} else {
+				err = sdk.NewSession(ctx, th.ID)
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			s, _ = sdk.Snapshot(ctx, th.ID)
+			if len(protocol.OpenRequests(s)) != 0 {
+				t.Fatalf("still open: %s", jsonOf(s))
+			}
+			rs := resolutions(t, sdk, th.ID)
+			if last := rs[len(rs)-1]; last.RequestID != q.ID() || last.Resolution.Outcome != protocol.ResolutionOutcomeCancel {
+				t.Fatalf("got %s", jsonOf(last))
+			}
+			answer := `{"type":"respond","thread_id":"` + th.ID + `","request_id":"` + q.ID() + `","resolution":{"outcome":"answer","answers":{"Colour?":["Blue"]}}}`
+			messages := len(userTexts(s))
+			sdk.HandleJSON(ctx, []byte(answer))
+			if s := settledQueue(t, sdk, th.ID); len(userTexts(s)) != messages {
+				t.Fatalf("an answer started a turn: %s", jsonOf(s))
+			}
+			if err := sdk.Close(ctx); err != nil {
+				t.Fatal(err)
+			}
+			sdk = newAsking(t, agentthreads.NewMemoryStoreOn(state), true)
+			if s, _ := sdk.Snapshot(ctx, th.ID); len(protocol.OpenRequests(s)) != 0 {
+				t.Fatalf("open after a restart: %s", jsonOf(s))
+			}
+			sdk.HandleJSON(ctx, []byte(answer))
+			if s := settledQueue(t, sdk, th.ID); len(userTexts(s)) != messages {
+				t.Fatalf("an answer after a restart started a turn: %s", jsonOf(s))
+			}
+		})
+	}
+}

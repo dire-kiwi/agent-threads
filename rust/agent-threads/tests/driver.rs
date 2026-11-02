@@ -3058,3 +3058,66 @@ async fn starts_claude_under_the_shim_with_the_threads_launch_options() {
     assert_eq!(run.env, json!({"AT_SET": "x y"}));
     env.sdk.close(true).await.unwrap();
 }
+
+/// A question kept open after its turn belongs to the conversation that asked it: a rewind or a new
+/// session cancels it, and answering it then starts nothing, before a restart or after.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_session_change_cancels_a_question_kept_open_after_its_turn() {
+    for change in ["rewind", "new_session"] {
+        let state = MemoryState::new();
+        let late = || Setup {
+            store: Some(Arc::new(MemoryStore::with_state(state.clone()))),
+            late_answers: true,
+            ..asking(PermissionPolicy::ask())
+        };
+        let mut env = setup(late());
+        let t = env.sdk.create(create()).await.unwrap();
+        env.sdk.send(&t.id, "reply one", SendOptions::default()).await.unwrap();
+        settle(&env.sdk, &t.id).await;
+        env.sdk
+            .send(
+                &t.id,
+                &format!("asking AskUserQuestion {QUESTION}"),
+                SendOptions::default(),
+            )
+            .await
+            .unwrap();
+        let q = open_request(&env.sdk, &t.id, "question", None).await;
+        env.sdk.interrupt(&t.id).await.unwrap();
+        let s = settle(&env.sdk, &t.id).await;
+        assert_eq!(open(&s).len(), 1, "{change}");
+        if change == "rewind" {
+            let turn = results(&s)[1]["turn_id"].as_str().unwrap().to_string();
+            env.sdk.rewind(&t.id, &turn).await.unwrap();
+        } else {
+            env.sdk.new_session(&t.id).await.unwrap();
+        }
+        let s = serde_json::to_value(env.sdk.snapshot(&t.id).await.unwrap()).unwrap();
+        assert!(open(&s).is_empty(), "{change}: {s}");
+        let last = env
+            .events_json()
+            .into_iter()
+            .rfind(|e| e["type"] == "request.resolved")
+            .unwrap();
+        assert_eq!(
+            (last["request_id"].clone(), last["resolution"]["outcome"].clone()),
+            (q["id"].clone(), json!("cancel")),
+            "{change}"
+        );
+        let respond = json!({"type": "respond", "thread_id": t.id, "request_id": q["id"],
+            "resolution": {"outcome": "answer", "answers": {"Colour?": ["Blue"]}}});
+        let before = items(&s, "user_message").len();
+        let _ = env.sdk.handle_json(respond.clone()).await;
+        let s = settle(&env.sdk, &t.id).await;
+        assert_eq!(items(&s, "user_message").len(), before, "{change}: {s}");
+        env.sdk.close(false).await.unwrap();
+
+        let env = setup(late());
+        let s = serde_json::to_value(env.sdk.snapshot(&t.id).await.unwrap()).unwrap();
+        assert!(open(&s).is_empty(), "{change} after a restart: {s}");
+        let _ = env.sdk.handle_json(respond).await;
+        let s = settle(&env.sdk, &t.id).await;
+        assert_eq!(items(&s, "user_message").len(), before, "{change} after a restart: {s}");
+        env.sdk.close(false).await.unwrap();
+    }
+}

@@ -1613,8 +1613,9 @@ impl Actor {
 
     /// The harness's session changes (new_session, rewind): what's still going on in the old one
     /// stops. Its running subagents (a background one, with no turn) are stopped and its open
-    /// requests cancelled, and its process is retired, so that nothing it says after reaches the
-    /// thread (Claude would start a turn of its own when a background subagent ended, in the old
+    /// requests cancelled (questions kept open after their turns too: an answer would go to a
+    /// conversation that's gone), and its process is retired, so that nothing it says after reaches
+    /// the thread (Claude would start a turn of its own when a background subagent ended, in the old
     /// session).
     fn retire(&mut self) {
         let c = &mut self.core;
@@ -1633,6 +1634,7 @@ impl Actor {
         for id in c.open_request_ids() {
             c.cancel_request(&id);
         }
+        c.cancel_late();
         if c.turn.is_none() && c.state.thread.status == crate::protocol::ThreadStatus::Waiting {
             c.set_thread(|t| t.status = crate::protocol::ThreadStatus::Idle);
         }
