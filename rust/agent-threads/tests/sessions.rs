@@ -17,6 +17,8 @@ use tokio::sync::broadcast;
 
 type Point = fn(&[Option<TurnSession>], usize) -> Result<RewindPoint, RewindError>;
 type Poster = Box<dyn Fn(SessionJob<Fake>) -> bool + Send + Sync>;
+/// A backend, what its harness was asked to do, and how to post to its thread's session.
+type Backend = (AgentThreads, Arc<Mutex<Counts>>, Arc<Mutex<Option<Poster>>>);
 
 /// What the fake harness was asked to do.
 #[derive(Default)]
@@ -89,6 +91,11 @@ struct Env {
 }
 
 async fn setup(point: Point, session_id: Option<&str>) -> Env {
+    setup_in(point, session_id, Arc::new(MemoryStore::new())).await
+}
+
+/// A backend with the fake harness on `store`.
+fn backend(point: Point, store: Arc<MemoryStore>) -> Backend {
     let counts = Arc::<Mutex<Counts>>::default();
     let poster = Arc::<Mutex<Option<Poster>>>::default();
     let harness = FakeHarness {
@@ -97,7 +104,7 @@ async fn setup(point: Point, session_id: Option<&str>) -> Env {
         poster: poster.clone(),
     };
     let sdk = AgentThreads::new(Options {
-        store: Some(Arc::new(MemoryStore::new())),
+        store: Some(store),
         harnesses: vec![Arc::new(harness)],
         capabilities: agent_threads::Capabilities {
             permissions: Some(PermissionPolicy::allow()),
@@ -105,6 +112,11 @@ async fn setup(point: Point, session_id: Option<&str>) -> Env {
         },
         ..Default::default()
     });
+    (sdk, counts, poster)
+}
+
+async fn setup_in(point: Point, session_id: Option<&str>, store: Arc<MemoryStore>) -> Env {
+    let (sdk, counts, poster) = backend(point, store);
     let rx = sdk.subscribe();
     let thread = sdk
         .create(CreateOptions {
@@ -361,6 +373,26 @@ async fn rewind_reverts_a_codex_session_to_before_the_first_turn_from_there_that
 }
 
 #[tokio::test]
+async fn rewind_keeps_a_codex_revert_not_yet_made_when_a_second_rewind_to_before_turns_with_no_mark_needs_it() {
+    let env = setup(|s, i| Ok(revert_point(s, i)), None).await;
+    env.turn("one", Some("S"), Some("c1")).await;
+    env.turn("two", None, None).await; // failed before Codex marked it
+    env.turn("three", None, Some("c3")).await;
+    let ids = turn_ids(&env.snap().await);
+    env.sdk.rewind(&env.id, &ids[2]).await.unwrap();
+    let t = env.snap().await["thread"].clone();
+    assert_eq!((&t["session_id"], &t["resume_at"]), (&json!("S"), &json!("c3")));
+    // Codex still has turn three: reverting to before it is what takes it back to before turn two.
+    env.sdk.rewind(&env.id, &ids[1]).await.unwrap();
+    let s = env.snap().await;
+    assert_eq!(
+        (&s["thread"]["session_id"], &s["thread"]["resume_at"]),
+        (&json!("S"), &json!("c3"))
+    );
+    assert_eq!(turn_ids(&s).len(), 1);
+}
+
+#[tokio::test]
 async fn rewind_is_refused_while_a_turn_runs_and_for_a_turn_the_thread_hasnt() {
     let env = setup(resume_at_point, None).await;
     env.turn("one", Some("S1"), Some("m1")).await;
@@ -465,4 +497,62 @@ fn the_rewind_points_revert_to_before_the_first_mark_from_the_turn_on_in_its_ses
         point(Some("A"), None)
     );
     assert_eq!(revert_point(&[a(Some("a1"), true)], 0), point(None, None));
+}
+
+// ---------- a turn the backend lost ----------
+
+/// A thread on `store`, made with `session_id`.
+async fn to_lose(session_id: Option<&str>) -> (Env, Arc<MemoryStore>) {
+    let store = Arc::new(MemoryStore::new());
+    (setup_in(resume_at_point, session_id, store.clone()).await, store)
+}
+
+/// Sends a turn that the harness says runs in `session`, then the backend goes (without closing)
+/// and another loads the thread: that backend, and the thread as it has it.
+async fn lose(env: Env, store: Arc<MemoryStore>, session: &str) -> (AgentThreads, Value) {
+    env.sdk
+        .send(&env.id, "the lost one", SendOptions::default())
+        .await
+        .unwrap();
+    let session = session.to_string();
+    env.harness(move |ctx| ctx.set_thread(|t| t.session_id = Some(session)));
+    env.sdk.events_since(&env.id, 0, None).await.unwrap();
+    let (next, _, _) = backend(resume_at_point, store);
+    let s = serde_json::to_value(next.snapshot(&env.id).await.unwrap()).unwrap();
+    (next, s)
+}
+
+#[tokio::test]
+async fn a_turn_the_backend_lost_records_that_it_started_the_session_it_got() {
+    let (env, store) = to_lose(None).await;
+    let id = env.id.clone();
+    let (next, s) = lose(env, store, "S-new").await;
+    assert_eq!(sessions(&s), vec![json!({"id": "S-new", "started": true})]);
+    next.rewind(&id, &turn_ids(&s)[0]).await.unwrap();
+    let s = serde_json::to_value(next.snapshot(&id).await.unwrap()).unwrap();
+    assert!(s["thread"].get("session_id").is_none());
+}
+
+#[tokio::test]
+async fn a_turn_the_backend_lost_records_that_it_started_the_one_it_got_after_a_new_session() {
+    let (env, store) = to_lose(None).await;
+    env.turn("one", Some("S-old"), Some("m1")).await;
+    env.sdk.new_session(&env.id).await.unwrap();
+    let (_, s) = lose(env, store, "S-new").await;
+    assert_eq!(
+        sessions(&s),
+        vec![
+            json!({"id": "S-old", "at": "m1", "started": true}),
+            json!({"id": "S-new", "started": true})
+        ]
+    );
+}
+
+#[tokio::test]
+async fn a_turn_the_backend_lost_records_that_it_continued_a_session_the_thread_adopted() {
+    let (env, store) = to_lose(Some("S0")).await;
+    let id = env.id.clone();
+    let (next, s) = lose(env, store, "S0").await;
+    assert_eq!(sessions(&s), vec![json!({"id": "S0"})]);
+    refused(next.rewind(&id, &turn_ids(&s)[0]).await, "can't be rewound");
 }

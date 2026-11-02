@@ -1111,10 +1111,19 @@ impl Actor {
             .map(|(_, it)| it.id().to_string())
             .collect();
         c.queue.retain(|id| !gone.contains(id));
+        // A rewind not yet made (resume_at) went back to before a later turn of the same session:
+        // with no mark of its own to go to, this one still needs that one made, as the turns since
+        // added nothing to the session but the ones it took back are still in it.
+        let t = &c.state.thread;
+        let resume_at = point.resume_at.or_else(|| {
+            (point.session_id.is_some() && point.session_id == t.session_id)
+                .then(|| t.resume_at.clone())
+                .flatten()
+        });
         c.emit(json!({"type": "items.removed", "item_ids": gone}));
         c.set_thread(|t| {
             t.session_id = point.session_id;
-            t.resume_at = point.resume_at;
+            t.resume_at = resume_at;
         });
         c.add_item(
             json!({"id": new_id("n"), "type": "notice", "level": "info", "code": "rewind", "text": REWIND_TEXT}),

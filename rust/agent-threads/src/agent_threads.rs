@@ -1130,24 +1130,33 @@ impl AgentThreads {
             .await?
             .and_then(|s| serde_json::from_value(s).ok());
         let mut state = snap.unwrap_or_else(|| initial_state(thread.clone()));
-        for e in store.read_events(thread_id, state.seq, None).await? {
-            match serde_json::from_value::<ThreadEvent>(e.clone()) {
-                Ok(e) => apply_event(&mut state, &e),
-                // A newer backend's event: counted, and nothing else.
-                Err(_) => state.seq = e["seq"].as_u64().unwrap_or(state.seq).max(state.seq),
-            }
-        }
+        let events = store.read_events(thread_id, state.seq, None).await?;
+        let mut started = fold_events(&mut state, events);
         if state.seq == 0 {
-            state = initial_state(thread);
+            state = initial_state(thread.clone());
         }
+        // The session the running turn (if one is) started in, which a turn rebuilt here starts
+        // with: from the events since the snapshot, or else from all the thread's.
+        let running = matches!(state.thread.status, ThreadStatus::Running | ThreadStatus::Waiting);
+        let mut started_in = None;
+        if running && let Some(turn) = last_turn(&state) {
+            started_in = match started.remove(&turn) {
+                Some(s) => Some(s),
+                None => {
+                    let events = store.read_events(thread_id, 0, None).await?;
+                    fold_events(&mut initial_state(thread), events).remove(&turn)
+                }
+            };
+        }
+        let started_in = started_in.unwrap_or_else(|| state.thread.session_id.clone());
         let (handle, mut actor, rx) = self.actor(state)?;
-        if !self.reattach(&mut actor).await? {
+        if !self.reattach(&mut actor, started_in.clone()).await? {
             // The process that ran its turn went with the backend before this one, or can't be
             // followed.
             let t = actor.core.thread();
-            if matches!(t.status, ThreadStatus::Running | ThreadStatus::Waiting) || t.run.is_some() {
+            if running || t.run.is_some() {
                 actor.core.lost_run = t.run.as_ref().map(|r| r.id.clone());
-                recover_lost(&mut actor.core);
+                recover_lost(&mut actor.core, started_in);
             }
         }
         self.run(&handle, actor, rx);
@@ -1157,8 +1166,8 @@ impl AgentThreads {
     /// Re-attaches a thread just loaded to its run, if it has one that outlived the backend
     /// before: its turn and open requests are as they were when the run was last saved, and the
     /// session carries on reading the run from there. Whether it did; if it couldn't, the run is
-    /// stopped.
-    async fn reattach(&self, actor: &mut Actor) -> Result<bool> {
+    /// stopped. `started_in` is the session its running turn started in.
+    async fn reattach(&self, actor: &mut Actor, started_in: Option<String>) -> Result<bool> {
         let Some(run) = actor.core.thread().run.clone() else {
             return Ok(false);
         };
@@ -1182,11 +1191,10 @@ impl AgentThreads {
             ThreadStatus::Running | ThreadStatus::Waiting
         ) {
             let last = last_turn(actor.core.snapshot());
-            let session = actor.core.thread().session_id.clone();
             actor.core.turn = Some(saved_turn.unwrap_or_else(|| Turn {
                 id: last.unwrap_or_else(|| new_id("turn")),
                 interrupted: false,
-                session,
+                session: started_in,
                 carried: 0,
                 progressed: false,
             }));
@@ -1303,15 +1311,35 @@ fn idle(a: &Actor, what: &str) -> Result<()> {
     Ok(())
 }
 
-/// Ends a turn whose process was lost when the backend stopped.
-fn recover_lost(c: &mut ThreadContext) {
+/// Folds a thread's stored events onto `state`. What the thread's session_id was when each turn
+/// whose turn.started is among them started (the last time, for one started more than once). (A
+/// session the turn starts is set after its turn.started.)
+fn fold_events(state: &mut Snapshot, events: Vec<Value>) -> HashMap<String, Option<String>> {
+    let mut started = HashMap::new();
+    for e in events {
+        match serde_json::from_value::<ThreadEvent>(e.clone()) {
+            Ok(e) => {
+                if let ThreadEvent::TurnStarted(t) = &e {
+                    started.insert(t.turn_id.clone(), state.thread.session_id.clone());
+                }
+                apply_event(state, &e);
+            }
+            // A newer backend's event: counted, and nothing else.
+            Err(_) => state.seq = e["seq"].as_u64().unwrap_or(state.seq).max(state.seq),
+        }
+    }
+    started
+}
+
+/// Ends a turn whose process was lost when the backend stopped. `started_in` is the session it
+/// started in.
+fn recover_lost(c: &mut ThreadContext, started_in: Option<String>) {
     if matches!(c.thread().status, ThreadStatus::Running | ThreadStatus::Waiting) {
         let id = last_turn(c.snapshot()).unwrap_or_else(|| new_id("turn"));
-        // Its session as it is now, which is as it was when it started unless the turn started it.
         c.turn = Some(Turn {
             id,
             interrupted: false,
-            session: c.thread().session_id.clone(),
+            session: started_in,
             carried: 0,
             progressed: false,
         });

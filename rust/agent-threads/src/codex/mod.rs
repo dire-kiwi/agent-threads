@@ -28,20 +28,19 @@ use crate::harness::{BoxFuture, Harness, HarnessSession, Message, RunCheckpoint,
 use crate::ids::{new_id, now_iso, now_ms, private_temp_dir};
 use crate::mcp_http::{LoopbackMcp, ToolServer, serve_tools};
 use crate::permissions::{Decided, PermissionDecision, PermissionQuery, permission_key};
-use crate::protocol::{DeltaEventKind, Item, Resolution, ResolutionOutcome, ToolKind, ToolStatus, TurnSession};
+use crate::protocol::{DeltaEventKind, Item, Resolution, ResolutionOutcome, ToolKind, ToolStatus, TurnSession, Usage};
 use crate::sessions::{RewindError, RewindPoint, revert_point};
 use crate::skills::write_skills;
 use crate::spawner::{ExitStatus, HarnessProcess, ProcessEvent, Signal, SpawnOptions};
 use crate::store::RunRecord;
-use crate::thread::{SECRET, SessionJob, ThreadContext, Timer};
+use crate::thread::{SECRET, SessionJob, ThreadContext, Timer, add_usage};
 use crate::tools::{Cancellation, Tool, ToolContext, ToolOutput, run_tool};
 use home::{
-    SessionState, Totals, default_codex_home, prepare_codex_home, read_session_state, user_codex_home,
-    write_session_state,
+    SessionState, default_codex_home, prepare_codex_home, read_session_state, user_codex_home, write_session_state,
 };
 use translate::{
-    APP_SERVER, codex_done, codex_policy, codex_tool, codex_usage, is_tool_item, mcp_server_config, questions, todos,
-    totals_as_usage,
+    APP_SERVER, call_usage, codex_done, codex_policy, codex_tool, is_tool_item, mcp_server_config, no_usage, questions,
+    todos,
 };
 
 /// How the app's tools reach Codex.
@@ -216,12 +215,14 @@ struct RunState {
     turn_id: Option<String>,
     starting: bool,
     compacting: bool,
-    total: Option<Totals>,
+    #[serde(default)]
+    reported: bool,
+    #[serde(default)]
+    used: Option<Usage>,
     error: Option<String>,
     home: String,
     dynamic: Option<Vec<Value>>,
     mcp_app: bool,
-    baseline: Option<Totals>,
     hidden_skills: Vec<String>,
     noticed_servers: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -277,8 +278,12 @@ struct Run {
     turn_waiters: Vec<TurnFn>,
     /// The running turn is a compaction.
     compacting: bool,
-    /// The thread's token totals, as Codex last reported them in this run.
-    total: Option<Totals>,
+    /// Codex has reported the thread's tokens in this run (so its turns' usage is known).
+    reported: bool,
+    /// What the running turn has used: each model call's tokens (tokenUsage.last), summed from its
+    /// turn/started on. Codex's running totals aren't used: for a session the thread adopted they
+    /// include what came before, and a revert doesn't take them back.
+    used: Option<Usage>,
     /// The running turn's last error that won't be retried.
     error: Option<String>,
     /// The CODEX_HOME it runs with.
@@ -288,8 +293,6 @@ struct Run {
     dynamic: Option<Vec<Value>>,
     /// Some of the app's tools are on the loopback MCP server.
     mcp_app: bool,
-    /// Codex's token totals for the session after its last turn, when they're known.
-    baseline: Option<Totals>,
     /// Skills Codex found that aren't the app's (the user's, the project's): they're turned off.
     hidden_skills: Vec<String>,
     noticed_servers: bool,
@@ -330,12 +333,12 @@ impl Run {
             starting: false,
             turn_waiters: Vec::new(),
             compacting: false,
-            total: None,
+            reported: false,
+            used: None,
             error: None,
             home: String::new(),
             dynamic: None,
             mcp_app: false,
-            baseline: None,
             hidden_skills: Vec::new(),
             noticed_servers: false,
             mcp: None,
@@ -411,12 +414,12 @@ impl Run {
             turn_id: self.turn_id.clone(),
             starting: self.starting,
             compacting: self.compacting,
-            total: self.total.clone(),
+            reported: self.reported,
+            used: self.used.clone(),
             error: self.error.clone(),
             home: self.home.clone(),
             dynamic: self.dynamic.clone(),
             mcp_app: self.mcp_app,
-            baseline: self.baseline.clone(),
             hidden_skills: self.hidden_skills.clone(),
             noticed_servers: self.noticed_servers,
             skills_dir: self.skills_dir.as_ref().map(|d| d.to_string_lossy().into()),
@@ -455,12 +458,12 @@ impl Run {
         self.turn_id = st.turn_id.clone();
         self.starting = st.starting;
         self.compacting = st.compacting;
-        self.total = st.total.clone();
+        self.reported = st.reported;
+        self.used = st.used.clone();
         self.error = st.error.clone();
         self.home = st.home.clone();
         self.dynamic = st.dynamic.clone();
         self.mcp_app = st.mcp_app;
-        self.baseline = st.baseline.clone();
         self.hidden_skills = st.hidden_skills.clone();
         self.noticed_servers = st.noticed_servers;
         self.skills_dir = st.skills_dir.as_ref().map(PathBuf::from);
@@ -1103,8 +1106,7 @@ impl CodexSession {
         let r = self.run(run).unwrap();
         // Codex keeps the dynamic tools the session started with, and resuming can't change them.
         let state = read_session_state(Path::new(&r.home), &session);
-        r.dynamic = state.as_ref().map(|s| s.dynamic_tools.clone());
-        r.baseline = state.and_then(|s| s.totals);
+        r.dynamic = state.map(|s| s.dynamic_tools);
         let mut params = match self.thread_params(ctx, run, false) {
             Ok(p) => p,
             Err(e) => return self.start_failed(ctx, run, e),
@@ -1211,12 +1213,9 @@ impl CodexSession {
     }
 
     fn new_thread_started(&mut self, ctx: &mut ThreadContext, run: &str, r: &Value) {
-        let Some(rs) = self.run(run) else { return };
-        // A new session's totals start at nothing.
-        rs.baseline = Some(Totals {
-            cache_write_input_tokens: Some(0),
-            ..Default::default()
-        });
+        if !self.runs.contains_key(run) {
+            return;
+        }
         if let Some(t) = r["thread"]["id"].as_str() {
             self.save_state(ctx, run, t);
         }
@@ -1260,13 +1259,12 @@ impl CodexSession {
         self.set_ready(ctx, run, Err(error));
     }
 
-    /// Records the session's dynamic tools and totals, where they're known.
+    /// Records the session's dynamic tools, where they're known.
     fn save_state(&self, ctx: &ThreadContext, run: &str, session: &str) {
         let Some(r) = self.runs.get(run) else { return };
         let Some(dynamic) = &r.dynamic else { return };
         let state = SessionState {
             dynamic_tools: dynamic.clone(),
-            totals: r.baseline.clone(),
         };
         if let Err(e) = write_session_state(Path::new(&r.home), session, &state) {
             ctx.error(Error::Other(format!("Codex's session state couldn't be saved: {e}")));
@@ -1570,6 +1568,7 @@ impl CodexSession {
                     let r = self.run(run).unwrap();
                     r.starting = true;
                     r.error = None;
+                    r.used = Some(no_usage());
                     self.set_turn(ctx, run, t.to_string());
                 }
             }
@@ -1587,11 +1586,13 @@ impl CodexSession {
                 }
             }
             "thread/tokenUsage/updated" => {
-                if own
-                    && !p["tokenUsage"]["total"].is_null()
-                    && let Ok(t) = serde_json::from_value(p["tokenUsage"]["total"].clone())
-                {
-                    self.run(run).unwrap().total = Some(t);
+                if own && p["tokenUsage"].is_object() {
+                    let r = self.run(run).unwrap();
+                    r.reported = true;
+                    // A report outside a turn (a resumed session's totals, say) isn't any turn's.
+                    if r.used.is_some() && p["tokenUsage"]["last"].is_object() {
+                        r.used = add_usage(r.used.as_ref(), Some(&call_usage(&p["tokenUsage"]["last"])));
+                    }
                 }
             }
             "warning" => {
@@ -1872,21 +1873,8 @@ impl CodexSession {
         r.error = None;
         // The turn's requests are moot now; its open ones are cancelled with it.
         r.open.clear();
-        // Codex reports the session's totals: the turn used how far they grew. (Where the
-        // session's totals before it aren't known, the thread's usage stands in for them.)
-        let usage = r.total.as_ref().map(|total| {
-            let before = match &r.baseline {
-                Some(b) => totals_as_usage(b),
-                None => serde_json::to_value(&ctx.thread().usage).unwrap_or_default(),
-            };
-            codex_usage(total, &before)
-        });
-        if let Some(total) = r.total.clone() {
-            r.baseline = Some(total);
-            if let Some(t) = r.thread_id.clone() {
-                self.save_state(ctx, run, &t);
-            }
-        }
+        let used = r.used.take();
+        let usage = r.reported.then(|| used.unwrap_or_else(no_usage));
         if ctx.turn_id().is_none() {
             return;
         }
@@ -1901,7 +1889,7 @@ impl CodexSession {
                     .or(error)
                     .unwrap_or_else(|| "The turn failed.".into())
             }),
-            usage: usage.and_then(|u| serde_json::from_value(u).ok()),
+            usage,
             duration_ms: turn["durationMs"].as_f64().map(|d| d as u64),
             session_at: at,
         };

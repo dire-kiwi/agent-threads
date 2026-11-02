@@ -56,28 +56,12 @@ pub(crate) fn prepare_codex_home(home: &Path, login: Option<&Path>) -> io::Resul
     Ok(dir)
 }
 
-/// Codex's token totals for a session.
-#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub(crate) struct Totals {
-    #[serde(default)]
-    pub input_tokens: u64,
-    #[serde(default)]
-    pub cached_input_tokens: u64,
-    #[serde(default)]
-    pub output_tokens: u64,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub cache_write_input_tokens: Option<u64>,
-}
-
 /// What the driver keeps about a Codex session, next to Codex's own record of it.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct SessionState {
     /// The dynamic tools the session was started with, which Codex keeps for it.
     pub dynamic_tools: Vec<Value>,
-    /// Codex's token totals for the session after its last turn.
-    pub totals: Option<Totals>,
 }
 
 fn state_path(home: &Path, session: &str) -> PathBuf {
