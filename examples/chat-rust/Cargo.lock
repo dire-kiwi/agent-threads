@@ -164,6 +164,7 @@ dependencies = [
  "agent-threads",
  "axum",
  "futures-util",
+ "libc",
  "serde_json",
  "tempfile",
  "tokio",
