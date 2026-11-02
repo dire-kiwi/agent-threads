@@ -1005,9 +1005,7 @@ func (rt *threadRuntime) endSubagents(ends map[string]protocol.SubagentState, or
 		rt.dropRequest(id)
 		rt.emit(&protocol.RequestResolvedEvent{RequestID: id, Resolution: protocol.Resolution{Outcome: protocol.ResolutionOutcomeCancel}})
 	}
-	if len(rt.requests) == 0 && rt.turn == nil && rt.state.Thread.Status == protocol.ThreadStatusWaiting {
-		rt.SetThread(func(t *protocol.Thread) { t.Status = protocol.ThreadStatusIdle })
-	}
+	rt.requestsDone()
 }
 
 // ancestors is the calls of the subagents an item is inside, innermost first.

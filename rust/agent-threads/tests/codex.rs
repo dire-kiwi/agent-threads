@@ -940,6 +940,41 @@ async fn cancels_what_a_child_thread_left_unfinished_when_it_ends_after_its_pare
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn sets_the_thread_running_again_when_a_child_thread_ends_during_its_parents_turn() {
+    for end in ["endchild interrupted", "closechild"] {
+        let env = setup(shell_asks(), plain(), &[]);
+        let t = env.sdk.create(create()).await.unwrap();
+        env.sdk
+            .send(
+                &t.id,
+                &format!("bg sleep 60\nsleep 200\n{end}\nsleep 1500"),
+                SendOptions::default(),
+            )
+            .await
+            .unwrap();
+        until(5, || async {
+            let s = serde_json::to_value(env.sdk.snapshot(&t.id).await.unwrap()).unwrap();
+            (s["requests"].as_array().unwrap().len() == 1 && s["thread"]["status"] == "waiting").then_some(())
+        })
+        .await;
+        let s = until(5, || async {
+            let s = serde_json::to_value(env.sdk.snapshot(&t.id).await.unwrap()).unwrap();
+            (calls(&s)[0]["subagent"]["status"] == "stopped").then_some(s)
+        })
+        .await;
+        assert!(results(&s).is_empty(), "{end}");
+        assert_eq!(s["requests"], json!([]), "{end}");
+        assert_eq!(s["thread"]["status"], "running", "{end}");
+        env.sdk.interrupt(&t.id).await.unwrap();
+        until(5, || async {
+            let s = serde_json::to_value(env.sdk.snapshot(&t.id).await.unwrap()).unwrap();
+            (s["thread"]["status"] == "idle").then_some(())
+        })
+        .await;
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn doesnt_take_a_child_threads_earlier_report_for_a_follow_up_that_ends_without_one() {
     let env = setup(Capabilities::default(), plain(), &[]);
     let t = env.sdk.create(create()).await.unwrap();

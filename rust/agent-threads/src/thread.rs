@@ -781,12 +781,7 @@ impl ThreadContext {
             let (id, _) = self.requests.remove(i);
             self.emit_resolved(&id, &cancel());
         }
-        if self.requests.is_empty()
-            && self.turn.is_none()
-            && self.state.thread.status == crate::protocol::ThreadStatus::Waiting
-        {
-            self.set_thread(|t| t.status = crate::protocol::ThreadStatus::Idle);
-        }
+        self.requests_done();
     }
 
     /// Sets the thread running again once it has no open requests, or idle if no turn is running

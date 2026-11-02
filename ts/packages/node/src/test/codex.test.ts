@@ -443,6 +443,27 @@ describe("the Codex driver", () => {
     ["its turn is interrupted", "endchild interrupted"],
     ["it's closed", "closechild"],
   ]) {
+    it(`sets the thread running again when ${how} while its parent's turn goes on`, async () => {
+      const { sdk, events } = setup({ permissions: (q) => (q.kind === "shell" ? "ask" : "allow") });
+      const t = await sdk.create({ harness: "codex", cwd: tempDir() });
+      await sdk.send(t.id, `bg sleep 60\nsleep 200\n${end}\nsleep 1500`);
+      const r = await request(sdk, t.id);
+      expect((await sdk.snapshot(t.id)).thread.status).toBe("waiting");
+      await until(() => events.some((e) => e.type === "request.resolved" && e.request_id === r.id));
+      const s = await sdk.snapshot(t.id);
+      expect(events.some((e) => e.type === "turn.completed")).toBe(false);
+      expect(calls(s.items)[0]!.subagent).toMatchObject({ status: "stopped" });
+      expect(s.requests).toEqual([]);
+      expect(s.thread.status).toBe("running");
+      await sdk.interrupt(t.id);
+      expect((await settle(sdk, t.id)).thread.status).toBe("idle");
+    });
+  }
+
+  for (const [how, end] of [
+    ["its turn is interrupted", "endchild interrupted"],
+    ["it's closed", "closechild"],
+  ]) {
     for (const late of [false, true]) {
       it(`cancels a child thread's approval that's about none of its calls, asked ${late ? "after" : "during"} its parent's turn, when ${how} after it`, async () => {
         const { sdk, events } = setup({ permissions: "ask" });

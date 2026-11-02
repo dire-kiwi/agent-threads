@@ -449,6 +449,41 @@ func TestACodexChildThreadThatEndsLeavesNothingRunning(t *testing.T) {
 	}
 }
 
+// A child that ends while its parent's turn goes on takes its requests with it, and the thread is
+// running again.
+func TestACodexChildThatEndsDuringItsParentsTurnLeavesItRunning(t *testing.T) {
+	ctx := context.Background()
+	shell := agentthreads.PolicyFunc(func(_ context.Context, q agentthreads.PermissionQuery, _ agentthreads.PermissionContext) agentthreads.Decision {
+		if q.Kind == protocol.ToolKindShell {
+			return agentthreads.Ask
+		}
+		return agentthreads.Allow
+	})
+	for _, end := range []string{"endchild interrupted", "closechild"} {
+		t.Run(end, func(t *testing.T) {
+			sdk, rec := miniCodex(t, shell)
+			th, _ := sdk.Create(ctx, agentthreads.CreateOptions{Harness: "codex", Cwd: t.TempDir()})
+			sdk.Send(ctx, th.ID, "bg sleep 60\nsleep 200\n"+end+"\nsleep 1500", agentthreads.SendOptions{})
+			at := rec.waitFor(0, []byte(`{"type":"request.opened"}`), waitFor)
+			if at < 0 {
+				t.Fatal("no request")
+			}
+			if rec.waitFor(at+1, []byte(`{"type":"request.resolved"}`), waitFor) < 0 {
+				t.Fatal("the request wasn't resolved")
+			}
+			snap, _ := sdk.Snapshot(ctx, th.ID)
+			if rec.waitFor(0, []byte(`{"type":"turn.completed"}`), time.Millisecond) >= 0 || snap.Thread.Status != protocol.ThreadStatusRunning || len(snap.Requests) != 0 || toolCalls(snap)[0].Subagent.Status != protocol.SubagentStatusStopped {
+				t.Fatalf("once the child ended:\n%s", show(rec.all()))
+			}
+			sdk.Interrupt(ctx, th.ID)
+			until(t, func() bool {
+				snap, _ = sdk.Snapshot(ctx, th.ID)
+				return snap.Thread.Status == protocol.ThreadStatusIdle
+			})
+		})
+	}
+}
+
 // A child's follow-up turn that ends without a report doesn't report the turn before it.
 func TestACodexChildsFollowUpWithNoReportHasNone(t *testing.T) {
 	ctx := context.Background()

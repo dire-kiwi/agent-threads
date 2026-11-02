@@ -561,7 +561,7 @@ export class ThreadRuntime implements ThreadContext {
       this.#requests.delete(id);
       this.emit({ type: "request.resolved", request_id: id, resolution: { outcome: "cancel" } });
     }
-    if (!this.#requests.size && !this.turn && this.#state.thread.status === "waiting") this.setThread({ status: "idle" });
+    if (!this.#requests.size && (this.turn || this.#state.thread.status === "waiting")) this.setThread({ status: this.turn ? "running" : "idle" });
   }
 
   #undelivered(n: number): void {

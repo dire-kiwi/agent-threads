@@ -320,7 +320,7 @@ class Draft {
       r.resolved = true;
       this.emit({ type: "request.resolved", request_id: r.id, resolution: { outcome: "cancel" } });
     }
-    if (!this.turn && this.thread.status === "waiting" && ![...this.requests.values()].some((r) => !r.resolved)) this.setThread({ status: "idle" });
+    if (this.thread.status === "waiting" && ![...this.requests.values()].some((r) => !r.resolved)) this.setThread({ status: this.turn ? "running" : "idle" });
   }
 
   endTurn({ ok, error, usage, duration_ms }) {
