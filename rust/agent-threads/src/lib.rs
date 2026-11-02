@@ -38,7 +38,7 @@ pub use agent_threads::{
 pub use claude::{ClaudeCodeOptions, claude_code};
 pub use codex::{AppTools, CodexOptions, codex};
 pub use harness::{
-    BoxFuture, Harness, HarnessSession, McpServer, Message, RunCheckpoint, Skill, ThreadConfig, TurnEnd,
+    BoxFuture, Harness, HarnessSession, LaunchOptions, McpServer, Message, RunCheckpoint, Skill, ThreadConfig, TurnEnd,
 };
 pub use permissions::{Decided, PermissionContext, PermissionDecision, PermissionPolicy, PermissionQuery};
 pub use protocol::{Command, Item, Snapshot, Thread, ThreadEvent};
