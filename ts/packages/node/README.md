@@ -53,7 +53,11 @@ await sdk.close(); // on shutdown: stops the harness processes (or with the shim
 - `rewind(id, turnId)` takes the conversation back to before a turn (the harness forgets it and the
   turns after, whose items are removed), `newSession(id)` has the next turn start a new
   conversation, and `compact(id)` compacts the harness's context in a turn of its own
-  ([spec/PROTOCOL.md](../../../spec/PROTOCOL.md#sessions)). They're refused while a turn runs.
+  ([spec/PROTOCOL.md](../../../spec/PROTOCOL.md#sessions)). They're refused while a turn runs. A
+  harness of the app's own takes part with `rewindPoint` (`resumeAtPoint` or `revertPoint`, or its
+  own), and gives each turn's mark with `ctx.mark()` as it goes (or at least in `endTurn`'s
+  `session_at`): a turn lost when the backend stops keeps the last one given, and one lost with
+  none can't be rewound past.
 - `get`, `list` and `delete` look threads up and remove them.
 - `snapshot(id)` is the thread's state now, and `snapshot(id, { limit })` a window of it (its last
   `limit` items, and what they need from before them); `itemsBefore(id, before, limit)` is a page of

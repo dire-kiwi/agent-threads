@@ -206,7 +206,9 @@ backend drives each CLI:
   request is open, or `error`, with the turn's `error`) and adds the turn's usage to the thread's.
   The `turn_result`'s `session` has the thread's `session_id` (if it has one), the harness's mark
   for the turn as `at` (below), and `started` if the thread had no `session_id` when the turn
-  started.
+  started. The thread.updated that ends it leaves out `turn_at`.
+- **The turn's mark so far**: each time the harness gives a new one (below) while a turn runs, a
+  `thread.updated` sets the thread's `turn_at` to it.
 - **A thread created with a `session_id`** has it in its first `thread.updated`.
 - **`compact`** starts a turn as `send` does, but with no `user_message`: `turn.started` and a
   `thread.updated` that's `running`. The harness's compaction is its `compaction` item.
@@ -240,7 +242,10 @@ backend drives each CLI:
   each block of a message as its own `assistant` message, in order). A `compact_boundary` is a
   `compaction` with its `uuid` as id, `trigger`, and `pre_tokens` as `tokens_before`; the next
   synthetic user message is its `summary`. A turn's mark (`session.at`) is the `uuid` of its last
-  `user` or `assistant` message without a `parent_tool_use_id` (replayed ones included). The
+  `user` or `assistant` message without a `parent_tool_use_id` (replayed ones included). It's
+  kept in `turn_at` as each such message comes, from the echo of one of the turn's messages on
+  (before that, what comes may be from before the turn: a `set_model`'s reply, say), or from the
+  start for a compaction (`/compact` isn't echoed) or a turn Claude started by itself. The
   `init` that follows a rewind clears `resume_at` in the same `thread.updated` as its `session_id`.
 - **Tools**: Bash is `shell` (`command`); Read `read` (`path`); Edit, MultiEdit, Write and
   NotebookEdit `edit` (`changes: [{path, op: update}]`, and when it ends the `diff`, made from the
@@ -329,7 +334,7 @@ backend drives each CLI:
   prompt), and other collab calls (`wait`...) aren't items; `contextCompaction` a `compaction`
   (`trigger: manual`). A `userMessage` item takes in a queued steered message. A turn's mark
   (`session.at`) is its `turn/completed` turn's `id`: the first one's, for a turn that went on after
-  a plan.
+  a plan. It's kept in `turn_at` at that turn's `turn/started`.
 - **Statuses**: `completed`, `failed`, `declined` (which is `denied`). A command's `result` is its
   `aggregatedOutput` (`""` when it's `null`) with `exit_code`.
 - **Subagents**: a `spawnAgent` call's `receiverThreadIds` are its child threads. Their items have
