@@ -11,7 +11,8 @@ codex-cli 0.165.0 (model `gpt-5.6-luna`, effort `low`), by `spec/tools/record.mj
 
 The Codex sessions' `skills/list` exchange was added afterwards (on 2026-11-01), with the response
 codex-cli 0.165.0 gives in a fresh CODEX_HOME and a working directory and home with no skills;
-`spec/tools/scenarios/codex.mjs` records it from now on.
+`spec/tools/scenarios/codex.mjs` records it from now on. The `adopt`, `rewind`, `new-session` and
+`compact` scenarios were recorded on 2026-11-02, with the same CLIs and models.
 
 ## Layout
 
@@ -39,6 +40,10 @@ Each fixture is a directory `spec/fixtures/<harness>/<scenario>/`:
 | `interrupt` | Stopping a turn while a command runs | `control_request` interrupt | `turn/interrupt` |
 | `resume` | A turn, a backend restart, then a turn in a new process | `--resume <session_id>` | `thread/resume` |
 | `compaction` | A turn, then `/compact` | sent as a message | sent as `thread/compact/start` |
+| `compact` | A turn, then the `compact` command | `/compact` sent as a message | `thread/compact/start` |
+| `adopt` | A thread created with the `session_id` of a conversation made before (by a setup run that isn't recorded), then a turn | `--resume <session_id>` | `thread/resume` |
+| `rewind` | Two turns, a `rewind` to before the second, then a turn that shows the agent forgot it | a new process with `--resume <session_id> --resume-session-at <uuid>` | a new process, `thread/resume`, then `thread/revert` |
+| `new-session` | A turn, `new_session`, then a turn in a new conversation | a new process without `--resume` | a new process, `thread/start` |
 | `error` | A turn that fails (the model doesn't exist) | an error result | a failed turn, after a warning |
 
 Some things the recordings show that a backend has to deal with: Claude Code echoes the backend's
@@ -59,12 +64,13 @@ What a backend's conformance test does with each fixture:
    environment. Give it the fixture's `tools` (each tool returns its `result` text), its
    `mcp_servers` (the fake CLI never starts them), and a permission policy from `permissions`:
    `allow` allows every tool without asking, `ask` asks the user (opens a request) for every one.
-2. **Create the thread** with `thread`'s options (`harness`, `model`, `effort`...) and the working
-   directory, and collect every event the SDK sends for it, deltas included.
+2. **Create the thread** with `thread`'s options (`harness`, `model`, `effort`, `session_id`...) and
+   the working directory, and collect every event the SDK sends for it, deltas included.
 3. **Run the steps** in order:
    - `{"command": {...}}`: send the command, with the thread's id as `thread_id`. A `respond`
      leaves out `request_id`: fill in the id of the thread's open request (the fixtures only ever
-     have one open).
+     have one open). A `rewind`'s `turn_id` is a placeholder `{{tN}}`: fill in the id of the
+     thread's Nth turn (in the order of its `turn.started` events).
    - `{"wait": {...}}`: wait for an event that matches the pattern: it has every field the pattern
      has, with the same value (objects are matched field by field, so `{"thread": {"status":
      "idle"}}` matches any thread.updated whose thread is idle). Only events after the previous
@@ -93,16 +99,18 @@ backend drives each CLI:
 - **Process lifetime.** The CLI is started at the thread's first `send`, not when it's created: one
   process per thread, kept between turns until the SDK is closed, which closes its stdin (or kills
   it, once it has sent everything). After a restart, the next `send` starts a new process that
-  resumes the session.
+  resumes the session. After a `rewind` or `new_session`, the next turn starts a new process too
+  (once the old one, whose stdin is closed then, has exited).
 - **Claude Code.** Arguments `-p --output-format stream-json --verbose --include-partial-messages
   --input-format stream-json --replay-user-messages --permission-prompt-tool stdio
-  --strict-mcp-config --forward-subagent-text --model <model>`, plus `--resume <session_id>`, and
+  --strict-mcp-config --forward-subagent-text --model <model>`, plus `--resume <session_id>` (and
+  `--resume-session-at <resume_at>` after a rewind), and
   `--mcp-config` with the thread's MCP servers (stdio ones as `type: stdio`) and, when it has app
   tools, an in-process server named `app` (`{"type": "sdk", "name": "app"}`). It sends a
   `control_request` `initialize` first (with `sdkMcpServers: ["app"]` when there are app tools),
   and waits for its response before the first user message. User messages are
   `{"type":"user","message":{"role":"user","content":[{"type":"text","text":...}]},"parent_tool_use_id":null}`.
-  It answers `can_use_tool` with `behavior: allow` (and `updatedInput`; for AskUserQuestion, the
+  The `compact` command is the user message `/compact`. It answers `can_use_tool` with `behavior: allow` (and `updatedInput`; for AskUserQuestion, the
   input plus `answers`, keyed by question text, with the labels joined by `", "`) or `deny` with a
   `message`, and the `app` server's `mcp_message`s as an MCP server would. It interrupts with a
   `control_request` `interrupt`.
@@ -110,12 +118,14 @@ backend drives each CLI:
   `initialized`, then `skills/list` (with `forceReload`) for the skills Codex finds in the working
   directory and the user's home, which a CODEX_HOME of the app's own doesn't keep out, and turns off
   each one that isn't the app's or Codex's built-in (`system`) with a `skills.config` entry
-  (`{path, enabled: false}`) in the thread's config. Then `thread/start` (or `thread/resume` with the thread's `session_id`) with the
+  (`{path, enabled: false}`) in the thread's config. Then `thread/start` (or `thread/resume` with the thread's `session_id`, followed after a rewind by
+  `thread/revert` with its `resume_at` as `beforeTurnId`) with the
   model, `approvalPolicy: untrusted` and `sandbox: workspace-write` (permission mode `default`),
   and a config with `features.default_mode_request_user_input = true` (so the agent can ask
   questions outside plan mode), the MCP servers in `mcp_servers`, and app tools as `dynamicTools`.
   A message is `turn/start` with the text and the thread's `effort`; one sent during a turn is
-  `turn/steer`; `/compact` is `thread/compact/start`; an interrupt is `turn/interrupt`. It answers
+  `turn/steer`; `/compact`, and the `compact` command, are `thread/compact/start`; an interrupt is
+  `turn/interrupt`. It answers
   approvals with `accept` or `decline`, MCP elicitations with `accept`, `requestUserInput` with
   `{answers: {<question id>: {answers: [labels]}}}`, and `item/tool/call` with the tool's text as
   `inputText` and `success: true`.
@@ -148,7 +158,22 @@ backend drives each CLI:
 - **The end of a turn**: calls still `running` or `pending` become `cancelled`, open requests are
   resolved with `cancel`, then a `turn_result` item is added, `turn.completed` is sent, and a
   `thread.updated` sets the thread `idle` (or `error`, with the turn's `error`) and adds the
-  turn's usage to the thread's.
+  turn's usage to the thread's. The `turn_result`'s `session` has the thread's `session_id` (if it
+  has one), the harness's mark for the turn as `at` (below), and `started` if the thread had no
+  `session_id` when the turn started.
+- **A thread created with a `session_id`** has it in its first `thread.updated`.
+- **`compact`** starts a turn as `send` does, but with no `user_message`: `turn.started` and a
+  `thread.updated` that's `running`. The harness's compaction is its `compaction` item.
+- **`new_session`**, when the thread has a session: a `thread.updated` without `session_id` (or
+  `resume_at`), then a `notice` (`level: info`, `code: session.new`, with the text "A new
+  conversation starts here: the agent doesn't remember what came before.").
+- **`rewind`** to before turn T: an `items.removed` with, in the items' order, the items of T and of
+  every turn after it (by `turn_id`), and the items with no `turn_id` after T's first item; then a
+  `thread.updated` with the `session_id` and `resume_at` the rules in
+  [PROTOCOL.md](../PROTOCOL.md#sessions) give (or without them); then a `notice` (`level: info`,
+  `code: rewind`, "The conversation was rewound to here: the agent doesn't remember what came
+  after."). Once the harness has gone back there (Claude Code's `init`, Codex's `thread/revert`
+  response), a `thread.updated` clears `resume_at`.
 - **An interrupt** sends nothing itself. Its turn's `turn_result` has `ok: false` and
   `interrupted: true`, and the calls it cut short are `cancelled`.
 - An `item.updated` is only sent when it changes something, and a `thread.updated` only when the
@@ -164,7 +189,9 @@ backend drives each CLI:
   `assistant_message` or `reasoning` with the id `<message id>:<block index>` (Claude Code sends
   each block of a message as its own `assistant` message, in order). A `compact_boundary` is a
   `compaction` with its `uuid` as id, `trigger`, and `pre_tokens` as `tokens_before`; the next
-  synthetic user message is its `summary`.
+  synthetic user message is its `summary`. A turn's mark (`session.at`) is the `uuid` of its last
+  `user` or `assistant` message without a `parent_tool_use_id` (replayed ones included). The
+  `init` that follows a rewind clears `resume_at` in the same `thread.updated` as its `session_id`.
 - **Tools**: Bash is `shell` (`command`); Read `read` (`path`); Edit, MultiEdit, Write and
   NotebookEdit `edit` (`changes: [{path, op: update}]`, and when it ends the `diff`, made from the
   result's `structuredPatch` as `@@ -a,b +c,d @@` hunks); Glob and Grep `search`; WebFetch and
@@ -199,7 +226,8 @@ backend drives each CLI:
   an `edit` call; `mcpToolCall` an `mcp` call named by its tool, with `server`; `dynamicToolCall`
   an `app` call; `collabAgentToolCall` with `spawnAgent` a `subagent` call (its `title` is the
   prompt), and other collab calls (`wait`...) aren't items; `contextCompaction` a `compaction`
-  (`trigger: manual`). A `userMessage` item takes in a queued steered message.
+  (`trigger: manual`). A `userMessage` item takes in a queued steered message. A turn's mark
+  (`session.at`) is its `turn/completed` turn's `id`.
 - **Statuses**: `completed`, `failed`, `declined` (which is `denied`). A command's `result` is its
   `aggregatedOutput` (`""` when it's `null`) with `exit_code`.
 - **Subagents**: a `spawnAgent` call's `receiverThreadIds` are its child threads. Their items have
@@ -212,7 +240,9 @@ backend drives each CLI:
 - **Notices**: a `warning` notification is a `notice` with `level: warning`; an `error` that will
   be retried is a `notice` with `code: retry`. One that won't is the turn's `error`.
 - **Usage**: Codex reports the thread's running totals, so a turn's usage is how far the last
-  totals in the turn are past the thread's usage before it. `input_tokens` leaves out the cached
+  totals in the turn are past the session's after its last turn: nothing, for a session
+  `thread/start` started, and the thread's usage for one it adopted (whose totals before aren't
+  known). `input_tokens` leaves out the cached
   ones (`cache_read_tokens`), as Claude's do. `duration_ms` is the turn's `durationMs`.
 
 ## Comparing events

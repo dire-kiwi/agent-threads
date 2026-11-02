@@ -1,0 +1,74 @@
+{
+  "description": "Two turns, a rewind to before the second, then a turn in a new process that resumes the session at the first turn's last message (--resume-session-at).",
+  "recorded": {
+    "cli": "2.1.312 (Claude Code)",
+    "model": "haiku",
+    "date": "2026-11-02"
+  },
+  "thread": {
+    "harness": "claude",
+    "model": "haiku"
+  },
+  "permissions": "allow",
+  "steps": [
+    {
+      "command": {
+        "type": "send",
+        "text": "Remember the word pineapple. Reply with just: ok",
+        "client_id": "c1"
+      }
+    },
+    {
+      "wait": {
+        "type": "thread.updated",
+        "thread": {
+          "status": "idle"
+        }
+      }
+    },
+    {
+      "command": {
+        "type": "send",
+        "text": "Forget that word: remember the word mango instead. Reply with just: ok",
+        "client_id": "c2"
+      }
+    },
+    {
+      "wait": {
+        "type": "thread.updated",
+        "thread": {
+          "status": "idle"
+        }
+      }
+    },
+    {
+      "command": {
+        "type": "rewind",
+        "turn_id": "{{t2}}"
+      }
+    },
+    {
+      "wait": {
+        "type": "item.added",
+        "item": {
+          "type": "notice"
+        }
+      }
+    },
+    {
+      "command": {
+        "type": "send",
+        "text": "What word did I ask you to remember? Reply with just the word.",
+        "client_id": "c3"
+      }
+    },
+    {
+      "wait": {
+        "type": "thread.updated",
+        "thread": {
+          "status": "idle"
+        }
+      }
+    }
+  ]
+}

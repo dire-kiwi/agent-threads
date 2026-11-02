@@ -1,0 +1,75 @@
+{
+  "description": "Two turns, a rewind to before the second, then a turn in a new app server that resumes the thread and reverts it to before the second turn (thread/revert).",
+  "recorded": {
+    "cli": "codex-cli 0.165.0",
+    "model": "gpt-5.6-luna",
+    "date": "2026-11-02"
+  },
+  "thread": {
+    "harness": "codex",
+    "model": "gpt-5.6-luna",
+    "effort": "low"
+  },
+  "permissions": "allow",
+  "steps": [
+    {
+      "command": {
+        "type": "send",
+        "text": "Remember the word pineapple. Reply with just: ok",
+        "client_id": "c1"
+      }
+    },
+    {
+      "wait": {
+        "type": "thread.updated",
+        "thread": {
+          "status": "idle"
+        }
+      }
+    },
+    {
+      "command": {
+        "type": "send",
+        "text": "Forget that word: remember the word mango instead. Reply with just: ok",
+        "client_id": "c2"
+      }
+    },
+    {
+      "wait": {
+        "type": "thread.updated",
+        "thread": {
+          "status": "idle"
+        }
+      }
+    },
+    {
+      "command": {
+        "type": "rewind",
+        "turn_id": "{{t2}}"
+      }
+    },
+    {
+      "wait": {
+        "type": "item.added",
+        "item": {
+          "type": "notice"
+        }
+      }
+    },
+    {
+      "command": {
+        "type": "send",
+        "text": "What word did I ask you to remember? Reply with just the word.",
+        "client_id": "c3"
+      }
+    },
+    {
+      "wait": {
+        "type": "thread.updated",
+        "thread": {
+          "status": "idle"
+        }
+      }
+    }
+  ]
+}

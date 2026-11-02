@@ -193,7 +193,7 @@ class Draft {
     const client_id = `c${++this.clientIds}`;
     this.command({ type: "send", text, client_id });
     if (!this.turn) {
-      this.turn = { id: this.ph("t"), interrupted: false, usage: null };
+      this.startTurn();
       this.item({ id: this.ph("u"), type: "user_message", text, client_id });
       this.emit({ type: "turn.started", turn_id: this.turn.id });
       this.setThread({ status: "running", error: undefined });
@@ -201,6 +201,61 @@ class Draft {
       const it = this.item({ id: this.ph("u"), type: "user_message", text, steered: true, queued: true, client_id });
       this.queued.push(it);
     }
+  }
+
+  /** A turn starts: it notes the session it starts in, for its turn_result's. */
+  startTurn() {
+    this.turn = { id: this.ph("t"), interrupted: false, usage: null, session: this.thread.session_id, at: undefined };
+  }
+
+  /** The harness's mark for the running turn (Claude's last message, Codex's turn id). */
+  mark(at) {
+    if (this.turn && at) this.turn.at = at;
+  }
+
+  /** A command the app sent that the recording noted (see Proc.note). */
+  note(c) {
+    if (c.type === "rewind") this.rewind(c.turn_id);
+    else if (c.type === "new_session") this.newSession();
+    else if (c.type === "compact") this.compact();
+    else throw new Error(`a note of a command draft-expected doesn't know: ${JSON.stringify(c)}`);
+  }
+
+  /** compact: a turn with no user_message, whose compaction the harness is sent next. */
+  compact() {
+    this.command({ type: "compact" });
+    this.startTurn();
+    this.compacting = true;
+    this.emit({ type: "turn.started", turn_id: this.turn.id });
+    this.setThread({ status: "running", error: undefined });
+  }
+
+  /** new_session: the session is let go of, and a notice marks where. */
+  newSession() {
+    this.command({ type: "new_session" });
+    if (!this.thread.session_id) return;
+    this.setThread({ session_id: undefined, resume_at: undefined });
+    this.item({ id: this.ph("n"), type: "notice", level: "info", code: "session.new", text: NEW_SESSION_TEXT });
+  }
+
+  /** rewind: the turn's items and every later one's go, and the session goes back to before it. */
+  rewind(turnId) {
+    this.command({ type: "rewind", turn_id: turnId });
+    const items = [...this.items.values()];
+    const order = [];
+    for (const it of items) if (it.turn_id && !order.includes(it.turn_id)) order.push(it.turn_id);
+    const dropped = new Set(order.slice(order.indexOf(turnId)));
+    const first = items.findIndex((it) => dropped.has(it.turn_id));
+    const gone = items.filter((it, i) => dropped.has(it.turn_id) || (!it.turn_id && i > first));
+    const results = items.filter((it) => it.type === "turn_result" && !it.parent_id);
+    const sessions = results.map((r) => r.session);
+    const at = results.findIndex((r) => r.turn_id === turnId);
+    const point = this.meta.harness === "claude" ? resumeAtPoint(sessions, at) : revertPoint(sessions, at);
+    for (const it of gone) this.items.delete(it.id);
+    this.queued = this.queued.filter((q) => this.items.has(q.id));
+    this.emit({ type: "items.removed", item_ids: gone.map((it) => it.id) });
+    this.setThread({ session_id: point.session_id, resume_at: point.resume_at });
+    this.item({ id: this.ph("n"), type: "notice", level: "info", code: "rewind", text: REWIND_TEXT });
   }
 
   /** The harness echoed a message back or took it in: it's no longer queued. */
@@ -256,11 +311,22 @@ class Draft {
     if (error && !this.turn.interrupted) tr.error = error;
     if (usage) tr.usage = usage;
     if (duration_ms !== undefined) tr.duration_ms = duration_ms;
+    if (this.thread.session_id) {
+      tr.session = { id: this.thread.session_id };
+      if (this.turn.at) tr.session.at = this.turn.at;
+      if (!this.turn.session) tr.session.started = true;
+    }
     this.item(tr);
     this.emit({ type: "turn.completed", turn_id: this.turn.id });
     const total = addUsage(this.thread.usage, usage);
     this.turn = null;
     this.setThread({ status: tr.ok || tr.interrupted ? "idle" : "error", error: tr.error, usage: total });
+  }
+
+  /** A new process: the backend restarted, unless a rewind or new_session made it start one. */
+  newRun() {
+    if (this.restartless) this.restartless = false;
+    else this.restart();
   }
 
   restart() {
@@ -287,6 +353,38 @@ class Draft {
       delete s.from;
     }
   }
+}
+
+/** The notices rewind and new_session add. */
+const REWIND_TEXT = "The conversation was rewound to here: the agent doesn't remember what came after.";
+const NEW_SESSION_TEXT = "A new conversation starts here: the agent doesn't remember what came before.";
+
+/**
+ * Where a Claude rewind to before the turn `i` goes, from each turn's session (spec/PROTOCOL.md,
+ * "Sessions"): the session it continued, at the last message of the latest turn before it in it.
+ */
+export function resumeAtPoint(sessions, i) {
+  const t = sessions[i];
+  if (!t || t.started) return {};
+  for (let j = i - 1; j >= 0; j--) {
+    const u = sessions[j];
+    if (!u || u.id !== t.id) break;
+    if (u.at) return { session_id: t.id, resume_at: u.at };
+    if (u.started) break;
+  }
+  throw new Error("the conversation before this turn isn't known");
+}
+
+/** Where a Codex rewind to before the turn `i` goes: its session, reverted to before the first turn from it on that has a mark. */
+export function revertPoint(sessions, i) {
+  const t = sessions[i];
+  if (!t || t.started) return {};
+  for (let j = i; j < sessions.length; j++) {
+    const u = sessions[j];
+    if (!u || u.id !== t.id || (j > i && u.started)) break;
+    if (u.at) return { session_id: t.id, resume_at: u.at };
+  }
+  return { session_id: t.id };
 }
 
 function addUsage(a, b) {
@@ -329,7 +427,7 @@ function pattern(e) {
 function draftClaude(d, runs) {
   let first = true;
   for (const [, entries] of runs) {
-    if (!first) d.restart();
+    if (!first) d.newRun();
     first = false;
     const asked = new Map(); // CLI request_id -> request
     const msgOfParent = new Map(); // parent_tool_use_id -> current streamed message id
@@ -341,11 +439,15 @@ function draftClaude(d, runs) {
     const opener = entries.find((e) => e.dir === "in" && e.msg.type === "user");
     for (const e of entries) {
       if (e.dir === "spawn" && opener) d.send(userText(opener.msg));
+      if (e.dir === "command") d.note(e.command);
+      if (e.dir === "command" && e.command.type !== "compact") d.restartless = true;
       const m = e.msg;
       if (!m) continue;
       if (e.dir === "in") {
         if (m.type === "user") {
-          if (e !== opener) d.send(userText(m));
+          // The compact command's /compact is its turn's, not a message.
+          if (d.compacting && userText(m) === "/compact") d.compacting = false;
+          else if (e !== opener) d.send(userText(m));
         } else if (m.type === "control_request" && m.request.subtype === "interrupt") {
           d.interrupt();
           interrupted = true;
@@ -369,9 +471,12 @@ function draftClaude(d, runs) {
       }
       if (e.dir !== "out") continue;
       const parent = m.parent_tool_use_id ?? undefined;
+      // The main conversation's messages: the last of a turn's is where a rewind can resume.
+      if ((m.type === "user" || m.type === "assistant") && !parent) d.mark(m.uuid);
       switch (m.type) {
         case "system":
-          if (m.subtype === "init" && m.session_id !== d.thread.session_id) d.setThread({ session_id: m.session_id });
+          // The session it runs in; a rewind's resume_at is done with once it's resumed there.
+          if (m.subtype === "init" && (m.session_id !== d.thread.session_id || d.thread.resume_at)) d.setThread({ session_id: m.session_id, resume_at: undefined });
           if (m.subtype === "compact_boundary") {
             d.item({ id: m.uuid, type: "compaction", trigger: m.compact_metadata.trigger, tokens_before: m.compact_metadata.pre_tokens });
             summaryNext = m.uuid;
@@ -515,8 +620,13 @@ function draftCodex(d, runs) {
   let first = true;
   let mainThread = null;
   const children = new Map(); // child thread id -> spawnAgent call id
+  // Each Codex thread's totals after its last turn (as usage), and the main thread's now: a new one
+  // starts at nothing, and one resumed where it left off (or, for one the thread adopted, at the
+  // thread's usage, as nothing else is known).
+  const baselines = new Map();
+  let baseline;
   for (const [, entries] of runs) {
-    if (!first) d.restart();
+    if (!first) d.newRun();
     first = false;
     const asked = new Map(); // server request id -> request
     const sentReq = new Map(); // our request id -> method
@@ -529,12 +639,16 @@ function draftCodex(d, runs) {
     const opener = entries.find((e) => e.dir === "in" && (e.msg.method === "turn/start" || e.msg.method === "thread/compact/start"));
     for (const e of entries) {
       if (e.dir === "spawn" && opener) d.send(opener.msg.method === "turn/start" ? text(opener.msg) : "/compact");
+      if (e.dir === "command") d.note(e.command);
+      if (e.dir === "command" && e.command.type !== "compact") d.restartless = true;
       const m = e.msg;
       if (!m) continue;
       if (e.dir === "in") {
         if (m.method !== undefined) {
           if (m.id !== undefined) sentReq.set(m.id, m.method);
-          if (m.method === "turn/start" || m.method === "thread/compact/start") {
+          // The compact command's compaction is its turn's, not a message.
+          if (m.method === "thread/compact/start" && d.compacting) d.compacting = false;
+          else if (m.method === "turn/start" || m.method === "thread/compact/start") {
             if (e !== opener) d.send(m.method === "turn/start" ? text(m) : "/compact");
           } else if (m.method === "turn/steer") d.send(text(m));
           else if (m.method === "turn/interrupt") d.interrupt();
@@ -563,8 +677,11 @@ function draftCodex(d, runs) {
         const method = sentReq.get(m.id);
         if ((method === "thread/start" || method === "thread/resume") && m.result?.thread) {
           mainThread = m.result.thread.id;
+          baseline = method === "thread/start" ? { input_tokens: 0, output_tokens: 0, cache_read_tokens: 0, cache_write_tokens: 0 } : baselines.get(mainThread);
           if (d.thread.session_id !== mainThread) d.setThread({ session_id: mainThread });
         }
+        // A rewind's revert is done.
+        if (method === "thread/revert" && m.result) d.setThread({ resume_at: undefined });
         continue;
       }
       const p = m.params ?? {};
@@ -685,9 +802,14 @@ function draftCodex(d, runs) {
             break;
           }
           const turn = p.turn;
+          d.mark(turn.id);
           // Codex reports the thread's running totals (again after a resume), so a turn used what
           // they've grown by since the thread's usage before it.
-          const usage = total ? codexUsage(total, d.thread.usage) : undefined;
+          const usage = total ? codexUsage(total, baseline ?? d.thread.usage) : undefined;
+          if (total) {
+            baseline = { input_tokens: total.inputTokens - total.cachedInputTokens, output_tokens: total.outputTokens, cache_read_tokens: total.cachedInputTokens, cache_write_tokens: total.cacheWriteInputTokens ?? 0 };
+            baselines.set(mainThread, baseline);
+          }
           d.endTurn({
             ok: turn.status === "completed",
             error: turn.status === "failed" ? (turn.error?.message ?? error ?? "the turn failed") : undefined,
@@ -769,6 +891,8 @@ export function draft(dir) {
   const { meta, runs } = loadSession(dir);
   const fixturePath = join(dir, "fixture.json");
   const fixture = existsSync(fixturePath) ? JSON.parse(readFileSync(fixturePath, "utf8")) : {};
+  // A thread made from a session the recording started with (adopt) has its id.
+  if (meta.thread) fixture.thread = { ...fixture.thread, ...meta.thread };
   const d = new Draft(meta, fixture);
   if (meta.harness === "claude") draftClaude(d, runs);
   else draftCodex(d, runs);

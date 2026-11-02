@@ -86,7 +86,7 @@ parts that matter (in [lib/canon.mjs](lib/canon.mjs)), and those must be equal:
 
 | Input | Compared |
 | --- | --- |
-| Claude arguments | `-p`/`--print`, `--output-format`, `--input-format`, `--verbose`, `--include-partial-messages`, `--replay-user-messages`, `--permission-prompt-tool`, `--forward-subagent-text`, `--strict-mcp-config`, `--model`, `--resume`, `--permission-mode` (as `--flag value` or `--flag=value`), and `--mcp-config`'s server names and types (given as JSON or a file). Other flags are the backend's business. |
+| Claude arguments | `-p`/`--print`, `--output-format`, `--input-format`, `--verbose`, `--include-partial-messages`, `--replay-user-messages`, `--permission-prompt-tool`, `--forward-subagent-text`, `--strict-mcp-config`, `--model`, `--resume`, `--resume-session-at`, `--permission-mode` (as `--flag value` or `--flag=value`), and `--mcp-config`'s server names and types (given as JSON or a file). Other flags are the backend's business. |
 | Claude user message | The text (text blocks joined by newlines), the number of images, `parent_tool_use_id`. |
 | Claude `control_request` | `subtype`; for `initialize`, the `sdkMcpServers`. |
 | Claude `control_response` | `request_id` and `subtype`; for `can_use_tool`, `behavior`, and an allow's input (its `updatedInput`, or the input it was asked about if it has none; AskUserQuestion's `answers` are in it) or a deny's `message`; for `mcp_message`, the JSON-RPC id, and the tool names (`tools/list`) or the result's text (`tools/call`). |
@@ -112,7 +112,10 @@ run is one process), in order:
 
 `t` is milliseconds since the run's process started. `in` is what the backend wrote to stdin, `out`
 what the CLI wrote to stdout (`msg` when it's JSON, `line` when it isn't), `close` when the backend
-closed stdin, and `exit` how the process ended.
+closed stdin, and `exit` how the process ended. `command` notes a command the app sent its backend
+there that the CLI isn't sent as it is (`{"dir":"command","command":{"type":"rewind","turn_id":"{{t2}}"}}`),
+for draft-expected.mjs; the fake CLI skips it. The meta line can have the `thread` options the
+session needs (`adopt`'s `session_id`), which draft-expected.mjs puts in fixture.json.
 
 ## Recording
 
@@ -122,14 +125,19 @@ node spec/tools/record.mjs codex all
 ```
 
 The recorder plays the backend's part itself: the scenarios in [scenarios/](scenarios/) send what a
-backend sends and answer what it answers. Each session runs in a new temporary directory, seeded
+backend sends and answer what it answers, and note the app's commands that aren't sent as they are
+(`p.note(command)`). A scenario can start a `setup` run that isn't recorded (`ctx.spawn(args,
+handlers, { setup: true })`), to make a session for the recorded runs to start from. Each session runs in a new temporary directory, seeded
 with `notes.txt` ([scenarios/common.mjs](scenarios/common.mjs)), with its own `CLAUDE_CONFIG_DIR`
 or `CODEX_HOME` that has only the login linked in (`.credentials.json` or `auth.json`), so the
 user's settings, MCP servers, skills, plugins and history stay out.
 
 Before it's written, the recording is sanitized ([lib/sanitize.mjs](lib/sanitize.mjs)): the
 temporary directories become `/work`, `/config`, `/codex-home` and `/tmp/recording`, this checkout
-`/repo`, the home directory `/home/user`, and the user name, host name and git email are replaced;
+`/repo`, the home directory `/home/user`, the machine's temporary directory `/tmp`, and the user
+name, host name (in any case) and git email and name are replaced (Claude Code tells the model the
+git user, which can end up in a compaction summary); Codex's `skills/list` answer keeps only its
+built-in skills, not the ones the machine has (and the config that turned those off goes too);
 account details (Claude's `account`, Codex's rate limits, emails, organization names, installation
 ids) are replaced with placeholders; and it fails if anything still looks like a secret (an API key,
 a JWT, a bearer token). Streamed text is cleaned as a whole stream, since a path can be split

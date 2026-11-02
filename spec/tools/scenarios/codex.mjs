@@ -78,8 +78,8 @@ function answers({ approve = () => true, userInput } = {}) {
 }
 
 /** Start the app server and initialize it, as every backend does first. */
-async function start(ctx, handlers = answers()) {
-  const p = ctx.spawn(args(), handlers);
+async function start(ctx, handlers = answers(), { setup } = {}) {
+  const p = ctx.spawn(args(), handlers, { setup });
   const rpc = new Rpc(p);
   await rpc.request("initialize", { clientInfo: { name: "agent-threads", title: "agent-threads", version: "0.0.0" }, capabilities: { experimentalApi: true } });
   rpc.notify("initialized");
@@ -97,8 +97,8 @@ async function turn(rpc, threadId, prompt) {
 }
 
 /** One thread, one turn, then the process is closed. */
-async function oneTurn(ctx, prompt, { thread, handlers } = {}) {
-  const { p, rpc } = await start(ctx, handlers);
+async function oneTurn(ctx, prompt, { thread, handlers, setup } = {}) {
+  const { p, rpc } = await start(ctx, handlers, { setup });
   const { thread: t } = await rpc.request("thread/start", thread ?? threadParams(ctx));
   await turn(rpc, t.id, prompt);
   await p.next(turnCompleted(t.id), "the turn to complete");
@@ -228,6 +228,73 @@ export const scenarios = {
       const { thread } = await rpc.request("thread/start", threadParams(ctx));
       await turn(rpc, thread.id, "Reply with just: ready");
       await p.next(turnCompleted(thread.id), "the first turn to complete");
+      await rpc.request("thread/compact/start", { threadId: thread.id });
+      await p.next(turnCompleted(thread.id), "the compaction to complete");
+      p.close();
+      await p.exited;
+    },
+  },
+
+  adopt: {
+    description: "A thread created with the id of a Codex thread the app already had (made by a setup run, not recorded): its first turn resumes it with thread/resume.",
+    async run(ctx) {
+      const threadId = await oneTurn(ctx, "Remember the word pineapple. Reply with just: ok", { setup: true });
+      ctx.meta.thread = { session_id: threadId };
+      const { p, rpc } = await start(ctx);
+      const { cwd, model, approvalPolicy, sandbox, config } = threadParams(ctx);
+      await rpc.request("thread/resume", { threadId, cwd, model, approvalPolicy, sandbox, config, excludeTurns: true });
+      await turn(rpc, threadId, "What word did I ask you to remember? Reply with just the word.");
+      await p.next(turnCompleted(threadId), "the turn to complete");
+      p.close();
+      await p.exited;
+    },
+  },
+
+  rewind: {
+    description: "Two turns, a rewind to before the second, then a turn in a new app server that resumes the thread and reverts it to before the second turn (thread/revert).",
+    async run(ctx) {
+      const first = await start(ctx);
+      const { thread } = await first.rpc.request("thread/start", threadParams(ctx));
+      await turn(first.rpc, thread.id, "Remember the word pineapple. Reply with just: ok");
+      await first.p.next(turnCompleted(thread.id), "the first turn to complete");
+      const second = await turn(first.rpc, thread.id, "Forget that word: remember the word mango instead. Reply with just: ok");
+      await first.p.next(turnCompleted(thread.id), "the second turn to complete");
+      first.p.note({ type: "rewind", turn_id: "{{t2}}" });
+      first.p.close();
+      await first.p.exited;
+      const { p, rpc } = await start(ctx);
+      const { cwd, model, approvalPolicy, sandbox, config } = threadParams(ctx);
+      await rpc.request("thread/resume", { threadId: thread.id, cwd, model, approvalPolicy, sandbox, config, excludeTurns: true });
+      await rpc.request("thread/revert", { threadId: thread.id, beforeTurnId: second });
+      await turn(rpc, thread.id, "What word did I ask you to remember? Reply with just the word.");
+      await p.next(turnCompleted(thread.id), "the third turn to complete");
+      p.close();
+      await p.exited;
+    },
+  },
+
+  "new-session": {
+    description: "A turn, then new_session: the next turn starts a new thread (thread/start) in a new app server.",
+    async run(ctx) {
+      const first = await start(ctx);
+      const { thread } = await first.rpc.request("thread/start", threadParams(ctx));
+      await turn(first.rpc, thread.id, "Remember the word pineapple. Reply with just: ok");
+      await first.p.next(turnCompleted(thread.id), "the first turn to complete");
+      first.p.note({ type: "new_session" });
+      first.p.close();
+      await first.p.exited;
+      await oneTurn(ctx, "What word did I ask you to remember? If you don't know, reply with just: unknown");
+    },
+  },
+
+  compact: {
+    description: "A turn, then the compact command, which the backend sends as thread/compact/start.",
+    async run(ctx) {
+      const { p, rpc } = await start(ctx);
+      const { thread } = await rpc.request("thread/start", threadParams(ctx));
+      await turn(rpc, thread.id, "Reply with just: ready");
+      await p.next(turnCompleted(thread.id), "the first turn to complete");
+      p.note({ type: "compact" });
       await rpc.request("thread/compact/start", { threadId: thread.id });
       await p.next(turnCompleted(thread.id), "the compaction to complete");
       p.close();

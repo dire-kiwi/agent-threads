@@ -85,9 +85,16 @@ function appServer(m) {
   }
 }
 
+/** The uuid of the main conversation's last message so far: where --resume-session-at resumes it. */
+function lastMessage(p) {
+  return p.messages
+    .slice(0, p.cursor)
+    .findLast((m) => (m.type === "user" || m.type === "assistant") && !m.parent_tool_use_id && m.uuid)?.uuid;
+}
+
 /** One turn on a fresh process: initialize, send the prompt, wait for the result, close. */
-async function oneTurn(ctx, prompt, { argv = args(), handlers, sdkMcpServers } = {}) {
-  const p = ctx.spawn(argv, handlers);
+async function oneTurn(ctx, prompt, { argv = args(), handlers, sdkMcpServers, setup } = {}) {
+  const p = ctx.spawn(argv, handlers, { setup });
   await initialize(p, sdkMcpServers);
   user(p, prompt);
   const result = await p.next(isResult, "the result");
@@ -221,6 +228,67 @@ export const scenarios = {
       await initialize(p);
       user(p, "Reply with just: ready");
       await p.next(isResult, "the first result");
+      user(p, "/compact");
+      await p.next(isResult, "the compaction's result");
+      p.close();
+      await p.exited;
+    },
+  },
+
+  adopt: {
+    description: "A thread created with the session id of a conversation the app already had (made by a setup run, not recorded): its first turn resumes it.",
+    async run(ctx) {
+      const setup = await oneTurn(ctx, "Remember the word pineapple. Reply with just: ok", { handlers: answers(), setup: true });
+      ctx.meta.thread = { session_id: setup.session_id };
+      await oneTurn(ctx, "What word did I ask you to remember? Reply with just the word.", {
+        argv: args({ resume: setup.session_id }),
+        handlers: answers(),
+      });
+    },
+  },
+
+  rewind: {
+    description: "Two turns, a rewind to before the second, then a turn in a new process that resumes the session at the first turn's last message (--resume-session-at).",
+    async run(ctx) {
+      const p = ctx.spawn(args(), answers());
+      await initialize(p);
+      user(p, "Remember the word pineapple. Reply with just: ok");
+      const first = await p.next(isResult, "the first result");
+      const at = lastMessage(p);
+      user(p, "Forget that word: remember the word mango instead. Reply with just: ok");
+      await p.next(isResult, "the second result");
+      p.note({ type: "rewind", turn_id: "{{t2}}" });
+      p.close();
+      await p.exited;
+      await oneTurn(ctx, "What word did I ask you to remember? Reply with just the word.", {
+        argv: args({ resume: first.session_id, extra: ["--resume-session-at", at] }),
+        handlers: answers(),
+      });
+    },
+  },
+
+  "new-session": {
+    description: "A turn, then new_session: the next turn starts a new conversation in a new process (no --resume).",
+    async run(ctx) {
+      const p = ctx.spawn(args(), answers());
+      await initialize(p);
+      user(p, "Remember the word pineapple. Reply with just: ok");
+      await p.next(isResult, "the first result");
+      p.note({ type: "new_session" });
+      p.close();
+      await p.exited;
+      await oneTurn(ctx, "What word did I ask you to remember? If you don't know, reply with just: unknown", { handlers: answers() });
+    },
+  },
+
+  compact: {
+    description: "A turn, then the compact command, which the backend sends as /compact.",
+    async run(ctx) {
+      const p = ctx.spawn(args(), answers());
+      await initialize(p);
+      user(p, "Reply with just: ready");
+      await p.next(isResult, "the first result");
+      p.note({ type: "compact" });
       user(p, "/compact");
       await p.next(isResult, "the compaction's result");
       p.close();

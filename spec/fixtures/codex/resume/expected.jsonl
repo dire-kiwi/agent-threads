@@ -6,7 +6,7 @@
 {"type":"item.added","thread_id":"{{thread}}","seq":6,"item":{"id":"msg_05c2206be86fd6ea016ae5f8f286b081918b0bbf0b7b58941c","type":"assistant_message","text":"","turn_id":"{{t1}}"}}
 {"type":"delta","thread_id":"{{thread}}","seq":6,"item_id":"msg_05c2206be86fd6ea016ae5f8f286b081918b0bbf0b7b58941c","kind":"text","offset":0,"text":"ok"}
 {"type":"item.updated","thread_id":"{{thread}}","seq":7,"item_id":"msg_05c2206be86fd6ea016ae5f8f286b081918b0bbf0b7b58941c","patch":{"text":"ok"}}
-{"type":"item.added","thread_id":"{{thread}}","seq":8,"item":{"id":"{{tr1}}","type":"turn_result","ok":true,"usage":{"input_tokens":12029,"output_tokens":5,"cache_read_tokens":0,"cache_write_tokens":0},"duration_ms":1975,"turn_id":"{{t1}}"}}
+{"type":"item.added","thread_id":"{{thread}}","seq":8,"item":{"id":"{{tr1}}","type":"turn_result","ok":true,"usage":{"input_tokens":12029,"output_tokens":5,"cache_read_tokens":0,"cache_write_tokens":0},"duration_ms":1975,"session":{"id":"01a19254-6adc-77a1-bc74-4c76511156dc","at":"01a19254-6c07-74b2-87c1-fcd66469f36f","started":true},"turn_id":"{{t1}}"}}
 {"type":"turn.completed","thread_id":"{{thread}}","seq":9,"turn_id":"{{t1}}"}
 {"type":"thread.updated","thread_id":"{{thread}}","seq":10,"thread":{"id":"{{thread}}","harness":"codex","status":"idle","model":"gpt-5.6-luna","effort":"low","permission_mode":"default","cwd":"{{cwd}}","created_at":"2026-11-01T00:00:00Z","session_id":"01a19254-6adc-77a1-bc74-4c76511156dc","usage":{"input_tokens":12029,"output_tokens":5,"cache_read_tokens":0,"cache_write_tokens":0}}}
 {"type":"item.added","thread_id":"{{thread}}","seq":11,"item":{"id":"{{u2}}","type":"user_message","text":"What word did I ask you to remember? Reply with just the word.","client_id":"c2","turn_id":"{{t2}}"}}
@@ -16,6 +16,6 @@
 {"type":"delta","thread_id":"{{thread}}","seq":14,"item_id":"msg_05c2206be86fd6ea016ae5f8f4cdec8191ab2dc0d0a8ecfbf9","kind":"text","offset":0,"text":"pine"}
 {"type":"delta","thread_id":"{{thread}}","seq":14,"item_id":"msg_05c2206be86fd6ea016ae5f8f4cdec8191ab2dc0d0a8ecfbf9","kind":"text","offset":4,"text":"apple"}
 {"type":"item.updated","thread_id":"{{thread}}","seq":15,"item_id":"msg_05c2206be86fd6ea016ae5f8f4cdec8191ab2dc0d0a8ecfbf9","patch":{"text":"pineapple"}}
-{"type":"item.added","thread_id":"{{thread}}","seq":16,"item":{"id":"{{tr2}}","type":"turn_result","ok":true,"usage":{"input_tokens":151,"output_tokens":6,"cache_read_tokens":11904,"cache_write_tokens":0},"duration_ms":2090,"turn_id":"{{t2}}"}}
+{"type":"item.added","thread_id":"{{thread}}","seq":16,"item":{"id":"{{tr2}}","type":"turn_result","ok":true,"usage":{"input_tokens":151,"output_tokens":6,"cache_read_tokens":11904,"cache_write_tokens":0},"duration_ms":2090,"session":{"id":"01a19254-6adc-77a1-bc74-4c76511156dc","at":"01a19254-7486-7821-b8c3-8312c8dcd7f1"},"turn_id":"{{t2}}"}}
 {"type":"turn.completed","thread_id":"{{thread}}","seq":17,"turn_id":"{{t2}}"}
 {"type":"thread.updated","thread_id":"{{thread}}","seq":18,"thread":{"id":"{{thread}}","harness":"codex","status":"idle","model":"gpt-5.6-luna","effort":"low","permission_mode":"default","cwd":"{{cwd}}","created_at":"2026-11-01T00:00:00Z","session_id":"01a19254-6adc-77a1-bc74-4c76511156dc","usage":{"input_tokens":12180,"output_tokens":11,"cache_read_tokens":11904,"cache_write_tokens":0}}}
