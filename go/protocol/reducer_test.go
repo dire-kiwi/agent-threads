@@ -122,9 +122,32 @@ func TestApplyEventRequests(t *testing.T) {
 	if len(s.Requests) != 2 {
 		t.Fatal("not opened")
 	}
+	if !reflect.DeepEqual(protocol.OpenRequests(s), s.Requests) {
+		t.Fatal("OpenRequests")
+	}
+	// It stays where it was, with its resolution.
 	r := protocol.ApplyEvent(s, event(t, `{"type":"request.resolved","thread_id":"th","seq":6,"request_id":"p1","resolution":{"outcome":"allow"}}`))
-	if len(r.Requests) != 1 || r.Requests[0].ID() != "q1" || len(s.Requests) != 2 {
-		t.Fatal("not resolved")
+	if got := asJSON(t, r.Requests[0]); got != `{"id":"p1","input":{},"kind":"shell","name":"Bash","resolution":{"outcome":"allow"},"type":"permission"}` {
+		t.Fatalf("got %s", got)
+	}
+	if len(r.Requests) != 2 || r.Requests[1] != s.Requests[1] || s.Requests[0].Resolution() != nil {
+		t.Fatal("not resolved in place")
+	}
+	if open := protocol.OpenRequests(r); len(open) != 1 || open[0].ID() != "q1" {
+		t.Fatal("OpenRequests")
+	}
+	again := protocol.ApplyEvent(r, event(t, `{"type":"request.resolved","thread_id":"th","seq":7,"request_id":"p1","resolution":{"outcome":"deny"}}`))
+	if again.Requests[0].Resolution().Outcome != protocol.ResolutionOutcomeDeny || r.Requests[0].Resolution().Outcome != protocol.ResolutionOutcomeAllow {
+		t.Fatal("not resolved again")
+	}
+	unknown := protocol.ApplyEvent(again, event(t, `{"type":"request.resolved","thread_id":"th","seq":8,"request_id":"nope","resolution":{"outcome":"allow"}}`))
+	if unknown.Seq != 8 || &unknown.Requests[0] != &again.Requests[0] {
+		t.Fatal("an unknown request")
+	}
+	// Opened again with its id, it's replaced in place, and open again.
+	reopened := protocol.ApplyEvent(unknown, protocol.ThreadEvent{Value: &protocol.RequestOpenedEvent{ThreadID: "th", Seq: 9, Request: s.Requests[0]}})
+	if reopened.Requests[0].ID() != "p1" || reopened.Requests[1].ID() != "q1" || len(protocol.OpenRequests(reopened)) != 2 {
+		t.Fatal("not reopened")
 	}
 	if !protocol.IsGap(r, event(t, `{"type":"turn.started","thread_id":"th","seq":8,"turn_id":"t"}`)) || protocol.IsGap(r, event(t, `{"type":"turn.started","thread_id":"th","seq":7,"turn_id":"t"}`)) {
 		t.Fatal("IsGap")

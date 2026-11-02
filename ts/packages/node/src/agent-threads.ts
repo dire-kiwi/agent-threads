@@ -6,9 +6,13 @@ import {
   applyEvent,
   applyEvents,
   initialState,
+  itemPage,
+  openRequests,
+  snapshotWindow,
   validate,
   type Attachment,
   type Command,
+  type ItemPage,
   type PermissionMode,
   type Resolution,
   type Snapshot,
@@ -17,8 +21,10 @@ import {
 } from "@dire-kiwi/agent-threads-protocol";
 import { claudeCode } from "./claude/driver.js";
 import { codex } from "./codex/driver.js";
-import type { Harness, McpServer, Skill, ThreadConfig } from "./harness.js";
+import { CommandError } from "./errors.js";
+import type { Harness, HarnessMessage, LaunchOptions, McpServer, Skill, ThreadConfig } from "./harness.js";
 import { newId } from "./ids.js";
+import { splitStored, storedThread } from "./launch.js";
 import type { PermissionPolicy } from "./permissions.js";
 import { RewindError } from "./sessions.js";
 import { direct, type Spawner } from "./spawner.js";
@@ -50,6 +56,17 @@ export interface AgentThreadsOptions extends Capabilities {
   spawner?: Spawner;
   /** Called with errors that aren't any command's: a store that fails, a subscriber that throws. */
   onError?: (error: unknown) => void;
+  /**
+   * Fill in `raw` on events, items and requests: the harness message each came from. Off by
+   * default; it's saved with the events, so they take more room.
+   */
+  raw?: boolean;
+  /**
+   * Called with every line a thread's harness process writes, once its driver has dealt with it:
+   * for what the protocol leaves out (Claude Code's system messages and rate limit events, Codex's
+   * token usage...). It runs as the output is read, so it should be quick.
+   */
+  onHarnessMessage?: (message: HarnessMessage) => void;
 }
 
 export interface CreateOptions extends Capabilities {
@@ -70,6 +87,25 @@ export interface CreateOptions extends Capabilities {
    * first turn resumes it. Its messages so far aren't made into items.
    */
   session_id?: string;
+  /**
+   * How its harness process is started (args, environment, directories, config directory), on top
+   * of the harness's options. They're stored with the thread, but not sent to clients.
+   */
+  launch?: LaunchOptions;
+}
+
+/** A thread's options, for setOptions(). */
+export interface ThreadOptions {
+  /** "" clears it. */
+  model?: string;
+  /** "" clears it. */
+  effort?: string;
+  permission_mode?: PermissionMode;
+  /**
+   * Replaces how the thread's harness process is started, in full. Only the app sets it: the
+   * `set_options` command doesn't.
+   */
+  launch?: LaunchOptions;
 }
 
 /** What recover() did. */
@@ -80,16 +116,11 @@ export interface Recovered {
   lost: string[];
 }
 
+export { CommandError, ControlError } from "./errors.js";
+
 /** How often the shim spawner's finished runs are pruned. */
 const PRUNE_EVERY_MS = 3600_000;
 
-/** A command that can't be carried out: an unknown thread, or a malformed command. */
-export class CommandError extends Error {
-  constructor(message: string) {
-    super(message);
-    this.name = "CommandError";
-  }
-}
 
 export class AgentThreads {
   readonly store: Store;
@@ -132,8 +163,9 @@ export class AgentThreads {
     };
     const { tools, mcpServers, skills, permissions, systemPrompt } = options;
     this.#configs.set(thread.id, { tools, mcpServers, skills, permissions, systemPrompt });
-    await this.store.createThread(thread);
-    const rt = this.#runtime(initialState(thread));
+    const launch = options.launch ?? {};
+    await this.store.createThread(storedThread(thread, launch));
+    const rt = this.#runtime(initialState(thread), launch);
     rt.emit({ type: "thread.updated", thread });
     await rt.saved();
     return thread;
@@ -160,12 +192,15 @@ export class AgentThreads {
 
   /** The thread, or null. */
   async get(threadId: string): Promise<Thread | null> {
-    return this.#threads.get(threadId)?.thread ?? (await this.store.getThread(threadId));
+    const live = this.#threads.get(threadId)?.thread;
+    if (live) return live;
+    const stored = await this.store.getThread(threadId);
+    return stored && splitStored(stored).thread;
   }
 
   async list(): Promise<Thread[]> {
     const threads = await this.store.listThreads();
-    return threads.map((t) => this.#threads.get(t.id)?.thread ?? t);
+    return threads.map((t) => this.#threads.get(t.id)?.thread ?? splitStored(t).thread);
   }
 
   /** Deletes a thread, stopping its harness first. Whether there was one. */
@@ -181,10 +216,24 @@ export class AgentThreads {
     return this.store.deleteThread(threadId);
   }
 
-  /** The thread's state now, including text streamed so far. */
-  async snapshot(threadId: string): Promise<Snapshot> {
+  /**
+   * The thread's state now, including text streamed so far. With a `limit`, a window of it: its
+   * last `limit` items and what they need from before them, for a client that loads earlier ones
+   * with itemsBefore (spec/PROTOCOL.md, "Windows").
+   */
+  async snapshot(threadId: string, options?: { limit?: number }): Promise<Snapshot> {
     this.#open();
-    return structuredClone((await this.#load(threadId)).snapshot);
+    return structuredClone(snapshotWindow((await this.#load(threadId)).snapshot, options?.limit));
+  }
+
+  /**
+   * The thread's items before index `before` (a window's `start`), at most `limit` of them, with
+   * the subagent calls they belong to and the requests they have: a page for a client that has a
+   * window to load earlier items into.
+   */
+  async itemsBefore(threadId: string, before: number, limit: number): Promise<ItemPage> {
+    this.#open();
+    return structuredClone(itemPage((await this.#load(threadId)).snapshot, before, limit));
   }
 
   /** The thread's saved events after `seq`, for a client catching up. */
@@ -251,6 +300,24 @@ export class AgentThreads {
     }
   }
 
+  /**
+   * Sends the thread's running harness process a request of the app's own, and resolves with its
+   * answer: for Claude Code a control request's `request` (e.g. `{subtype: "get_context_usage"}`),
+   * answered with the control response's `response`; for Codex `{method, params?}`, answered with the
+   * JSON-RPC result. Rejects with a CommandError if the thread has no running process or its harness
+   * takes no requests, and with a ControlError if the harness refuses it, or its process exits (or
+   * the backend closes) before it answers. It mustn't be used for what the driver does itself
+   * (starting turns, answering the harness's requests...).
+   */
+  async control(threadId: string, request: unknown): Promise<unknown> {
+    this.#open();
+    const rt = await this.#load(threadId);
+    this.#open();
+    const session = rt.session;
+    if (!session?.control) throw new CommandError(`thread ${threadId} runs on ${rt.thread.harness}, which doesn't take control requests`);
+    return session.control(request);
+  }
+
   // ---------- commands ----------
 
   /** Carries out a command from a client. Throws a CommandError for one it can't. */
@@ -269,8 +336,13 @@ export class AgentThreads {
       case "respond":
         return this.respond(command.thread_id, command.request_id, command.resolution);
       case "set_options": {
-        const { type: _t, thread_id, ...options } = command;
-        return this.setOptions(thread_id, options);
+        // Only the thread's options a client may change: not its launch options.
+        const { thread_id, model, effort, permission_mode } = command;
+        return this.setOptions(thread_id, {
+          ...(model !== undefined ? { model } : {}),
+          ...(effort !== undefined ? { effort } : {}),
+          ...(permission_mode !== undefined ? { permission_mode } : {}),
+        });
       }
       case "rewind":
         return this.rewind(command.thread_id, command.turn_id);
@@ -297,9 +369,10 @@ export class AgentThreads {
     (await this.#ready({ type: "respond", thread_id: threadId, request_id: requestId, resolution })).respond(requestId, resolution);
   }
 
-  /** Changes the thread's model, effort or permission mode, from its next turn. */
-  async setOptions(threadId: string, options: { model?: string; effort?: string; permission_mode?: PermissionMode }): Promise<void> {
-    const rt = await this.#ready({ type: "set_options", thread_id: threadId, ...options });
+  /** Changes the thread's model, effort, permission mode or launch options, from its next turn. */
+  async setOptions(threadId: string, options: ThreadOptions): Promise<void> {
+    const { launch, ...rest } = options;
+    const rt = await this.#ready({ type: "set_options", thread_id: threadId, ...rest });
     const patch: Partial<Thread> = {};
     if (options.model !== undefined) patch.model = options.model || undefined;
     if (options.effort !== undefined) patch.effort = options.effort || undefined;
@@ -307,6 +380,7 @@ export class AgentThreads {
     const before = JSON.stringify(rt.thread);
     rt.setThread(patch);
     if (JSON.stringify(rt.thread) !== before) rt.session?.optionsChanged();
+    if (launch) rt.setLaunch(launch);
   }
 
   /**
@@ -436,15 +510,25 @@ export class AgentThreads {
     return this.#configs.get(threadId)?.permissions ?? this.#options.permissions ?? "ask";
   }
 
-  #runtime(state: Snapshot): ThreadRuntime {
+  #runtime(state: Snapshot, launch: LaunchOptions): ThreadRuntime {
     const id = state.thread.id;
+    const onMessage = this.#options.onHarnessMessage;
     const host = {
       store: this.store,
       spawner: this.spawner,
+      raw: !!this.#options.raw,
       publish: (e: ThreadEvent) => this.#publish(e),
+      harnessMessage: (m: HarnessMessage) => {
+        if (!onMessage) return;
+        try {
+          onMessage(m);
+        } catch (e) {
+          this.#error(e);
+        }
+      },
       error: (e: unknown) => this.#error(e),
     };
-    const rt = new ThreadRuntime(host, state, this.#config(id), this.#policy(id));
+    const rt = new ThreadRuntime(host, state, this.#config(id), launch, this.#policy(id));
     const harness = this.harnesses[state.thread.harness];
     if (!harness) throw new CommandError(`thread ${id} runs on ${state.thread.harness}, which isn't configured`);
     rt.session = harness.open(rt);
@@ -465,30 +549,31 @@ export class AgentThreads {
   }
 
   async #fromStore(threadId: string): Promise<ThreadRuntime> {
-    const thread = await this.store.getThread(threadId);
-    if (!thread) throw new CommandError(`there's no thread ${threadId}`);
+    const stored = await this.store.getThread(threadId);
+    if (!stored) throw new CommandError(`there's no thread ${threadId}`);
+    const { thread, launch } = splitStored(stored);
     const snap = await this.store.loadSnapshot(threadId);
     const events = await this.store.readEvents(threadId, { after: snap?.seq ?? 0 });
     let state = applyEvents(snap ?? initialState(thread), events);
     if (state.seq === 0) state = initialState(thread);
-    const rt = this.#runtime(state);
-    // The session the running turn (if one is) started in, which a turn rebuilt here starts with.
+    const rt = this.#runtime(state, launch);
+    // The turn that was running, if one was (a compaction may have no items yet), and the session it
+    // started in: what a turn rebuilt here is.
     const running = rt.thread.status === "running" || rt.thread.status === "waiting";
-    const turnId = [...state.items].reverse().find((i) => i.turn_id)?.turn_id;
-    const startedIn = running && turnId ? (sessionAtStart(snap ?? initialState(thread), events, turnId) ?? (await this.#sessionAtStart(thread, turnId))) : undefined;
-    const session = startedIn ?? (rt.thread.session_id ? { session: rt.thread.session_id } : {});
-    if (await this.#reattach(rt, session)) return rt;
+    const open = running ? (runningTurn(snap ?? initialState(thread), events) ?? (await this.#runningTurn(thread))) : undefined;
+    const lost: LostTurn = open ?? (rt.thread.session_id ? { session: rt.thread.session_id } : {});
+    if (await this.#reattach(rt, lost)) return rt;
     // The process that ran its turn went with the backend before this one, or can't be followed.
     if (running || rt.thread.run) {
       if (rt.thread.run) rt.lostRun = rt.thread.run.id;
-      recoverLost(rt, session);
+      recoverLost(rt, lost);
     }
     return rt;
   }
 
-  /** The session the turn `turnId` started in, from all the thread's events (see sessionAtStart). */
-  async #sessionAtStart(thread: Thread, turnId: string): Promise<{ session?: string } | undefined> {
-    return sessionAtStart(initialState(thread), await this.store.readEvents(thread.id, { after: 0 }), turnId);
+  /** The turn that was running, from all the thread's events (see runningTurn). */
+  async #runningTurn(thread: Thread): Promise<LostTurn | undefined> {
+    return runningTurn(initialState(thread), await this.store.readEvents(thread.id, { after: 0 }));
   }
 
   /**
@@ -496,7 +581,7 @@ export class AgentThreads {
    * its turn and open requests are as they were when the run was last saved, and the session
    * carries on reading the run from there. Whether it did; if it couldn't, the run is stopped.
    */
-  async #reattach(rt: ThreadRuntime, startedIn: { session?: string }): Promise<boolean> {
+  async #reattach(rt: ThreadRuntime, lost: LostTurn): Promise<boolean> {
     const run = rt.thread.run;
     if (!run || run.spawner === "direct") return false;
     const record = await this.store.getRun(run.id);
@@ -504,8 +589,7 @@ export class AgentThreads {
     const data = (record.data ?? {}) as { turn?: Turn | null };
     const s = rt.thread.status;
     if (s === "running" || s === "waiting") {
-      const last = [...rt.snapshot.items].reverse().find((i) => i.turn_id)?.turn_id;
-      rt.turn = data.turn ? { ...data.turn } : { id: last ?? newId("turn"), interrupted: false, ...startedIn };
+      rt.turn = data.turn ? { ...data.turn } : { id: lost.id ?? latestTurn(rt) ?? newId("turn"), interrupted: false, ...(lost.session ? { session: lost.session } : {}) };
     }
     rt.adoptRun(record);
     const session = rt.session;
@@ -516,7 +600,7 @@ export class AgentThreads {
     }
     // Requests the session didn't take up again can't be answered.
     const open = new Set(rt.openRequests.map((r) => r.id));
-    for (const r of rt.snapshot.requests) if (!open.has(r.id)) rt.emit({ type: "request.resolved", request_id: r.id, resolution: { outcome: "cancel" } });
+    for (const r of openRequests(rt.snapshot)) if (!open.has(r.id)) rt.emit({ type: "request.resolved", request_id: r.id, resolution: { outcome: "cancel" } });
     // With none left (one answered before the restart is closed, say), the turn runs on.
     if (rt.turn && !open.size && rt.thread.status === "waiting") rt.setThread({ status: "running" });
     rt.setThread({ run: { ...run, reattached_at: new Date().toISOString() } });
@@ -553,32 +637,43 @@ function idle(rt: ThreadRuntime, what: string): void {
   if (rt.turn) throw new CommandError(`a turn is running: the thread can't be ${what} until it ends (interrupt it first)`);
 }
 
-/**
- * The thread's session_id when the turn `turnId` started (as `{session}`, empty for none), from
- * `events` folded onto `from`; undefined if its turn.started isn't among them. (A session the turn
- * starts is set after its turn.started.)
- */
-function sessionAtStart(from: Snapshot, events: ThreadEvent[], turnId: string): { session?: string } | undefined {
-  let state = from;
-  let found: { session?: string } | undefined;
-  for (const e of events) {
-    if (e.type === "turn.started" && e.turn_id === turnId) found = state.thread.session_id ? { session: state.thread.session_id } : {};
-    state = applyEvent(state, e);
-  }
-  return found;
+/** A turn that was running when the thread was loaded: its id, and the session it started in. */
+interface LostTurn {
+  id?: string;
+  session?: string;
 }
 
 /**
- * Ends a turn whose process was lost when the backend stopped. `startedIn` is the session it
- * started in.
+ * The turn that's still running in `events` folded onto `from` (the last turn.started with no
+ * turn.completed after it), with the thread's session_id when it started (a session the turn
+ * starts is set after its turn.started); undefined if there's none in them.
  */
-function recoverLost(rt: ThreadRuntime, startedIn: { session?: string }): void {
+function runningTurn(from: Snapshot, events: ThreadEvent[]): LostTurn | undefined {
+  let state = from;
+  let open: LostTurn | undefined;
+  for (const e of events) {
+    if (e.type === "turn.started") open = { id: e.turn_id, ...(state.thread.session_id ? { session: state.thread.session_id } : {}) };
+    else if (e.type === "turn.completed" && e.turn_id === open?.id) open = undefined;
+    state = applyEvent(state, e);
+  }
+  return open;
+}
+
+/** The id of the thread's latest turn, from its items, for a lost turn whose id isn't known. */
+function latestTurn(rt: ThreadRuntime): string | undefined {
+  return [...rt.snapshot.items].reverse().find((i) => i.turn_id)?.turn_id;
+}
+
+/**
+ * Ends a turn whose process was lost when the backend stopped: `lost` (or, with no id, the latest
+ * turn).
+ */
+function recoverLost(rt: ThreadRuntime, lost: LostTurn): void {
   const s = rt.thread.status;
   if (s === "running" || s === "waiting") {
-    const items = rt.snapshot.items;
-    const turnId = [...items].reverse().find((i) => i.turn_id)?.turn_id ?? newId("turn");
-    rt.turn = { id: turnId, interrupted: false, ...startedIn };
-    for (const r of rt.snapshot.requests) {
+    const turnId = lost.id ?? latestTurn(rt) ?? newId("turn");
+    rt.turn = { id: turnId, interrupted: false, ...(lost.session ? { session: lost.session } : {}) };
+    for (const r of openRequests(rt.snapshot)) {
       rt.emit({ type: "request.resolved", request_id: r.id, resolution: { outcome: "cancel" } });
     }
     rt.addItem({

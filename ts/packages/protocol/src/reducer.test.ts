@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 import { readJson, readJsonl } from "./examples.js";
 import type { AssistantMessage, Item, Snapshot, Thread, ThreadEvent, ToolCall } from "./generated.js";
-import { applyEvent, applyEvents, initialState, isGap } from "./reducer.js";
+import { applyEvent, applyEvents, initialState, isGap, openRequests } from "./reducer.js";
 
 const thread: Thread = { id: "th", harness: "claude", status: "idle", created_at: "2026-11-01T00:00:00Z" };
 const user: Item = { id: "u1", type: "user_message", text: "hi" };
@@ -138,12 +138,22 @@ describe("applyEvent", () => {
     ]);
     expect(open.requests.map((r) => r.id)).toEqual(["p1", "q1"]);
     expect(open.items).toBe(s.items);
+    expect(openRequests(open)).toEqual(open.requests);
     const resolved = applyEvent(open, { type: "request.resolved", thread_id: "th", seq: 6, request_id: "p1", resolution: { outcome: "allow" } });
-    expect(resolved.requests).toEqual([open.requests[1]]);
-    expect(resolved.requests[0]).toBe(open.requests[1]);
-    const unknown = applyEvent(resolved, { type: "request.resolved", thread_id: "th", seq: 7, request_id: "p1", resolution: { outcome: "allow" } });
-    expect(unknown.requests).toBe(resolved.requests);
-    expect(unknown.seq).toBe(7);
+    // It stays where it was, with its resolution.
+    expect(resolved.requests).toEqual([{ ...open.requests[0], resolution: { outcome: "allow" } }, open.requests[1]]);
+    expect(resolved.requests[1]).toBe(open.requests[1]);
+    expect(open.requests[0]).not.toHaveProperty("resolution");
+    expect(openRequests(resolved)).toEqual([open.requests[1]]);
+    const again = applyEvent(resolved, { type: "request.resolved", thread_id: "th", seq: 7, request_id: "p1", resolution: { outcome: "deny" } });
+    expect(again.requests[0]).toHaveProperty("resolution", { outcome: "deny" });
+    const unknown = applyEvent(again, { type: "request.resolved", thread_id: "th", seq: 8, request_id: "nope", resolution: { outcome: "allow" } });
+    expect(unknown.requests).toBe(again.requests);
+    expect(unknown.seq).toBe(8);
+    // Opened again with its id, it's replaced in place, and open again.
+    const reopened = applyEvent(unknown, { type: "request.opened", thread_id: "th", seq: 9, request: open.requests[0]! });
+    expect(reopened.requests.map((r) => r.id)).toEqual(["p1", "q1"]);
+    expect(openRequests(reopened)).toHaveLength(2);
   });
 
   it("replaces the thread", () => {

@@ -189,6 +189,54 @@
       "turn_id": "t1"
     }
   ],
-  "requests": [],
+  "requests": [
+    {
+      "id": "p1",
+      "type": "permission",
+      "tool_call_id": "tc1",
+      "name": "Bash",
+      "kind": "shell",
+      "input": {
+        "command": "npm test"
+      },
+      "title": "npm test",
+      "turn_id": "t1",
+      "resolution": {
+        "outcome": "allow",
+        "always": true
+      }
+    },
+    {
+      "id": "q1",
+      "type": "question",
+      "tool_call_id": "tc5",
+      "questions": [
+        {
+          "id": "runner",
+          "question": "Which test runner?",
+          "header": "Runner",
+          "options": [
+            {
+              "label": "vitest",
+              "description": "Already in devDependencies"
+            },
+            {
+              "label": "jest"
+            }
+          ],
+          "allow_other": true
+        }
+      ],
+      "turn_id": "t1",
+      "resolution": {
+        "outcome": "answer",
+        "answers": {
+          "runner": [
+            "vitest"
+          ]
+        }
+      }
+    }
+  ],
   "seq": 34
 }

@@ -37,7 +37,8 @@
 // it to be run, and MINI_CODEX_RESULT_DELAY=<ms> between its answer and the item's completion.
 // MINI_CODEX_NO_DYNAMIC=1 refuses
 // thread/start with dynamicTools. MINI_CODEX_LOG names a file each run appends its argv and
-// CODEX_HOME, and every message it's sent, to.
+// CODEX_HOME (and the variables MINI_LOG_ENV names, comma-separated), and every message it's sent,
+// to.
 
 import { appendFileSync, existsSync, mkdirSync, readdirSync, readFileSync, realpathSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
@@ -47,7 +48,8 @@ const log = process.env.MINI_CODEX_LOG;
 const steerMode = process.env.MINI_CODEX_STEER ?? "now";
 const home = process.env.CODEX_HOME;
 const note = (v) => log && appendFileSync(log, JSON.stringify(v) + "\n");
-note({ argv: process.argv.slice(2), codexHome: home });
+const loggedEnv = Object.fromEntries((process.env.MINI_LOG_ENV ?? "").split(",").filter(Boolean).map((k) => [k, process.env[k] ?? null]));
+note({ argv: process.argv.slice(2), codexHome: home, env: loggedEnv });
 
 const out = (m) => process.stdout.write(JSON.stringify(m) + "\n");
 const notify = (method, params) => out({ method, params });

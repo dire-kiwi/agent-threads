@@ -9,15 +9,17 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { Resolution, TurnSession } from "@dire-kiwi/agent-threads-protocol";
 import { messageParts, pathText } from "../attachments.js";
-import type { Harness, HarnessSession, Message, RunCheckpoint, Skill, ThreadContext } from "../harness.js";
+import { CommandError, ControlError } from "../errors.js";
+import { parseLine, type Harness, type HarnessSession, type Message, type RunCheckpoint, type Skill, type ThreadContext } from "../harness.js";
 import { newId } from "../ids.js";
+import { applyLaunchEnv, launchedNow, launchedOf, withEnv, type Launched } from "../launch.js";
 import { permissionKey, type PermissionDecision } from "../permissions.js";
 import { resumeAtPoint, type RewindPoint } from "../sessions.js";
 import { writeSkills } from "../skills.js";
 import type { ExitStatus, HarnessProcess, ProcessHandlers } from "../spawner.js";
 import type { RunRecord } from "../store.js";
 import { runTool } from "../tools.js";
-import { APP_SERVER, claudePermissionMode, claudeTool, claudeUsage, editChange, questions, resultText, slim, title } from "./translate.js";
+import { APP_SERVER, claudePermissionMode, claudeRateLimits, claudeTool, claudeUsage, editChange, hookNotice, questions, resultText, retryText, slim, title } from "./translate.js";
 
 export interface ClaudeCodeOptions {
   /** The `claude` binary. */
@@ -94,9 +96,6 @@ interface RunState {
   stopAt?: number;
 }
 
-/** The thread's options a process is started with: a different one needs another. */
-type Launched = { model?: string; effort?: string; permission_mode?: string };
-
 /** One `claude` process, and what's needed to read it. */
 class Run {
   readonly id: string;
@@ -104,7 +103,7 @@ class Run {
   /** Claude answered `initialize`, so messages can go in. */
   ready = false;
   waiting: string[] = [];
-  /** Our control requests, by id. */
+  /** Our control requests (and the app's), by id: they're given the control response, or null if there's none. */
   pending = new Map<string, { subtype: string; resolve: (response: Json | null) => void }>();
   #nextRequest = 1;
   exited = false;
@@ -151,7 +150,13 @@ class Run {
     else this.waiting.push(JSON.stringify(msg));
   }
 
+  /** Sends a control request of ours: its answer's body, or null if Claude refused it (or exited). */
   control(request: Json): Promise<Json | null> {
+    return this.request(request).then(body);
+  }
+
+  /** Sends a control request: its control response (`subtype`, `response`, `error`), or null if it exited first. */
+  request(request: Json): Promise<Json | null> {
     const request_id = `req_${this.#nextRequest++}`;
     const p = new Promise<Json | null>((resolve) => this.pending.set(request_id, { subtype: String(request.subtype), resolve }));
     this.write({ type: "control_request", request_id, request });
@@ -228,6 +233,8 @@ class ClaudeSession implements HarnessSession {
   /** A directory for the thread's generated files (skills, attached files), made when needed. */
   #tmp: string | undefined;
   #closed = false;
+  /** The app's control requests not yet answered: what fails each, when the backend lets go of its run. */
+  #controls = new Set<(error: Error) => void>();
 
   constructor(ctx: ThreadContext, options: ClaudeCodeOptions) {
     this.#ctx = ctx;
@@ -363,7 +370,7 @@ class ClaudeSession implements HarnessSession {
     const spawner = this.#ctx.spawner;
     if (!st || st.v !== 1 || !spawner.attach || this.#run) return false;
     const run = new Run(record.id);
-    run.restore(st, (subtype) => (subtype === "initialize" ? (r) => this.#initialized(run, r) : () => {}));
+    run.restore(st, (subtype) => (subtype === "initialize" ? (r) => this.#initialized(run, body(r)) : () => {}));
     this.#run = run;
     try {
       run.proc = spawner.attach(record, this.#handlers(run));
@@ -373,9 +380,7 @@ class ClaudeSession implements HarnessSession {
       return false;
     }
     // A process started with other options than the thread's now is replaced at the next turn.
-    const t = this.#ctx.thread;
-    const l = st.launched;
-    this.#stale = !!st.stale || !l || l.model !== t.model || l.effort !== t.effort || l.permission_mode !== t.permission_mode;
+    this.#stale = !!st.stale || !launchedNow(st.launched, this.#ctx);
     // Claude's requests that were open: the user's questions are taken up again, and the rest
     // (a policy that hadn't decided, a tool that was running) are dealt with again. One answered
     // before the restart, though that wasn't saved, is closed: Claude has its answer.
@@ -397,7 +402,30 @@ class ClaudeSession implements HarnessSession {
     run.detached = true;
     run.proc.detach();
     run.abort.abort();
+    for (const fail of [...this.#controls]) fail(new ControlError("The backend closed before Claude Code answered."));
     return true;
+  }
+
+  control(request: unknown): Promise<unknown> {
+    const run = this.#live();
+    if (!run?.proc || run.detached) return Promise.reject(new CommandError(`thread ${this.#ctx.threadId} has no running Claude Code process`));
+    if (!request || typeof request !== "object" || Array.isArray(request) || typeof (request as Json).subtype !== "string") {
+      return Promise.reject(new CommandError("a Claude Code control request is an object with a subtype"));
+    }
+    return new Promise((resolve, reject) => {
+      const fail = (e: Error) => {
+        this.#controls.delete(fail);
+        reject(e);
+      };
+      this.#controls.add(fail);
+      void run.request(request as Json).then((r) => {
+        if (!this.#controls.has(fail)) return;
+        this.#controls.delete(fail);
+        if (!r) reject(new ControlError("Claude Code exited before it answered."));
+        else if (r.subtype === "error") reject(new ControlError(typeof r.error === "string" && r.error ? r.error : "Claude Code refused the request.", r.error));
+        else resolve(r.response ?? null);
+      });
+    });
   }
 
   /** A request of Claude's that was open when the backend restarted. */
@@ -515,6 +543,9 @@ class ClaudeSession implements HarnessSession {
     const thread = ctx.thread;
     const { tools } = ctx.config;
     const o = this.#o;
+    const env = applyLaunchEnv(withEnv(o.env), ctx.launch);
+    const configDir = ctx.launch.configDir || o.configDir;
+    if (configDir) env.CLAUDE_CONFIG_DIR = configDir;
     let proc: HarnessProcess;
     try {
       proc = ctx.spawner.spawn(
@@ -522,7 +553,7 @@ class ClaudeSession implements HarnessSession {
           command: o.bin ?? "claude",
           args: [...(o.binArgs ?? []), ...this.#args(run)],
           ...(thread.cwd ? { cwd: thread.cwd } : {}),
-          env: { ...process.env, ...o.env, ...(o.configDir ? { CLAUDE_CONFIG_DIR: o.configDir } : {}) },
+          env,
           threadId: ctx.threadId,
           runId: run.id,
         },
@@ -533,14 +564,17 @@ class ClaudeSession implements HarnessSession {
       return;
     }
     run.proc = proc;
-    run.launched = { model: thread.model, effort: thread.effort, permission_mode: thread.permission_mode };
+    run.launched = launchedOf(ctx);
     ctx.setThread({ run: { id: run.id, spawner: ctx.spawner.name, started_at: new Date().toISOString() } });
     void run.control({ subtype: "initialize", ...(tools.length ? { sdkMcpServers: [APP_SERVER] } : {}) }).then((r) => this.#initialized(run, r));
   }
 
   #handlers(run: Run): ProcessHandlers {
     return {
-      line: (line) => this.#line(run, line),
+      line: (line) => {
+        const m = parseLine(line);
+        this.#ctx.fromHarness(run.id, line, m, () => this.#line(run, m));
+      },
       stderr: (line) => {
         run.stderr.push(line);
         if (run.stderr.length > 20) run.stderr.shift();
@@ -571,7 +605,7 @@ class ClaudeSession implements HarnessSession {
     const args = ["-p", "--output-format", "stream-json", "--verbose", "--include-partial-messages", "--input-format", "stream-json"];
     args.push("--replay-user-messages", "--permission-prompt-tool", "stdio");
     if (!o.userSettings) args.push("--setting-sources", "", "--strict-mcp-config");
-    args.push("--forward-subagent-text");
+    args.push("--forward-subagent-text", "--include-hook-events");
     if (t.model) args.push("--model", t.model);
     if (t.effort) args.push("--effort", t.effort);
     const mode = claudePermissionMode(t.permission_mode);
@@ -596,7 +630,9 @@ class ClaudeSession implements HarnessSession {
       args.push("--plugin-dir", run.pluginDir);
     }
     if (systemPrompt) args.push("--append-system-prompt", systemPrompt);
-    args.push(...(o.args ?? []));
+    const launch = ctx.launch;
+    for (const d of launch.addDirs ?? []) args.push("--add-dir", d);
+    args.push(...(o.args ?? []), ...(launch.args ?? []));
     return args;
   }
 
@@ -624,21 +660,18 @@ class ClaudeSession implements HarnessSession {
 
   // ---------- what Claude says ----------
 
-  #line(run: Run, line: string): void {
-    let m: Json;
-    try {
-      m = JSON.parse(line);
-    } catch {
-      return; // Not a message: Claude Code doesn't write anything else to stdout, but be safe.
-    }
-    if (!m || typeof m !== "object") return;
+  /** A line of Claude's output, parsed (undefined if it isn't JSON). */
+  #line(run: Run, parsed: unknown): void {
+    // Not a message: Claude Code doesn't write anything else to stdout, but be safe.
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return;
+    const m = parsed as Json;
     if (m.type === "control_response") {
       // Claude echoes our own responses back too; those aren't for a request of ours.
       const r = m.response ?? {};
       const p = run.pending.get(r.request_id);
       if (p) {
         run.pending.delete(r.request_id);
-        p.resolve(r.subtype === "error" ? null : (r.response ?? {}));
+        p.resolve(r);
       }
       return;
     }
@@ -656,7 +689,15 @@ class ClaudeSession implements HarnessSession {
     // The main conversation's messages (replayed ones too): the turn's last is where a rewind to
     // after it resumes the session.
     if ((m.type === "user" || m.type === "assistant") && !parent && typeof m.uuid === "string") run.at = m.uuid;
+    // A message refused for the usage limit says which limit, before anything else it leads to.
+    if ((m.type === "assistant" || m.type === "user" || m.type === "result") && m.api_error === "usage_limit_reached") {
+      const info = m.api_error_params?.rate_limit_info;
+      if (info && typeof info === "object") ctx.rateLimits(claudeRateLimits(info));
+    }
     switch (m.type) {
+      case "rate_limit_event":
+        if (m.rate_limit_info && typeof m.rate_limit_info === "object") ctx.rateLimits(claudeRateLimits(m.rate_limit_info));
+        break;
       case "system":
         if (m.subtype === "init") {
           // The session it runs in; and a rewind's resume_at is done with once it has resumed there.
@@ -664,6 +705,11 @@ class ClaudeSession implements HarnessSession {
           if (m.session_id && m.session_id !== ctx.thread.session_id) patch.session_id = m.session_id;
           if (run.resumeAt && ctx.thread.resume_at === run.resumeAt) patch.resume_at = undefined;
           if (Object.keys(patch).length) ctx.setThread(patch);
+        }
+        if (m.subtype === "api_retry") ctx.addItem({ id: newId("n"), type: "notice", level: "warning", code: "retry", text: retryText(m), ...(parent ? { parent_id: parent } : {}) });
+        if (m.subtype === "hook_response") {
+          const n = hookNotice(m);
+          if (n) ctx.addItem({ id: newId("n"), type: "notice", ...n, code: "hook", ...(parent ? { parent_id: parent } : {}) });
         }
         if (m.subtype === "compact_boundary") {
           const meta = m.compact_metadata ?? {};
@@ -946,6 +992,11 @@ class ClaudeSession implements HarnessSession {
         return reply({ error: { code: -32601, message: `method ${msg.method} isn't supported` } });
     }
   }
+}
+
+/** A control response's body, or null if Claude refused the request (or exited before answering). */
+function body(r: Json | null): Json | null {
+  return r && r.subtype !== "error" ? (r.response ?? {}) : null;
 }
 
 /**

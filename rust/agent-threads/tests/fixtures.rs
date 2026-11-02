@@ -1,17 +1,18 @@
 //! Every fixture in spec/fixtures (Claude Code and Codex), run as spec/fixtures/README.md says: the
 //! SDK drives the fake CLI (which replays the recording and checks what it's sent), and its events
 //! must match expected.jsonl by spec/tools/check-events.mjs's rules. Its snapshot must be its
-//! events, folded. Each runs with the harness as a child process, and under the shim.
+//! events, folded. Each runs with the harness as a child process, and under the shim. The
+//! pass-through fixtures' control requests, harness messages and raw payloads are checked too.
 
 mod common;
 
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use agent_threads::reducer::{apply_events, initial_state};
+use agent_threads::reducer::{apply_events, initial_state, open_requests};
 use agent_threads::{
-    AgentThreads, Capabilities, ClaudeCodeOptions, CodexOptions, CreateOptions, McpServer, MemoryStore, Options,
-    PermissionPolicy, Spawner, ThreadEvent, claude_code, codex, direct, tool,
+    AgentThreads, Capabilities, ClaudeCodeOptions, CodexOptions, CreateOptions, Error, HarnessMessage, McpServer,
+    MemoryStore, Options, PermissionPolicy, Spawner, ThreadEvent, claude_code, codex, direct, tool,
 };
 use serde_json::{Value, json};
 use tokio::sync::broadcast;
@@ -75,11 +76,13 @@ struct Setup<'a> {
     spawner: Arc<dyn Spawner>,
     store: Arc<dyn agent_threads::Store>,
     errors: Arc<Mutex<Vec<String>>>,
+    messages: Arc<Mutex<Vec<HarnessMessage>>>,
 }
 
 fn make(s: &Setup) -> AgentThreads {
     let (fixture, dir, state, codex_home) = (s.fixture, s.dir, s.state, s.codex_home);
     let errors = s.errors.clone();
+    let messages = s.messages.clone();
     let fake = common::spec_dir()
         .join("tools/fake-cli.mjs")
         .to_string_lossy()
@@ -149,6 +152,9 @@ fn make(s: &Setup) -> AgentThreads {
         },
         on_error: Some(Arc::new(move |e| errors.lock().unwrap().push(e.to_string()))),
         event_capacity: 1 << 16,
+        raw: fixture["raw"] == true,
+        on_harness_message: (fixture["raw"] == true)
+            .then(|| Arc::new(move |m: &HarnessMessage| messages.lock().unwrap().push(m.clone())) as _),
     })
 }
 
@@ -164,6 +170,7 @@ async fn run_fixture(scenario: &str, spawner_name: &str) {
         _ => direct(),
     };
     let errors = Arc::new(Mutex::new(Vec::new()));
+    let messages = Arc::new(Mutex::new(Vec::new()));
 
     // The same store each time, as an app that restarts has.
     let setup = Setup {
@@ -174,6 +181,7 @@ async fn run_fixture(scenario: &str, spawner_name: &str) {
         spawner,
         store,
         errors: errors.clone(),
+        messages: messages.clone(),
     };
     let mut sdk = make(&setup);
     let mut events = Events {
@@ -204,13 +212,25 @@ async fn run_fixture(scenario: &str, spawner_name: &str) {
             sdk = make(&setup);
             events.rx = sdk.subscribe();
             from = events.all.len();
+        } else if let Some(request) = step.get("control") {
+            let answer = sdk.control(&thread.id, request.clone()).await;
+            match step.get("error").and_then(Value::as_str) {
+                Some(want) => match answer {
+                    Err(Error::Control { message, .. }) => {
+                        assert!(message.contains(want), "{at}: the error {message:?}")
+                    }
+                    other => panic!("{at}: expected a control error, got {other:?}"),
+                },
+                None => assert_eq!(answer.unwrap_or_else(|e| panic!("{at}: {e}")), step["result"], "{at}"),
+            }
         } else if let Some(command) = step.get("command") {
             let mut command = command.clone();
             command["thread_id"] = json!(thread.id);
             if command["type"] == "respond" {
                 let snap = sdk.snapshot(&thread.id).await.unwrap();
-                assert_eq!(snap.requests.len(), 1, "{at}: open requests");
-                command["request_id"] = json!(snap.requests[0].id());
+                let open: Vec<_> = open_requests(&snap).collect();
+                assert_eq!(open.len(), 1, "{at}: open requests");
+                command["request_id"] = json!(open[0].id());
             }
             if command["type"] == "rewind" {
                 // {{tN}}: the thread's Nth turn.
@@ -304,6 +324,58 @@ async fn run_fixture(scenario: &str, spawner_name: &str) {
     );
     let errors = errors.lock().unwrap();
     assert!(errors.is_empty(), "{scenario} ({spawner_name}): errors: {errors:?}");
+
+    // What the protocol leaves out came through.
+    let messages = messages.lock().unwrap();
+    for m in messages.iter() {
+        assert_eq!(m.thread_id, thread.id, "{scenario}: a harness message's thread");
+        assert_eq!(
+            m.harness,
+            t["harness"].as_str().unwrap(),
+            "{scenario}: a harness message's harness"
+        );
+        assert_eq!(
+            m.message,
+            serde_json::from_str::<Value>(&m.line).ok(),
+            "{scenario}: a harness message's line"
+        );
+    }
+    for p in fixture["harness_messages"].as_array().into_iter().flatten() {
+        assert!(
+            messages
+                .iter()
+                .any(|m| m.message.as_ref().is_some_and(|v| matches(v, p))),
+            "{scenario} ({spawner_name}): no harness message like {p}"
+        );
+    }
+    for check in fixture["raw_checks"].as_array().into_iter().flatten() {
+        let (pattern, raw) = (&check["event"], &check["raw"]);
+        let matching: Vec<Value> = all
+            .iter()
+            .map(|e| serde_json::to_value(e).unwrap())
+            .filter(|e| matches(e, pattern))
+            .collect();
+        assert!(
+            !matching.is_empty(),
+            "{scenario} ({spawner_name}): no event like {pattern}"
+        );
+        for e in matching {
+            let got = match e["type"].as_str() {
+                Some("item.added") => e["item"].get("raw"),
+                Some("request.opened") => e["request"].get("raw"),
+                _ => e.get("raw"),
+            };
+            let shown: String = e.to_string().chars().take(300).collect();
+            match got {
+                None => assert!(raw.is_null(), "{scenario} ({spawner_name}): {shown} has no raw"),
+                Some(got) => assert!(
+                    !raw.is_null() && matches(got, raw),
+                    "{scenario} ({spawner_name}): {shown} has a raw like {raw}: {}",
+                    got.to_string().chars().take(300).collect::<String>()
+                ),
+            }
+        }
+    }
 }
 
 /// The spawners to run fixtures with: both, or those in $AGENT_THREADS_SPAWNERS (comma-separated).
@@ -356,6 +428,7 @@ fixtures! {
     claude_interrupt: "claude/interrupt",
     claude_mcp_tool: "claude/mcp-tool",
     claude_new_session: "claude/new-session",
+    claude_pass_through: "claude/pass-through",
     claude_permission_allow: "claude/permission-allow",
     claude_permission_deny: "claude/permission-deny",
     claude_plain_reply: "claude/plain-reply",
@@ -373,6 +446,7 @@ fixtures! {
     codex_interrupt: "codex/interrupt",
     codex_mcp_tool: "codex/mcp-tool",
     codex_new_session: "codex/new-session",
+    codex_pass_through: "codex/pass-through",
     codex_permission_allow: "codex/permission-allow",
     codex_permission_deny: "codex/permission-deny",
     codex_plain_reply: "codex/plain-reply",

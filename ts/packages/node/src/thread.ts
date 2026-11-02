@@ -2,9 +2,10 @@
 // steering queue and open requests. Every change is an event, numbered, applied, sent to the
 // subscribers, and saved to the store in order (deltas aren't saved).
 
-import { applyEvent, type Attachment, type Item, type Resolution, type Snapshot, type Thread, type ThreadEvent, type ThreadRequest, type TurnResult, type TurnSession, type Usage, type UserMessage } from "@dire-kiwi/agent-threads-protocol";
-import type { HarnessSession, Message, NewItem, NewRequest, ThreadConfig, ThreadContext, TurnEnd } from "./harness.js";
+import { applyEvent, type Attachment, type Item, type RateLimit, type Resolution, type Snapshot, type Thread, type ThreadEvent, type ThreadRequest, type TurnResult, type TurnSession, type Usage, type UserMessage } from "@dire-kiwi/agent-threads-protocol";
+import type { HarnessMessage, HarnessSession, LaunchOptions, Message, NewItem, NewRequest, ThreadConfig, ThreadContext, TurnEnd } from "./harness.js";
 import { newId } from "./ids.js";
+import { normalLaunch, sameLaunch, storedThread, type StoredThread } from "./launch.js";
 import { decide, permissionKey, type PermissionDecision, type PermissionPolicy, type PermissionQuery } from "./permissions.js";
 import { RewindError } from "./sessions.js";
 import type { Spawner } from "./spawner.js";
@@ -57,7 +58,11 @@ export interface Outgoing {
 export interface RuntimeHost {
   store: Store;
   spawner: Spawner;
+  /** Fill in events' `raw` (the raw option). */
+  raw: boolean;
   publish(event: ThreadEvent): void;
+  /** A line from the thread's harness, for the app's onHarnessMessage. */
+  harnessMessage(message: HarnessMessage): void;
   error(error: unknown): void;
 }
 
@@ -73,6 +78,8 @@ export class ThreadRuntime implements ThreadContext {
   lostRun: string | undefined;
 
   #host: RuntimeHost;
+  /** How its harness process is started: stored with the thread. */
+  #launch: LaunchOptions;
   /** The live state, with the text streamed so far. */
   #state: Snapshot;
   /** The saved events' state, without deltas: what a change is a change to. */
@@ -96,9 +103,12 @@ export class ThreadRuntime implements ThreadContext {
   #streaming = new Set<string>();
   /** App tools' structured output, by tool call, until the harness gives the call its result. */
   #structured = new Map<string, unknown>();
+  /** The harness message being handled, which events made now have as their `raw` (with the raw option). */
+  #raw: unknown = undefined;
 
-  constructor(host: RuntimeHost, state: Snapshot, config: ThreadConfig, policy: PermissionPolicy) {
+  constructor(host: RuntimeHost, state: Snapshot, config: ThreadConfig, launch: LaunchOptions, policy: PermissionPolicy) {
     this.#host = host;
+    this.#launch = normalLaunch(launch);
     this.#state = state;
     this.#saved = state;
     this.threadId = state.thread.id;
@@ -110,6 +120,9 @@ export class ThreadRuntime implements ThreadContext {
 
   get thread(): Thread {
     return this.#state.thread;
+  }
+  get launch(): LaunchOptions {
+    return this.#launch;
   }
   get snapshot(): Snapshot {
     return this.#state;
@@ -127,6 +140,13 @@ export class ThreadRuntime implements ThreadContext {
   // ---------- events ----------
 
   emit(event: Unnumbered): void {
+    // An item or request has the harness message it came from, and its event doesn't as well.
+    const raw = this.#raw;
+    if (raw !== undefined) {
+      if (event.type === "item.added") event = { ...event, item: { ...event.item, raw } };
+      else if (event.type === "request.opened") event = { ...event, request: { ...event.request, raw } };
+      else event = { ...event, raw };
+    }
     const saved = event.type !== "delta";
     const e = { ...event, thread_id: this.threadId, seq: this.#state.seq + (saved ? 1 : 0) } as ThreadEvent;
     this.#state = applyEvent(this.#state, e);
@@ -179,7 +199,7 @@ export class ThreadRuntime implements ThreadContext {
       if (threadChanged) {
         this.#threadChanged = false;
         try {
-          await store.updateThread(this.#state.thread);
+          await store.updateThread(this.storedThread());
         } catch (e) {
           this.#threadChanged = true;
           throw e;
@@ -338,6 +358,20 @@ export class ThreadRuntime implements ThreadContext {
 
   // ---------- items and the thread ----------
 
+  /** The thread as the store keeps it: with its launch options, which clients aren't sent. */
+  storedThread(): StoredThread {
+    return storedThread(this.#state.thread, this.#launch);
+  }
+
+  /** Changes how the harness process is started, from the next one; it's saved with the thread. */
+  setLaunch(launch: LaunchOptions): void {
+    if (sameLaunch(launch, this.#launch)) return;
+    this.#launch = normalLaunch(launch);
+    this.#threadChanged = true;
+    this.#scheduleFlush();
+    this.session?.optionsChanged();
+  }
+
   item(id: string): Item | undefined {
     const items = this.#saved.items;
     for (let i = items.length - 1; i >= 0; i--) if (items[i]!.id === id) return items[i];
@@ -395,6 +429,24 @@ export class ThreadRuntime implements ThreadContext {
     this.emit({ type: "thread.updated", thread: next as unknown as Thread });
   }
 
+  rateLimits(limits: RateLimit[]): void {
+    if (!limits.length) return;
+    const all = new Map((this.thread.rate_limits ?? []).map((l) => [l.id, l]));
+    for (const l of limits) all.set(l.id, l);
+    this.setThread({ rate_limits: [...all.values()].sort((a, b) => (a.id < b.id ? -1 : a.id > b.id ? 1 : 0)) });
+  }
+
+  fromHarness(runId: string, line: string, message: unknown, handle: () => void): void {
+    const before = this.#raw;
+    if (this.#host.raw && message !== undefined) this.#raw = message;
+    try {
+      handle();
+    } finally {
+      this.#raw = before;
+    }
+    this.#host.harnessMessage({ threadId: this.threadId, runId, harness: this.thread.harness, line, ...(message !== undefined ? { message } : {}) });
+  }
+
   // ---------- turns ----------
 
   /** Sends a message: starts a turn, or steers the running one. */
@@ -446,8 +498,6 @@ export class ThreadRuntime implements ThreadContext {
    */
   rewind(turnId: string): void {
     const items = this.#saved.items;
-    const order: string[] = [];
-    for (const it of items) if (it.turn_id && !order.includes(it.turn_id)) order.push(it.turn_id);
     const results = items.filter((it): it is TurnResult => it.type === "turn_result" && !it.parent_id);
     const index = results.findIndex((r) => r.turn_id === turnId);
     if (index < 0) throw new RewindError(`there's no turn ${turnId} in the thread`);
@@ -456,9 +506,13 @@ export class ThreadRuntime implements ThreadContext {
       results.map((r): TurnSession | undefined => r.session),
       index,
     );
-    const dropped = new Set(order.slice(order.indexOf(turnId)));
+    // The turn and those after it, in the order they ran (a message carried over to a later turn
+    // keeps its place in the items, so their order isn't the turns'). What isn't any turn's goes
+    // too, after the last turn kept and the first item of one that goes.
+    const dropped = new Set(results.slice(index).map((r) => r.turn_id));
+    const kept = index > 0 ? items.indexOf(results[index - 1]!) : -1;
     const first = items.findIndex((it) => it.turn_id !== undefined && dropped.has(it.turn_id));
-    const gone = items.filter((it, i) => (it.turn_id !== undefined ? dropped.has(it.turn_id) : i > first)).map((it) => it.id);
+    const gone = items.filter((it, i) => (it.turn_id !== undefined ? dropped.has(it.turn_id) : i > kept && i > first)).map((it) => it.id);
     const goneSet = new Set(gone);
     this.#queue = this.#queue.filter((id) => !goneSet.has(id));
     // A rewind not yet made (resume_at) went back to before a later turn of the same session: with
@@ -605,7 +659,7 @@ export class ThreadRuntime implements ThreadContext {
   reopen(requestId: string, answered: (resolution: Resolution) => void, standing?: string): boolean {
     if (this.#requests.has(requestId)) return false;
     const request = this.#state.requests.find((r) => r.id === requestId);
-    if (!request) return false;
+    if (!request || request.resolution) return false;
     this.#requests.set(requestId, { request, answered, ...(standing ? { standing } : {}) });
     return true;
   }

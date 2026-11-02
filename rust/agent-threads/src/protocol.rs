@@ -365,6 +365,21 @@ pub struct ItemAddedEvent {
     pub seq: ::std::num::NonZeroU64,
     pub thread_id: ::std::string::String,
 }
+///The thread's items before an index (a window's start), a page at a time, for a client that has a window to load earlier items into.
+#[derive(::serde::Deserialize, ::serde::Serialize, Clone, Debug)]
+pub struct ItemPage {
+    ///The indices of the items from before start it has anyway because its items need them (the subagent calls they belong to): the first context.length of items, in order.
+    pub context: ::std::vec::Vec<u64>,
+    ///The items of context, then the thread's items from start up to the index asked for.
+    pub items: ::std::vec::Vec<Item>,
+    ///The requests its items (after the context ones) have, oldest first.
+    pub requests: ::std::vec::Vec<ThreadRequest>,
+    ///The seq of the last saved event its items and requests include.
+    pub seq: u64,
+    ///The index, in the thread's whole list of items, of its first item after the context ones. 0: there are none before it.
+    pub start: u64,
+    pub thread_id: ::std::string::String,
+}
 ///An item changed: patch's fields replace the item's, and a field set to null is removed. id and type never change.
 #[derive(::serde::Deserialize, ::serde::Serialize, Clone, Debug)]
 pub struct ItemUpdatedEvent {
@@ -524,6 +539,9 @@ pub struct PermissionRequest {
     ///Why the harness asks, when it says.
     #[serde(skip_serializing_if = "::std::option::Option::is_none")]
     pub reason: ::std::option::Option<::std::string::String>,
+    ///How it was resolved, once it is (request.resolved): the state keeps resolved requests with this set. Absent while it's open.
+    #[serde(skip_serializing_if = "::std::option::Option::is_none")]
+    pub resolution: ::std::option::Option<Resolution>,
     ///A short summary of what's asked, e.g. the command line.
     #[serde(skip_serializing_if = "::std::option::Option::is_none")]
     pub title: ::std::option::Option<::std::string::String>,
@@ -576,11 +594,73 @@ pub struct QuestionRequest {
     ///The harness's own payload, for debugging.
     #[serde(skip_serializing_if = "::std::option::Option::is_none")]
     pub raw: ::std::option::Option<::serde_json::Value>,
+    ///How it was resolved, once it is (request.resolved): the state keeps resolved requests with this set. Absent while it's open.
+    #[serde(skip_serializing_if = "::std::option::Option::is_none")]
+    pub resolution: ::std::option::Option<Resolution>,
     ///The tool_call item it's for, when there is one.
     #[serde(skip_serializing_if = "::std::option::Option::is_none")]
     pub tool_call_id: ::std::option::Option<::std::string::String>,
     #[serde(skip_serializing_if = "::std::option::Option::is_none")]
     pub turn_id: ::std::option::Option<::std::string::String>,
+}
+///A usage limit of the account the harness runs on (a subscription's session or weekly limit, say), as the harness last reported it.
+#[derive(::serde::Deserialize, ::serde::Serialize, Clone, Debug)]
+pub struct RateLimit {
+    ///Which limit, by the harness's name for it: Claude Code's rateLimitType (five_hour, seven_day, seven_day_opus...), Codex's primary and secondary windows.
+    pub id: ::std::string::String,
+    ///When it resets, when the harness says.
+    #[serde(skip_serializing_if = "::std::option::Option::is_none")]
+    pub resets_at: ::std::option::Option<::std::string::String>,
+    ///allowed: there's room. warning: it's nearly used up, or used up with extra usage carrying on. rejected: the harness refuses turns until it resets.
+    pub status: RateLimitStatus,
+    ///How much of it is used, from 0 to 100, when the harness says.
+    #[serde(skip_serializing_if = "::std::option::Option::is_none")]
+    pub used_percent: ::std::option::Option<f64>,
+    ///How long its window is, when the harness says.
+    #[serde(skip_serializing_if = "::std::option::Option::is_none")]
+    pub window_minutes: ::std::option::Option<u64>,
+}
+///allowed: there's room. warning: it's nearly used up, or used up with extra usage carrying on. rejected: the harness refuses turns until it resets.
+#[derive(::serde::Deserialize, ::serde::Serialize, Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub enum RateLimitStatus {
+    #[serde(rename = "allowed")]
+    Allowed,
+    #[serde(rename = "warning")]
+    Warning,
+    #[serde(rename = "rejected")]
+    Rejected,
+}
+impl ::std::fmt::Display for RateLimitStatus {
+    fn fmt(&self, f: &mut ::std::fmt::Formatter<'_>) -> ::std::fmt::Result {
+        match *self {
+            Self::Allowed => f.write_str("allowed"),
+            Self::Warning => f.write_str("warning"),
+            Self::Rejected => f.write_str("rejected"),
+        }
+    }
+}
+impl ::std::str::FromStr for RateLimitStatus {
+    type Err = self::error::ConversionError;
+    fn from_str(value: &str) -> ::std::result::Result<Self, self::error::ConversionError> {
+        match value {
+            "allowed" => Ok(Self::Allowed),
+            "warning" => Ok(Self::Warning),
+            "rejected" => Ok(Self::Rejected),
+            _ => Err("invalid value".into()),
+        }
+    }
+}
+impl ::std::convert::TryFrom<&str> for RateLimitStatus {
+    type Error = self::error::ConversionError;
+    fn try_from(value: &str) -> ::std::result::Result<Self, self::error::ConversionError> {
+        value.parse()
+    }
+}
+impl ::std::convert::TryFrom<::std::string::String> for RateLimitStatus {
+    type Error = self::error::ConversionError;
+    fn try_from(value: ::std::string::String) -> ::std::result::Result<Self, self::error::ConversionError> {
+        value.parse()
+    }
 }
 ///The agent's thinking, or a summary of it, as the harness gives it. Streams like assistant_message.
 #[derive(::serde::Deserialize, ::serde::Serialize, Clone, Debug)]
@@ -768,14 +848,20 @@ pub struct SetOptionsCommand {
     pub permission_mode: ::std::option::Option<PermissionMode>,
     pub thread_id: ::std::string::String,
 }
-///A thread's whole state as of seq: what applying its events, in order, from the start gives.
+///A thread's state as of seq: what applying its events, in order, from the start gives. A window (a snapshot taken with a limit) has only its last items, and what they need from before them (start, context).
 #[derive(::serde::Deserialize, ::serde::Serialize, Clone, Debug)]
 pub struct Snapshot {
+    ///A window: the indices, in the thread's whole list of items, of the items from before start it has anyway because the window needs them (the subagent calls its items and open requests belong to, the open requests' tool calls, and the subagents still running, with the subagents those belong to). They're the first context.length of items, in order; the rest are the thread's items from start on.
+    #[serde(default, skip_serializing_if = "::std::vec::Vec::is_empty")]
+    pub context: ::std::vec::Vec<u64>,
     pub items: ::std::vec::Vec<Item>,
-    ///The open requests, oldest first.
+    ///The thread's requests, oldest first: the open ones, and the resolved ones with their resolution. A window has the open ones, and the resolved ones its items have (see PROTOCOL.md, Windows).
     pub requests: ::std::vec::Vec<ThreadRequest>,
     ///The seq of the last saved event it includes; 0 for none.
     pub seq: u64,
+    ///A window: the index, in the thread's whole list of items, of the first item of the window. The items before it are left out, but for those in context. Absent (or 0): items has them all.
+    #[serde(skip_serializing_if = "::std::option::Option::is_none")]
+    pub start: ::std::option::Option<u64>,
     pub thread: Thread,
 }
 ///A thread's own state. Sent whole in thread.updated and in snapshots.
@@ -803,6 +889,9 @@ pub struct Thread {
     pub model: ::std::option::Option<::std::string::String>,
     #[serde(skip_serializing_if = "::std::option::Option::is_none")]
     pub permission_mode: ::std::option::Option<PermissionMode>,
+    ///The usage limits of the account the harness runs on, as it last reported them in this thread, sorted by id. Absent until it reports one.
+    #[serde(default, skip_serializing_if = "::std::vec::Vec::is_empty")]
+    pub rate_limits: ::std::vec::Vec<RateLimit>,
     ///Where the next turn takes up session_id, after a rewind: Claude Code resumes it at this message (--resume-session-at), Codex reverts it to before this turn (thread/revert). Cleared once the harness has done it.
     #[serde(skip_serializing_if = "::std::option::Option::is_none")]
     pub resume_at: ::std::option::Option<::std::string::String>,
@@ -889,7 +978,7 @@ impl ::std::convert::From<RequestResolvedEvent> for ThreadEvent {
         Self::RequestResolved(value)
     }
 }
-///An open request, told apart by type.
+///A request, told apart by type: open, or resolved (with its resolution).
 #[derive(::serde::Deserialize, ::serde::Serialize, Clone, Debug)]
 #[serde(tag = "type")]
 pub enum ThreadRequest {

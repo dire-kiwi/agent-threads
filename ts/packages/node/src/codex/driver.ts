@@ -9,12 +9,14 @@
 
 import { mkdtempSync, realpathSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join, resolve, sep } from "node:path";
+import { isAbsolute, join, resolve, sep } from "node:path";
 import type { Resolution, ToolCall, TurnSession, Usage } from "@dire-kiwi/agent-threads-protocol";
 import { messageParts } from "../attachments.js";
 import { title } from "../claude/translate.js";
-import type { Harness, HarnessSession, Message, RunCheckpoint, ThreadContext } from "../harness.js";
+import { CommandError, ControlError } from "../errors.js";
+import { parseLine, type Harness, type HarnessSession, type Message, type RunCheckpoint, type ThreadContext } from "../harness.js";
 import { newId } from "../ids.js";
+import { applyLaunchEnv, launchedNow, launchedOf, withEnv, type Launched } from "../launch.js";
 import { serveTools, type LoopbackMcp } from "../mcp-http.js";
 import { permissionKey, type PermissionDecision, type PermissionQuery } from "../permissions.js";
 import { revertPoint, type RewindPoint } from "../sessions.js";
@@ -43,7 +45,7 @@ import type {
   UserInput,
 } from "./protocol.js";
 import { Rpc, RpcError, type Incoming, type PendingRequest, type RequestId } from "./rpc.js";
-import { APP_SERVER, callUsage, codexDone, codexPolicy, codexTool, isToolItem, mcpServerConfig, questions, todos, unwrapCommand } from "./translate.js";
+import { APP_SERVER, callUsage, codexDone, codexPolicy, codexRateLimits, codexTool, isToolItem, mcpServerConfig, questions, todos, unwrapCommand } from "./translate.js";
 
 export interface CodexOptions {
   /** The `codex` binary. */
@@ -103,9 +105,6 @@ interface OpenRequest {
 
 /** A message sent (by turn/start or turn/steer), by what Codex echoes when it takes it in. */
 type Sent = { ids: string[]; key: string };
-
-/** The thread's options a process is started with: a different one needs another. */
-type Launched = { model?: string; effort?: string; permission_mode?: string };
 
 /**
  * What a run's checkpoint holds (see HarnessSession.checkpoint): what's needed to carry on reading
@@ -324,6 +323,8 @@ class CodexSession implements HarnessSession {
   /** A directory for the thread's generated files (skills, attached files), made when needed. */
   #tmp: string | undefined;
   #closed = false;
+  /** The app's control requests not yet answered: what fails each, when the backend lets go of its run. */
+  #controls = new Set<(error: Error) => void>();
 
   constructor(ctx: ThreadContext, options: CodexOptions) {
     this.#ctx = ctx;
@@ -495,9 +496,7 @@ class CodexSession implements HarnessSession {
       );
     }
     // A process started with other options than the thread's now is replaced at the next turn.
-    const t = ctx.thread;
-    const l = st.launched;
-    this.#stale = !!st.stale || !l || l.model !== t.model || l.effort !== t.effort || l.permission_mode !== t.permission_mode;
+    this.#stale = !!st.stale || !launchedNow(st.launched, ctx);
     // Codex's requests that were open: the user's questions are taken up again, an app tool that
     // was running is answered (not run again), and the rest are dealt with again. One answered
     // before the restart, though that wasn't saved, is closed: Codex has its answer.
@@ -518,7 +517,36 @@ class CodexSession implements HarnessSession {
     run.proc.detach();
     run.abort.abort();
     void run.mcp?.close();
+    for (const fail of [...this.#controls]) fail(new ControlError("The backend closed before Codex answered."));
     return true;
+  }
+
+  control(request: unknown): Promise<unknown> {
+    const run = this.#live();
+    if (!run?.proc || !run.rpc || run.detached) return Promise.reject(new CommandError(`thread ${this.#ctx.threadId} has no running Codex process`));
+    const r = request as { method?: unknown; params?: unknown } | null;
+    if (!r || typeof r !== "object" || Array.isArray(r) || typeof r.method !== "string") {
+      return Promise.reject(new CommandError("a Codex control request is an object with a method (and params)"));
+    }
+    return new Promise((resolve, reject) => {
+      const fail = (e: Error) => {
+        this.#controls.delete(fail);
+        reject(e);
+      };
+      this.#controls.add(fail);
+      run.rpc.requestRaw(r.method as string, r.params).then(
+        (result) => {
+          if (!this.#controls.has(fail)) return;
+          this.#controls.delete(fail);
+          resolve(result);
+        },
+        (e: unknown) => {
+          if (!this.#controls.has(fail)) return;
+          this.#controls.delete(fail);
+          reject(e instanceof RpcError ? new ControlError(e.message, e.error) : e);
+        },
+      );
+    });
   }
 
   /** A request of Codex's that was open when the backend restarted. */
@@ -657,9 +685,12 @@ class CodexSession implements HarnessSession {
     }
     const ctx = this.#ctx;
     const o = this.#o;
+    const launch = ctx.launch;
     let home: string;
     try {
-      home = o.userConfig ? userCodexHome() : prepareCodexHome(o.home ?? defaultCodexHome(), o.login ?? userCodexHome());
+      // The thread's own CODEX_HOME is used as it is.
+      if (launch.configDir) home = resolve(launch.configDir);
+      else home = o.userConfig ? userCodexHome() : prepareCodexHome(o.home ?? defaultCodexHome(), o.login ?? userCodexHome());
     } catch (e) {
       this.#exited(run, { code: null, signal: null, error: e instanceof Error ? e : new Error(String(e)) });
       throw e;
@@ -669,9 +700,9 @@ class CodexSession implements HarnessSession {
       proc = ctx.spawner.spawn(
         {
           command: o.bin ?? "codex",
-          args: [...(o.binArgs ?? []), "app-server", ...(o.args ?? [])],
+          args: [...(o.binArgs ?? []), "app-server", ...(o.args ?? []), ...(launch.args ?? [])],
           ...(ctx.thread.cwd ? { cwd: ctx.thread.cwd } : {}),
-          env: { ...process.env, ...o.env, CODEX_HOME: home },
+          env: { ...applyLaunchEnv(withEnv(o.env), launch), CODEX_HOME: home },
           threadId: ctx.threadId,
           runId: run.id,
         },
@@ -682,7 +713,7 @@ class CodexSession implements HarnessSession {
       throw e;
     }
     run.proc = proc;
-    run.launched = { model: ctx.thread.model, effort: ctx.thread.effort, permission_mode: ctx.thread.permission_mode };
+    run.launched = launchedOf(ctx);
     ctx.setThread({ run: { id: run.id, spawner: ctx.spawner.name, started_at: new Date().toISOString() } });
 
     try {
@@ -825,6 +856,7 @@ class CodexSession implements HarnessSession {
       "features.default_mode_request_user_input": true,
       suppress_unstable_features_warning: true,
       ...(Object.keys(servers).length ? { mcp_servers: servers } : {}),
+      ...writableRoots(this.#o.config, ctx.launch.addDirs, t.cwd),
       ...(run.hiddenSkills.length ? { skills: { config: run.hiddenSkills.map((path) => ({ path, enabled: false })) } } : {}),
     };
     const dynamic = fresh ? [...(run.dynamic?.values() ?? [])] : [];
@@ -840,7 +872,10 @@ class CodexSession implements HarnessSession {
 
   #handlers(run: Run): ProcessHandlers {
     return {
-      line: (line) => this.#line(run, line),
+      line: (line) => {
+        const m = parseLine(line);
+        this.#ctx.fromHarness(run.id, line, m, () => this.#line(run, m));
+      },
       stderr: (line) => {
         run.stderr.push(line);
         if (run.stderr.length > 20) run.stderr.shift();
@@ -879,14 +914,11 @@ class CodexSession implements HarnessSession {
 
   // ---------- what Codex says ----------
 
-  #line(run: Run, line: string): void {
-    let m: Incoming;
-    try {
-      m = JSON.parse(line);
-    } catch {
-      return; // Not a message: the app server writes only JSON-RPC to stdout, but be safe.
-    }
-    if (!m || typeof m !== "object") return;
+  /** A line of Codex's output, parsed (undefined if it isn't JSON). */
+  #line(run: Run, parsed: unknown): void {
+    // Not a message: the app server writes only JSON-RPC to stdout, but be safe.
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return;
+    const m = parsed as Incoming;
     if (run.rpc.take(m)) return;
     if (run.retired || run !== this.#run) {
       // A run being stopped: its requests go unanswered.
@@ -951,6 +983,9 @@ class CodexSession implements HarnessSession {
         run.reported = true;
         // A report outside a turn (a resumed session's totals, say) isn't any turn's.
         if (run.used && p.tokenUsage.last) run.used = addUsage(run.used, callUsage(p.tokenUsage.last))!;
+        return;
+      case "account/rateLimits/updated":
+        if (p.rateLimits && typeof p.rateLimits === "object") ctx.rateLimits(codexRateLimits(p.rateLimits));
         return;
       case "warning":
         if (own && p.threadId && p.message) this.#notice(p.message);
@@ -1348,6 +1383,21 @@ class CodexSession implements HarnessSession {
 }
 
 type ToolSpec = { name: string; description: string; inputSchema: unknown };
+
+/** Where Codex's sandbox lets the agent write besides the working directory (a dotted config key). */
+const WRITABLE_ROOTS = "sandbox_workspace_write.writable_roots";
+
+/**
+ * The thread's other directories, as config: writable as its working directory is (relative ones
+ * are in it), after any the options' config gives. Nothing if it has none.
+ */
+function writableRoots(config: { [k: string]: unknown } | undefined, addDirs: string[] | undefined, cwd: string | undefined): { [k: string]: unknown } {
+  if (!addDirs?.length) return {};
+  const given = config?.[WRITABLE_ROOTS];
+  const roots = Array.isArray(given) ? [...given] : [];
+  for (const d of addDirs) roots.push(cwd && !isAbsolute(d) ? join(cwd, d) : d);
+  return { [WRITABLE_ROOTS]: roots };
+}
 
 /** A tool as Codex has it as a dynamic tool. */
 function toolSpec(t: Tool): ToolSpec {

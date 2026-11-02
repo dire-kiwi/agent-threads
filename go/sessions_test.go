@@ -346,6 +346,69 @@ func TestRewind(t *testing.T) {
 		}
 	})
 
+	t.Run("goes by the order turns ran, though a message carried over to a later turn keeps its place", func(t *testing.T) {
+		carried := func(t *testing.T) (*sessionsScene, protocol.Snapshot, string) {
+			s := newSessionsScene(t, agentthreads.ResumeAtPoint, "")
+			send := func(text string) {
+				if err := s.sdk.Send(ctx, s.id, text, agentthreads.SendOptions{}); err != nil {
+					t.Fatal(err)
+				}
+			}
+			// Turn one, steered with a message the harness doesn't take in; turn two (carrying it
+			// over) fails without taking it in; turn three, with the user's next message, takes it in.
+			send("one")
+			s.h.on(func(c agentthreads.ThreadContext) { c.SetThread(func(t *protocol.Thread) { t.SessionID = "S" }) })
+			send("steered")
+			s.h.on(func(c agentthreads.ThreadContext) {
+				c.EndTurn(agentthreads.TurnEnd{OK: true, SessionAt: "m1"})
+				c.EndTurn(agentthreads.TurnEnd{OK: false, Error: "failed"})
+			})
+			send("three")
+			var steered string
+			s.h.on(func(c agentthreads.ThreadContext) {
+				steered = c.Queued()[0].ID
+				c.TookIn(steered)
+				c.EndTurn(agentthreads.TurnEnd{OK: true, SessionAt: "m3"})
+			})
+			snap := s.snap()
+			for _, it := range snap.Items {
+				if it.ID() == steered && it.TurnID() != turnIDs(snap.Items)[2] {
+					t.Fatalf("the steered message is turn %s's, not turn three's", it.TurnID())
+				}
+			}
+			return s, snap, steered
+		}
+		has := func(items []protocol.Item, id string) bool {
+			for _, it := range items {
+				if it.ID() == id {
+					return true
+				}
+			}
+			return false
+		}
+		// To before turn two: turn three goes too, with the message it took in.
+		s, before, steered := carried(t)
+		if err := s.rewind(turnIDs(before.Items)[1]); err != nil {
+			t.Fatal(err)
+		}
+		snap := s.snap()
+		sameAs(t, "turns", turnIDs(snap.Items), turnIDs(before.Items)[:1])
+		if has(snap.Items, steered) {
+			t.Fatal("the steered message is still there")
+		}
+		sameAs(t, "items", kinds(snap.Items), []string{"user_message", "turn_result", "rewind"})
+		// To before turn three: turn two stays.
+		s, before, steered = carried(t)
+		if err := s.rewind(turnIDs(before.Items)[2]); err != nil {
+			t.Fatal(err)
+		}
+		snap = s.snap()
+		sameAs(t, "turns", turnIDs(snap.Items), turnIDs(before.Items)[:2])
+		if has(snap.Items, steered) {
+			t.Fatal("the steered message is still there")
+		}
+	})
+
 	t.Run("is refused while a turn runs, and for a turn the thread hasn't", func(t *testing.T) {
 		s := newSessionsScene(t, agentthreads.ResumeAtPoint, "")
 		s.turn("one", "S1", "m1")
@@ -565,6 +628,67 @@ func TestLostTurnSession(t *testing.T) {
 			}
 		})
 		sameAs(t, "sessions", turnSessions(snap.Items), []*protocol.TurnSession{{ID: "S-old", At: "m1", Started: true}, {ID: "S-new", Started: true}})
+	})
+	t.Run("is a compaction that had no items yet, not the turn before it", func(t *testing.T) {
+		store := agentthreads.NewMemoryStore()
+		h := &sessionHarness{point: agentthreads.ResumeAtPoint}
+		// Never closed: it goes as a backend that stopped would.
+		first := agentthreads.New(agentthreads.Options{
+			Store:        store,
+			Harnesses:    map[string]agentthreads.Harness{"fake": h},
+			Capabilities: agentthreads.Capabilities{Permissions: agentthreads.Allow},
+			OnError:      func(error) {},
+		})
+		th, err := first.Create(ctx, agentthreads.CreateOptions{})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := first.Send(ctx, th.ID, "one", agentthreads.SendOptions{}); err != nil {
+			t.Fatal(err)
+		}
+		h.on(func(c agentthreads.ThreadContext) {
+			c.SetThread(func(t *protocol.Thread) { t.SessionID = "S" })
+			c.EndTurn(agentthreads.TurnEnd{OK: true, SessionAt: "m1"})
+		})
+		if err := first.Compact(ctx, th.ID); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := first.EventsSince(ctx, th.ID, 0, 0); err != nil {
+			t.Fatal(err)
+		}
+		next := agentthreads.New(agentthreads.Options{
+			Store:        store,
+			Harnesses:    map[string]agentthreads.Harness{"fake": &sessionHarness{point: agentthreads.ResumeAtPoint}},
+			Capabilities: agentthreads.Capabilities{Permissions: agentthreads.Allow},
+			OnError:      func(err error) { t.Errorf("OnError: %v", err) },
+		})
+		t.Cleanup(func() { next.Stop(context.Background()) })
+		snap, err := next.Snapshot(ctx, th.ID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		events, err := next.EventsSince(ctx, th.ID, 0, 0)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var started, completed []string
+		for _, e := range events {
+			switch ev := e.Value.(type) {
+			case *protocol.TurnStartedEvent:
+				started = append(started, ev.TurnID)
+			case *protocol.TurnCompletedEvent:
+				completed = append(completed, ev.TurnID)
+			}
+		}
+		sameAs(t, "turns completed", completed, started)
+		sameAs(t, "turns", turnIDs(snap.Items), started)
+		sameAs(t, "sessions", turnSessions(snap.Items), []*protocol.TurnSession{{ID: "S", At: "m1", Started: true}, {ID: "S"}})
+		if err := next.Rewind(ctx, th.ID, started[1]); err != nil {
+			t.Fatal(err)
+		}
+		if after, _ := next.Snapshot(ctx, th.ID); after.Thread.SessionID != "S" || after.Thread.ResumeAt != "m1" {
+			t.Fatalf("got %s", mustMarshal(after.Thread))
+		}
 	})
 	t.Run("records that it continued a session the thread adopted", func(t *testing.T) {
 		next, id, snap := lostTurn(t, "S0", nil)

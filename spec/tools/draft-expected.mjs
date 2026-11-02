@@ -154,12 +154,31 @@ class Draft {
     return bind;
   }
 
+  /** A control request the app sends (with `control`), and the harness's answer: `{result}` or `{error}`. */
+  control(request, answer) {
+    if (this.events.length > 1 || this.steps.length) this.waitForLast();
+    this.steps.push({ control: request, ...answer, from: this.events.length });
+  }
+
+  /** The harness reported usage limits: they replace the thread's with the same ids. */
+  rateLimits(limits) {
+    if (!limits.length) return;
+    const all = new Map((this.thread.rate_limits ?? []).map((l) => [l.id, l]));
+    for (const l of limits) all.set(l.id, l);
+    this.setThread({ rate_limits: [...all.values()].sort((a, b) => (a.id < b.id ? -1 : a.id > b.id ? 1 : 0)) });
+  }
+
   waitForLast() {
-    const e = this.events[this.events.length - 1];
-    const step = { wait: pattern(e) };
+    // The last event whose pattern an earlier one (since the step before) doesn't match too. The
+    // events after it don't depend on the command (a rate limit reported meanwhile, say).
+    const last = this.steps[this.steps.length - 1];
+    const start = !last ? 0 : last.wait ? last.at + 1 : last.from;
+    let at = this.events.length - 1;
+    while (at > start && this.events.findIndex((e, i) => i >= start && matches(e, pattern(this.events[at]))) !== at) at--;
+    const step = { wait: pattern(this.events[at]) };
     const prev = this.steps.findLast?.((s) => s.wait);
-    if (prev && JSON.stringify(prev.wait) === JSON.stringify(step.wait) && prev.at === this.events.length - 1) return;
-    step.at = this.events.length - 1;
+    if (prev && JSON.stringify(prev.wait) === JSON.stringify(step.wait) && prev.at === at) return;
+    step.at = at;
     this.steps.push(step);
   }
 
@@ -242,14 +261,15 @@ class Draft {
   rewind(turnId) {
     this.command({ type: "rewind", turn_id: turnId });
     const items = [...this.items.values()];
-    const order = [];
-    for (const it of items) if (it.turn_id && !order.includes(it.turn_id)) order.push(it.turn_id);
-    const dropped = new Set(order.slice(order.indexOf(turnId)));
-    const first = items.findIndex((it) => dropped.has(it.turn_id));
-    const gone = items.filter((it, i) => dropped.has(it.turn_id) || (!it.turn_id && i > first));
     const results = items.filter((it) => it.type === "turn_result" && !it.parent_id);
     const sessions = results.map((r) => r.session);
     const at = results.findIndex((r) => r.turn_id === turnId);
+    // The turns from it on, in the order they ran; what isn't a turn's, after the last turn kept and
+    // the first item of one that goes.
+    const dropped = new Set(results.slice(at).map((r) => r.turn_id));
+    const kept = at > 0 ? items.indexOf(results[at - 1]) : -1;
+    const first = items.findIndex((it) => dropped.has(it.turn_id));
+    const gone = items.filter((it, i) => dropped.has(it.turn_id) || (!it.turn_id && i > kept && i > first));
     const point = this.meta.harness === "claude" ? resumeAtPoint(sessions, at) : revertPoint(sessions, at);
     for (const it of gone) this.items.delete(it.id);
     this.queued = this.queued.filter((q) => this.items.has(q.id));
@@ -453,6 +473,10 @@ function draftClaude(d, runs) {
         } else if (m.type === "control_request" && m.request.subtype === "interrupt") {
           d.interrupt();
           interrupted = true;
+        } else if (m.type === "control_request" && m.request.subtype !== "initialize") {
+          // The app's own, sent with control().
+          const reply = entries.find((x) => x.dir === "out" && x.msg?.type === "control_response" && x.msg.response?.request_id === m.request_id)?.msg.response;
+          d.control(m.request, reply?.subtype === "success" ? { result: reply.response ?? {} } : { error: reply?.error ?? "" });
         } else if (m.type === "control_response") {
           const req = asked.get(m.response.request_id);
           const r = d.requests.get(m.response.request_id);
@@ -475,10 +499,22 @@ function draftClaude(d, runs) {
       const parent = m.parent_tool_use_id ?? undefined;
       // The main conversation's messages: the last of a turn's is where a rewind can resume.
       if ((m.type === "user" || m.type === "assistant") && !parent) d.mark(m.uuid);
+      // A message refused for the usage limit says which limit, before anything else it leads to.
+      if (["assistant", "user", "result"].includes(m.type) && m.api_error === "usage_limit_reached" && m.api_error_params?.rate_limit_info) {
+        d.rateLimits(claudeLimits(m.api_error_params.rate_limit_info));
+      }
       switch (m.type) {
+        case "rate_limit_event":
+          d.rateLimits(claudeLimits(m.rate_limit_info ?? {}));
+          break;
         case "system":
           // The session it runs in; a rewind's resume_at is done with once it's resumed there.
           if (m.subtype === "init" && (m.session_id !== d.thread.session_id || d.thread.resume_at)) d.setThread({ session_id: m.session_id, resume_at: undefined });
+          if (m.subtype === "api_retry") d.item({ id: d.ph("n"), type: "notice", level: "warning", code: "retry", text: retryText(m), parent_id: parent });
+          if (m.subtype === "hook_response") {
+            const n = hookNotice(m);
+            if (n) d.item({ id: d.ph("n"), type: "notice", ...n, code: "hook", parent_id: parent });
+          }
           if (m.subtype === "compact_boundary") {
             d.item({ id: m.uuid, type: "compaction", trigger: m.compact_metadata.trigger, tokens_before: m.compact_metadata.pre_tokens });
             summaryNext = m.uuid;
@@ -603,6 +639,37 @@ export function claudeUsage(result) {
   return u;
 }
 
+/** A Claude rate_limit_info as the rate limits it reports (none, or one). */
+export function claudeLimits(info) {
+  const overage = info.isUsingOverage === true || info.overageStatus === "allowed" || info.overageStatus === "allowed_warning";
+  const status = { allowed: "allowed", allowed_warning: "warning", rejected: overage ? "warning" : "rejected" }[info.status];
+  if (!status) return [];
+  const l = { id: info.rateLimitType || "unknown", status };
+  if (typeof info.utilization === "number") l.used_percent = info.utilization * 100;
+  if (typeof info.resetsAt === "number") l.resets_at = unixTime(info.resetsAt);
+  return [l];
+}
+
+/** Unix seconds as YYYY-MM-DDTHH:MM:SSZ. */
+const unixTime = (s) => new Date(Math.floor(s) * 1000).toISOString().replace(/\.\d{3}Z$/, "Z");
+
+/** An api_retry's notice text. */
+function retryText(m) {
+  const why = [m.error ? String(m.error) : "", m.error_status != null ? `status ${m.error_status}` : ""].filter(Boolean).join(", ");
+  return `API request failed${why ? ` (${why})` : ""}; retrying in ${Math.ceil((m.retry_delay_ms ?? 0) / 1000)}s (attempt ${m.attempt} of ${m.max_retries}).`;
+}
+
+/** A hook_response's notice (level, text and detail), if it makes one. */
+function hookNotice(m) {
+  const output = typeof m.output === "string" ? m.output.trim() : "";
+  if (m.outcome === "error") {
+    const detail = (typeof m.stderr === "string" ? m.stderr.trim() : "") || output;
+    const code = typeof m.exit_code === "number" ? ` (exit code ${m.exit_code})` : "";
+    return { level: "warning", text: `Hook ${m.hook_name} failed${code}`, ...(detail ? { detail } : {}) };
+  }
+  return output ? { level: "info", text: `Hook ${m.hook_name} ran`, detail: output } : null;
+}
+
 const userText = (m) => {
   const c = m.message.content;
   return typeof c === "string" ? c : c.filter((b) => b.type === "text").map((b) => b.text).join("\n");
@@ -617,6 +684,26 @@ function title(t) {
 }
 
 // ---------- Codex ----------
+
+/** The requests a Codex driver sends itself: any other is the app's. */
+const DRIVER_METHODS = new Set(["initialize", "skills/list", "skills/extraRoots/set", "thread/start", "thread/resume", "turn/start", "turn/steer", "turn/interrupt", "thread/compact/start", "thread/revert"]);
+
+/** A Codex rate limit snapshot as the rate limits it reports: its primary and secondary windows. */
+export function codexLimits(rl) {
+  const prefix = rl.limitId && rl.limitId !== "codex" ? `${rl.limitId}:` : "";
+  const out = [];
+  for (const key of ["primary", "secondary"]) {
+    const w = rl[key];
+    if (!w || typeof w !== "object") continue;
+    const credits = rl.credits?.hasCredits === true || rl.credits?.unlimited === true;
+    const l = { id: prefix + key, status: typeof w.usedPercent === "number" && w.usedPercent >= 100 ? (credits ? "warning" : "rejected") : "allowed" };
+    if (typeof w.usedPercent === "number") l.used_percent = w.usedPercent;
+    if (typeof w.resetsAt === "number") l.resets_at = unixTime(w.resetsAt);
+    if (typeof w.windowDurationMins === "number") l.window_minutes = w.windowDurationMins;
+    out.push(l);
+  }
+  return out;
+}
 
 function draftCodex(d, runs) {
   let first = true;
@@ -653,6 +740,12 @@ function draftCodex(d, runs) {
             if (e !== opener) d.send(m.method === "turn/start" ? text(m) : "/compact");
           } else if (m.method === "turn/steer") d.send(text(m));
           else if (m.method === "turn/interrupt") d.interrupt();
+          else if (m.id !== undefined && !DRIVER_METHODS.has(m.method)) {
+            // The app's own, sent with control().
+            const reply = entries.find((x) => x.dir === "out" && x.msg?.id === m.id && x.msg.method === undefined)?.msg;
+            const request = { method: m.method, ...(m.params !== undefined ? { params: m.params } : {}) };
+            d.control(request, reply?.error ? { error: reply.error.message ?? "" } : { result: reply?.result ?? null });
+          }
           continue;
         }
         const req = asked.get(m.id);
@@ -800,6 +893,9 @@ function draftCodex(d, runs) {
           if (child) break;
           reported = true;
           if (used) used = addUsage(used, callUsage(p.tokenUsage.last));
+          break;
+        case "account/rateLimits/updated":
+          d.rateLimits(codexLimits(p.rateLimits ?? {}));
           break;
         case "turn/completed": {
           if (child) {

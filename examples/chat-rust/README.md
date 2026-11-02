@@ -22,8 +22,8 @@ by default), and `CHAT_DEV=1` behind Vite's dev server (its pages, on port 5173,
 asks it to (offered only with `CHAT_SHIM`, as a restart without it loses the running turn).
 
 The whole seam is in [src/main.rs](src/main.rs): every thread's events from `sdk.subscribe()` to
-every client, `command` requests to `sdk.handle_json`, and `snapshot` and `events_since` for clients
-that connect or reconnect. Like chat-node, it takes WebSockets only from its own page on a loopback
+every client, `command` requests to `sdk.handle_json`, and `snapshot` (or `snapshot_window`, given
+a `limit`), `items_before` and `events_since` for clients that connect, scroll back or reconnect. Like chat-node, it takes WebSockets only from its own page on a loopback
 host (403 otherwise), ignores frames that aren't requests, ends only the socket a bad frame comes
 on, and answers a path that doesn't decode with 400.
 

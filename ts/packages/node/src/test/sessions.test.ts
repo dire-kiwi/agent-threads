@@ -155,6 +155,40 @@ describe("rewind", () => {
     expect(turnIds((await snap()).items)).toHaveLength(1);
   });
 
+  it("goes by the order turns ran, though a message carried over to a later turn keeps its place", async () => {
+    const carried = async () => {
+      const t = await setup();
+      const { sdk, h, id } = t;
+      // Turn one, steered with a message the harness doesn't take in; turn two (carrying it over)
+      // fails without taking it in; turn three, with the user's next message, takes it in.
+      await sdk.send(id, "one");
+      h.ctx!.setThread({ session_id: "S" });
+      await sdk.send(id, "steered");
+      h.ctx!.endTurn({ ok: true, session_at: "m1" });
+      h.ctx!.endTurn({ ok: false, error: "failed" });
+      await sdk.send(id, "three");
+      const steered = h.ctx!.queued()[0]!;
+      h.ctx!.tookIn(steered.id);
+      h.ctx!.endTurn({ ok: true, session_at: "m3" });
+      const s = await t.snap();
+      expect(s.items.find((i) => i.id === steered.id)?.turn_id).toBe(turnIds(s.items)[2]);
+      return { ...t, s, steered };
+    };
+    // To before turn two: turn three goes too, with the message it took in.
+    const a = await carried();
+    await a.sdk.rewind(a.id, turnIds(a.s.items)[1]!);
+    let s = await a.snap();
+    expect(turnIds(s.items)).toEqual(turnIds(a.s.items).slice(0, 1));
+    expect(s.items.some((i) => i.id === a.steered.id)).toBe(false);
+    expect(s.items.map((i) => (i.type === "notice" ? i.code : i.type))).toEqual(["user_message", "turn_result", "rewind"]);
+    // To before turn three: turn two stays.
+    const b = await carried();
+    await b.sdk.rewind(b.id, turnIds(b.s.items)[2]!);
+    s = await b.snap();
+    expect(turnIds(s.items)).toEqual(turnIds(b.s.items).slice(0, 2));
+    expect(s.items.some((i) => i.id === b.steered.id)).toBe(false);
+  });
+
   it("is refused while a turn runs, and for a turn the thread hasn't", async () => {
     const { sdk, id, turn, snap } = await setup();
     await turn("one", "S1", "m1");
@@ -248,6 +282,27 @@ describe("a turn the backend lost", () => {
       await sdk.newSession(id);
     });
     expect(sessions(s.items)).toEqual([{ id: "S-old", at: "m1", started: true }, { id: "S-new", started: true }]);
+  });
+
+  it("is a compaction that had no items yet, not the turn before it", async () => {
+    const store = new MemoryStore();
+    const first = fake(resumeAtPoint);
+    const sdk = new AgentThreads({ store, harnesses: { fake: first.harness }, permissions: "allow" });
+    const thread = await sdk.create();
+    await sdk.send(thread.id, "one");
+    first.h.ctx!.setThread({ session_id: "S" });
+    first.h.ctx!.endTurn({ ok: true, session_at: "m1" });
+    await sdk.compact(thread.id);
+    await sdk.eventsSince(thread.id, 0);
+    const next = new AgentThreads({ store, harnesses: { fake: fake(resumeAtPoint).harness }, permissions: "allow" });
+    const s = await next.snapshot(thread.id);
+    const events = await next.eventsSince(thread.id, 0);
+    const started = events.flatMap((e) => (e.type === "turn.started" ? [e.turn_id] : []));
+    expect(events.flatMap((e) => (e.type === "turn.completed" ? [e.turn_id] : []))).toEqual(started);
+    expect(turnIds(s.items)).toEqual(started);
+    expect(sessions(s.items)).toEqual([{ id: "S", at: "m1", started: true }, { id: "S" }]);
+    await next.rewind(thread.id, started[1]!);
+    expect((await next.snapshot(thread.id)).thread).toMatchObject({ session_id: "S", resume_at: "m1" });
   });
 
   it("records that it continued a session the thread adopted", async () => {

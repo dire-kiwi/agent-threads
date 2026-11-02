@@ -145,7 +145,8 @@ details.
 - **Snapshot**: `{thread, items, requests, seq}`. A client that reconnects asks for the events after
   its `seq`, or takes a fresh snapshot.
 
-Items and events can carry the harness's `raw` payload, which backends can switch off.
+Items, requests and events can carry the harness's `raw` payload, which backends fill in when the
+app turns it on.
 
 ## Backend API
 
@@ -169,7 +170,14 @@ const off = sdk.subscribe((event) => ws.broadcast(event)); // the app's transpor
 ws.on("message", (cmd) => sdk.handle(cmd));                 // send / interrupt / respond / set_options
 await sdk.snapshot(thread.id);                              // for a client that just connected
 await sdk.recover();                                        // on startup, with the shim spawner
+await sdk.control(thread.id, { subtype: "get_context_usage" }); // a request to the harness itself
 ```
+
+What the protocol leaves out goes through to the app in three ways ([spec/PROTOCOL.md](../spec/PROTOCOL.md#pass-through)):
+the `raw` option fills in each event's harness message, `onHarnessMessage` gets every line a harness
+writes (Claude's `system` and `rate_limit_event` messages, Codex's token usage...), and `control()`
+sends the harness a request of the app's own (Claude's `get_context_usage`, a Codex JSON-RPC method).
+Usage limits, which every app wants, are normalized into the thread's `rate_limits`.
 
 Tools, MCP servers, skills and the permission policy can be set per SDK instance or per thread.
 Tool handlers get a `ctx` with the thread id and metadata, so an app can scope tools per user.

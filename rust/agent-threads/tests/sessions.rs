@@ -392,6 +392,65 @@ async fn rewind_keeps_a_codex_revert_not_yet_made_when_a_second_rewind_to_before
     assert_eq!(turn_ids(&s).len(), 1);
 }
 
+/// Turn one, steered with a message the harness doesn't take in; turn two (carrying it over) fails
+/// without taking it in; turn three, with the user's next message, takes it in. The thread, and
+/// the steered message's id.
+async fn carried() -> (Env, Value, String) {
+    let env = setup(resume_at_point, None).await;
+    env.sdk.send(&env.id, "one", SendOptions::default()).await.unwrap();
+    env.harness(|ctx| ctx.set_thread(|t| t.session_id = Some("S".into())));
+    env.sdk.send(&env.id, "steered", SendOptions::default()).await.unwrap();
+    env.harness(|ctx| {
+        let end = |ok: bool, session_at: Option<&str>| TurnEnd {
+            ok,
+            error: (!ok).then(|| "failed".into()),
+            session_at: session_at.map(String::from),
+            ..Default::default()
+        };
+        ctx.end_turn(end(true, Some("m1")), false);
+        ctx.end_turn(end(false, None), false);
+    });
+    env.sdk.send(&env.id, "three", SendOptions::default()).await.unwrap();
+    let steered = Arc::new(Mutex::new(String::new()));
+    let took = steered.clone();
+    env.harness(move |ctx| {
+        let id = ctx.queued()[0].id.clone();
+        assert!(ctx.took_in(&id));
+        *took.lock().unwrap() = id;
+        ctx.end_turn(
+            TurnEnd {
+                ok: true,
+                session_at: Some("m3".into()),
+                ..Default::default()
+            },
+            false,
+        );
+    });
+    let s = env.snap().await;
+    let steered = steered.lock().unwrap().clone();
+    let item = items(&s).iter().find(|i| i["id"] == steered.as_str()).unwrap();
+    assert_eq!(item["turn_id"].as_str(), Some(turn_ids(&s)[2].as_str()));
+    (env, s, steered)
+}
+
+#[tokio::test]
+async fn rewind_goes_by_the_order_turns_ran_though_a_message_carried_over_to_a_later_turn_keeps_its_place() {
+    let has = |s: &Value, id: &str| items(s).iter().any(|i| i["id"] == id);
+    // To before turn two: turn three goes too, with the message it took in.
+    let (a, before, steered) = carried().await;
+    a.sdk.rewind(&a.id, &turn_ids(&before)[1]).await.unwrap();
+    let s = a.snap().await;
+    assert_eq!(turn_ids(&s), turn_ids(&before)[..1]);
+    assert!(!has(&s, &steered));
+    assert_eq!(kinds(&s), ["user_message", "turn_result", "rewind"]);
+    // To before turn three: turn two stays.
+    let (b, before, steered) = carried().await;
+    b.sdk.rewind(&b.id, &turn_ids(&before)[2]).await.unwrap();
+    let s = b.snap().await;
+    assert_eq!(turn_ids(&s), turn_ids(&before)[..2]);
+    assert!(!has(&s, &steered));
+}
+
 #[tokio::test]
 async fn rewind_is_refused_while_a_turn_runs_and_for_a_turn_the_thread_hasnt() {
     let env = setup(resume_at_point, None).await;
@@ -546,6 +605,49 @@ async fn a_turn_the_backend_lost_records_that_it_started_the_one_it_got_after_a_
             json!({"id": "S-new", "started": true})
         ]
     );
+}
+
+#[tokio::test]
+async fn a_turn_the_backend_lost_is_a_compaction_that_had_no_items_yet_not_the_turn_before_it() {
+    let (env, store) = to_lose(None).await;
+    let id = env.id.clone();
+    env.sdk.send(&id, "one", SendOptions::default()).await.unwrap();
+    env.harness(|ctx| {
+        ctx.set_thread(|t| t.session_id = Some("S".into()));
+        ctx.end_turn(
+            TurnEnd {
+                ok: true,
+                session_at: Some("m1".into()),
+                ..Default::default()
+            },
+            false,
+        );
+    });
+    env.sdk.compact(&id).await.unwrap();
+    env.sdk.events_since(&id, 0, None).await.unwrap();
+    let (next, _, _) = backend(resume_at_point, store);
+    let s = serde_json::to_value(next.snapshot(&id).await.unwrap()).unwrap();
+    let events = next.events_since(&id, 0, None).await.unwrap();
+    let ids = |started: bool| -> Vec<String> {
+        events
+            .iter()
+            .filter_map(|e| match e {
+                ThreadEvent::TurnStarted(t) if started => Some(t.turn_id.clone()),
+                ThreadEvent::TurnCompleted(t) if !started => Some(t.turn_id.clone()),
+                _ => None,
+            })
+            .collect()
+    };
+    let started = ids(true);
+    assert_eq!(ids(false), started);
+    assert_eq!(turn_ids(&s), started);
+    assert_eq!(
+        sessions(&s),
+        vec![json!({"id": "S", "at": "m1", "started": true}), json!({"id": "S"})]
+    );
+    next.rewind(&id, &started[1]).await.unwrap();
+    let t = serde_json::to_value(next.snapshot(&id).await.unwrap()).unwrap()["thread"].clone();
+    assert_eq!((&t["session_id"], &t["resume_at"]), (&json!("S"), &json!("m1")));
 }
 
 #[tokio::test]

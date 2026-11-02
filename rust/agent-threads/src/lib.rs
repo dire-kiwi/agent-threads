@@ -6,12 +6,14 @@
 //! transport. See docs/design.md and spec/PROTOCOL.md in the repository.
 //!
 //! [`protocol`] has the types of the shared spec (`spec/`): items, requests, events, commands and
-//! snapshots, and [`reducer`] folds events into a thread's state.
+//! snapshots, [`reducer`] folds events into a thread's state, and [`window`] takes windows of it
+//! and pages of the items before them.
 
 pub mod protocol;
 pub mod reducer;
 pub mod store;
 pub mod stores;
+pub mod window;
 
 mod agent_threads;
 mod attachments;
@@ -39,10 +41,11 @@ pub use agent_threads::{
 pub use claude::{ClaudeCodeOptions, claude_code};
 pub use codex::{AppTools, CodexOptions, codex};
 pub use harness::{
-    BoxFuture, Harness, HarnessSession, McpServer, Message, RunCheckpoint, Skill, ThreadConfig, TurnEnd,
+    BoxFuture, ControlReply, Harness, HarnessMessage, HarnessMessageHandler, HarnessSession, LaunchOptions, McpServer,
+    Message, RunCheckpoint, Skill, ThreadConfig, TurnEnd,
 };
 pub use permissions::{Decided, PermissionContext, PermissionDecision, PermissionPolicy, PermissionQuery};
-pub use protocol::{Command, Item, Snapshot, Thread, ThreadEvent};
+pub use protocol::{Command, Item, ItemPage, Snapshot, Thread, ThreadEvent};
 pub use sessions::{RewindError, RewindPoint, resume_at_point, revert_point};
 #[doc(hidden)]
 pub use shim::kill_runs;

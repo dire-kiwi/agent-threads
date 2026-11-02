@@ -76,6 +76,7 @@ type threadRuntime struct {
 	id      string
 	loop    *loop
 	config  ThreadConfig
+	launch  LaunchOptions // how its harness process is started: stored with the thread
 	policy  PermissionPolicy
 	session Session
 	turn    *turnState
@@ -124,15 +125,19 @@ type threadRuntime struct {
 	// run was left going instead.
 	sessionDone chan struct{}
 	detached    bool
+	// raw is the harness message being handled, which events made now have as their raw (with the
+	// Raw option).
+	raw json.RawMessage
 }
 
-func newRuntime(sdk *AgentThreads, state protocol.Snapshot, config ThreadConfig, policy PermissionPolicy) *threadRuntime {
+func newRuntime(sdk *AgentThreads, state protocol.Snapshot, config ThreadConfig, launch LaunchOptions, policy PermissionPolicy) *threadRuntime {
 	rt := &threadRuntime{
 		sdk:        sdk,
 		id:         state.Thread.ID,
 		state:      state,
 		saved:      state,
 		config:     config,
+		launch:     launch,
 		policy:     policy,
 		requests:   map[string]*openRequest{},
 		always:     map[string]Decision{},
@@ -157,6 +162,8 @@ func (rt *threadRuntime) ThreadID() string { return rt.id }
 func (rt *threadRuntime) Thread() protocol.Thread { return rt.state.Thread }
 
 func (rt *threadRuntime) Config() ThreadConfig { return rt.config }
+
+func (rt *threadRuntime) Launch() LaunchOptions { return rt.launch }
 
 func (rt *threadRuntime) Spawner() Spawner { return rt.sdk.spawner }
 
@@ -191,6 +198,17 @@ func (rt *threadRuntime) liveThread() protocol.Thread {
 
 func (rt *threadRuntime) emit(v protocol.ThreadEventValue) {
 	e := protocol.ThreadEvent{Value: v}
+	// An item or request has the harness message it came from, and its event doesn't as well.
+	if rt.raw != nil {
+		switch x := v.(type) {
+		case *protocol.ItemAddedEvent:
+			x.Item.SetRaw(rt.raw)
+		case *protocol.RequestOpenedEvent:
+			x.Request.SetRaw(rt.raw)
+		default:
+			e.SetRaw(rt.raw)
+		}
+	}
 	saved := e.Saved()
 	seq := rt.state.Seq
 	if saved {
@@ -221,7 +239,7 @@ func (rt *threadRuntime) take() {
 	b.runs = rt.runs()
 	if rt.threadChanged {
 		rt.threadChanged = false
-		t := clone(rt.saved.Thread)
+		t := withLaunch(clone(rt.saved.Thread), rt.launch)
 		b.thread = &t
 	}
 	if rt.snapshotDue {
@@ -696,6 +714,64 @@ func (rt *threadRuntime) SetThread(change func(*protocol.Thread)) {
 	rt.emit(&protocol.ThreadUpdatedEvent{Thread: next})
 }
 
+func (rt *threadRuntime) RateLimits(limits []protocol.RateLimit) {
+	if len(limits) == 0 {
+		return
+	}
+	rt.SetThread(func(t *protocol.Thread) {
+		all := map[string]protocol.RateLimit{}
+		for _, l := range t.RateLimits {
+			all[l.ID] = l
+		}
+		for _, l := range limits {
+			all[l.ID] = l
+		}
+		out := make([]protocol.RateLimit, 0, len(all))
+		for _, id := range sortedKeys(all) {
+			out = append(out, all[id])
+		}
+		t.RateLimits = out
+	})
+}
+
+func (rt *threadRuntime) FromHarness(runID, line string, handle func()) {
+	var message json.RawMessage
+	if json.Valid([]byte(line)) {
+		message = json.RawMessage(line)
+	}
+	before := rt.raw
+	if rt.sdk.options.Raw && message != nil {
+		rt.raw = message
+	}
+	func() {
+		defer func() { rt.raw = before }()
+		handle()
+	}()
+	if fn := rt.sdk.options.OnHarnessMessage; fn != nil {
+		m := HarnessMessage{ThreadID: rt.id, RunID: runID, Harness: rt.state.Thread.Harness, Line: line, Message: message}
+		func() {
+			defer func() {
+				if r := recover(); r != nil {
+					rt.sdk.reportError(fmt.Errorf("agentthreads: OnHarnessMessage panicked: %v", r))
+				}
+			}()
+			fn(m)
+		}()
+	}
+}
+
+// setLaunch changes how the harness process is started, from the next one; it's saved with the
+// thread.
+func (rt *threadRuntime) setLaunch(launch LaunchOptions) {
+	if sameJSONValue(launch, rt.launch) {
+		return
+	}
+	rt.launch = clone(launch)
+	rt.threadChanged = true
+	rt.flushQueued = true
+	rt.session.OptionsChanged()
+}
+
 func sameJSONValue(a, b any) bool {
 	x, err1 := json.Marshal(a)
 	y, err2 := json.Marshal(b)
@@ -922,20 +998,16 @@ func (rt *threadRuntime) newSession() {
 // turn the thread hasn't, or one the harness can't rewind to. The caller checks no turn is running.
 func (rt *threadRuntime) rewind(turnID string) error {
 	items := rt.saved.Items
-	var order []string
-	seen := map[string]bool{}
-	var sessions []*protocol.TurnSession
+	var results []*protocol.TurnResult
+	var resultAt []int // Each result's index in items.
 	index := -1
-	for _, it := range items {
-		if t := it.TurnID(); t != "" && !seen[t] {
-			seen[t] = true
-			order = append(order, t)
-		}
+	for i, it := range items {
 		if r, ok := it.Value.(*protocol.TurnResult); ok && r.ParentID == "" {
 			if r.TurnID == turnID && index < 0 {
-				index = len(sessions)
+				index = len(results)
 			}
-			sessions = append(sessions, r.Session)
+			results = append(results, r)
+			resultAt = append(resultAt, i)
 		}
 	}
 	if index < 0 {
@@ -945,20 +1017,25 @@ func (rt *threadRuntime) rewind(turnID string) error {
 	if !ok {
 		return &RewindError{Message: fmt.Sprintf("%s threads can't be rewound", rt.state.Thread.Harness)}
 	}
+	sessions := make([]*protocol.TurnSession, len(results))
+	for i, r := range results {
+		sessions[i] = r.Session
+	}
 	point, err := rewinder.RewindPoint(sessions, index)
 	if err != nil {
 		return err
 	}
+	// The turn and those after it, in the order they ran (a message carried over to a later turn
+	// keeps its place in the items, so their order isn't the turns'). What isn't any turn's goes
+	// too, after the last turn kept and the first item of one that goes.
 	dropped := map[string]bool{}
-	for i, t := range order {
-		if t == turnID {
-			for _, d := range order[i:] {
-				dropped[d] = true
-			}
-			break
-		}
+	for _, r := range results[index:] {
+		dropped[r.TurnID] = true
 	}
-	first := -1
+	kept, first := -1, -1
+	if index > 0 {
+		kept = resultAt[index-1]
+	}
 	for i, it := range items {
 		if t := it.TurnID(); t != "" && dropped[t] {
 			first = i
@@ -968,7 +1045,7 @@ func (rt *threadRuntime) rewind(turnID string) error {
 	gone := []string{}
 	goneSet := map[string]bool{}
 	for i, it := range items {
-		if t := it.TurnID(); (t != "" && dropped[t]) || (t == "" && i > first) {
+		if t := it.TurnID(); (t != "" && dropped[t]) || (t == "" && i > kept && i > first) {
 			gone = append(gone, it.ID())
 			goneSet[it.ID()] = true
 		}
@@ -1059,7 +1136,8 @@ func (rt *threadRuntime) Reopen(requestID string, answered func(protocol.Resolut
 		return false
 	}
 	for _, r := range rt.state.Requests {
-		if r.ID() == requestID {
+		// One that's been resolved stays in the state, with its resolution, but can't be reopened.
+		if r.ID() == requestID && r.Resolution() == nil {
 			rt.addRequest(requestID, &openRequest{request: r, answered: answered, standing: standing})
 			return true
 		}

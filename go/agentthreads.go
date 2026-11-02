@@ -46,6 +46,15 @@ type Options struct {
 	// OnError is called with errors that aren't any command's: a store that fails, a subscriber that
 	// panics. They're logged by default.
 	OnError func(error)
+	// Raw fills in raw on events, items and requests: the harness message each came from. It's off
+	// by default; it's saved with the events, so they take more room.
+	Raw bool
+	// OnHarnessMessage is called with every line a thread's harness process writes, once its driver
+	// has dealt with it: for what the protocol leaves out (Claude Code's system messages and rate
+	// limit events, Codex's token usage...). It runs on the thread's goroutine as the output is read,
+	// so it should be quick, and mustn't call the AgentThreads and wait. A panic is reported to
+	// OnError.
+	OnHarnessMessage func(HarnessMessage)
 }
 
 // CreateOptions are a new thread's.
@@ -67,6 +76,10 @@ type CreateOptions struct {
 	// SessionID is the harness's own session to adopt (Claude Code's session id, Codex's thread id):
 	// the thread's first turn resumes it. Its messages so far aren't made into items.
 	SessionID string
+	// Launch is how its harness process is started (args, environment, directories, config
+	// directory), on top of the harness's options. It's stored with the thread, but not sent to
+	// clients.
+	Launch LaunchOptions
 }
 
 // SendOptions are a message's attachments and the client's id for it.
@@ -80,6 +93,9 @@ type ThreadOptions struct {
 	Model          *string
 	Effort         *string
 	PermissionMode *protocol.PermissionMode
+	// Launch, if it isn't nil, replaces how the thread's harness process is started, in full. Only
+	// the app sets it: the set_options command doesn't.
+	Launch *LaunchOptions
 }
 
 // Recovered is what Recover did.
@@ -100,6 +116,16 @@ func (e *CommandError) Error() string { return e.Message }
 func commandErr(format string, args ...any) error {
 	return &CommandError{Message: fmt.Sprintf(format, args...)}
 }
+
+// ControlError is a control request (Control) the harness refused, or didn't answer: its process
+// exited first, or the backend closed. Data is the harness's own error, when it gave one (Claude
+// Code's error text, as a JSON string, or Codex's JSON-RPC error object).
+type ControlError struct {
+	Message string
+	Data    json.RawMessage
+}
+
+func (e *ControlError) Error() string { return e.Message }
 
 // pruneEvery is how often the shim spawner's finished runs are pruned.
 const pruneEvery = time.Hour
@@ -210,7 +236,7 @@ func (a *AgentThreads) Create(ctx context.Context, o CreateOptions) (protocol.Th
 	a.loading[id] = l
 	a.configs[id] = o.Capabilities
 	a.mu.Unlock()
-	rt, err := a.createRuntime(ctx, thread)
+	rt, err := a.createRuntime(ctx, thread, clone(o.Launch))
 	a.mu.Lock()
 	if err == nil {
 		a.threads[id] = rt
@@ -229,11 +255,11 @@ func (a *AgentThreads) Create(ctx context.Context, o CreateOptions) (protocol.Th
 }
 
 // createRuntime stores a new thread, and makes its runtime with its first event.
-func (a *AgentThreads) createRuntime(ctx context.Context, thread protocol.Thread) (*threadRuntime, error) {
-	if err := a.store.CreateThread(ctx, thread); err != nil {
+func (a *AgentThreads) createRuntime(ctx context.Context, thread protocol.Thread, launch LaunchOptions) (*threadRuntime, error) {
+	if err := a.store.CreateThread(ctx, withLaunch(thread, launch)); err != nil {
 		return nil, err
 	}
-	rt, err := a.runtime(protocol.InitialState(thread))
+	rt, err := a.runtime(protocol.InitialState(thread), launch)
 	if err != nil {
 		return nil, err
 	}
@@ -308,7 +334,12 @@ func (a *AgentThreads) Get(ctx context.Context, threadID string) (*protocol.Thre
 		t := rt.liveThread()
 		return &t, nil
 	}
-	return a.store.GetThread(ctx, threadID)
+	t, err := a.store.GetThread(ctx, threadID)
+	if t != nil {
+		// Its launch options aren't the client's.
+		*t, _ = splitLaunch(*t)
+	}
+	return t, err
 }
 
 // List is every thread, oldest first.
@@ -320,6 +351,8 @@ func (a *AgentThreads) List(ctx context.Context) ([]protocol.Thread, error) {
 	for i, t := range threads {
 		if rt := a.live(t.ID); rt != nil {
 			threads[i] = rt.liveThread()
+		} else {
+			threads[i], _ = splitLaunch(t)
 		}
 	}
 	return threads, nil
@@ -372,6 +405,28 @@ func (a *AgentThreads) Snapshot(ctx context.Context, threadID string) (protocol.
 		return protocol.Snapshot{}, err
 	}
 	return rt.snapshot(), nil
+}
+
+// SnapshotWindow is the thread's state now, as Snapshot, but a window of it: its last limit items
+// and what they need from before them, for a client that loads earlier ones with ItemsBefore
+// (spec/PROTOCOL.md, "Windows"). With a negative limit, or one it's within, it's the whole state.
+func (a *AgentThreads) SnapshotWindow(ctx context.Context, threadID string, limit int) (protocol.Snapshot, error) {
+	snap, err := a.Snapshot(ctx, threadID)
+	if err != nil {
+		return protocol.Snapshot{}, err
+	}
+	return protocol.SnapshotWindow(snap, limit), nil
+}
+
+// ItemsBefore is the thread's items before index before (a window's start), at most limit of them,
+// with the subagent calls they belong to and the requests they have: a page for a client that has
+// a window to load earlier items into.
+func (a *AgentThreads) ItemsBefore(ctx context.Context, threadID string, before int64, limit int) (protocol.ItemPage, error) {
+	snap, err := a.Snapshot(ctx, threadID)
+	if err != nil {
+		return protocol.ItemPage{}, err
+	}
+	return protocol.ItemsBefore(snap, before, limit), nil
 }
 
 // EventsSince is the thread's saved events after seq (at most limit of them, if limit > 0), for a
@@ -597,7 +652,8 @@ func (a *AgentThreads) Respond(ctx context.Context, threadID, requestID string, 
 	return a.do(ctx, threadID, func(rt *threadRuntime) { rt.respond(requestID, res) })
 }
 
-// SetOptions changes the thread's model, effort or permission mode, from its next turn.
+// SetOptions changes the thread's model, effort, permission mode or launch options, from its next
+// turn.
 func (a *AgentThreads) SetOptions(ctx context.Context, threadID string, o ThreadOptions) error {
 	if o.PermissionMode != nil {
 		if problems := protocol.ValidateValue(*o.PermissionMode, "PermissionMode"); len(problems) > 0 {
@@ -620,6 +676,9 @@ func (a *AgentThreads) SetOptions(ctx context.Context, threadID string, o Thread
 		after := rt.state.Thread
 		if before.Model != after.Model || before.Effort != after.Effort || before.PermissionMode != after.PermissionMode {
 			rt.session.OptionsChanged()
+		}
+		if o.Launch != nil {
+			rt.setLaunch(*o.Launch)
 		}
 	})
 }
@@ -721,6 +780,52 @@ func (a *AgentThreads) doErr(ctx context.Context, threadID string, fn func(rt *t
 		return err
 	}
 	return refused
+}
+
+// Control sends the thread's running harness process a request of the app's own, and returns its
+// answer: for Claude Code a control request's request (e.g. {"subtype": "get_context_usage"}),
+// answered with the control response's response; for Codex {"method": ..., "params": ...}, answered
+// with the JSON-RPC result. It returns a *CommandError if the thread has no running process or its
+// harness takes no requests, a *ControlError if the harness refuses it or its process exits (or the
+// backend closes) before it answers, and ctx's error if ctx is done first. It mustn't be used for
+// what the driver does itself (starting turns, answering the harness's requests...).
+func (a *AgentThreads) Control(ctx context.Context, threadID string, request json.RawMessage) (json.RawMessage, error) {
+	type answer struct {
+		result json.RawMessage
+		err    error
+	}
+	answers := make(chan answer, 1)
+	var refused error
+	var rt *threadRuntime
+	err := a.do(ctx, threadID, func(r *threadRuntime) {
+		rt = r
+		cs, ok := r.session.(ControlSession)
+		if !ok {
+			refused = commandErr("thread %s runs on %s, which doesn't take control requests", threadID, r.state.Thread.Harness)
+			return
+		}
+		refused = cs.Control(request, func(result json.RawMessage, err error) { answers <- answer{result, err} })
+	})
+	if err != nil {
+		return nil, err
+	}
+	if refused != nil {
+		return nil, refused
+	}
+	select {
+	case a := <-answers:
+		return a.result, a.err
+	case <-rt.loop.stoppedCh:
+		// The thread let go of its process without saying (it was closed).
+		select {
+		case a := <-answers:
+			return a.result, a.err
+		default:
+			return nil, &ControlError{Message: "the backend closed before the harness answered"}
+		}
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
 }
 
 // Close stops every harness process, saves everything, and returns once the subscribers have had
@@ -931,14 +1036,14 @@ func (a *AgentThreads) policy(threadID string) PermissionPolicy {
 	return Ask
 }
 
-func (a *AgentThreads) runtime(state protocol.Snapshot) (*threadRuntime, error) {
+func (a *AgentThreads) runtime(state protocol.Snapshot, launch LaunchOptions) (*threadRuntime, error) {
 	id := state.Thread.ID
 	harness := a.harnesses[state.Thread.Harness]
 	if harness == nil {
 		return nil, commandErr("thread %s runs on %s, which isn't configured", id, state.Thread.Harness)
 	}
 	// Not live yet: the caller makes it so (in a.threads) once it's ready to take commands.
-	rt := newRuntime(a, state, a.config(id), a.policy(id))
+	rt := newRuntime(a, state, a.config(id), launch, a.policy(id))
 	rt.loop.call(func() { rt.session = harness.Open(rt) })
 	return rt, nil
 }
@@ -984,6 +1089,9 @@ func (a *AgentThreads) fromStore(ctx context.Context, threadID string) (*threadR
 	if thread == nil {
 		return nil, commandErr("there's no thread %s", threadID)
 	}
+	// Its launch options are kept with it in the store, but aren't part of its state.
+	stored, launch := splitLaunch(*thread)
+	thread = &stored
 	snap, err := a.store.LoadSnapshot(ctx, threadID)
 	if err != nil {
 		return nil, err
@@ -1000,20 +1108,21 @@ func (a *AgentThreads) fromStore(ctx context.Context, threadID string) (*threadR
 	if state.Seq == 0 {
 		state = protocol.InitialState(*thread)
 	}
-	// The session the running turn (if one is) started in, which a turn rebuilt here starts with.
+	// The turn that was running, if one was (a compaction may have no items yet), and the session it
+	// started in: what a turn rebuilt here is.
 	running := state.Thread.Status == protocol.ThreadStatusRunning || state.Thread.Status == protocol.ThreadStatusWaiting
-	startedIn := state.Thread.SessionID
-	if turnID := latestTurn(state.Items); running && turnID != "" {
-		session, found := sessionAtStart(base, events, turnID)
+	lost := lostTurn{Session: state.Thread.SessionID}
+	if running {
+		open, found := runningTurn(base, events)
 		if !found {
 			all, err := a.store.ReadEvents(ctx, threadID, 0, 0)
 			if err != nil {
 				return nil, err
 			}
-			session, found = sessionAtStart(protocol.InitialState(*thread), all, turnID)
+			open, found = runningTurn(protocol.InitialState(*thread), all)
 		}
 		if found {
-			startedIn = session
+			lost = open
 		}
 	}
 	// The run it had, read first: a store that can't say leaves the thread to be loaded again later,
@@ -1028,13 +1137,13 @@ func (a *AgentThreads) fromStore(ctx context.Context, threadID string) (*threadR
 			record = r
 		}
 	}
-	rt, err := a.runtime(state)
+	rt, err := a.runtime(state, launch)
 	if err != nil {
 		return nil, err
 	}
 	var abandon *RunRecord
 	rt.loop.call(func() {
-		ok, stop := a.reattach(rt, record, startedIn)
+		ok, stop := a.reattach(rt, record, lost)
 		if ok {
 			return
 		}
@@ -1044,7 +1153,7 @@ func (a *AgentThreads) fromStore(ctx context.Context, threadID string) (*threadR
 			if rt.state.Thread.Run != nil {
 				rt.lostRun = rt.state.Thread.Run.ID
 			}
-			recoverLost(rt, startedIn)
+			recoverLost(rt, lost)
 		}
 	})
 	if abandon != nil {
@@ -1055,9 +1164,9 @@ func (a *AgentThreads) fromStore(ctx context.Context, threadID string) (*threadR
 
 // reattach re-attaches a thread just loaded to its run (record), if it has one that outlived the
 // backend before: its turn and open requests are as they were when the run was last saved, and the
-// session carries on reading the run from there (a turn the run data hasn't is rebuilt, starting in
-// the session startedIn). It says whether it did; if it couldn't, it returns the run, to be stopped.
-func (a *AgentThreads) reattach(rt *threadRuntime, record *RunRecord, startedIn string) (bool, *RunRecord) {
+// session carries on reading the run from there (a turn the run data hasn't is rebuilt as lost). It
+// says whether it did; if it couldn't, it returns the run, to be stopped.
+func (a *AgentThreads) reattach(rt *threadRuntime, record *RunRecord, lost lostTurn) (bool, *RunRecord) {
 	if record == nil {
 		return false, nil
 	}
@@ -1072,7 +1181,7 @@ func (a *AgentThreads) reattach(rt *threadRuntime, record *RunRecord, startedIn 
 			t := *data.Turn
 			rt.turn = &t
 		} else {
-			rt.turn = &turnState{ID: lastTurn(rt.state.Items), Session: startedIn}
+			rt.turn = lost.turn(rt.state.Items)
 		}
 	}
 	rt.adoptRun(*record)
@@ -1084,7 +1193,7 @@ func (a *AgentThreads) reattach(rt *threadRuntime, record *RunRecord, startedIn 
 	}
 	// Requests the session didn't take up again can't be answered.
 	open := rt.openRequestIDs()
-	for _, r := range rt.state.Requests {
+	for _, r := range protocol.OpenRequests(rt.state) {
 		if !open[r.ID()] {
 			rt.emit(&protocol.RequestResolvedEvent{RequestID: r.ID(), Resolution: protocol.Resolution{Outcome: protocol.ResolutionOutcomeCancel}})
 		}
@@ -1106,45 +1215,52 @@ func (a *AgentThreads) reattach(rt *threadRuntime, record *RunRecord, startedIn 
 	return true, nil
 }
 
-// latestTurn is the turn of the last item that has one, or "".
-func latestTurn(items []protocol.Item) string {
-	for i := len(items) - 1; i >= 0; i-- {
-		if t := items[i].TurnID(); t != "" {
-			return t
-		}
-	}
-	return ""
+// lostTurn is a turn that was running when the thread was loaded: its id ("" if it isn't known),
+// and the session it started in.
+type lostTurn struct {
+	ID      string
+	Session string
 }
 
-// lastTurn is the turn of the last item that has one, or a new turn id.
-func lastTurn(items []protocol.Item) string {
-	if t := latestTurn(items); t != "" {
-		return t
+// turn is the turn rebuilt for it: with no id, the latest turn's (of the last item that has one), or
+// a new one.
+func (l lostTurn) turn(items []protocol.Item) *turnState {
+	id := l.ID
+	for i := len(items) - 1; i >= 0 && id == ""; i-- {
+		id = items[i].TurnID()
 	}
-	return NewID("turn")
+	if id == "" {
+		id = NewID("turn")
+	}
+	return &turnState{ID: id, Session: l.Session}
 }
 
-// sessionAtStart is the thread's session_id when the turn turnID started ("" for none), from events
-// folded onto from; found is false if its turn.started isn't among them. (A session the turn starts
-// is set after its turn.started.)
-func sessionAtStart(from protocol.Snapshot, events []protocol.ThreadEvent, turnID string) (session string, found bool) {
+// runningTurn is the turn that's still running in events folded onto from (the last turn.started
+// with no turn.completed after it), with the thread's session_id when it started (a session the turn
+// starts is set after its turn.started); found is false if there's none in them.
+func runningTurn(from protocol.Snapshot, events []protocol.ThreadEvent) (open lostTurn, found bool) {
 	state := from
 	for _, e := range events {
-		if t, ok := e.Value.(*protocol.TurnStartedEvent); ok && t.TurnID == turnID {
-			session, found = state.Thread.SessionID, true
+		switch ev := e.Value.(type) {
+		case *protocol.TurnStartedEvent:
+			open, found = lostTurn{ID: ev.TurnID, Session: state.Thread.SessionID}, true
+		case *protocol.TurnCompletedEvent:
+			if found && ev.TurnID == open.ID {
+				open, found = lostTurn{}, false
+			}
 		}
 		state = protocol.ApplyEvent(state, e)
 	}
-	return session, found
+	return open, found
 }
 
-// recoverLost ends a turn whose process was lost when the backend stopped. startedIn is the session
-// it started in.
-func recoverLost(rt *threadRuntime, startedIn string) {
+// recoverLost ends a turn whose process was lost when the backend stopped: lost (or, with no id, the
+// latest turn).
+func recoverLost(rt *threadRuntime, lost lostTurn) {
 	s := rt.state.Thread.Status
 	if s == protocol.ThreadStatusRunning || s == protocol.ThreadStatusWaiting {
-		rt.turn = &turnState{ID: lastTurn(rt.state.Items), Session: startedIn}
-		for _, r := range rt.state.Requests {
+		rt.turn = lost.turn(rt.state.Items)
+		for _, r := range protocol.OpenRequests(rt.state) {
 			rt.emit(&protocol.RequestResolvedEvent{RequestID: r.ID(), Resolution: protocol.Resolution{Outcome: protocol.ResolutionOutcomeCancel}})
 		}
 		rt.AddItem(&protocol.Notice{

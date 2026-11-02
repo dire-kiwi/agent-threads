@@ -5,7 +5,8 @@ use serde_json::{Map, Value, json};
 
 use crate::claude::{result_text, slim};
 use crate::harness::McpServer;
-use crate::protocol::{PermissionMode, Usage};
+use crate::ids::unix_time;
+use crate::protocol::{PermissionMode, RateLimit, RateLimitStatus, Usage};
 
 /// The MCP server that serves a thread's app tools when Codex can't take them as dynamic tools.
 pub(crate) const APP_SERVER: &str = "app";
@@ -330,4 +331,36 @@ pub(crate) fn mcp_server_config(s: &McpServer) -> Result<Value, &'static str> {
             Ok(v)
         }
     }
+}
+
+/// The limits an `account/rateLimits/updated` notification's snapshot reports: its primary and
+/// secondary windows, named by its limitId when that isn't Codex's own. A used-up window is
+/// rejected, unless credits carry on past it.
+pub(crate) fn codex_rate_limits(rl: &Value) -> Vec<RateLimit> {
+    let prefix = match rl["limitId"].as_str() {
+        Some(l) if !l.is_empty() && l != "codex" => format!("{l}:"),
+        _ => String::new(),
+    };
+    let credits = rl["credits"]["hasCredits"] == true || rl["credits"]["unlimited"] == true;
+    let mut out = Vec::new();
+    for key in ["primary", "secondary"] {
+        let w = &rl[key];
+        if !w.is_object() {
+            continue;
+        }
+        let used = w["usedPercent"].as_f64().filter(|u| u.is_finite());
+        let status = match used {
+            Some(u) if u >= 100.0 && credits => RateLimitStatus::Warning,
+            Some(u) if u >= 100.0 => RateLimitStatus::Rejected,
+            _ => RateLimitStatus::Allowed,
+        };
+        out.push(RateLimit {
+            id: format!("{prefix}{key}"),
+            status,
+            used_percent: used,
+            resets_at: w["resetsAt"].as_f64().and_then(unix_time),
+            window_minutes: w["windowDurationMins"].as_u64(),
+        });
+    }
+    out
 }
