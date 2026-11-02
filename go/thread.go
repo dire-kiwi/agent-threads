@@ -123,6 +123,9 @@ type threadRuntime struct {
 	// run was left going instead.
 	sessionDone chan struct{}
 	detached    bool
+	// raw is the harness message being handled, which events made now have as their raw (with the
+	// Raw option).
+	raw json.RawMessage
 }
 
 func newRuntime(sdk *AgentThreads, state protocol.Snapshot, config ThreadConfig, launch LaunchOptions, policy PermissionPolicy) *threadRuntime {
@@ -193,6 +196,17 @@ func (rt *threadRuntime) liveThread() protocol.Thread {
 
 func (rt *threadRuntime) emit(v protocol.ThreadEventValue) {
 	e := protocol.ThreadEvent{Value: v}
+	// An item or request has the harness message it came from, and its event doesn't as well.
+	if rt.raw != nil {
+		switch x := v.(type) {
+		case *protocol.ItemAddedEvent:
+			x.Item.SetRaw(rt.raw)
+		case *protocol.RequestOpenedEvent:
+			x.Request.SetRaw(rt.raw)
+		default:
+			e.SetRaw(rt.raw)
+		}
+	}
 	saved := e.Saved()
 	seq := rt.state.Seq
 	if saved {
@@ -696,6 +710,52 @@ func (rt *threadRuntime) SetThread(change func(*protocol.Thread)) {
 	next.UpdatedAt = now()
 	rt.threadChanged = true
 	rt.emit(&protocol.ThreadUpdatedEvent{Thread: next})
+}
+
+func (rt *threadRuntime) RateLimits(limits []protocol.RateLimit) {
+	if len(limits) == 0 {
+		return
+	}
+	rt.SetThread(func(t *protocol.Thread) {
+		all := map[string]protocol.RateLimit{}
+		for _, l := range t.RateLimits {
+			all[l.ID] = l
+		}
+		for _, l := range limits {
+			all[l.ID] = l
+		}
+		out := make([]protocol.RateLimit, 0, len(all))
+		for _, id := range sortedKeys(all) {
+			out = append(out, all[id])
+		}
+		t.RateLimits = out
+	})
+}
+
+func (rt *threadRuntime) FromHarness(runID, line string, handle func()) {
+	var message json.RawMessage
+	if json.Valid([]byte(line)) {
+		message = json.RawMessage(line)
+	}
+	before := rt.raw
+	if rt.sdk.options.Raw && message != nil {
+		rt.raw = message
+	}
+	func() {
+		defer func() { rt.raw = before }()
+		handle()
+	}()
+	if fn := rt.sdk.options.OnHarnessMessage; fn != nil {
+		m := HarnessMessage{ThreadID: rt.id, RunID: runID, Harness: rt.state.Thread.Harness, Line: line, Message: message}
+		func() {
+			defer func() {
+				if r := recover(); r != nil {
+					rt.sdk.reportError(fmt.Errorf("agentthreads: OnHarnessMessage panicked: %v", r))
+				}
+			}()
+			fn(m)
+		}()
+	}
 }
 
 // setLaunch changes how the harness process is started, from the next one; it's saved with the

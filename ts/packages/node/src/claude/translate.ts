@@ -1,7 +1,8 @@
 // Claude Code's tools, results and usage in the protocol's terms (spec/fixtures/README.md, "Claude
 // Code").
 
-import type { FileChange, Question, SubagentState, SubagentStatus, ToolCall, ToolKind, Usage } from "@dire-kiwi/agent-threads-protocol";
+import type { FileChange, Question, RateLimit, SubagentState, SubagentStatus, ToolCall, ToolKind, Usage } from "@dire-kiwi/agent-threads-protocol";
+import { unixTime } from "../harness.js";
 
 /** The in-process MCP server that serves a thread's app tools. */
 export const APP_SERVER = "app";
@@ -256,4 +257,37 @@ export function claudePermissionMode(mode: string | undefined): string | undefin
     default:
       return undefined;
   }
+}
+
+/**
+ * The limit a `rate_limit_info` reports (from a rate_limit_event, or a message refused for the
+ * usage limit), if it says how it stands.
+ */
+export function claudeRateLimits(info: Json): RateLimit[] {
+  const overage = info.isUsingOverage === true || info.overageStatus === "allowed" || info.overageStatus === "allowed_warning";
+  const status = info.status === "allowed" ? "allowed" : info.status === "allowed_warning" ? "warning" : info.status === "rejected" ? (overage ? "warning" : "rejected") : undefined;
+  if (!status) return [];
+  const limit: RateLimit = { id: typeof info.rateLimitType === "string" && info.rateLimitType ? info.rateLimitType : "unknown", status };
+  if (typeof info.utilization === "number" && Number.isFinite(info.utilization)) limit.used_percent = info.utilization * 100;
+  if (typeof info.resetsAt === "number" && Number.isFinite(info.resetsAt)) limit.resets_at = unixTime(info.resetsAt);
+  return [limit];
+}
+
+/** An `api_retry` system message's notice text. */
+export function retryText(m: Json): string {
+  const why = [typeof m.error === "string" ? m.error : "", typeof m.error_status === "number" ? `status ${m.error_status}` : ""].filter(Boolean).join(", ");
+  const secs = Math.ceil((typeof m.retry_delay_ms === "number" ? m.retry_delay_ms : 0) / 1000);
+  return `API request failed${why ? ` (${why})` : ""}; retrying in ${secs}s (attempt ${m.attempt} of ${m.max_retries}).`;
+}
+
+/** A `hook_response` system message's notice, if it makes one: a hook that failed, or said something. */
+export function hookNotice(m: Json): { level: "info" | "warning"; text: string; detail?: string } | undefined {
+  const text = (v: unknown) => (typeof v === "string" ? v.trim() : "");
+  const output = text(m.output);
+  if (m.outcome === "error") {
+    const detail = text(m.stderr) || output;
+    const code = typeof m.exit_code === "number" ? ` (exit code ${m.exit_code})` : "";
+    return { level: "warning", text: `Hook ${m.hook_name} failed${code}`, ...(detail ? { detail } : {}) };
+  }
+  return output ? { level: "info", text: `Hook ${m.hook_name} ran`, detail: output } : undefined;
 }

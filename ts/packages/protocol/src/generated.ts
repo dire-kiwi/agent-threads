@@ -169,6 +169,10 @@ export interface Thread {
   error?: string;
   run?: Run;
   /**
+   * The usage limits of the account the harness runs on, as it last reported them in this thread, sorted by id. Absent until it reports one.
+   */
+  rate_limits?: RateLimit[];
+  /**
    * The app's own data, given when the thread was created. Backends store it and pass it to tools; they don't read it.
    */
   metadata?: {
@@ -207,6 +211,31 @@ export interface Run {
    * When a restarted backend last re-attached to the run. Absent if it never has.
    */
   reattached_at?: string;
+}
+/**
+ * A usage limit of the account the harness runs on (a subscription's session or weekly limit, say), as the harness last reported it.
+ */
+export interface RateLimit {
+  /**
+   * Which limit, by the harness's name for it: Claude Code's rateLimitType (five_hour, seven_day, seven_day_opus...), Codex's primary and secondary windows.
+   */
+  id: string;
+  /**
+   * allowed: there's room. warning: it's nearly used up, or used up with extra usage carrying on. rejected: the harness refuses turns until it resets.
+   */
+  status: "allowed" | "warning" | "rejected";
+  /**
+   * How much of it is used, from 0 to 100, when the harness says.
+   */
+  used_percent?: number;
+  /**
+   * When it resets, when the harness says.
+   */
+  resets_at?: string;
+  /**
+   * How long its window is, when the harness says.
+   */
+  window_minutes?: number;
 }
 /**
  * A turn started: the agent is working on a message.

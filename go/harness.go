@@ -3,7 +3,9 @@ package agentthreads
 import (
 	"context"
 	"encoding/json"
+	"math"
 	"strings"
+	"time"
 
 	"github.com/dire-kiwi/agent-threads/go/protocol"
 )
@@ -178,6 +180,13 @@ type ThreadContext interface {
 	Delta(itemID string, kind protocol.DeltaEventKind, text string)
 	// SetThread changes the thread's fields (change gets a copy); it sends nothing if nothing changes.
 	SetThread(change func(*protocol.Thread))
+	// RateLimits says the harness reported usage limits: they replace the thread's rate_limits with
+	// the same ids (with a thread.updated if that changes them).
+	RateLimits(limits []protocol.RateLimit)
+	// FromHarness handles a line the harness process runID wrote: it runs handle, which translates
+	// it, with the events it makes taking it as their raw (with the Raw option), and then passes it
+	// to the app's OnHarnessMessage.
+	FromHarness(runID, line string, handle func())
 	// TookIn says the harness took in the queued message with this id, and whether it was queued.
 	TookIn(id string) bool
 	// ToolOutput says an app tool returned structured output for the tool call toolCallID: it goes
@@ -252,6 +261,34 @@ type Session interface {
 	OptionsChanged()
 	// Close stops the harness process, if it's running, and calls done once it has.
 	Close(done func())
+}
+
+// ControlSession is a Session that takes the app's own requests to its running process
+// (AgentThreads.Control).
+type ControlSession interface {
+	Session
+	// Control sends the running process the request and calls reply (on the thread's goroutine)
+	// with its answer, or with a *ControlError if the harness refuses it or doesn't answer. It
+	// returns a *CommandError, and doesn't call reply, if there's no process to send it to or the
+	// request is malformed.
+	Control(request json.RawMessage, reply func(json.RawMessage, error)) error
+}
+
+// HarnessMessage is a line a thread's harness process wrote, for the app's OnHarnessMessage.
+type HarnessMessage struct {
+	ThreadID string
+	// RunID is the process that wrote it (the thread's run.id while it runs).
+	RunID   string
+	Harness string
+	// Line is the line, without its newline.
+	Line string
+	// Message is the line, if it's JSON; nil if it isn't.
+	Message json.RawMessage
+}
+
+// unixTime is Unix seconds as an RFC 3339 time, to the second: YYYY-MM-DDTHH:MM:SSZ.
+func unixTime(seconds float64) string {
+	return time.Unix(int64(math.Floor(seconds)), 0).UTC().Format(time.RFC3339)
 }
 
 // DurableSession is a Session that can carry on with a run after the backend restarts, with a

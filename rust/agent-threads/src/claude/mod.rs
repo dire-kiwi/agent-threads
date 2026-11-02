@@ -18,7 +18,9 @@ use tokio::sync::{mpsc, watch};
 
 use crate::agent_threads::Error;
 use crate::attachments::{Part, message_parts, path_text};
-use crate::harness::{BoxFuture, Harness, HarnessSession, LaunchOptions, Message, RunCheckpoint, TurnEnd};
+use crate::harness::{
+    BoxFuture, ControlReply, Harness, HarnessSession, LaunchOptions, Message, RunCheckpoint, TurnEnd,
+};
 use crate::ids::{new_id, now_iso, now_ms, private_temp_dir};
 use crate::permissions::{Decided, PermissionDecision, PermissionQuery, permission_key};
 use crate::protocol::{DeltaEventKind, Item, Resolution, ResolutionOutcome, ToolKind, ToolStatus, Usage};
@@ -30,8 +32,8 @@ use crate::tools::{Cancellation, ToolContext, run_tool};
 
 pub(crate) use translate::{APP_SERVER, result_text, slim, title};
 use translate::{
-    claude_permission_mode, claude_tool, claude_usage, edit_change, questions, subagent_result, subagent_started,
-    subagent_task,
+    claude_permission_mode, claude_rate_limits, claude_tool, claude_usage, edit_change, hook_notice, questions,
+    retry_text, subagent_result, subagent_started, subagent_task,
 };
 
 /// How the Claude Code harness runs.
@@ -183,8 +185,10 @@ struct Run {
     /// Claude answered `initialize`, so messages can go in.
     ready: bool,
     waiting: Vec<String>,
-    /// Our control requests, by id: their subtypes.
+    /// Our control requests (and the app's), by id: their subtypes.
     pending: Vec<(String, String)>,
+    /// The app's control requests not yet answered, by id: where their answers go.
+    controls: Vec<(String, ControlReply)>,
     next: u64,
     exited: bool,
     /// Stopped on purpose (to restart), so its end doesn't end the turn.
@@ -227,6 +231,7 @@ impl Run {
             ready: false,
             waiting: Vec::new(),
             pending: Vec::new(),
+            controls: Vec::new(),
             next: 1,
             exited: false,
             retired: false,
@@ -272,7 +277,8 @@ impl Run {
         }
     }
 
-    fn control(&mut self, request: Value) {
+    /// Sends a control request; its id.
+    fn control(&mut self, request: Value) -> String {
         let request_id = format!("req_{}", self.next);
         self.next += 1;
         self.pending.push((
@@ -280,6 +286,17 @@ impl Run {
             request["subtype"].as_str().unwrap_or("").to_string(),
         ));
         self.write(&json!({"type": "control_request", "request_id": request_id, "request": request}));
+        request_id
+    }
+
+    /// Fails the app's control requests not yet answered.
+    fn fail_controls(&mut self, message: &str) {
+        for (_, reply) in self.controls.drain(..) {
+            reply(Err(Error::Control {
+                message: message.to_string(),
+                error: None,
+            }));
+        }
     }
 
     fn is_open(&self, id: &str) -> bool {
@@ -698,7 +715,7 @@ impl ClaudeSession {
         if !o.user_settings {
             args.extend(["--setting-sources", "", "--strict-mcp-config"].map(String::from));
         }
-        args.push("--forward-subagent-text".into());
+        args.extend(["--forward-subagent-text", "--include-hook-events"].map(String::from));
         if let Some(m) = &t.model {
             args.extend(["--model".into(), m.clone()]);
         }
@@ -789,6 +806,7 @@ impl ClaudeSession {
             let _ = std::fs::remove_dir_all(dir);
         }
         run.pending.clear();
+        run.fail_controls("Claude Code exited before it answered.");
         let retired = run.retired;
         let agents = run.agents.clone();
         let error = exit_error(&status, &run.stderr);
@@ -862,7 +880,8 @@ impl ClaudeSession {
                 if end.is_some() {
                     run.offset = end;
                 }
-                self.line(ctx, id, &line);
+                let m = serde_json::from_str::<Value>(&line).ok();
+                ctx.from_harness(id, &line, m, |ctx, m| self.line(ctx, id, m));
             }
             ProcessEvent::Stderr(line) => {
                 if let Some(run) = self.run(id) {
@@ -883,14 +902,12 @@ impl ClaudeSession {
         }
     }
 
-    fn line(&mut self, ctx: &mut ThreadContext, id: &str, line: &str) {
+    /// A line of Claude's output, parsed (none if it isn't JSON).
+    fn line(&mut self, ctx: &mut ThreadContext, id: &str, m: Option<&Value>) {
         // Not a message: Claude Code doesn't write anything else to stdout, but be safe.
-        let Ok(m) = serde_json::from_str::<Value>(line) else {
+        let Some(m) = m.filter(|m| m.is_object()) else {
             return;
         };
-        if !m.is_object() {
-            return;
-        }
         let run = self.run(id).unwrap();
         if m["type"] == "control_response" {
             // Claude echoes our own responses back too; those aren't for a request of ours.
@@ -898,6 +915,22 @@ impl ClaudeSession {
             let request_id = r["request_id"].as_str().unwrap_or("");
             if let Some(at) = run.pending.iter().position(|(p, _)| p == request_id) {
                 let (_, subtype) = run.pending.remove(at);
+                if let Some(at) = run.controls.iter().position(|(c, _)| c == request_id) {
+                    let (_, reply) = run.controls.remove(at);
+                    reply(if r["subtype"] == "error" {
+                        let message = r["error"]
+                            .as_str()
+                            .filter(|e| !e.is_empty())
+                            .unwrap_or("Claude Code refused the request.");
+                        Err(Error::Control {
+                            message: message.to_string(),
+                            error: r.get("error").cloned(),
+                        })
+                    } else {
+                        Ok(r.get("response").cloned().unwrap_or(Value::Null))
+                    });
+                    return;
+                }
                 let response = if r["subtype"] == "error" {
                     None
                 } else {
@@ -912,7 +945,7 @@ impl ClaudeSession {
         if run.retired || self.current.as_deref() != Some(id) {
             return;
         }
-        self.message(ctx, id, &m);
+        self.message(ctx, id, m);
     }
 
     fn message(&mut self, ctx: &mut ThreadContext, id: &str, m: &Value) {
@@ -923,7 +956,19 @@ impl ClaudeSession {
             }
             item
         };
+        // A message refused for the usage limit says which limit, before anything else it leads to.
+        if matches!(m["type"].as_str(), Some("assistant" | "user" | "result"))
+            && m["api_error"] == "usage_limit_reached"
+            && m["api_error_params"]["rate_limit_info"].is_object()
+        {
+            ctx.rate_limits(claude_rate_limits(&m["api_error_params"]["rate_limit_info"]));
+        }
         match m["type"].as_str().unwrap_or("") {
+            "rate_limit_event" => {
+                if m["rate_limit_info"].is_object() {
+                    ctx.rate_limits(claude_rate_limits(&m["rate_limit_info"]));
+                }
+            }
             "system" => {
                 // Claude starts a turn by itself to tell the agent that a background subagent has
                 // ended.
@@ -931,6 +976,18 @@ impl ClaudeSession {
                     ctx.begin_turn();
                     let turn = ctx.turn_id().map(String::from);
                     self.run(id).unwrap().auto_turn = turn;
+                }
+                if m["subtype"] == "api_retry" {
+                    let n = json!({"id": new_id("n"), "type": "notice", "level": "warning", "code": "retry", "text": retry_text(m)});
+                    ctx.add_item(under(n));
+                }
+                if m["subtype"] == "hook_response"
+                    && let Some(mut n) = hook_notice(m)
+                {
+                    n["id"] = json!(new_id("n"));
+                    n["type"] = json!("notice");
+                    n["code"] = json!("hook");
+                    ctx.add_item(under(n));
                 }
                 if m["subtype"].as_str().is_some_and(|s| s.starts_with("task_")) {
                     self.task(ctx, id, m);
@@ -1795,7 +1852,25 @@ impl HarnessSession for ClaudeSession {
         run.detached = true;
         proc.detach();
         run.cancel.cancel();
+        run.fail_controls("The backend closed before Claude Code answered.");
         true
+    }
+
+    fn control(&mut self, ctx: &mut ThreadContext, request: Value, reply: ControlReply) {
+        let run = self.live_id().and_then(|id| self.runs.get_mut(&id));
+        let Some(run) = run.filter(|r| r.proc.is_some() && !r.detached) else {
+            return reply(Err(Error::Command(format!(
+                "thread {} has no running Claude Code process",
+                ctx.thread_id()
+            ))));
+        };
+        if !request["subtype"].is_string() {
+            return reply(Err(Error::Command(
+                "a Claude Code control request is an object with a subtype".into(),
+            )));
+        }
+        let id = run.control(request);
+        run.controls.push((id, reply));
     }
 
     fn as_any_mut(&mut self) -> &mut dyn Any {

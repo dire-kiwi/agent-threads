@@ -129,6 +129,8 @@ type claudeRunState struct {
 type pendingControl struct {
 	subtype string
 	resolve func(jmap) // nil: refused, or the process went
+	// full, for the app's requests, is given the whole control response (nil: the process went).
+	full func(jmap)
 }
 
 // claudeRun is one claude process, and what's needed to read it.
@@ -485,6 +487,10 @@ type claudeSession struct {
 	// tmp is a directory for the thread's generated files (skills, attached files), made when needed.
 	tmp    string
 	closed bool
+	// controls is what fails each of the app's control requests not yet answered, when the backend
+	// lets go of its run.
+	controls    map[int]func(error)
+	nextControl int
 }
 
 // ---------- the core's side ----------
@@ -693,7 +699,80 @@ func (s *claudeSession) Detach() bool {
 	run.detached = true
 	dp.Detach()
 	run.abort()
+	failControls(s.controls, "The backend closed before Claude Code answered.")
 	return true
+}
+
+// failControls fails the app's control requests not yet answered.
+func failControls(controls map[int]func(error), message string) {
+	for _, n := range sortedIntKeys(controls) {
+		if fail := controls[n]; fail != nil {
+			fail(&ControlError{Message: message})
+		}
+	}
+}
+
+func sortedIntKeys[V any](m map[int]V) []int {
+	keys := make([]int, 0, len(m))
+	for k := range m {
+		keys = append(keys, k)
+	}
+	sort.Ints(keys)
+	return keys
+}
+
+// addControl keeps an app's control request's reply until it's answered or failed; it returns the
+// reply to call, which does nothing after the first time.
+func addControl(controls *map[int]func(error), next *int, reply func(json.RawMessage, error)) func(json.RawMessage, error) {
+	if *controls == nil {
+		*controls = map[int]func(error){}
+	}
+	n := *next
+	*next++
+	done := func(result json.RawMessage, err error) {
+		if _, ok := (*controls)[n]; !ok {
+			return
+		}
+		delete(*controls, n)
+		reply(result, err)
+	}
+	(*controls)[n] = func(err error) { done(nil, err) }
+	return done
+}
+
+func (s *claudeSession) Control(request json.RawMessage, reply func(json.RawMessage, error)) error {
+	run := s.live()
+	if run == nil || run.proc == nil || run.detached {
+		return commandErr("thread %s has no running Claude Code process", s.ctx.ThreadID())
+	}
+	req := parseObj(request)
+	if req == nil || !isStr(req.raw("subtype")) {
+		return commandErr("a Claude Code control request is an object with a subtype")
+	}
+	done := addControl(&s.controls, &s.nextControl, reply)
+	id := fmt.Sprintf("req_%d", run.nextRequest)
+	run.nextRequest++
+	run.pending[id] = &pendingControl{subtype: req.str("subtype"), full: func(r jmap) {
+		switch {
+		case r == nil:
+			done(nil, &ControlError{Message: "Claude Code exited before it answered."})
+		case r.str("subtype") == "error":
+			msg := r.str("error")
+			if msg == "" {
+				msg = "Claude Code refused the request."
+			}
+			done(nil, &ControlError{Message: msg, Data: r.raw("error")})
+		default:
+			result := r.raw("response")
+			if result == nil {
+				result = json.RawMessage("null")
+			}
+			done(result, nil)
+		}
+	}}
+	run.pendingOrder = append(run.pendingOrder, id)
+	run.write(map[string]any{"type": "control_request", "request_id": id, "request": json.RawMessage(request)})
+	return nil
 }
 
 // answered says whether an answer to Claude's request id was written before the backend restarted.
@@ -926,7 +1005,7 @@ func sortStrings(s []string) { sort.Strings(s) }
 
 func (s *claudeSession) handlers(run *claudeRun) ProcessHandlers {
 	return ProcessHandlers{
-		Line: func(line string) { s.line(run, line) },
+		Line: func(line string) { s.ctx.FromHarness(run.id, line, func() { s.line(run, line) }) },
 		Stderr: func(line string) {
 			run.stderr = append(run.stderr, line)
 			if len(run.stderr) > 20 {
@@ -967,7 +1046,7 @@ func (s *claudeSession) args(run *claudeRun) ([]string, error) {
 	if !s.o.UserSettings {
 		args = append(args, "--setting-sources", "", "--strict-mcp-config")
 	}
-	args = append(args, "--forward-subagent-text")
+	args = append(args, "--forward-subagent-text", "--include-hook-events")
 	if t.Model != "" {
 		args = append(args, "--model", t.Model)
 	}
@@ -1050,7 +1129,9 @@ func (s *claudeSession) exited(run *claudeRun, status ExitStatus) {
 	order := run.pendingOrder
 	run.pending, run.pendingOrder = map[string]*pendingControl{}, nil
 	for _, id := range order {
-		if p := pending[id]; p != nil && p.resolve != nil {
+		if p := pending[id]; p != nil && p.full != nil {
+			p.full(nil)
+		} else if p != nil && p.resolve != nil {
 			p.resolve(nil)
 		}
 	}
@@ -1083,7 +1164,9 @@ func (s *claudeSession) line(run *claudeRun, line string) {
 	if m.str("type") == "control_response" {
 		// Claude echoes our own responses back too; those aren't for a request of ours.
 		r := m.obj("response")
-		if p := run.takePending(r.str("request_id")); p != nil && p.resolve != nil {
+		if p := run.takePending(r.str("request_id")); p != nil && p.full != nil {
+			p.full(r)
+		} else if p != nil && p.resolve != nil {
 			if r.str("subtype") == "error" {
 				p.resolve(nil)
 			} else if resp := r.obj("response"); resp != nil {
@@ -1103,7 +1186,17 @@ func (s *claudeSession) line(run *claudeRun, line string) {
 func (s *claudeSession) message(run *claudeRun, m jmap) {
 	ctx := s.ctx
 	parent := m.str("parent_tool_use_id")
+	// A message refused for the usage limit says which limit, before anything else it leads to.
+	if t := m.str("type"); (t == "assistant" || t == "user" || t == "result") && m.str("api_error") == "usage_limit_reached" {
+		if info := m.obj("api_error_params").obj("rate_limit_info"); info != nil {
+			ctx.RateLimits(claudeRateLimits(info))
+		}
+	}
 	switch m.str("type") {
+	case "rate_limit_event":
+		if info := m.obj("rate_limit_info"); info != nil {
+			ctx.RateLimits(claudeRateLimits(info))
+		}
 	case "system":
 		// Claude starts a turn by itself to tell the agent that a background subagent has ended.
 		if m.str("subtype") == "init" && ctx.TurnID() == "" {
@@ -1113,6 +1206,15 @@ func (s *claudeSession) message(run *claudeRun, m jmap) {
 		sid := m.str("session_id")
 		if m.str("subtype") == "init" && sid != "" && sid != ctx.Thread().SessionID {
 			ctx.SetThread(func(t *protocol.Thread) { t.SessionID = sid })
+		}
+		if m.str("subtype") == "api_retry" {
+			ctx.AddItem(&protocol.Notice{ID: NewID("n"), Level: protocol.NoticeLevelWarning, Code: "retry", Text: retryText(m), ParentID: parent})
+		}
+		if m.str("subtype") == "hook_response" {
+			if n := hookNotice(m); n != nil {
+				n.ID, n.Code, n.ParentID = NewID("n"), "hook", parent
+				ctx.AddItem(n)
+			}
 		}
 		if strings.HasPrefix(m.str("subtype"), "task_") {
 			s.task(run, m)

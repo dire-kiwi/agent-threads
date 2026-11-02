@@ -562,6 +562,65 @@ pub struct QuestionRequest {
     #[serde(skip_serializing_if = "::std::option::Option::is_none")]
     pub turn_id: ::std::option::Option<::std::string::String>,
 }
+///A usage limit of the account the harness runs on (a subscription's session or weekly limit, say), as the harness last reported it.
+#[derive(::serde::Deserialize, ::serde::Serialize, Clone, Debug)]
+pub struct RateLimit {
+    ///Which limit, by the harness's name for it: Claude Code's rateLimitType (five_hour, seven_day, seven_day_opus...), Codex's primary and secondary windows.
+    pub id: ::std::string::String,
+    ///When it resets, when the harness says.
+    #[serde(skip_serializing_if = "::std::option::Option::is_none")]
+    pub resets_at: ::std::option::Option<::std::string::String>,
+    ///allowed: there's room. warning: it's nearly used up, or used up with extra usage carrying on. rejected: the harness refuses turns until it resets.
+    pub status: RateLimitStatus,
+    ///How much of it is used, from 0 to 100, when the harness says.
+    #[serde(skip_serializing_if = "::std::option::Option::is_none")]
+    pub used_percent: ::std::option::Option<f64>,
+    ///How long its window is, when the harness says.
+    #[serde(skip_serializing_if = "::std::option::Option::is_none")]
+    pub window_minutes: ::std::option::Option<u64>,
+}
+///allowed: there's room. warning: it's nearly used up, or used up with extra usage carrying on. rejected: the harness refuses turns until it resets.
+#[derive(::serde::Deserialize, ::serde::Serialize, Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub enum RateLimitStatus {
+    #[serde(rename = "allowed")]
+    Allowed,
+    #[serde(rename = "warning")]
+    Warning,
+    #[serde(rename = "rejected")]
+    Rejected,
+}
+impl ::std::fmt::Display for RateLimitStatus {
+    fn fmt(&self, f: &mut ::std::fmt::Formatter<'_>) -> ::std::fmt::Result {
+        match *self {
+            Self::Allowed => f.write_str("allowed"),
+            Self::Warning => f.write_str("warning"),
+            Self::Rejected => f.write_str("rejected"),
+        }
+    }
+}
+impl ::std::str::FromStr for RateLimitStatus {
+    type Err = self::error::ConversionError;
+    fn from_str(value: &str) -> ::std::result::Result<Self, self::error::ConversionError> {
+        match value {
+            "allowed" => Ok(Self::Allowed),
+            "warning" => Ok(Self::Warning),
+            "rejected" => Ok(Self::Rejected),
+            _ => Err("invalid value".into()),
+        }
+    }
+}
+impl ::std::convert::TryFrom<&str> for RateLimitStatus {
+    type Error = self::error::ConversionError;
+    fn try_from(value: &str) -> ::std::result::Result<Self, self::error::ConversionError> {
+        value.parse()
+    }
+}
+impl ::std::convert::TryFrom<::std::string::String> for RateLimitStatus {
+    type Error = self::error::ConversionError;
+    fn try_from(value: ::std::string::String) -> ::std::result::Result<Self, self::error::ConversionError> {
+        value.parse()
+    }
+}
 ///The agent's thinking, or a summary of it, as the harness gives it. Streams like assistant_message.
 #[derive(::serde::Deserialize, ::serde::Serialize, Clone, Debug)]
 pub struct Reasoning {
@@ -851,6 +910,9 @@ pub struct Thread {
     pub model: ::std::option::Option<::std::string::String>,
     #[serde(skip_serializing_if = "::std::option::Option::is_none")]
     pub permission_mode: ::std::option::Option<PermissionMode>,
+    ///The usage limits of the account the harness runs on, as it last reported them in this thread, sorted by id. Absent until it reports one.
+    #[serde(default, skip_serializing_if = "::std::vec::Vec::is_empty")]
+    pub rate_limits: ::std::vec::Vec<RateLimit>,
     ///The harness process running the thread, if one is. Absent when it's idle with no process.
     #[serde(skip_serializing_if = "::std::option::Option::is_none")]
     pub run: ::std::option::Option<Run>,

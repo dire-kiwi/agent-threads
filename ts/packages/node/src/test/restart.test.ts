@@ -269,8 +269,9 @@ describe.skipIf(process.platform === "win32")("a backend restart", () => {
     const a = s.start();
     const thread = await a.call<{ id: string }>("create", { harness, cwd: s.dirs.cwd });
     await a.call("handle", { type: "send", thread_id: thread.id, text: "app lookup {}" } satisfies Command);
-    // It has done what it does, and hasn't returned.
-    await until(() => existsSync(marker));
+    // It has done what it does, and hasn't returned. (The file is there before what's written to it.)
+    const ran = () => (existsSync(marker) ? readFileSync(marker, "utf8") : "");
+    await until(() => ran().includes("ran\n"));
     if (how === "died") await a.crash();
     else {
       // Shutting down aborts it, which it returns on: it isn't answered, but left for the next.
@@ -284,7 +285,7 @@ describe.skipIf(process.platform === "win32")("a backend restart", () => {
     const snap = await b.call<Snapshot>("snapshot", thread.id);
     await b.call("close", { stop: true });
     await b.exited;
-    expect(readFileSync(marker, "utf8")).toBe("ran\n");
+    expect(ran()).toBe("ran\n");
     // The agent was told it may have finished.
     const said = snap.items.filter((i) => i.type === "assistant_message").map((i) => (i.type === "assistant_message" ? i.text : ""));
     expect(said.join("\n")).toMatch(/may or may not have finished/);

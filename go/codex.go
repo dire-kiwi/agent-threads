@@ -393,6 +393,10 @@ type codexSession struct {
 	stopTimer *loopTimer
 	tmp       string
 	closed    bool
+	// controls is what fails each of the app's control requests not yet answered, when the backend
+	// lets go of its run.
+	controls    map[int]func(error)
+	nextControl int
 }
 
 // ---------- the core's side ----------
@@ -649,7 +653,29 @@ func (s *codexSession) Detach() bool {
 	dp.Detach()
 	run.abort()
 	run.mcp.close()
+	failControls(s.controls, "The backend closed before Codex answered.")
 	return true
+}
+
+func (s *codexSession) Control(request json.RawMessage, reply func(json.RawMessage, error)) error {
+	run := s.live()
+	if run == nil || run.proc == nil || run.rpc == nil || run.detached {
+		return commandErr("thread %s has no running Codex process", s.ctx.ThreadID())
+	}
+	req := parseObj(request)
+	if req == nil || !isStr(req.raw("method")) {
+		return commandErr("a Codex control request is an object with a method (and params)")
+	}
+	done := addControl(&s.controls, &s.nextControl, reply)
+	run.rpc.requestRaw(req.str("method"), req.raw("params"), func(result json.RawMessage) { done(result, nil) }, func(err error) {
+		var re *rpcError
+		if errors.As(err, &re) {
+			done(nil, &ControlError{Message: re.message, Data: re.data})
+		} else {
+			done(nil, &ControlError{Message: err.Error()})
+		}
+	})
+	return nil
 }
 
 // answered says whether an answer to Codex's request id was written before the backend restarted.
@@ -1182,7 +1208,7 @@ func jsonList(v any) []any {
 
 func (s *codexSession) handlers(run *codexRun) ProcessHandlers {
 	return ProcessHandlers{
-		Line: func(line string) { s.line(run, line) },
+		Line: func(line string) { s.ctx.FromHarness(run.id, line, func() { s.line(run, line) }) },
 		Stderr: func(line string) {
 			run.stderr = append(run.stderr, line)
 			if len(run.stderr) > 20 {
@@ -1327,6 +1353,10 @@ func (s *codexSession) notification(run *codexRun, m jmap) {
 			if json.Unmarshal(total, &t) == nil {
 				run.total = &t
 			}
+		}
+	case "account/rateLimits/updated":
+		if rl := p.obj("rateLimits"); rl != nil {
+			ctx.RateLimits(codexRateLimits(rl))
 		}
 	case "warning":
 		if own && p.str("threadId") != "" && p.str("message") != "" {

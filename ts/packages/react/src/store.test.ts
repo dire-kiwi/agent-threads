@@ -429,15 +429,50 @@ describe("ThreadStore", () => {
       expect(store.getState().loadingEarlier).toBe(false);
     });
 
-    it("leaves out a page that doesn't end at the window's start", async () => {
+    it("leaves out a page that doesn't end at the window's start, noting it failed", async () => {
       const { store, pages, whole, ids } = paged();
-      const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+      const err = vi.spyOn(console, "error").mockImplementation(() => {});
       const done = store.loadEarlier();
       pages.shift()!.resolve(itemPage(whole(), 5, 3));
       await done;
       expect(store.getState().snapshot.start).toBe(6);
       expect(ids()).toEqual(["s3", "m6", "m7", "b8", "m9"]);
-      expect(warn).toHaveBeenCalled();
+      expect(store.getState()).toMatchObject({ loadingEarlier: false, earlierError: "the page of items before 6 doesn't fit the thread's window" });
+      expect(err).toHaveBeenCalled();
+    });
+
+    it("stops loading back to an item when a page doesn't fit, rather than asking for it forever", async () => {
+      const { store, pages, whole } = paged();
+      vi.spyOn(console, "error").mockImplementation(() => {});
+      const done = store.loadEarlier({ to: "m0" });
+      pages.shift()!.resolve(itemPage(whole(), 5, 3));
+      await done;
+      expect(pages).toEqual([]);
+      expect(store.getState()).toMatchObject({ loadingEarlier: false, earlierError: expect.stringContaining("doesn't fit") });
+    });
+
+    it("notes a failure that comes after the page does, rather than staying loading", async () => {
+      const { store, pages, answer, ids } = paged();
+      const err = vi.spyOn(console, "error").mockImplementation(() => {});
+      let broken = true;
+      store.subscribe(() => {
+        if (broken && store.getState().snapshot.start !== 6) throw new Error("listener broke");
+      });
+      const done = store.loadEarlier({ to: "m0" });
+      answer(2);
+      await done;
+      // The page is in, but the load failed: it says why, and loading back to m0 stopped.
+      expect(ids()).toContain("m4");
+      expect(store.getState()).toMatchObject({ loadingEarlier: false, earlierError: "listener broke" });
+      expect(pages).toEqual([]);
+      expect(err).toHaveBeenCalled();
+      // And the next load goes ahead.
+      broken = false;
+      const again = store.loadEarlier();
+      expect(store.getState()).toMatchObject({ loadingEarlier: true, earlierError: null });
+      answer(10);
+      await again;
+      expect(store.hasEarlier()).toBe(false);
     });
 
     it("asks the source again after it threw rather than failed a promise", async () => {

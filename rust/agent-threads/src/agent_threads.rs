@@ -12,7 +12,9 @@ use serde_json::{Map, Value, json};
 use tokio::sync::{Mutex, broadcast, oneshot};
 use tokio::task::JoinHandle;
 
-use crate::harness::{Harness, LaunchOptions, McpServer, Skill, ThreadConfig, TurnEnd};
+use crate::harness::{
+    ControlReply, Harness, HarnessMessageHandler, LaunchOptions, McpServer, Skill, ThreadConfig, TurnEnd,
+};
 use crate::ids::{new_id, now_iso};
 use crate::permissions::PermissionPolicy;
 use crate::protocol::{
@@ -35,6 +37,10 @@ pub enum Error {
     Command(String),
     /// The store failed.
     Store(StoreError),
+    /// A control request ([`AgentThreads::control`]) the harness refused, or didn't answer: its
+    /// process exited first, or the backend closed. `error` is the harness's own error, when it
+    /// gave one (Claude Code's error text, or Codex's JSON-RPC error object).
+    Control { message: String, error: Option<Value> },
     /// Something else: a harness that misbehaved, say (for `on_error`).
     Other(String),
 }
@@ -42,7 +48,7 @@ pub enum Error {
 impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Error::Command(m) | Error::Other(m) => f.write_str(m),
+            Error::Command(m) | Error::Other(m) | Error::Control { message: m, .. } => f.write_str(m),
             Error::Store(e) => write!(f, "the store failed: {e}"),
         }
     }
@@ -114,6 +120,14 @@ pub struct Options {
     /// How many events a subscriber may fall behind by before it misses some (and gets
     /// `RecvError::Lagged`, after which it catches up with `events_since`). 4096 by default.
     pub event_capacity: usize,
+    /// Fill in `raw` on events, items and requests: the harness message each came from. Off by
+    /// default; it's saved with the events, so they take more room.
+    pub raw: bool,
+    /// Called with every line a thread's harness process writes, once its driver has dealt with it:
+    /// for what the protocol leaves out (Claude Code's system messages and rate limit events,
+    /// Codex's token usage...). It's called on the thread's task as the output is read, so it
+    /// should be quick, and mustn't wait on the backend.
+    pub on_harness_message: Option<HarnessMessageHandler>,
 }
 
 impl Default for Options {
@@ -125,6 +139,8 @@ impl Default for Options {
             capabilities: Capabilities::default(),
             on_error: None,
             event_capacity: 4096,
+            raw: false,
+            on_harness_message: None,
         }
     }
 }
@@ -269,6 +285,8 @@ struct Inner {
     spawner: Arc<dyn Spawner>,
     capabilities: Capabilities,
     on_error: Arc<dyn Fn(Error) + Send + Sync>,
+    raw: bool,
+    on_harness_message: Option<HarnessMessageHandler>,
     events: broadcast::Sender<ThreadEvent>,
     threads: StdMutex<Threads>,
     configs: StdMutex<HashMap<String, Capabilities>>,
@@ -311,6 +329,8 @@ impl AgentThreads {
                 spawner: options.spawner.unwrap_or_else(direct),
                 capabilities: options.capabilities,
                 on_error,
+                raw: options.raw,
+                on_harness_message: options.on_harness_message,
                 events,
                 threads: StdMutex::new(Threads::default()),
                 configs: StdMutex::new(HashMap::new()),
@@ -670,6 +690,31 @@ impl AgentThreads {
         abandon(&self.inner.spawner, &self.inner.store, &self.inner.on_error, run).await;
     }
 
+    /// Sends the thread's running harness process a request of the app's own, and returns its
+    /// answer: for Claude Code a control request's `request` (e.g. `{"subtype":
+    /// "get_context_usage"}`), answered with the control response's `response`; for Codex
+    /// `{"method", "params"?}`, answered with the JSON-RPC result. It's an `Error::Command` if the
+    /// thread has no running process or its harness takes no requests, and an `Error::Control` if
+    /// the harness refuses it, or its process exits (or the backend closes) before it answers. It
+    /// mustn't be used for what the driver does itself (starting turns, answering the harness's
+    /// requests...).
+    pub async fn control(&self, thread_id: &str, request: Value) -> Result<Value> {
+        let (tx, rx) = oneshot::channel();
+        let reply: ControlReply = Box::new(move |r| {
+            let _ = tx.send(r);
+        });
+        self.ready(thread_id)
+            .await?
+            .call(move |a| a.session.control(&mut a.core, request, reply))
+            .await?;
+        rx.await.unwrap_or_else(|_| {
+            Err(Error::Control {
+                message: "the harness didn't answer before the thread was closed".into(),
+                error: None,
+            })
+        })
+    }
+
     // ---------- commands ----------
 
     /// Carries out a command from a client. A command it can't carry out (an unknown thread, a
@@ -984,6 +1029,8 @@ impl AgentThreads {
             spawner: i.spawner.clone(),
             events: i.events.clone(),
             on_error: i.on_error.clone(),
+            raw: i.raw,
+            on_harness_message: i.on_harness_message.clone(),
         })
     }
 
