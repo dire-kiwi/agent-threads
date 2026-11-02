@@ -3,7 +3,7 @@
  * set them on any element to change the components inside it. The light preset is the default and
  * the dark one follows the page's prefers-color-scheme; .at-theme-light and .at-theme-dark (or
  * <Thread theme>) pick one for a part of the page. Classes are all at-*, and every component takes
- * a className of its own.
+ * a className of its own. The README says how to map the variables onto an app's own tokens.
  */
 
 :root,
@@ -557,6 +557,16 @@
   background: var(--at-accent-soft);
 }
 
+.at-subagent-tag {
+  flex-shrink: 0;
+  padding: 0 6px;
+  border: 1px solid var(--at-line-strong);
+  border-radius: 999px;
+  color: var(--at-muted);
+  font-size: 0.78em;
+  line-height: 1.5;
+}
+
 .at-subagent-activity {
   max-width: 16rem;
   overflow: hidden;
@@ -955,6 +965,79 @@ button.at-line-rule:not(:disabled):hover {
 .at-choice-description {
   color: var(--at-muted);
   font-size: 0.88em;
+}
+
+/* An answered request, where it was asked: greyed out, with how it was answered. */
+.at-card-done {
+  gap: 8px;
+  padding: 8px 12px;
+  border-left-color: var(--at-line-strong);
+  background: var(--at-panel);
+  color: var(--at-muted);
+}
+
+.at-card-done .at-q-text,
+.at-card-done .at-choice-label {
+  color: var(--at-muted);
+}
+
+.at-card-done .at-choice {
+  cursor: default;
+}
+
+.at-card-done .at-choice:not(.at-choice-picked) {
+  opacity: 0.6;
+}
+
+.at-card-done-summary {
+  flex: 1 1 12rem;
+}
+
+.at-card-note {
+  padding: 4px 10px;
+  border-left: 2px solid var(--at-line-strong);
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  font-size: 0.9em;
+}
+
+.at-outcome {
+  flex-shrink: 0;
+  margin-left: auto;
+  padding: 1px 6px;
+  border-radius: 4px;
+  font-size: 0.8em;
+}
+
+.at-outcome-good {
+  background: var(--at-add-bg);
+  color: var(--at-good);
+}
+
+.at-outcome-bad {
+  background: var(--at-bad-soft);
+  color: var(--at-bad);
+}
+
+.at-outcome-plain {
+  background: var(--at-hover);
+  color: var(--at-faint);
+}
+
+/* ---------- earlier items ---------- */
+
+.at-earlier {
+  display: flex;
+  justify-content: center;
+  color: var(--at-faint);
+  font-size: 0.9em;
+}
+
+.at-earlier-loading {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 0.85em;
 }
 
 /* ---------- composer ---------- */

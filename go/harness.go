@@ -3,6 +3,9 @@ package agentthreads
 import (
 	"context"
 	"encoding/json"
+	"math"
+	"strings"
+	"time"
 
 	"github.com/dire-kiwi/agent-threads/go/protocol"
 )
@@ -46,6 +49,91 @@ type ThreadConfig struct {
 	SystemPrompt string
 }
 
+// LaunchOptions are how a thread's harness process is started, on top of the harness's own options:
+// stored with the thread (but not sent to clients), so a run started after a restart has them too.
+// A change applies from the next process the thread starts, as a model change does.
+type LaunchOptions struct {
+	// Args are more arguments, after the harness's (and its options' Args): for Claude Code, say,
+	// --allowedTools, --disallowedTools or --settings; for Codex, -c key=value.
+	Args []string `json:"args,omitempty"`
+	// Env is changes to the environment, after the harness options' Env: a value sets a variable,
+	// nil removes it.
+	Env map[string]*string `json:"env,omitempty"`
+	// AddDirs are more directories the agent may use besides the working directory: --add-dir for
+	// Claude Code, writable roots (sandbox_workspace_write.writable_roots) for Codex.
+	AddDirs []string `json:"add_dirs,omitempty"`
+	// ConfigDir is the harness's config directory, in place of the harness options': CLAUDE_CONFIG_DIR
+	// for Claude Code, CODEX_HOME for Codex (used as it is, with its own login and config). The
+	// harness keeps its sessions there, so a thread that changes it can't resume what it had.
+	ConfigDir string `json:"config_dir,omitempty"`
+}
+
+// IsEmpty says whether there are none.
+func (l LaunchOptions) IsEmpty() bool {
+	return len(l.Args) == 0 && len(l.Env) == 0 && len(l.AddDirs) == 0 && l.ConfigDir == ""
+}
+
+// applyEnv makes these changes to an environment (the backend's, with the harness options' changes).
+func (l LaunchOptions) applyEnv(env []string) []string {
+	if len(l.Env) == 0 {
+		return env
+	}
+	set := map[string]string{}
+	out := make([]string, 0, len(env)+len(l.Env))
+	for _, kv := range env {
+		k, _, _ := strings.Cut(kv, "=")
+		if _, ok := l.Env[k]; !ok {
+			out = append(out, kv)
+		}
+	}
+	for k, v := range l.Env {
+		if v != nil {
+			set[k] = *v
+		}
+	}
+	for _, k := range sortedKeys(set) {
+		out = append(out, k+"="+set[k])
+	}
+	return out
+}
+
+// launchField is the stored thread's field the launch options are kept in.
+const launchField = "launch"
+
+// withLaunch is the thread as the store keeps it: with its launch options, which clients aren't sent.
+func withLaunch(t protocol.Thread, l LaunchOptions) protocol.Thread {
+	extra := make(map[string]json.RawMessage, len(t.Extra)+1)
+	for k, v := range t.Extra {
+		if k != launchField {
+			extra[k] = v
+		}
+	}
+	if !l.IsEmpty() {
+		data, err := json.Marshal(l)
+		if err == nil {
+			extra[launchField] = data
+		}
+	}
+	if len(extra) == 0 {
+		extra = nil
+	}
+	t.Extra = extra
+	return t
+}
+
+// splitLaunch is a stored thread without its launch options (its launch field), and them (or none).
+func splitLaunch(t protocol.Thread) (protocol.Thread, LaunchOptions) {
+	var l LaunchOptions
+	raw, ok := t.Extra[launchField]
+	if !ok {
+		return t, l
+	}
+	if json.Unmarshal(raw, &l) != nil {
+		l = LaunchOptions{}
+	}
+	return withLaunch(t, LaunchOptions{}), l
+}
+
 // Message is a message to give the harness: its user_message item's id, text and attachments.
 type Message struct {
 	ID          string
@@ -70,6 +158,9 @@ type ThreadContext interface {
 	ThreadID() string
 	Thread() protocol.Thread
 	Config() ThreadConfig
+	// Launch is how the thread's harness process is started: its args, environment, directories and
+	// config directory. Don't change what it returns.
+	Launch() LaunchOptions
 	Spawner() Spawner
 	// TurnID is the running turn's id, or "" if none is running.
 	TurnID() string
@@ -89,6 +180,13 @@ type ThreadContext interface {
 	Delta(itemID string, kind protocol.DeltaEventKind, text string)
 	// SetThread changes the thread's fields (change gets a copy); it sends nothing if nothing changes.
 	SetThread(change func(*protocol.Thread))
+	// RateLimits says the harness reported usage limits: they replace the thread's rate_limits with
+	// the same ids (with a thread.updated if that changes them).
+	RateLimits(limits []protocol.RateLimit)
+	// FromHarness handles a line the harness process runID wrote: it runs handle, which translates
+	// it, with the events it makes taking it as their raw (with the Raw option), and then passes it
+	// to the app's OnHarnessMessage.
+	FromHarness(runID, line string, handle func())
 	// TookIn says the harness took in the queued message with this id, and whether it was queued.
 	TookIn(id string) bool
 	// ToolOutput says an app tool returned structured output for the tool call toolCallID: it goes
@@ -114,6 +212,12 @@ type ThreadContext interface {
 	CancelRequest(id string)
 	// EndTurn says the running turn ended.
 	EndTurn(end TurnEnd)
+	// BeginTurn says the harness started a turn by itself, with no message (Claude does, to tell
+	// the agent that a background subagent has ended). It does nothing if a turn is running.
+	BeginTurn()
+	// StopSubagents says the subagents of these calls that are still running were stopped (their
+	// harness process ended): their calls still running are cancelled, and their open requests too.
+	StopSubagents(ids []string)
 	// Error reports something that went wrong that isn't the turn's, to the app's OnError.
 	Error(err error)
 	// Post runs fn on the thread's goroutine, after what's running there now.
@@ -160,6 +264,34 @@ type Session interface {
 	ConfigChanged()
 	// Close stops the harness process, if it's running, and calls done once it has.
 	Close(done func())
+}
+
+// ControlSession is a Session that takes the app's own requests to its running process
+// (AgentThreads.Control).
+type ControlSession interface {
+	Session
+	// Control sends the running process the request and calls reply (on the thread's goroutine)
+	// with its answer, or with a *ControlError if the harness refuses it or doesn't answer. It
+	// returns a *CommandError, and doesn't call reply, if there's no process to send it to or the
+	// request is malformed.
+	Control(request json.RawMessage, reply func(json.RawMessage, error)) error
+}
+
+// HarnessMessage is a line a thread's harness process wrote, for the app's OnHarnessMessage.
+type HarnessMessage struct {
+	ThreadID string
+	// RunID is the process that wrote it (the thread's run.id while it runs).
+	RunID   string
+	Harness string
+	// Line is the line, without its newline.
+	Line string
+	// Message is the line, if it's JSON; nil if it isn't.
+	Message json.RawMessage
+}
+
+// unixTime is Unix seconds as an RFC 3339 time, to the second: YYYY-MM-DDTHH:MM:SSZ.
+func unixTime(seconds float64) string {
+	return time.Unix(int64(math.Floor(seconds)), 0).UTC().Format(time.RFC3339)
 }
 
 // DurableSession is a Session that can carry on with a run after the backend restarts, with a

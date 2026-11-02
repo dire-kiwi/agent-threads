@@ -1,7 +1,8 @@
 // Claude Code's tools, results and usage in the protocol's terms (spec/fixtures/README.md, "Claude
 // Code").
 
-import type { FileChange, Question, ToolCall, ToolKind, Usage } from "@dire-kiwi/agent-threads-protocol";
+import type { FileChange, Question, RateLimit, SubagentState, SubagentStatus, ToolCall, ToolKind, Usage } from "@dire-kiwi/agent-threads-protocol";
+import { unixTime } from "../harness.js";
 
 /** The in-process MCP server that serves a thread's app tools. */
 export const APP_SERVER = "app";
@@ -72,6 +73,97 @@ export function claudeTool(name: string, input: unknown): ToolFields {
       break;
   }
   return t;
+}
+
+type Json = { [k: string]: any };
+
+const str = (v: unknown): string | undefined => (typeof v === "string" && v ? v : undefined);
+const count = (v: unknown): number | undefined => (typeof v === "number" && Number.isInteger(v) && v >= 0 ? v : undefined);
+
+/** How Claude says a subagent ended (in its task_* messages and the Agent call's result), as a SubagentStatus. */
+export function subagentEnd(status: unknown): SubagentStatus | undefined {
+  switch (status) {
+    case "completed":
+    case "success":
+      return "completed";
+    case "failed":
+    case "error":
+      return "failed";
+    case "killed":
+    case "stopped":
+    case "cancelled":
+    case "interrupted":
+      return "stopped";
+  }
+  return undefined;
+}
+
+/** A subagent call's subagent, as a task_started (of a local_agent) says it has started. */
+export function subagentStarted(call: ToolCall, m: Json): SubagentState {
+  const s: SubagentState = { ...call.subagent, status: "running" };
+  if (m.is_backgrounded === true) s.background = true;
+  if (str(m.subagent_type)) s.agent_type = m.subagent_type;
+  const model = str(m.model) ?? str((call.input as Json | undefined)?.model);
+  if (model) s.model = model;
+  return s;
+}
+
+/** A subagent, after a task_progress, task_updated or task_notification about it. */
+export function subagentTask(s: SubagentState, m: Json): SubagentState {
+  const next: SubagentState = { ...s };
+  switch (m.subtype) {
+    case "task_progress":
+      if (str(m.description)) next.activity = m.description;
+      if (count(m.usage?.tool_uses) !== undefined) next.tool_uses = m.usage.tool_uses;
+      break;
+    case "task_updated": {
+      // Continued (with SendMessage) after it ended, it runs again.
+      const end = subagentEnd(m.patch?.status);
+      if (m.patch?.status === "running") {
+        next.status = "running";
+        delete next.summary;
+      } else if (end && s.status === "running") next.status = end;
+      break;
+    }
+    case "task_notification": {
+      const end = subagentEnd(m.status);
+      if (end && s.status === "running") next.status = end;
+      if (count(m.usage?.tool_uses) !== undefined) next.tool_uses = m.usage.tool_uses;
+      // A foreground subagent's report is its call's result.
+      if (s.background && str(m.summary)) next.summary = slim(m.summary).content;
+      break;
+    }
+  }
+  return next;
+}
+
+/**
+ * A subagent call's subagent, as its result says (`meta` is the result's tool_use_result, `text`
+ * its content). Undefined for a call whose subagent never started (it failed, or was denied).
+ */
+export function subagentResult(call: ToolCall, isError: boolean, interrupted: boolean, meta: unknown, text: string): SubagentState | undefined {
+  if (call.kind !== "subagent" || (!call.subagent && isError)) return undefined;
+  const r: Json = meta && typeof meta === "object" ? meta : {};
+  const s: SubagentState = { status: "running", ...call.subagent };
+  if (str(r.resolvedModel)) s.model = r.resolvedModel;
+  if (str(r.agentType)) s.agent_type = r.agentType;
+  if (count(r.totalToolUseCount) !== undefined) s.tool_uses = r.totalToolUseCount;
+  // A background subagent's call returns as soon as it has started it.
+  if (r.isAsync === true || r.status === "async_launched" || /^\s*Async agent launched/.test(text)) s.background = true;
+  else if (s.status === "running") s.status = isError ? (interrupted ? "stopped" : "failed") : (subagentEnd(r.status) ?? "completed");
+  return s;
+}
+
+/** Two turns' usage together. */
+export function sumUsage(a: Usage | undefined, b: Usage): Usage {
+  if (!a) return b;
+  return {
+    input_tokens: (a.input_tokens ?? 0) + (b.input_tokens ?? 0),
+    output_tokens: (a.output_tokens ?? 0) + (b.output_tokens ?? 0),
+    cache_read_tokens: (a.cache_read_tokens ?? 0) + (b.cache_read_tokens ?? 0),
+    cache_write_tokens: (a.cache_write_tokens ?? 0) + (b.cache_write_tokens ?? 0),
+    cost_usd: Math.round(((a.cost_usd ?? 0) + (b.cost_usd ?? 0)) * 1e12) / 1e12,
+  };
 }
 
 /** A permission's title: what it's about, in a few words. */
@@ -170,4 +262,37 @@ export function claudePermissionMode(mode: string | undefined): string | undefin
     default:
       return undefined;
   }
+}
+
+/**
+ * The limit a `rate_limit_info` reports (from a rate_limit_event, or a message refused for the
+ * usage limit), if it says how it stands.
+ */
+export function claudeRateLimits(info: Json): RateLimit[] {
+  const overage = info.isUsingOverage === true || info.overageStatus === "allowed" || info.overageStatus === "allowed_warning";
+  const status = info.status === "allowed" ? "allowed" : info.status === "allowed_warning" ? "warning" : info.status === "rejected" ? (overage ? "warning" : "rejected") : undefined;
+  if (!status) return [];
+  const limit: RateLimit = { id: typeof info.rateLimitType === "string" && info.rateLimitType ? info.rateLimitType : "unknown", status };
+  if (typeof info.utilization === "number" && Number.isFinite(info.utilization)) limit.used_percent = info.utilization * 100;
+  if (typeof info.resetsAt === "number" && Number.isFinite(info.resetsAt)) limit.resets_at = unixTime(info.resetsAt);
+  return [limit];
+}
+
+/** An `api_retry` system message's notice text. */
+export function retryText(m: Json): string {
+  const why = [typeof m.error === "string" ? m.error : "", typeof m.error_status === "number" ? `status ${m.error_status}` : ""].filter(Boolean).join(", ");
+  const secs = Math.ceil((typeof m.retry_delay_ms === "number" ? m.retry_delay_ms : 0) / 1000);
+  return `API request failed${why ? ` (${why})` : ""}; retrying in ${secs}s (attempt ${m.attempt} of ${m.max_retries}).`;
+}
+
+/** A `hook_response` system message's notice, if it makes one: a hook that failed, or said something. */
+export function hookNotice(m: Json): { level: "info" | "warning"; text: string; detail?: string } | undefined {
+  const text = (v: unknown) => (typeof v === "string" ? v.trim() : "");
+  const output = text(m.output);
+  if (m.outcome === "error") {
+    const detail = text(m.stderr) || output;
+    const code = typeof m.exit_code === "number" ? ` (exit code ${m.exit_code})` : "";
+    return { level: "warning", text: `Hook ${m.hook_name} failed${code}`, ...(detail ? { detail } : {}) };
+  }
+  return output ? { level: "info", text: `Hook ${m.hook_name} ran`, detail: output } : undefined;
 }

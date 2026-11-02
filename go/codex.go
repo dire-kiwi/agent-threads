@@ -425,6 +425,10 @@ type codexSession struct {
 	stopTimer *loopTimer
 	tmp       string
 	closed    bool
+	// controls is what fails each of the app's control requests not yet answered, when the backend
+	// lets go of its run.
+	controls    map[int]func(error)
+	nextControl int
 }
 
 // ---------- the core's side ----------
@@ -674,8 +678,9 @@ func (s *codexSession) Reattach(record RunRecord) bool {
 			run.mcp = mcp
 		}
 	}
-	// The options it doesn't have go with its next turn; one whose options aren't known is replaced.
-	s.stale = st.Stale || st.Launched == nil
+	// The options it doesn't have go with its next turn; one whose options aren't known, or that was
+	// started with other launch options than the thread's now, is replaced.
+	s.stale = st.Stale || st.Launched.launchStale(ctx)
 	// Codex's requests that were open: the user's questions are taken up again, an app tool that was
 	// running is answered (not run again), and the rest are dealt with again. One answered before the
 	// restart, though that wasn't saved, is closed: Codex has its answer.
@@ -712,7 +717,29 @@ func (s *codexSession) Detach() bool {
 	dp.Detach()
 	run.abort()
 	run.mcp.close()
+	failControls(s.controls, "The backend closed before Codex answered.")
 	return true
+}
+
+func (s *codexSession) Control(request json.RawMessage, reply func(json.RawMessage, error)) error {
+	run := s.live()
+	if run == nil || run.proc == nil || run.rpc == nil || run.detached {
+		return commandErr("thread %s has no running Codex process", s.ctx.ThreadID())
+	}
+	req := parseObj(request)
+	if req == nil || !isStr(req.raw("method")) {
+		return commandErr("a Codex control request is an object with a method (and params)")
+	}
+	done := addControl(&s.controls, &s.nextControl, reply)
+	run.rpc.requestRaw(req.str("method"), req.raw("params"), func(result json.RawMessage) { done(result, nil) }, func(err error) {
+		var re *rpcError
+		if errors.As(err, &re) {
+			done(nil, &ControlError{Message: re.message, Data: re.data})
+		} else {
+			done(nil, &ControlError{Message: err.Error()})
+		}
+	})
+	return nil
 }
 
 // answered says whether an answer to Codex's request id was written before the backend restarted.
@@ -847,7 +874,7 @@ func (s *codexSession) turnOptions(run *codexRun, params map[string]any) {
 		params["collaborationMode"] = map[string]any{"mode": collab, "settings": settings}
 		run.collab = collab
 	}
-	run.launched = &launched{Model: model, Effort: t.Effort, PermissionMode: string(t.PermissionMode)}
+	run.launched = &launched{Model: model, Effort: t.Effort, PermissionMode: string(t.PermissionMode), Launch: l.Launch}
 }
 
 // sentAs records that messages are being sent to the process, as this input.
@@ -957,9 +984,13 @@ func (s *codexSession) spawn(run *codexRun) {
 		return
 	}
 	ctx := s.ctx
+	launch := ctx.Launch()
 	var home string
 	var err error
-	if s.o.UserConfig {
+	if launch.ConfigDir != "" {
+		// The thread's own CODEX_HOME is used as it is.
+		home, err = filepath.Abs(launch.ConfigDir)
+	} else if s.o.UserConfig {
 		home = userCodexHome()
 	} else {
 		h := s.o.Home
@@ -984,8 +1015,8 @@ func (s *codexSession) spawn(run *codexRun) {
 	if bin == "" {
 		bin = "codex"
 	}
-	args := append(append(append([]string{}, s.o.BinArgs...), "app-server"), s.o.Args...)
-	env := mergeEnv(mergeEnv(os.Environ(), s.o.Env), map[string]string{"CODEX_HOME": home})
+	args := append(append(append(append([]string{}, s.o.BinArgs...), "app-server"), s.o.Args...), launch.Args...)
+	env := mergeEnv(launch.applyEnv(mergeEnv(os.Environ(), s.o.Env)), map[string]string{"CODEX_HOME": home})
 	proc, err := ctx.Spawner().Spawn(SpawnOptions{
 		Command: bin, Args: args, Cwd: ctx.Thread().Cwd, Env: env, ThreadID: ctx.ThreadID(), RunID: run.id, Post: ctx.Post,
 	}, s.handlers(run))
@@ -1257,6 +1288,19 @@ func (s *codexSession) threadParams(run *codexRun, fresh bool) (map[string]any, 
 	if len(servers) > 0 {
 		config["mcp_servers"] = servers
 	}
+	// The thread's other directories are writable as its working directory is (relative ones are
+	// in it), after any the options give.
+	if dirs := ctx.Launch().AddDirs; len(dirs) > 0 {
+		const key = "sandbox_workspace_write.writable_roots"
+		roots := jsonList(config[key])
+		for _, d := range dirs {
+			if t.Cwd != "" && !filepath.IsAbs(d) {
+				d = filepath.Join(t.Cwd, d)
+			}
+			roots = append(roots, d)
+		}
+		config[key] = roots
+	}
 	if len(run.hiddenSkills) > 0 {
 		var list []any
 		for _, p := range run.hiddenSkills {
@@ -1266,7 +1310,7 @@ func (s *codexSession) threadParams(run *codexRun, fresh bool) (map[string]any, 
 	}
 	approval, sandbox := codexPolicy(t.PermissionMode)
 	params := map[string]any{"approvalPolicy": approval, "sandbox": sandbox, "config": config}
-	run.launched = launchedOf(t)
+	run.launched = launchedOf(s.ctx)
 	if t.Cwd != "" {
 		params["cwd"] = t.Cwd
 	}
@@ -1286,9 +1330,19 @@ func (s *codexSession) threadParams(run *codexRun, fresh bool) (map[string]any, 
 	return params, nil
 }
 
+// jsonList is v as a JSON array's values, or none if it isn't one.
+func jsonList(v any) []any {
+	data, err := json.Marshal(v)
+	var out []any
+	if err != nil || json.Unmarshal(data, &out) != nil {
+		return nil
+	}
+	return out
+}
+
 func (s *codexSession) handlers(run *codexRun) ProcessHandlers {
 	return ProcessHandlers{
-		Line: func(line string) { s.line(run, line) },
+		Line: func(line string) { s.ctx.FromHarness(run.id, line, func() { s.line(run, line) }) },
 		Stderr: func(line string) {
 			run.stderr = append(run.stderr, line)
 			if len(run.stderr) > 20 {
@@ -1434,6 +1488,10 @@ func (s *codexSession) notification(run *codexRun, m jmap) {
 			if json.Unmarshal(total, &t) == nil {
 				run.total = &t
 			}
+		}
+	case "account/rateLimits/updated":
+		if rl := p.obj("rateLimits"); rl != nil {
+			ctx.RateLimits(codexRateLimits(rl))
 		}
 	case "warning":
 		if own && p.str("threadId") != "" && p.str("message") != "" {

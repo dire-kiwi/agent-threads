@@ -1,0 +1,227 @@
+{
+  "description": "Made by hand from plain-reply: what the protocol leaves out. A turn with hooks, API retries, rate limits and lines the driver doesn't know; control requests (one Claude refuses); then a turn refused for the usage limit. With raw payloads on.",
+  "recorded": {
+    "cli": "2.1.312 (Claude Code)",
+    "model": "haiku",
+    "date": "2026-11-02"
+  },
+  "thread": {
+    "harness": "claude",
+    "model": "haiku"
+  },
+  "permissions": "allow",
+  "raw": true,
+  "steps": [
+    {
+      "command": {
+        "type": "send",
+        "text": "Reply with exactly these words and nothing else: hello from the fixture",
+        "client_id": "c1"
+      }
+    },
+    {
+      "wait": {
+        "type": "thread.updated",
+        "thread": {
+          "status": "idle"
+        }
+      }
+    },
+    {
+      "control": {
+        "subtype": "get_context_usage",
+        "detail": "summary"
+      },
+      "result": {
+        "categories": [
+          {
+            "name": "System prompt",
+            "tokens": 3100,
+            "color": "promptBorder"
+          },
+          {
+            "name": "Messages",
+            "tokens": 42,
+            "color": "purple_FOR_SUBAGENTS_ONLY"
+          },
+          {
+            "name": "Free space",
+            "tokens": 180458,
+            "color": "promptBorder"
+          }
+        ],
+        "totalTokens": 19442,
+        "maxTokens": 200000,
+        "rawMaxTokens": 200000,
+        "percentage": 10,
+        "gridRows": [],
+        "model": "claude-haiku-5-5",
+        "memoryFiles": [],
+        "mcpTools": [],
+        "agents": [],
+        "isAutoCompactEnabled": true,
+        "autoCompactThreshold": 167000
+      }
+    },
+    {
+      "control": {
+        "subtype": "no_such_request"
+      },
+      "error": "Unsupported control request subtype: no_such_request"
+    },
+    {
+      "command": {
+        "type": "send",
+        "text": "Reply with exactly these words and nothing else: hello again",
+        "client_id": "c2"
+      }
+    },
+    {
+      "wait": {
+        "type": "thread.updated",
+        "thread": {
+          "status": "error"
+        }
+      }
+    }
+  ],
+  "harness_messages": [
+    {
+      "type": "system",
+      "subtype": "status",
+      "status": "requesting"
+    },
+    {
+      "type": "system",
+      "subtype": "hook_started",
+      "hook_name": "Stop"
+    },
+    {
+      "type": "future_message"
+    },
+    {
+      "type": "rate_limit_event",
+      "rate_limit_info": {
+        "rateLimitType": "five_hour",
+        "isUsingOverage": true
+      }
+    },
+    {
+      "type": "control_response",
+      "response": {
+        "subtype": "error",
+        "error": "Unsupported control request subtype: no_such_request"
+      }
+    },
+    {
+      "type": "result",
+      "is_error": true,
+      "api_error": "usage_limit_reached"
+    }
+  ],
+  "raw_checks": [
+    {
+      "event": {
+        "type": "item.added",
+        "item": {
+          "type": "user_message"
+        }
+      },
+      "raw": null
+    },
+    {
+      "event": {
+        "type": "turn.started"
+      },
+      "raw": null
+    },
+    {
+      "event": {
+        "type": "item.added",
+        "item": {
+          "type": "notice",
+          "code": "retry"
+        }
+      },
+      "raw": {
+        "type": "system",
+        "subtype": "api_retry"
+      }
+    },
+    {
+      "event": {
+        "type": "item.added",
+        "item": {
+          "type": "notice",
+          "code": "hook"
+        }
+      },
+      "raw": {
+        "type": "system",
+        "subtype": "hook_response"
+      }
+    },
+    {
+      "event": {
+        "type": "item.added",
+        "item": {
+          "type": "assistant_message"
+        }
+      },
+      "raw": {
+        "type": "stream_event"
+      }
+    },
+    {
+      "event": {
+        "type": "delta"
+      },
+      "raw": {
+        "type": "stream_event"
+      }
+    },
+    {
+      "event": {
+        "type": "item.updated",
+        "patch": {
+          "text": "hello from the fixture"
+        }
+      },
+      "raw": {
+        "type": "assistant"
+      }
+    },
+    {
+      "event": {
+        "type": "item.added",
+        "item": {
+          "type": "turn_result"
+        }
+      },
+      "raw": {
+        "type": "result"
+      }
+    },
+    {
+      "event": {
+        "type": "turn.completed"
+      },
+      "raw": {
+        "type": "result"
+      }
+    },
+    {
+      "event": {
+        "type": "item.added",
+        "item": {
+          "type": "turn_result",
+          "ok": false
+        }
+      },
+      "raw": {
+        "type": "result",
+        "is_error": true
+      }
+    }
+  ]
+}

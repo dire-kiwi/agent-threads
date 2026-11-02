@@ -14,7 +14,7 @@ import {
   useSyncExternalStore,
   type ReactNode,
 } from "react";
-import { ThreadStore, type ThreadSource, type ThreadState } from "./store.js";
+import { ThreadStore, type LoadEarlierOptions, type ThreadSource, type ThreadState } from "./store.js";
 import type { ThreadConfig } from "./config.js";
 import { lineage } from "./view.js";
 
@@ -189,10 +189,34 @@ class Focus {
   }
 }
 
-/** Shows a subagent's row in the thread (see Focus). */
+/**
+ * Shows a subagent's row in the thread (see Focus). One that started before the items loaded (its
+ * call is only there for context) has the earlier items loaded back to its start.
+ */
 export function useReveal(): (id: string) => void {
-  const { focus } = useCtx();
-  return useCallback((id) => focus.reveal(id), [focus]);
+  const { focus, store } = useCtx();
+  return useCallback(
+    (id) => {
+      focus.reveal(id);
+      if (!store.isLoaded(id)) void store.loadEarlier({ to: id });
+    },
+    [focus, store],
+  );
+}
+
+/** Whether the thread's snapshot is a window with earlier items to load (with the source's loadEarlier). */
+export function useHasEarlier(): boolean {
+  const { store } = useCtx();
+  return useThreadState((s) => !!s.snapshot.start) && !!store.source.loadEarlier;
+}
+
+/**
+ * Loads the earlier items of a thread whose snapshot is a window (see ThreadStore.loadEarlier): a
+ * page, or with `to`, back to that item.
+ */
+export function useLoadEarlier(): (options?: LoadEarlierOptions) => Promise<void> {
+  const { store } = useCtx();
+  return useCallback((options) => store.loadEarlier(options), [store]);
 }
 
 /**

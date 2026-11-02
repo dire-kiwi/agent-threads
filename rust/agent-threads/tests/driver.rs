@@ -11,10 +11,11 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use agent_threads::protocol::{PermissionMode, ToolKind};
+use agent_threads::reducer::open_requests;
 use agent_threads::{
-    AgentThreads, Capabilities, ClaudeCodeOptions, CreateOptions, Error, FileStore, McpServer, MemoryState,
-    MemoryStore, Options, PermissionDecision, PermissionPolicy, RunRecord, SendOptions, Skill, SqliteStore, Store,
-    StoreError, StoreResult, ThreadEvent, ThreadOptions, ToolContext, tool,
+    AgentThreads, Capabilities, ClaudeCodeOptions, CreateOptions, Error, FileStore, HarnessMessage, LaunchOptions,
+    McpServer, MemoryState, MemoryStore, Options, PermissionDecision, PermissionPolicy, RunRecord, SendOptions, Skill,
+    Snapshot, Spawner, SqliteStore, Store, StoreError, StoreResult, ThreadEvent, ThreadOptions, ToolContext, tool,
 };
 use async_trait::async_trait;
 use common::{items, mini_runs, settle, texts, until};
@@ -26,8 +27,11 @@ struct Setup {
     steer: &'static str,
     env: Vec<(&'static str, String)>,
     store: Option<Arc<dyn Store>>,
+    spawner: Option<Arc<dyn Spawner>>,
     capabilities: Capabilities,
     errors: Arc<Mutex<Vec<String>>>,
+    /// What the app's on_harness_message has been given.
+    messages: Arc<Mutex<Vec<HarnessMessage>>>,
 }
 
 impl Default for Setup {
@@ -37,11 +41,13 @@ impl Default for Setup {
             steer: "now",
             env: Vec::new(),
             store: None,
+            spawner: None,
             capabilities: Capabilities {
                 permissions: Some(PermissionPolicy::allow()),
                 ..Default::default()
             },
             errors: Arc::default(),
+            messages: Arc::default(),
         }
     }
 }
@@ -68,12 +74,15 @@ impl Env {
         }
         claude.env.extend(env);
         let errors = self.setup.errors.clone();
+        let messages = self.setup.messages.clone();
         AgentThreads::new(Options {
             store: Some(store),
             harnesses: vec![agent_threads::claude_code(claude)],
+            spawner: self.setup.spawner.clone(),
             capabilities: self.setup.capabilities.clone(),
             on_error: Some(Arc::new(move |e| errors.lock().unwrap().push(e.to_string()))),
             event_capacity: 1 << 16,
+            on_harness_message: Some(Arc::new(move |m| messages.lock().unwrap().push(m.clone()))),
             ..Default::default()
         })
     }
@@ -157,6 +166,67 @@ async fn runs_turns_in_one_process_and_sets_the_session_id() {
     assert_eq!(runs.len(), 1);
     assert!(has(&runs[0].argv, "--model", "mini") && has(&runs[0].argv, "--setting-sources", ""));
     assert!(runs[0].argv.contains(&"--strict-mcp-config".to_string()));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn leaves_raw_out_unless_its_turned_on_and_passes_the_app_every_line() {
+    let mut env = setup(Setup::default());
+    let t = env.sdk.create(create()).await.unwrap();
+    env.sdk.send(&t.id, "reply hi", SendOptions::default()).await.unwrap();
+    let s = settle(&env.sdk, &t.id).await;
+    assert!(
+        env.events_json()
+            .iter()
+            .all(|e| e.get("raw").is_none() && e["item"].get("raw").is_none())
+    );
+    assert!(s["items"].as_array().unwrap().iter().all(|i| i.get("raw").is_none()));
+    let messages = env.setup.messages.lock().unwrap();
+    let types: Vec<&str> = messages
+        .iter()
+        .filter_map(|m| m.message.as_ref()?["type"].as_str())
+        .collect();
+    for want in ["control_response", "system", "assistant", "result"] {
+        assert!(types.contains(&want), "no {want} message in {types:?}");
+    }
+    let run = s["thread"]["run"]["id"].as_str().unwrap();
+    assert!(messages.iter().all(|m| m.thread_id == t.id
+        && m.harness == "claude"
+        && m.run_id == run
+        && m.message == serde_json::from_str::<Value>(&m.line).ok()));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn sends_control_requests_to_the_running_process_and_fails_them_when_it_cant() {
+    let env = setup(Setup::default());
+    let t = env.sdk.create(create()).await.unwrap();
+    let usage = json!({"subtype": "get_context_usage"});
+    assert!(matches!(
+        env.sdk.control(&t.id, usage.clone()).await,
+        Err(Error::Command(_))
+    ));
+    env.sdk.send(&t.id, "reply hi", SendOptions::default()).await.unwrap();
+    settle(&env.sdk, &t.id).await;
+    assert_eq!(env.sdk.control(&t.id, usage.clone()).await.unwrap(), json!({}));
+    assert!(matches!(
+        env.sdk.control(&t.id, json!("get_context_usage")).await,
+        Err(Error::Command(_))
+    ));
+    // One the process exits before answering.
+    let sdk = env.sdk.clone();
+    let id = t.id.clone();
+    let pending = tokio::spawn(async move { sdk.control(&id, json!({"subtype": "never_answered"})).await });
+    until(5, || async {
+        env.runs()
+            .first()?
+            .sent
+            .iter()
+            .any(|m| m["request"]["subtype"] == "never_answered")
+            .then_some(())
+    })
+    .await;
+    env.sdk.close(true).await.unwrap();
+    assert!(matches!(pending.await.unwrap(), Err(Error::Control { .. })));
+    assert!(matches!(env.sdk.control(&t.id, usage).await, Err(Error::Command(_))));
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -563,7 +633,7 @@ async fn asks_the_policy_and_remembers_an_answer_given_always() {
         .await
         .unwrap();
     let r = until(5, || async {
-        env.sdk.snapshot(&t.id).await.unwrap().requests.first().cloned()
+        open_requests(&env.sdk.snapshot(&t.id).await.unwrap()).next().cloned()
     })
     .await;
     let r = serde_json::to_value(r).unwrap();
@@ -578,7 +648,12 @@ async fn asks_the_policy_and_remembers_an_answer_given_always() {
     );
     let respond = json!({"type": "respond", "thread_id": t.id, "request_id": r["id"], "resolution": {"outcome": "allow", "always": true}});
     env.sdk.handle_json(respond).await.unwrap();
-    settle(&env.sdk, &t.id).await;
+    let s = settle(&env.sdk, &t.id).await;
+
+    // The answered request stays, with its answer.
+    let mut answered = r.clone();
+    answered["resolution"] = json!({"outcome": "allow", "always": true});
+    assert_eq!(s["requests"], json!([answered]));
 
     env.sdk
         .send(&t.id, r#"tool Bash {"command":"pwd"}"#, SendOptions::default())
@@ -594,6 +669,217 @@ async fn asks_the_policy_and_remembers_an_answer_given_always() {
     );
     assert_eq!(*seen.lock().unwrap(), ["Read", "WebFetch", "Bash"]);
     assert_eq!(texts(&s).last().unwrap(), r#"ran with {"command":"pwd"}"#);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn keeps_a_background_subagents_calls_and_requests_after_its_turn_and_runs_the_turn_claude_starts() {
+    let policy = PermissionPolicy::from_fn(|q, _| match q.kind {
+        ToolKind::Shell => PermissionDecision::Ask,
+        _ => PermissionDecision::Allow,
+    });
+    let env = setup(Setup {
+        capabilities: Capabilities {
+            permissions: Some(policy),
+            ..Default::default()
+        },
+        ..Default::default()
+    });
+    let t = env.sdk.create(create()).await.unwrap();
+    env.sdk
+        .send(&t.id, "background 0 apple", SendOptions::default())
+        .await
+        .unwrap();
+    // The turn ends with the subagent's call waiting for the user, who's still asked.
+    let s = until(5, || async {
+        let s = serde_json::to_value(env.sdk.snapshot(&t.id).await.unwrap()).unwrap();
+        (results(&s).len() == 1).then_some(s)
+    })
+    .await;
+    assert_eq!(s["thread"]["status"], "waiting");
+    let open: Vec<&Value> = s["requests"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|r| r.get("resolution").is_none())
+        .collect();
+    assert_eq!(open.len(), 1);
+    let request = open[0]["id"].clone();
+    let calls = items(&s, "tool_call");
+    assert_eq!(
+        (calls[0]["status"].clone(), calls[0]["subagent"].clone()),
+        (
+            json!("completed"),
+            json!({"status": "running", "background": true, "agent_type": "general-purpose", "model": "mini-1"})
+        )
+    );
+    assert_eq!(
+        (calls[1]["status"].clone(), calls[1]["parent_id"].clone()),
+        (json!("pending"), calls[0]["id"].clone())
+    );
+
+    let respond =
+        json!({"type": "respond", "thread_id": t.id, "request_id": request, "resolution": {"outcome": "allow"}});
+    env.sdk.handle_json(respond).await.unwrap();
+    let s = until(5, || async {
+        let s = serde_json::to_value(env.sdk.snapshot(&t.id).await.unwrap()).unwrap();
+        (results(&s).len() == 2 && s["thread"]["status"] == "idle").then_some(s)
+    })
+    .await;
+    let calls = items(&s, "tool_call");
+    assert_eq!(
+        calls[0]["subagent"],
+        json!({"status": "completed", "background": true, "agent_type": "general-purpose", "model": "mini-1", "activity": "Running true", "tool_uses": 1, "summary": "apple"})
+    );
+    assert_eq!(calls[1]["status"], "completed");
+    // Claude's own turn has no message of the user's.
+    let second = results(&s)[1]["turn_id"].clone();
+    assert!(items(&s, "user_message").iter().all(|u| u["turn_id"] != second));
+    assert_eq!(texts(&s).last().unwrap(), "the subagent said apple");
+    assert!(
+        env.runs()[0]
+            .sent
+            .iter()
+            .any(|m| m["response"]["response"]["behavior"] == "allow")
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn keeps_a_users_turn_going_past_a_turn_claude_makes_before_taking_its_message_in() {
+    let mut env = setup(Setup {
+        env: vec![("MINI_CLAUDE_NOTIFY_FIRST", "1".into())],
+        ..Default::default()
+    });
+    let t = env.sdk.create(create()).await.unwrap();
+    env.sdk
+        .send(&t.id, "background 300 apple", SendOptions::default())
+        .await
+        .unwrap();
+    until(5, || async {
+        let s = serde_json::to_value(env.sdk.snapshot(&t.id).await.unwrap()).unwrap();
+        (results(&s).len() == 1).then_some(())
+    })
+    .await;
+    // Sent before the subagent is done: Claude reports the subagent first, then takes this in.
+    env.sdk.send(&t.id, "reply hi", SendOptions::default()).await.unwrap();
+    let s = until(5, || async {
+        let s = serde_json::to_value(env.sdk.snapshot(&t.id).await.unwrap()).unwrap();
+        (texts(&s).last().map(String::as_str) == Some("hi") && s["thread"]["status"] == "idle").then_some(s)
+    })
+    .await;
+    let results = results(&s);
+    assert_eq!(results.len(), 2, "{:?}", env.events_json());
+    // The user's turn has its message, both replies, and both results' usage.
+    let turn = results[1]["turn_id"].clone();
+    let said: Vec<&Value> = s["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|i| i["turn_id"] == turn && i["type"] != "turn_result")
+        .map(|i| &i["text"])
+        .collect();
+    assert_eq!(
+        said,
+        [&json!("reply hi"), &json!("the subagent said apple"), &json!("hi")]
+    );
+    assert_eq!(results[1]["usage"]["input_tokens"], 2);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn keeps_a_background_subagents_app_tools_structured_output_for_the_result_after_its_turn() {
+    let lookup = tool("lookup", "Looks it up.", json!({"type": "object"}), |_, _| async {
+        agent_threads::ToolOutput::text("42").with_structured(json!({"answer": 42}))
+    });
+    let env = setup(Setup {
+        env: vec![("MINI_CLAUDE_BACKGROUND_APP", "lookup".into())],
+        capabilities: Capabilities {
+            tools: vec![lookup],
+            permissions: Some(PermissionPolicy::allow()),
+            ..Default::default()
+        },
+        ..Default::default()
+    });
+    let t = env.sdk.create(create()).await.unwrap();
+    env.sdk
+        .send(&t.id, "background 200 apple", SendOptions::default())
+        .await
+        .unwrap();
+    let s = until(5, || async {
+        let s = serde_json::to_value(env.sdk.snapshot(&t.id).await.unwrap()).unwrap();
+        (results(&s).len() == 2 && s["thread"]["status"] == "idle").then_some(s)
+    })
+    .await;
+    let call = items(&s, "tool_call")
+        .into_iter()
+        .find(|c| c["name"] == "lookup")
+        .unwrap()
+        .clone();
+    assert_eq!(call["status"], "completed");
+    assert_eq!(call["result"]["structured"], json!({"answer": 42}), "{call}");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn stops_a_runs_subagents_when_it_ends_and_cancels_what_they_were_doing() {
+    let mut env = setup(Setup::default());
+    let t = env.sdk.create(create()).await.unwrap();
+    env.sdk
+        .send(&t.id, "background 60000 apple", SendOptions::default())
+        .await
+        .unwrap();
+    until(5, || async {
+        let s = serde_json::to_value(env.sdk.snapshot(&t.id).await.unwrap()).unwrap();
+        let calls = items(&s, "tool_call");
+        (s["thread"]["status"] == "idle" && calls.len() == 2 && calls[1]["status"] == "running").then_some(())
+    })
+    .await;
+    env.sdk.close(false).await.unwrap();
+    let events = env.events_json();
+    let patches: Vec<&Value> = events
+        .iter()
+        .filter(|e| e["type"] == "item.updated")
+        .map(|e| &e["patch"])
+        .collect();
+    assert!(patches.iter().any(|p| p["subagent"]["status"] == "stopped"));
+    assert!(patches.iter().any(|p| p["status"] == "cancelled"));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn gives_a_window_of_a_threads_last_items_and_pages_of_the_items_before_it() {
+    let env = setup(Setup::default());
+    let t = env.sdk.create(create()).await.unwrap();
+    for n in ["one", "two", "three"] {
+        env.sdk
+            .send(&t.id, &format!("reply {n}"), SendOptions::default())
+            .await
+            .unwrap();
+        settle(&env.sdk, &t.id).await;
+    }
+    let whole = serde_json::to_value(env.sdk.snapshot(&t.id).await.unwrap()).unwrap();
+    // A user message, the reply and the turn's result, for each turn.
+    let all = whole["items"].as_array().unwrap();
+    assert_eq!(all.len(), 9);
+    assert!(whole.get("start").is_none());
+    let value = |s| serde_json::to_value::<Snapshot>(s).unwrap();
+    assert_eq!(value(env.sdk.snapshot_window(&t.id, 20).await.unwrap()), whole);
+
+    let window = value(env.sdk.snapshot_window(&t.id, 4).await.unwrap());
+    assert_eq!(
+        (&window["start"], &window["seq"], &window["thread"]),
+        (&json!(5), &whole["seq"], &whole["thread"])
+    );
+    assert_eq!(window["items"], json!(all[5..]));
+    assert!(window.get("context").is_none());
+
+    let page = env.sdk.items_before(&t.id, 5, 3).await.unwrap();
+    assert_eq!(
+        serde_json::to_value(page).unwrap(),
+        json!({"thread_id": t.id, "items": all[2..5], "requests": [], "start": 2, "context": [], "seq": whole["seq"]})
+    );
+    let first = env.sdk.items_before(&t.id, 2, 3).await.unwrap();
+    assert_eq!(
+        (first.start, serde_json::to_value(first.items).unwrap()),
+        (0, json!(all[..2]))
+    );
+    assert!(env.sdk.items_before("nope", 2, 3).await.is_err());
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -819,7 +1105,7 @@ async fn refuses_a_malformed_command_before_it_changes_anything() {
         .await
         .unwrap();
     let r = until(5, || async {
-        env.sdk.snapshot(&t.id).await.unwrap().requests.first().cloned()
+        open_requests(&env.sdk.snapshot(&t.id).await.unwrap()).next().cloned()
     })
     .await;
     let request_id = r.id().to_string();
@@ -1919,4 +2205,155 @@ async fn a_thread_configured_while_its_run_is_reattached_answers_the_runs_open_r
     assert_eq!(said.len(), 1, "{said:?}");
     assert!(said[0].contains(r#""behavior":"deny""#), "{said:?}");
     second.close(true).await.unwrap();
+}
+
+/// A thread's launch options: (args, env, add_dirs, config_dir).
+fn launch(args: &[&str], env: &[(&str, Option<&str>)], add_dirs: &[&str], config_dir: &str) -> LaunchOptions {
+    LaunchOptions {
+        args: args.iter().map(|a| a.to_string()).collect(),
+        env: env.iter().map(|(k, v)| (k.to_string(), v.map(String::from))).collect(),
+        add_dirs: add_dirs.iter().map(PathBuf::from).collect(),
+        config_dir: Some(PathBuf::from(config_dir)),
+    }
+}
+
+/// The values `flag` is given in `argv`, in order.
+fn flag_values(argv: &[String], flag: &str) -> Vec<String> {
+    argv.windows(2).filter(|a| a[0] == flag).map(|a| a[1].clone()).collect()
+}
+
+/// Launch options with the claude harness's own options, stored with the thread but not sent to
+/// clients, for every process it starts: after set_options changes them, and after a restart.
+#[tokio::test(flavor = "multi_thread")]
+async fn starts_claude_with_the_threads_launch_options_and_keeps_them_across_a_restart() {
+    let store: Arc<dyn Store> = Arc::new(FileStore::open(common::temp_dir()).unwrap());
+    let mut claude = ClaudeCodeOptions {
+        args: vec!["--own".into()],
+        config_dir: Some("/instance-config".into()),
+        ..Default::default()
+    };
+    claude.env.insert("AT_GONE".into(), Some("instance".into()));
+    let mut env = setup(Setup {
+        claude,
+        store: Some(store.clone()),
+        env: vec![
+            ("MINI_LOG_ENV", "AT_SET,AT_GONE,AT_KEPT".into()),
+            ("AT_KEPT", "kept".into()),
+        ],
+        ..Default::default()
+    });
+    let first = launch(
+        &["--allowedTools", "Read Edit", "--settings", "{\"a\":1}"],
+        &[("AT_SET", Some("a b")), ("AT_GONE", None)],
+        &["/one", "/two"],
+        "/profile-a",
+    );
+    let t = env
+        .sdk
+        .create(CreateOptions {
+            launch: first.clone(),
+            ..create()
+        })
+        .await
+        .unwrap();
+    env.sdk.send(&t.id, "reply one", SendOptions::default()).await.unwrap();
+    settle(&env.sdk, &t.id).await;
+    let run = &env.runs()[0];
+    assert_eq!(flag_values(&run.argv, "--add-dir"), ["/one", "/two"]);
+    // After the driver's arguments and the harness options'.
+    let n = run.argv.len();
+    assert_eq!(
+        run.argv[n - 5..],
+        ["--own", "--allowedTools", "Read Edit", "--settings", "{\"a\":1}"]
+    );
+    assert_eq!(run.config_dir.as_deref(), Some("/profile-a"));
+    assert_eq!(run.env, json!({"AT_SET": "a b", "AT_GONE": null, "AT_KEPT": "kept"}));
+    // Stored with the thread, and never sent to clients.
+    let stored = store.get_thread(&t.id).await.unwrap().unwrap();
+    assert_eq!(stored["launch"]["env"], json!({"AT_SET": "a b", "AT_GONE": null}));
+    assert!(env.events_json().iter().all(|e| !e.to_string().contains("profile-a")));
+    assert!(
+        serde_json::to_value(env.sdk.snapshot(&t.id).await.unwrap()).unwrap()["thread"]
+            .get("launch")
+            .is_none()
+    );
+
+    // Changed: the next turn's process has the new ones.
+    let second = launch(
+        &["--disallowedTools", "Bash"],
+        &[("AT_SET", Some("b"))],
+        &["/three"],
+        "/profile-b",
+    );
+    env.sdk
+        .set_options(
+            &t.id,
+            ThreadOptions {
+                launch: Some(second.clone()),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    env.sdk.send(&t.id, "reply two", SendOptions::default()).await.unwrap();
+    let s = settle(&env.sdk, &t.id).await;
+    let runs = env.runs();
+    assert_eq!(runs.len(), 2);
+    assert_eq!(flag_values(&runs[1].argv, "--add-dir"), ["/three"]);
+    assert_eq!(runs[1].argv[runs[1].argv.len() - 2..], ["--disallowedTools", "Bash"]);
+    assert!(!runs[1].argv.contains(&"--allowedTools".to_string()));
+    assert_eq!(runs[1].config_dir.as_deref(), Some("/profile-b"));
+    assert_eq!(
+        runs[1].env,
+        json!({"AT_SET": "b", "AT_GONE": "instance", "AT_KEPT": "kept"})
+    );
+
+    // A new backend on the same store resumes the thread with them.
+    env.sdk.close(false).await.unwrap();
+    let again = env.make(store.clone());
+    again.send(&t.id, "reply three", SendOptions::default()).await.unwrap();
+    settle(&again, &t.id).await;
+    let runs = env.runs();
+    assert_eq!(runs.len(), 3);
+    assert!(has(
+        &runs[2].argv,
+        "--resume",
+        s["thread"]["session_id"].as_str().unwrap()
+    ));
+    assert_eq!(flag_values(&runs[2].argv, "--add-dir"), ["/three"]);
+    assert_eq!(runs[2].argv[runs[2].argv.len() - 2..], ["--disallowedTools", "Bash"]);
+    assert_eq!(runs[2].config_dir.as_deref(), Some("/profile-b"));
+    assert_eq!(runs[2].env["AT_SET"], "b");
+    again.close(false).await.unwrap();
+}
+
+/// Under the shim, the process is started with the thread's launch options too.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread")]
+async fn starts_claude_under_the_shim_with_the_threads_launch_options() {
+    let runs_dir = KillRuns(common::temp_dir());
+    let env = setup(Setup {
+        spawner: Some(agent_threads::shim(
+            common::shim_path(),
+            agent_threads::ShimOptions::new(&runs_dir.0),
+        )),
+        env: vec![("MINI_LOG_ENV", "AT_SET".into())],
+        ..Default::default()
+    });
+    let t = env
+        .sdk
+        .create(CreateOptions {
+            launch: launch(&["--settings", "{}"], &[("AT_SET", Some("x y"))], &["/one"], "/profile"),
+            ..create()
+        })
+        .await
+        .unwrap();
+    env.sdk.send(&t.id, "reply one", SendOptions::default()).await.unwrap();
+    assert_eq!(texts(&settle(&env.sdk, &t.id).await), ["one"]);
+    let run = &env.runs()[0];
+    assert_eq!(flag_values(&run.argv, "--add-dir"), ["/one"]);
+    assert_eq!(run.argv[run.argv.len() - 2..], ["--settings", "{}"]);
+    assert_eq!(run.config_dir.as_deref(), Some("/profile"));
+    assert_eq!(run.env, json!({"AT_SET": "x y"}));
+    env.sdk.close(true).await.unwrap();
 }

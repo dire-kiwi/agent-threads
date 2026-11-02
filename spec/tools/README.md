@@ -128,7 +128,8 @@ or `CODEX_HOME` that has only the login linked in (`.credentials.json` or `auth.
 user's settings, MCP servers, skills, plugins and history stay out.
 
 Before it's written, the recording is sanitized ([lib/sanitize.mjs](lib/sanitize.mjs)): the
-temporary directories become `/work`, `/config`, `/codex-home` and `/tmp/recording`, this checkout
+temporary directories become `/work`, `/config`, `/codex-home` and `/tmp/recording`, the system's
+own (a `TMPDIR` other than `/tmp`, where Claude keeps its tasks' output) `/tmp`, this checkout
 `/repo`, the home directory `/home/user`, and the user name, host name and git email are replaced;
 account details (Claude's `account`, Codex's rate limits, emails, organization names, installation
 ids) are replaced with placeholders; and it fails if anything still looks like a secret (an API key,

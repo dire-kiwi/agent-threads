@@ -8,9 +8,11 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 use agent_threads::protocol::{PermissionMode, ToolKind};
+use agent_threads::reducer::open_requests;
 use agent_threads::{
-    AgentThreads, AppTools, Capabilities, CapabilitiesUpdate, CodexOptions, CreateOptions, McpServer, MemoryStore,
-    Options, PermissionDecision, PermissionPolicy, SendOptions, Skill, Store, ThreadEvent, ToolContext, codex, tool,
+    AgentThreads, AppTools, Capabilities, CapabilitiesUpdate, CodexOptions, CreateOptions, LaunchOptions, McpServer,
+    MemoryStore, Options, PermissionDecision, PermissionPolicy, SendOptions, Skill, Store, ThreadEvent, ThreadOptions,
+    ToolContext, codex, tool,
 };
 use common::{items, mini_runs, settle, texts, until};
 use serde_json::{Value, json};
@@ -90,12 +92,8 @@ impl Env {
 
     async fn request(&self, id: &str) -> Value {
         until(5, || async {
-            self.sdk
-                .snapshot(id)
-                .await
-                .unwrap()
-                .requests
-                .first()
+            open_requests(&self.sdk.snapshot(id).await.unwrap())
+                .next()
                 .map(|r| serde_json::to_value(r).unwrap())
         })
         .await
@@ -944,7 +942,7 @@ async fn in_plan_mode_carries_on_in_the_mode_the_user_approves_the_plan_in() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn in_plan_mode_takes_a_message_sent_while_a_plan_waits_as_more_to_plan_with() {
-    let mut env = setup(Capabilities::default(), plain(), &[]);
+    let env = setup(Capabilities::default(), plain(), &[]);
     let t = planning(&env).await;
     env.sdk.send(&t, "propose One.", SendOptions::default()).await.unwrap();
     let r = env.request(&t).await;
@@ -954,14 +952,13 @@ async fn in_plan_mode_takes_a_message_sent_while_a_plan_waits_as_more_to_plan_wi
     };
     env.sdk.send(&t, "reply And two.", o).await.unwrap();
     let s = settle(&env.sdk, &t).await;
-    let mut cancelled = false;
-    while let Ok(e) = env.rx.try_recv() {
-        let e = serde_json::to_value(e).unwrap();
-        cancelled |= e["type"] == "request.resolved"
-            && e["request_id"] == r["id"]
-            && e["resolution"] == json!({"outcome": "cancel"});
-    }
-    assert!(cancelled);
+    let plan = s["requests"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|x| x["id"] == r["id"])
+        .unwrap();
+    assert_eq!(plan["resolution"], json!({"outcome": "cancel"}));
     let m = items(&s, "user_message")
         .into_iter()
         .find(|i| i["client_id"] == "more")
@@ -979,7 +976,7 @@ async fn in_plan_mode_takes_a_message_sent_while_a_plan_waits_as_more_to_plan_wi
 
 #[tokio::test(flavor = "multi_thread")]
 async fn in_plan_mode_ends_the_turn_when_its_interrupted_while_a_plan_waits() {
-    let mut env = setup(Capabilities::default(), plain(), &[]);
+    let env = setup(Capabilities::default(), plain(), &[]);
     let t = planning(&env).await;
     env.sdk.send(&t, "propose One.", SendOptions::default()).await.unwrap();
     let r = env.request(&t).await;
@@ -990,15 +987,11 @@ async fn in_plan_mode_ends_the_turn_when_its_interrupted_while_a_plan_waits() {
         (res.len(), res[0]["ok"].clone(), res[0]["interrupted"].clone()),
         (1, json!(false), json!(true))
     );
-    let mut cancelled = false;
-    while let Ok(e) = env.rx.try_recv() {
-        let e = serde_json::to_value(e).unwrap();
-        cancelled |= e["type"] == "request.resolved"
-            && e["request_id"] == r["id"]
-            && e["resolution"] == json!({"outcome": "cancel"});
-    }
-    assert!(cancelled);
-    assert_eq!(s["requests"], json!([]));
+    // Kept, resolved.
+    assert_eq!(
+        (s["requests"][0]["id"].clone(), s["requests"][0]["resolution"].clone()),
+        (r["id"].clone(), json!({"outcome": "cancel"}))
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -1134,4 +1127,84 @@ async fn links_the_users_login_into_the_apps_home() {
     let link = env.home.join("auth.json");
     assert!(std::fs::symlink_metadata(&link).unwrap().file_type().is_symlink());
     assert_eq!(std::fs::read_link(&link).unwrap(), user.join("auth.json"));
+}
+
+/// A thread's launch options: its own CODEX_HOME (used as it is), arguments after the options',
+/// environment, and writable roots; stored with the thread, and changed by set_options.
+#[tokio::test(flavor = "multi_thread")]
+async fn starts_codex_with_the_threads_launch_options() {
+    let mut o = plain();
+    o.args = vec!["--own".into()];
+    o.config
+        .insert("sandbox_workspace_write.writable_roots".into(), json!(["/base"]));
+    let env = setup(
+        Capabilities::default(),
+        o,
+        &[("MINI_LOG_ENV", "AT_SET,AT_GONE"), ("AT_GONE", "instance")],
+    );
+    let (home, cwd) = (common::temp_dir(), common::temp_dir());
+    let t = env
+        .sdk
+        .create(CreateOptions {
+            cwd: Some(cwd.clone()),
+            launch: LaunchOptions {
+                args: vec!["-c".into(), "a=1".into()],
+                env: [
+                    ("AT_SET".to_string(), Some("x y".to_string())),
+                    ("AT_GONE".to_string(), None),
+                ]
+                .into(),
+                add_dirs: vec!["sub".into(), "/abs".into()],
+                config_dir: Some(home.clone()),
+            },
+            ..create()
+        })
+        .await
+        .unwrap();
+    env.sdk.send(&t.id, "reply one", SendOptions::default()).await.unwrap();
+    assert_eq!(texts(&settle(&env.sdk, &t.id).await), ["one"]);
+    let runs = mini_runs(&env.log);
+    assert_eq!(runs[0].argv, ["app-server", "--own", "-c", "a=1"]);
+    assert_eq!(runs[0].config_dir.as_deref(), Some(home.to_str().unwrap()));
+    assert_eq!(runs[0].env, json!({"AT_SET": "x y", "AT_GONE": null}));
+    assert_eq!(
+        env.sent("thread/start")[0]["params"]["config"]["sandbox_workspace_write.writable_roots"],
+        json!(["/base", cwd.join("sub"), "/abs"])
+    );
+    // Its own home, not the app's: no login was linked into it.
+    assert!(!home.join("auth.json").exists());
+    let stored = env.store.get_thread(&t.id).await.unwrap().unwrap();
+    assert_eq!(stored["launch"]["args"], json!(["-c", "a=1"]));
+    assert!(
+        serde_json::to_value(env.sdk.snapshot(&t.id).await.unwrap()).unwrap()["thread"]
+            .get("launch")
+            .is_none()
+    );
+
+    // New arguments: the next turn resumes the thread in a new process that has them.
+    env.sdk
+        .set_options(
+            &t.id,
+            ThreadOptions {
+                launch: Some(LaunchOptions {
+                    args: vec!["-c".into(), "a=2".into()],
+                    config_dir: Some(home.clone()),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    env.sdk.send(&t.id, "reply two", SendOptions::default()).await.unwrap();
+    assert_eq!(texts(&settle(&env.sdk, &t.id).await), ["one", "two"]);
+    let runs = mini_runs(&env.log);
+    assert_eq!(runs.len(), 2);
+    assert_eq!(runs[1].argv, ["app-server", "--own", "-c", "a=2"]);
+    assert_eq!(runs[1].env, json!({"AT_SET": null, "AT_GONE": "instance"}));
+    assert_eq!(env.sent("thread/resume").len(), 1);
+    assert_eq!(
+        env.sent("thread/resume")[0]["params"]["config"]["sandbox_workspace_write.writable_roots"],
+        json!(["/base"])
+    );
 }

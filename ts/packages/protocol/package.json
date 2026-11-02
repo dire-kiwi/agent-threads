@@ -2,6 +2,8 @@
   "name": "@dire-kiwi/agent-threads-protocol",
   "version": "0.0.0",
   "description": "agent-threads' protocol: types generated from spec/, and the applyEvent reducer.",
+  "license": "MIT",
+  "repository": "github:dire-kiwi/agent-threads",
   "type": "module",
   "exports": {
     ".": {

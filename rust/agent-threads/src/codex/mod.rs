@@ -13,7 +13,7 @@ mod translate;
 use std::any::Any;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -24,7 +24,9 @@ use tokio::sync::{oneshot, watch};
 use crate::agent_threads::Error;
 use crate::attachments::{Part, message_parts, path_text};
 use crate::claude::{forward_events, last_chars, title};
-use crate::harness::{BoxFuture, Harness, HarnessSession, Message, RunCheckpoint, TurnEnd};
+use crate::harness::{
+    BoxFuture, ControlReply, Harness, HarnessSession, LaunchOptions, Message, RunCheckpoint, TurnEnd,
+};
 use crate::ids::{new_id, now_iso, now_ms, private_temp_dir};
 use crate::mcp_http::{LoopbackMcp, ToolServer, serve_tools};
 use crate::permissions::{Decided, PermissionDecision, PermissionQuery, mode_after_plan, permission_key};
@@ -41,8 +43,8 @@ use home::{
     write_session_state,
 };
 use translate::{
-    APP_SERVER, codex_done, codex_policy, codex_tool, codex_usage, is_tool_item, mcp_server_config, questions,
-    sandbox_policy, todos, totals_as_usage,
+    APP_SERVER, codex_done, codex_policy, codex_rate_limits, codex_tool, codex_usage, is_tool_item, mcp_server_config,
+    questions, sandbox_policy, todos, totals_as_usage,
 };
 
 /// How the app's tools reach Codex.
@@ -128,6 +130,8 @@ const APP_TOOL_TIMEOUT_SEC: u64 = 3600;
 #[derive(Clone, Debug)]
 struct RpcError {
     message: String,
+    /// The error response's error object, if it was one.
+    error: Option<Value>,
 }
 
 type Then = Box<dyn FnOnce(&mut CodexSession, &mut ThreadContext, &str, Result<Value, RpcError>) + Send>;
@@ -142,6 +146,8 @@ struct Pending {
     method: String,
     meta: Option<Value>,
     then: Then,
+    /// The app's (control): its result is passed on as it came, null included.
+    raw: bool,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -188,6 +194,20 @@ struct Launched {
     effort: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     permission_mode: Option<PermissionMode>,
+    #[serde(default, skip_serializing_if = "LaunchOptions::is_empty")]
+    launch: LaunchOptions,
+}
+
+impl Launched {
+    fn of(ctx: &ThreadContext) -> Self {
+        let t = ctx.thread();
+        Launched {
+            model: t.model.clone(),
+            effort: t.effort.clone(),
+            permission_mode: t.permission_mode,
+            launch: ctx.launch().clone(),
+        }
+    }
 }
 
 /// What Codex is told when the user approves its plan, as its own client says it.
@@ -587,6 +607,9 @@ pub(crate) struct CodexSession {
     stop_at: Option<u64>,
     tmp: Option<PathBuf>,
     closed: bool,
+    /// The app's control requests not yet answered: where each answer goes, taken out by whichever
+    /// comes first, the answer or the backend letting go of the run.
+    controls: Vec<Arc<StdMutex<Option<ControlReply>>>>,
 }
 
 /// The app's tools on the loopback MCP server, served from the thread's task.
@@ -644,6 +667,7 @@ impl CodexSession {
             stop_at: None,
             tmp: None,
             closed: false,
+            controls: Vec::new(),
         }
     }
 
@@ -680,9 +704,24 @@ impl CodexSession {
         meta: Option<Value>,
         then: Then,
     ) {
+        self.send_request(ctx, run, method, params, meta, then, false);
+    }
+
+    /// Sends a request; `raw` passes its result on as it came (a null one too), for the app's.
+    #[allow(clippy::too_many_arguments)]
+    fn send_request(
+        &mut self,
+        ctx: &ThreadContext,
+        run: &str,
+        method: &str,
+        params: Value,
+        meta: Option<Value>,
+        then: Then,
+        raw: bool,
+    ) {
         let fail = |message: String, then: Then| {
             let run = run.to_string();
-            ctx.post::<CodexSession>(move |s, ctx| then(s, ctx, &run, Err(RpcError { message })));
+            ctx.post::<CodexSession>(move |s, ctx| then(s, ctx, &run, Err(RpcError { message, error: None })));
         };
         let Some(r) = self.runs.get_mut(run) else {
             return fail("the run has gone".into(), then);
@@ -697,8 +736,13 @@ impl CodexSession {
             method: method.to_string(),
             meta,
             then,
+            raw,
         });
-        r.write(&json!({"id": id, "method": method, "params": params}));
+        r.write(&if params.is_null() {
+            json!({"id": id, "method": method})
+        } else {
+            json!({"id": id, "method": method, "params": params})
+        });
     }
 
     /// Takes a response to one of our requests; whether it was one.
@@ -716,9 +760,14 @@ impl CodexSession {
                 .as_str()
                 .map(String::from)
                 .unwrap_or_else(|| format!("{} failed", p.method));
-            Err(RpcError { message })
+            Err(RpcError {
+                message,
+                error: msg.get("error").cloned(),
+            })
         } else {
             Ok(match msg.get("result") {
+                Some(r) if p.raw => r.clone(),
+                None if p.raw => Value::Null,
                 Some(Value::Null) | None => json!({}),
                 Some(r) => r.clone(),
             })
@@ -905,6 +954,7 @@ impl CodexSession {
             model: t.model.clone().or(l.model),
             effort: t.effort.clone(),
             permission_mode: t.permission_mode,
+            launch: l.launch,
         });
         o
     }
@@ -1058,7 +1108,11 @@ impl CodexSession {
             return self.set_ready(ctx, id, Err("the session is closed".into()));
         }
         let o = self.o.clone();
-        let home = if o.user_config {
+        let launch = ctx.launch().clone();
+        // The thread's own CODEX_HOME is used as it is.
+        let home = if let Some(h) = &launch.config_dir {
+            std::path::absolute(h)
+        } else if o.user_config {
             Ok(user_codex_home())
         } else {
             prepare_codex_home(&o.home.clone().unwrap_or_else(default_codex_home), o.login.as_deref())
@@ -1074,6 +1128,7 @@ impl CodexSession {
                 None => env.remove(k),
             };
         }
+        launch.apply_env(&mut env);
         env.insert("CODEX_HOME".into(), home.to_string_lossy().into());
         let options = SpawnOptions {
             command: o.bin.clone(),
@@ -1083,6 +1138,7 @@ impl CodexSession {
                 .cloned()
                 .chain(["app-server".to_string()])
                 .chain(o.args.iter().cloned())
+                .chain(launch.args.iter().cloned())
                 .collect(),
             cwd: ctx.thread().cwd.as_ref().map(PathBuf::from),
             env,
@@ -1421,6 +1477,22 @@ impl CodexSession {
         if !servers.is_empty() {
             cfg.insert("mcp_servers".into(), Value::Object(servers));
         }
+        // The thread's other directories are writable as its working directory is (relative ones
+        // are in it), after any the options give.
+        let add_dirs = &ctx.launch().add_dirs;
+        if !add_dirs.is_empty() {
+            let key = "sandbox_workspace_write.writable_roots";
+            let mut roots = cfg.get(key).and_then(Value::as_array).cloned().unwrap_or_default();
+            let cwd = t.cwd.as_deref().map(Path::new);
+            for d in add_dirs {
+                let d = match cwd {
+                    Some(cwd) if d.is_relative() => cwd.join(d),
+                    _ => d.clone(),
+                };
+                roots.push(json!(d.to_string_lossy()));
+            }
+            cfg.insert(key.into(), Value::Array(roots));
+        }
         if !r.hidden_skills.is_empty() {
             let skills: Vec<Value> = r
                 .hidden_skills
@@ -1442,11 +1514,7 @@ impl CodexSession {
         } else {
             Vec::new()
         };
-        r.launched = Some(Launched {
-            model: t.model.clone(),
-            effort: t.effort.clone(),
-            permission_mode: t.permission_mode,
-        });
+        r.launched = Some(Launched::of(ctx));
         if !dynamic.is_empty() {
             let tools: Vec<Value> = dynamic
                 .into_iter()
@@ -1476,7 +1544,7 @@ impl CodexSession {
         // Requests still waiting fail, after this.
         for p in std::mem::take(&mut run.pending) {
             let (run_id, message) = (id.to_string(), message.clone());
-            ctx.post::<CodexSession>(move |s, ctx| (p.then)(s, ctx, &run_id, Err(RpcError { message })));
+            ctx.post::<CodexSession>(move |s, ctx| (p.then)(s, ctx, &run_id, Err(RpcError { message, error: None })));
         }
         if let Some(mcp) = run.mcp.take() {
             mcp.close();
@@ -1538,7 +1606,8 @@ impl CodexSession {
                 if end.is_some() {
                     run.offset = end;
                 }
-                self.line(ctx, id, &line);
+                let m = serde_json::from_str::<Value>(&line).ok();
+                ctx.from_harness(id, &line, m, |ctx, m| self.line(ctx, id, m));
             }
             ProcessEvent::Stderr(line) => {
                 if let Some(run) = self.run(id) {
@@ -1559,13 +1628,13 @@ impl CodexSession {
         }
     }
 
-    fn line(&mut self, ctx: &mut ThreadContext, id: &str, line: &str) {
-        let Ok(m) = serde_json::from_str::<Value>(line) else {
+    /// A line of Codex's output, parsed (none if it isn't JSON).
+    fn line(&mut self, ctx: &mut ThreadContext, id: &str, m: Option<&Value>) {
+        // Not a message: the app server writes only JSON-RPC to stdout, but be safe.
+        let Some(m) = m.filter(|m| m.is_object()) else {
             return;
         };
-        if !m.is_object() {
-            return;
-        }
+        let m = m.clone();
         if self.take_response(ctx, id, &m) {
             return;
         }
@@ -1686,6 +1755,11 @@ impl CodexSession {
                         &p["turn"],
                         parent.as_deref().unwrap(),
                     );
+                }
+            }
+            "account/rateLimits/updated" => {
+                if p["rateLimits"].is_object() {
+                    ctx.rate_limits(codex_rate_limits(&p["rateLimits"]));
                 }
             }
             "thread/tokenUsage/updated" => {
@@ -3025,6 +3099,7 @@ impl HarnessSession for CodexSession {
                 method: p.method.clone(),
                 meta: p.meta.clone(),
                 then,
+                raw: false,
             });
         }
         let (proc, rx) = match ctx.spawner().attach(record) {
@@ -3056,9 +3131,9 @@ impl HarnessSession for CodexSession {
                 ),
             }
         }
-        // The options it doesn't have go with its next turn; one whose options aren't known is
-        // replaced.
-        self.stale = st.stale || st.launched.is_none();
+        // The options it doesn't have go with its next turn; one whose options aren't known, or that
+        // was started with other launch options than the thread's now, is replaced.
+        self.stale = st.stale || st.launched.as_ref().is_none_or(|l| l.launch != *ctx.launch());
         // Codex's requests that were open: the user's questions are taken up again, an app tool
         // that was running is answered (not run again), and the rest are dealt with again.
         // One answered before the restart, though that wasn't saved, is closed: Codex has its
@@ -3103,7 +3178,52 @@ impl HarnessSession for CodexSession {
         if let Some(mcp) = run.mcp.take() {
             mcp.close();
         }
+        for slot in self.controls.drain(..) {
+            if let Some(reply) = slot.lock().unwrap().take() {
+                reply(Err(Error::Control {
+                    message: "The backend closed before Codex answered.".into(),
+                    error: None,
+                }));
+            }
+        }
         true
+    }
+
+    fn control(&mut self, ctx: &mut ThreadContext, request: Value, reply: ControlReply) {
+        let live = self
+            .live_id()
+            .filter(|id| self.runs.get(id).is_some_and(|r| r.proc.is_some() && !r.detached));
+        let Some(id) = live else {
+            return reply(Err(Error::Command(format!(
+                "thread {} has no running Codex process",
+                ctx.thread_id()
+            ))));
+        };
+        let Some(method) = request["method"].as_str().map(String::from) else {
+            return reply(Err(Error::Command(
+                "a Codex control request is an object with a method (and params)".into(),
+            )));
+        };
+        let params = request.get("params").cloned().unwrap_or(Value::Null);
+        let slot = Arc::new(StdMutex::new(Some(reply)));
+        self.controls.retain(|s| s.lock().unwrap().is_some());
+        self.controls.push(slot.clone());
+        self.send_request(
+            ctx,
+            &id,
+            &method,
+            params,
+            None,
+            Box::new(move |_, _, _, r| {
+                if let Some(reply) = slot.lock().unwrap().take() {
+                    reply(r.map_err(|e| Error::Control {
+                        message: e.message,
+                        error: e.error,
+                    }));
+                }
+            }),
+            true,
+        );
     }
 
     fn as_any_mut(&mut self) -> &mut dyn Any {

@@ -68,6 +68,11 @@ func runBackend() {
 	if env("POLICY") == "ask" {
 		policy = agentthreads.Ask
 	}
+	// SPAWNER=direct runs the harnesses as its own children instead of under the shim.
+	var spawner agentthreads.Spawner = agentthreads.Shim(env("SHIM"), agentthreads.ShimOptions{RunsDir: env("RUNS"), Poll: 50 * time.Millisecond})
+	if env("SPAWNER") == "direct" {
+		spawner = agentthreads.Direct()
+	}
 	var mu sync.Mutex
 	out := func(msg any) {
 		mu.Lock()
@@ -81,7 +86,7 @@ func runBackend() {
 			"codex":  agentthreads.Codex(agentthreads.CodexOptions{Bin: or("CODEX_BIN", env("FAKE_CLI")), Env: fake, Home: env("CODEX_HOME_DIR"), NoLogin: true, StopGrace: ms("STOP_GRACE_MS"), CloseGrace: ms("CLOSE_GRACE_MS")}),
 		},
 		Capabilities: agentthreads.Capabilities{Permissions: policy},
-		Spawner:      agentthreads.Shim(env("SHIM"), agentthreads.ShimOptions{RunsDir: env("RUNS"), Poll: 50 * time.Millisecond}),
+		Spawner:      spawner,
 		OnError:      func(err error) { fmt.Fprintf(os.Stderr, "backend error: %v\n", err) },
 	})
 	sdk.Subscribe(func(e protocol.ThreadEvent) { out(map[string]any{"event": e}) })
@@ -402,10 +407,10 @@ func TestRestart(t *testing.T) {
 				b := s.start()
 				expectRecovered(t, b, id)
 				snap := snapshotOf(t, b, id)
-				if snap.Thread.Status != protocol.ThreadStatusWaiting || snap.Thread.Run == nil || snap.Thread.Run.ReattachedAt == "" || len(snap.Requests) != 1 {
+				if snap.Thread.Status != protocol.ThreadStatusWaiting || snap.Thread.Run == nil || snap.Thread.Run.ReattachedAt == "" || len(protocol.OpenRequests(snap)) != 1 {
 					t.Fatalf("got %s", mustMarshal(snap))
 				}
-				b.call("handle", map[string]any{"type": "respond", "thread_id": id, "request_id": snap.Requests[0].ID(), "resolution": map[string]any{"outcome": "allow"}})
+				b.call("handle", map[string]any{"type": "respond", "thread_id": id, "request_id": protocol.OpenRequests(snap)[0].ID(), "resolution": map[string]any{"outcome": "allow"}})
 				b.waitFor(`{"type":"thread.updated","thread":{"status":"idle"}}`)
 				b.call("stop")
 				<-b.exited
@@ -493,7 +498,7 @@ func TestRestart(t *testing.T) {
 				b := s.start()
 				expectRecovered(t, b, id)
 				snap := snapshotOf(t, b, id)
-				b.call("handle", map[string]any{"type": "respond", "thread_id": id, "request_id": snap.Requests[0].ID(), "resolution": map[string]any{"outcome": "allow"}})
+				b.call("handle", map[string]any{"type": "respond", "thread_id": id, "request_id": protocol.OpenRequests(snap)[0].ID(), "resolution": map[string]any{"outcome": "allow"}})
 				b.waitFor(`{"type":"thread.updated","thread":{"status":"idle"}}`)
 				b.call("stop")
 				<-b.exited
@@ -656,7 +661,7 @@ func TestRestartDoesntAskAgainWhatWasAnswered(t *testing.T) {
 			// The tool's still running: nothing's asked of the user, and the turn runs on.
 			time.Sleep(500 * time.Millisecond)
 			snap := snapshotOf(t, b, id)
-			if len(snap.Requests) != 0 || snap.Thread.Status != protocol.ThreadStatusRunning {
+			if len(protocol.OpenRequests(snap)) != 0 || snap.Thread.Status != protocol.ThreadStatusRunning {
 				t.Fatalf("got %s", mustMarshal(snap))
 			}
 			resolved, notice := -1, -1

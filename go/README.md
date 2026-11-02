@@ -9,9 +9,8 @@ says. [examples/chat-go](../examples/chat-go) is a WebSocket server that chat-no
 talks to.
 
 It needs Go 1.26+, and no cgo. Nothing is published yet: `go get
-github.com/dire-kiwi/agent-threads/go@main` takes a commit as a pseudo-version (with `GOPRIVATE`
-set, the repository being private), or use a checkout with a `replace` directive
-([how](../README.md#go-module)).
+github.com/dire-kiwi/agent-threads/go@main` takes a commit as a pseudo-version, or use a checkout
+with a `replace` directive ([how](../README.md#go-module)).
 
 ```go
 import (
@@ -50,6 +49,8 @@ thread, _ := sdk.Create(ctx, agentthreads.CreateOptions{Model: "sonnet", Cwd: "/
 stop := sdk.Subscribe(func(e protocol.ThreadEvent) { broadcast(e) }) // every thread's events, deltas included
 err := sdk.HandleJSON(ctx, frame)         // send / interrupt / respond / set_options, from a client
 snap, _ := sdk.Snapshot(ctx, thread.ID)   // for a client that just connected
+win, _ := sdk.SnapshotWindow(ctx, thread.ID, 100) // or a window of its last 100 items
+page, _ := sdk.ItemsBefore(ctx, thread.ID, start, 100) // the 100 before a window's start, as it scrolls back
 events, _ := sdk.EventsSince(ctx, thread.ID, seq, 0) // for one catching up
 sdk.Close(ctx) // on shutdown: stops the harness processes (or with the shim, leaves them going) and saves everything
 ```
@@ -67,7 +68,10 @@ sdk.Close(ctx) // on shutdown: stops the harness processes (or with the shim, le
 - `Subscribe(func(protocol.ThreadEvent))` calls the function with every thread's events, in order,
   one at a time, on a goroutine of the SDK's own (so it may call the SDK); `Events(ctx)` is the same
   as a channel. `Snapshot` is the thread's state now, text streamed so far included, and
-  `EventsSince` its saved events after a `seq`, once what's been sent is saved.
+  `EventsSince` its saved events after a `seq`, once what's been sent is saved. `SnapshotWindow` is
+  a window of the snapshot (its last items, and what they need from before them), and
+  `ItemsBefore` a page of the items before one, for a client that loads a long thread a page at a
+  time ([spec/PROTOCOL.md](../spec/PROTOCOL.md), "Windows").
 - `Get`, `List` and `Delete` look threads up and remove them. `Close` stops the harness processes
   (or with the shim leaves them going) and saves everything; `Stop` stops shim runs too.
 - `Recover(ctx)`, with the shim spawner, re-attaches to runs that outlived the last process
@@ -83,7 +87,8 @@ sdk.Close(ctx) // on shutdown: stops the harness processes (or with the shim, le
   the user, return `Ask`. An answer given `always` stands for that tool for the rest of the thread.
 
 The types of the spec are in [protocol](protocol), generated from `spec/schema` (`make gen`), with
-`ApplyEvent` (the reducer the snapshots are made with) and `Validate`. Their `Extra` keeps the
+`ApplyEvent` (the reducer the snapshots are made with), `OpenRequests`, the windows and pages
+(`SnapshotWindow`, `ItemsBefore`, `WithPage`, `RequestAnchor`) and `Validate`. Their `Extra` keeps the
 fields the spec doesn't name, so a value written again (by a store, say) is the value given.
 
 ## How it runs
@@ -102,6 +107,27 @@ isolated config) and Codex (approvals, `requestUserInput`, dynamic tools with th
 fallback, child-thread subagents, `skills/list` and `skills/extraRoots/set`, an app-specific
 `CODEX_HOME`) holds here too, with the options named the Go way (`ClaudeOptions.StopGrace`,
 `CodexOptions.AppToolsOverMCP`...).
+
+## What the protocol leaves out
+
+See [Pass-through](../spec/PROTOCOL.md#pass-through) in the protocol:
+
+```go
+sdk := agentthreads.New(agentthreads.Options{
+	Raw: true, // events, items and requests carry the harness message they came from
+	OnHarnessMessage: func(m agentthreads.HarnessMessage) {
+		// every line a harness writes (m.Line, and m.Message if it's JSON), e.g. Claude's system
+		// messages or Codex's token usage; on the thread's goroutine, so keep it quick
+	},
+})
+usage, err := sdk.Control(ctx, threadID, json.RawMessage(`{"subtype":"get_context_usage"}`))  // Claude Code
+limits, err := sdk.Control(ctx, threadID, json.RawMessage(`{"method":"account/rateLimits/read"}`)) // Codex
+```
+
+`Control` needs the thread's process to be running (it is from the first `Send` until the SDK
+closes): it returns a `*CommandError` when it isn't, and a `*ControlError` when the harness refuses
+the request or exits first. Usage limits are in each thread's `RateLimits`, and Claude's API retries
+and hooks are `notice` items (codes `retry` and `hook`).
 
 ## Stores
 

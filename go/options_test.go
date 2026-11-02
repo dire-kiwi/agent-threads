@@ -24,9 +24,9 @@ import (
 
 var miniDir = filepath.Join(specDir, "..", "ts", "packages", "node", "src", "test")
 
-// mini is an AgentThreads with Claude Code played by mini-claude.mjs and Codex by mini-codex.mjs,
+// optEnv is an AgentThreads with Claude Code played by mini-claude.mjs and Codex by mini-codex.mjs,
 // each logging what its runs were started with and sent.
-type mini struct {
+type optEnv struct {
 	t      *testing.T
 	sdk    *agentthreads.AgentThreads
 	events recorder
@@ -34,16 +34,16 @@ type mini struct {
 	cwd    string
 }
 
-// miniRun is a run's argv and the messages it was sent.
-type miniRun struct {
+// optRun is a run's argv and the messages it was sent.
+type optRun struct {
 	argv []string
 	sent []map[string]any
 }
 
-func newMini(t *testing.T, policy agentthreads.PermissionPolicy, env map[string]string) *mini {
+func newMini(t *testing.T, policy agentthreads.PermissionPolicy, env map[string]string) *optEnv {
 	t.Helper()
 	needNode(t)
-	m := &mini{t: t, log: filepath.Join(t.TempDir(), "log.jsonl"), cwd: t.TempDir()}
+	m := &optEnv{t: t, log: filepath.Join(t.TempDir(), "log.jsonl"), cwd: t.TempDir()}
 	all := map[string]string{"MINI_CLAUDE_LOG": m.log, "MINI_CODEX_LOG": m.log, "HOME": t.TempDir()}
 	for k, v := range env {
 		all[k] = v
@@ -61,7 +61,7 @@ func newMini(t *testing.T, policy agentthreads.PermissionPolicy, env map[string]
 	return m
 }
 
-func (m *mini) create(o agentthreads.CreateOptions) string {
+func (m *optEnv) create(o agentthreads.CreateOptions) string {
 	m.t.Helper()
 	if o.Cwd == "" {
 		o.Cwd = m.cwd
@@ -73,7 +73,7 @@ func (m *mini) create(o agentthreads.CreateOptions) string {
 	return th.ID
 }
 
-func (m *mini) send(id, text string, o ...agentthreads.SendOptions) {
+func (m *optEnv) send(id, text string, o ...agentthreads.SendOptions) {
 	m.t.Helper()
 	var so agentthreads.SendOptions
 	if len(o) > 0 {
@@ -84,21 +84,21 @@ func (m *mini) send(id, text string, o ...agentthreads.SendOptions) {
 	}
 }
 
-func (m *mini) respond(id, requestID string, res protocol.Resolution) {
+func (m *optEnv) respond(id, requestID string, res protocol.Resolution) {
 	m.t.Helper()
 	if err := m.sdk.Respond(context.Background(), id, requestID, res); err != nil {
 		m.t.Fatal(err)
 	}
 }
 
-func (m *mini) setOptions(id string, o agentthreads.ThreadOptions) {
+func (m *optEnv) setOptions(id string, o agentthreads.ThreadOptions) {
 	m.t.Helper()
 	if err := m.sdk.SetOptions(context.Background(), id, o); err != nil {
 		m.t.Fatal(err)
 	}
 }
 
-func (m *mini) snapshot(id string) protocol.Snapshot {
+func (m *optEnv) snapshot(id string) protocol.Snapshot {
 	m.t.Helper()
 	s, err := m.sdk.Snapshot(context.Background(), id)
 	if err != nil {
@@ -108,7 +108,7 @@ func (m *mini) snapshot(id string) protocol.Snapshot {
 }
 
 // settle waits until the thread is idle (or failed), and is its snapshot.
-func (m *mini) settle(id string) protocol.Snapshot {
+func (m *optEnv) settle(id string) protocol.Snapshot {
 	m.t.Helper()
 	var s protocol.Snapshot
 	until(m.t, func() bool {
@@ -119,7 +119,7 @@ func (m *mini) settle(id string) protocol.Snapshot {
 }
 
 // request waits for an open request other than those not, and is it.
-func (m *mini) request(id string, not ...string) protocol.ThreadRequest {
+func (m *optEnv) request(id string, not ...string) protocol.ThreadRequest {
 	m.t.Helper()
 	var r protocol.ThreadRequest
 	until(m.t, func() bool {
@@ -135,16 +135,16 @@ func (m *mini) request(id string, not ...string) protocol.ThreadRequest {
 }
 
 // runs is what each run was started with and sent.
-func (m *mini) runs() []miniRun {
+func (m *optEnv) runs() []optRun {
 	data, _ := os.ReadFile(m.log)
-	var out []miniRun
+	var out []optRun
 	for _, line := range strings.Split(string(data), "\n") {
 		var v map[string]any
 		if json.Unmarshal([]byte(line), &v) != nil {
 			continue
 		}
 		if argv, ok := v["argv"].([]any); ok {
-			r := miniRun{argv: []string{}}
+			r := optRun{argv: []string{}}
 			for _, a := range argv {
 				r.argv = append(r.argv, a.(string))
 			}
@@ -157,7 +157,7 @@ func (m *mini) runs() []miniRun {
 }
 
 // controls is the control requests a Claude run was sent.
-func (r miniRun) controls() []any {
+func (r optRun) controls() []any {
 	var out []any
 	for _, m := range r.sent {
 		if m["type"] == "control_request" {
@@ -168,7 +168,7 @@ func (r miniRun) controls() []any {
 }
 
 // answers is the responses a Claude run was sent to its control requests.
-func (r miniRun) answers() []any {
+func (r optRun) answers() []any {
 	var out []any
 	for _, m := range r.sent {
 		if m["type"] == "control_response" {
@@ -179,7 +179,7 @@ func (r miniRun) answers() []any {
 }
 
 // params is the params of each request a Codex run was sent with the method.
-func (r miniRun) params(method string) []map[string]any {
+func (r optRun) params(method string) []map[string]any {
 	var out []map[string]any
 	for _, m := range r.sent {
 		if m["method"] == method {
@@ -190,7 +190,7 @@ func (r miniRun) params(method string) []map[string]any {
 	return out
 }
 
-func texts(items []protocol.Item) []string {
+func itemTexts(items []protocol.Item) []string {
 	out := []string{}
 	for _, it := range items {
 		if a, ok := it.Value.(*protocol.AssistantMessage); ok {
@@ -271,7 +271,7 @@ func TestClaudeGivesARunningProcessANewModelAndPermissionMode(t *testing.T) {
 	m.setOptions(id, agentthreads.ThreadOptions{Model: ptr("b"), PermissionMode: ptr(protocol.PermissionModeAcceptEdits)})
 	m.send(id, "reply two")
 	s := m.settle(id)
-	if got := texts(s.Items); !reflect.DeepEqual(got, []string{"one", "two"}) {
+	if got := itemTexts(s.Items); !reflect.DeepEqual(got, []string{"one", "two"}) {
 		t.Fatalf("texts %v", got)
 	}
 	runs := m.runs()
@@ -301,7 +301,7 @@ func TestClaudeStartsANewProcessForANewEffort(t *testing.T) {
 		s = m.snapshot(id)
 		return len(results(s.Items)) == 2 && s.Thread.Status == protocol.ThreadStatusIdle
 	})
-	if got := texts(s.Items); !reflect.DeepEqual(got, []string{"steered"}) {
+	if got := itemTexts(s.Items); !reflect.DeepEqual(got, []string{"steered"}) {
 		t.Fatalf("texts %v", got)
 	}
 	runs := m.runs()
@@ -508,7 +508,7 @@ func TestCodexStartsANewProcessWhenTheConfigChanges(t *testing.T) {
 
 func TestCodexInPlanMode(t *testing.T) {
 	plan := ptr(protocol.PermissionModePlan)
-	cancelled := func(m *mini, requestID string) bool {
+	cancelled := func(m *optEnv, requestID string) bool {
 		for _, e := range m.events.all() {
 			if r, ok := e.Value.(*protocol.RequestResolvedEvent); ok && r.RequestID == requestID && r.Resolution.Outcome == protocol.ResolutionOutcomeCancel {
 				return true
@@ -550,7 +550,7 @@ func TestCodexInPlanMode(t *testing.T) {
 		if len(rs) != 1 || !has(rs[0], `{"ok":true,"duration_ms":14,"usage":{"input_tokens":120,"cache_read_tokens":80,"output_tokens":20}}`) {
 			t.Fatalf("results %s", mustMarshal(rs))
 		}
-		if got := texts(s.Items); !reflect.DeepEqual(got, []string{"Change apple to apricot."}) {
+		if got := itemTexts(s.Items); !reflect.DeepEqual(got, []string{"Change apple to apricot."}) {
 			t.Fatalf("texts %v", got)
 		}
 		// Codex stays in its default mode, which isn't sent again.
@@ -621,7 +621,7 @@ func TestCodexInPlanMode(t *testing.T) {
 		if more == nil || !more.Steered {
 			t.Fatalf("message %s", mustMarshal(more))
 		}
-		if got := texts(s.Items); !reflect.DeepEqual(got, []string{"One.", "And two."}) {
+		if got := itemTexts(s.Items); !reflect.DeepEqual(got, []string{"One.", "And two."}) {
 			t.Fatalf("texts %v", got)
 		}
 		if len(results(s.Items)) != 1 {
@@ -645,7 +645,7 @@ func TestCodexInPlanMode(t *testing.T) {
 		if rs := results(s.Items); len(rs) != 1 || rs[0].OK || !rs[0].Interrupted {
 			t.Fatalf("results %s", mustMarshal(rs))
 		}
-		if len(s.Requests) != 0 {
+		if len(s.Requests) != 1 || !has(s.Requests[0], `{"resolution":{"outcome":"cancel"}}`) {
 			t.Fatalf("the plan wasn't cancelled: %s", mustMarshal(s.Requests))
 		}
 		until(t, func() bool { return cancelled(m, r.ID()) })

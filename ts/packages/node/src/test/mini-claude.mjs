@@ -16,9 +16,21 @@
 //   sleepcrash <ms>       waits, then crashes
 //   streamcrash <text>    streams <text> (deltas, no final message), then crashes
 //   streamhang <text>     streams <text>, then waits for its input to close
+//   background <ms> <text>
+//                         starts a background subagent and ends the turn; the subagent calls Bash
+//                         (asking can_use_tool before the turn ends), runs it for <ms>, and
+//                         reports <text>; then, as Claude does, a turn of its own says so (its
+//                         result has origin.kind task-notification). With
+//                         MINI_CLAUDE_BACKGROUND_APP=<name>, the subagent calls that app tool
+//                         instead, which is answered before the turn ends, and its tool_result
+//                         comes <ms> after. With MINI_CLAUDE_NOTIFY_FIRST=1, messages that come
+//                         while a background subagent runs wait for the turn that reports it
 //
-// MINI_CLAUDE_LOG names a file each run appends its argv, every line it's sent and each result
-// it sends ({"result": ...}) to. With
+// It answers every control request with success and an empty response, but a `never_answered` one.
+//
+// MINI_CLAUDE_LOG names a file each run appends its argv (with CLAUDE_CONFIG_DIR, and the
+// variables MINI_LOG_ENV names, comma-separated), every line it's sent and each result it sends
+// ({"result": ...}) to. With
 // MINI_CLAUDE_STEER=late, messages sent during a turn are taken in after its result (as the next
 // turn); with MINI_CLAUDE_STEER=never, they never are (and the process has to be restarted); with
 // MINI_CLAUDE_STEER=hold, they're never taken in either, and an interrupt while no turn runs gets
@@ -37,7 +49,8 @@ import { createInterface } from "node:readline";
 const log = process.env.MINI_CLAUDE_LOG;
 const steer = process.env.MINI_CLAUDE_STEER ?? "now";
 const note = (v) => log && appendFileSync(log, JSON.stringify(v) + "\n");
-note({ argv: process.argv.slice(2) });
+const loggedEnv = Object.fromEntries((process.env.MINI_LOG_ENV ?? "").split(",").filter(Boolean).map((k) => [k, process.env[k] ?? null]));
+note({ argv: process.argv.slice(2), configDir: process.env.CLAUDE_CONFIG_DIR, env: loggedEnv });
 
 const out = (m) => process.stdout.write(JSON.stringify(m) + "\n");
 const args = process.argv.slice(2);
@@ -54,6 +67,7 @@ let stubborn = false;
 let initialized = false;
 let idleErrors = Number(process.env.MINI_CLAUDE_IDLE_ERRORS ?? 0);
 let wasInterrupted = false;
+let backgrounds = 0; // background subagents still running
 
 const ask = (request) =>
   new Promise((resolve) => {
@@ -68,6 +82,7 @@ createInterface({ input: process.stdin })
     const m = JSON.parse(line);
     note(m);
     if (m.type === "control_request") {
+      if (m.request.subtype === "never_answered") return;
       if (m.request.subtype === "initialize") initialized = true;
       // As Claude Code, which can be switched to bypass mode only if it was started in it.
       if (m.request.subtype === "set_permission_mode" && m.request.mode === "bypassPermissions" && !process.argv.includes("bypassPermissions")) {
@@ -190,6 +205,52 @@ async function step(text) {
     await new Promise((r) => setTimeout(r, Number(process.env.MINI_CLAUDE_RESULT_DELAY ?? 0)));
     out({ type: "user", message: { role: "user", content: [{ type: "tool_result", tool_use_id: id, content: res.content, is_error: !!res.isError }] }, parent_tool_use_id: null, session_id: session });
     say(`app said ${res.content[0].text}`);
+  } else if (cmd === "background") {
+    const [ms, ...words] = rest;
+    const agent = `toolu_${++ids}`;
+    const task = `task_${agent}`;
+    out({ type: "assistant", message: { id: `msg_${process.pid}_${++msgs}`, model: "mini", content: [{ type: "tool_use", id: agent, name: "Agent", input: { description: "bg", prompt: "p", subagent_type: "general-purpose", run_in_background: true } }] }, parent_tool_use_id: null, session_id: session });
+    out({ type: "system", subtype: "task_started", task_id: task, tool_use_id: agent, description: "bg", subagent_type: "general-purpose", is_backgrounded: true, task_type: "local_agent", session_id: session });
+    out({ type: "user", message: { role: "user", content: [{ type: "tool_result", tool_use_id: agent, content: [{ type: "text", text: "Async agent launched successfully." }] }] }, parent_tool_use_id: null, session_id: session, tool_use_result: { isAsync: true, status: "async_launched", resolvedModel: "mini-1" } });
+    const call = `toolu_${++ids}`;
+    const app = process.env.MINI_CLAUDE_BACKGROUND_APP;
+    let finish;
+    if (app) {
+      out({ type: "assistant", message: { id: `msg_${process.pid}_${++msgs}`, model: "mini", content: [{ type: "tool_use", id: call, name: `mcp__app__${app}`, input: {} }] }, parent_tool_use_id: agent, session_id: session });
+      // Answered before the turn ends; its result comes after.
+      const r = await ask({ subtype: "mcp_message", server_name: "app", message: { jsonrpc: "2.0", id: 8, method: "tools/call", params: { name: app, arguments: {}, _meta: { "claudecode/toolUseId": call } } } });
+      const res = r.response.mcp_response.result;
+      finish = async () => {
+        await sleep(Number(ms));
+        return { content: res.content, is_error: !!res.isError };
+      };
+    } else {
+      out({ type: "assistant", message: { id: `msg_${process.pid}_${++msgs}`, model: "mini", content: [{ type: "tool_use", id: call, name: "Bash", input: { command: "true" } }] }, parent_tool_use_id: agent, session_id: session });
+      // Asked now, so it's open when the turn ends.
+      const answer = ask({ subtype: "can_use_tool", tool_name: "Bash", input: { command: "true" }, tool_use_id: call });
+      finish = async () => {
+        const r = await answer;
+        const allowed = r.response.behavior === "allow";
+        if (allowed) await sleep(Number(ms));
+        return { content: allowed ? "done" : r.response.message, is_error: !allowed };
+      };
+    }
+    backgrounds++;
+    void (async () => {
+      const { content, is_error } = await finish();
+      out({ type: "user", message: { role: "user", content: [{ type: "tool_result", tool_use_id: call, content, is_error }] }, parent_tool_use_id: agent, session_id: session });
+      out({ type: "system", subtype: "task_progress", task_id: task, tool_use_id: agent, description: "Running true", usage: { tool_uses: 1 }, session_id: session });
+      out({ type: "system", subtype: "task_updated", task_id: task, patch: { status: "completed" }, session_id: session });
+      out({ type: "system", subtype: "task_notification", task_id: task, tool_use_id: agent, status: "completed", summary: words.join(" "), usage: { tool_uses: 1 }, session_id: session });
+      backgrounds--;
+      if (busy) return void wake?.();
+      busy = true;
+      out({ type: "system", subtype: "init", session_id: session });
+      say(`the subagent said ${words.join(" ")}`);
+      result({ origin: { kind: "task-notification" } });
+      busy = false;
+      wake?.();
+    })();
   } else if (cmd === "slow" || cmd === "stubborn") {
     stubborn = cmd === "stubborn";
     // Running with nothing else to do once its stdin's closed.
@@ -214,7 +275,7 @@ async function step(text) {
 }
 
 for (;;) {
-  if (!inbox.length || busy) {
+  if (!inbox.length || busy || (process.env.MINI_CLAUDE_NOTIFY_FIRST && backgrounds > 0)) {
     await new Promise((r) => (wake = r));
     wake = null;
     continue;

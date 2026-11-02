@@ -136,6 +136,16 @@ impl Backend {
     }
 }
 
+/// A snapshot's open requests (those without a resolution), as JSON.
+fn open_requests(snap: &Value) -> Vec<&Value> {
+    snap["requests"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|r| r.get("resolution").is_none())
+        .collect()
+}
+
 fn matches(v: &Value, p: &Value) -> bool {
     match p {
         Value::Object(p) => v.is_object() && p.iter().all(|(k, x)| matches(v.get(k).unwrap_or(&Value::Null), x)),
@@ -349,8 +359,10 @@ async fn while_waiting(h: &str, shut_down: bool) {
     let snap = b.call("snapshot", json!(id)).await;
     assert_eq!(snap["thread"]["status"], "waiting");
     assert!(snap["thread"]["run"]["reattached_at"].is_string());
-    assert_eq!(snap["requests"].as_array().unwrap().len(), 1);
-    let respond = json!({"type": "respond", "thread_id": id, "request_id": snap["requests"][0]["id"], "resolution": {"outcome": "allow"}});
+    let open = open_requests(&snap);
+    assert_eq!(open.len(), 1);
+    let respond =
+        json!({"type": "respond", "thread_id": id, "request_id": open[0]["id"], "resolution": {"outcome": "allow"}});
     b.call("handle", respond).await;
     b.wait_for(&json!({"type": "thread.updated", "thread": {"status": "idle"}}))
         .await;
@@ -533,9 +545,9 @@ async fn app_tool_not_run_again(h: &str, died: bool) {
         json!({"type": "send", "thread_id": id, "text": "app lookup {}"}),
     )
     .await;
-    // It has done what it does, and hasn't returned.
+    // It has done what it does, and hasn't returned. (The file is there before what's written to it.)
     let m = marker.clone();
-    until(move || m.exists()).await;
+    until(move || std::fs::read_to_string(&m).is_ok_and(|s| s.contains("ran\n"))).await;
     if died {
         a.crash().await;
     } else {
@@ -669,7 +681,12 @@ async fn backend() {
                 ..Default::default()
             }),
         ],
-        spawner: Some(shim(env("SHIM").unwrap(), shim_options)),
+        // SPAWNER=direct runs the harnesses as its own children instead of under the shim.
+        spawner: Some(if env("SPAWNER").as_deref() == Some("direct") {
+            agent_threads::direct()
+        } else {
+            shim(env("SHIM").unwrap(), shim_options)
+        }),
         capabilities: Capabilities {
             tools,
             permissions: Some(if env("POLICY").as_deref() == Some("ask") {
@@ -681,6 +698,7 @@ async fn backend() {
         },
         on_error: Some(Arc::new(|e| eprintln!("backend error: {e}"))),
         event_capacity: 1 << 16,
+        ..Default::default()
     });
     let out = Arc::new(Mutex::new(std::io::stdout()));
     let say = {
@@ -964,7 +982,7 @@ async fn doesnt_ask_again(harness: &str, opening_saved: bool, text: &str, answer
     // The tool's still running: nothing's asked of the user, and the turn runs on.
     tokio::time::sleep(Duration::from_millis(500)).await;
     let snap = b.call("snapshot", json!(id)).await;
-    assert_eq!(snap["requests"], json!([]));
+    assert_eq!(open_requests(&snap), Vec::<&Value>::new());
     assert_eq!(snap["thread"]["status"], "running");
     let events = b.events.lock().unwrap().clone();
     assert!(!events.iter().any(|e| e["type"] == "request.opened"));
@@ -1019,4 +1037,134 @@ async fn codex_doesnt_ask_again_what_the_user_answered_just_before_the_backend_d
         r#""decision":"accept""#,
     )
     .await;
+}
+
+fn of_type<'a>(snap: &'a Value, ty: &str) -> Vec<&'a Value> {
+    snap["items"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|i| i["type"] == ty)
+        .collect()
+}
+
+/// Waits until the thread's snapshot is as `ok` says, and returns it.
+async fn snapshot_until(b: &mut Backend, id: &str, ok: impl Fn(&Value) -> bool) -> Value {
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        let snap = b.call("snapshot", json!(id)).await;
+        if ok(&snap) {
+            return snap;
+        }
+        assert!(Instant::now() < deadline, "the thread is still {snap}");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
+/// A background subagent whose run was lost with the backend is stopped, and the turn that started
+/// it, which had ended, isn't ended again.
+async fn stops_a_lost_runs_background_subagent(waiting: bool) {
+    // The direct spawner's runs go with the backend: the next can't pick them up.
+    let mut extra = vec![("SPAWNER", "direct")];
+    if waiting {
+        extra.push(("POLICY", "ask"));
+    }
+    let s = mini_scene(&extra);
+    let mut a = s.start();
+    let thread = a.call("create", json!({"harness": "claude", "cwd": s.cwd})).await;
+    let id = thread["id"].as_str().unwrap().to_string();
+    a.call(
+        "handle",
+        json!({"type": "send", "thread_id": id, "text": "background 60000 apple"}),
+    )
+    .await;
+    let want = if waiting { "waiting" } else { "idle" };
+    snapshot_until(&mut a, &id, |s| {
+        of_type(s, "turn_result").len() == 1 && s["thread"]["status"] == want && of_type(s, "tool_call").len() == 2
+    })
+    .await;
+    a.call("saved", json!(id)).await;
+    a.crash().await;
+
+    let mut b = s.start();
+    let snap = b.call("snapshot", json!(id)).await;
+    b.call("close", json!({"stop": true})).await;
+    b.exited().await;
+    let calls = of_type(&snap, "tool_call");
+    assert_eq!(calls[0]["subagent"]["status"], "stopped", "{snap}");
+    assert_eq!(calls[1]["status"], "cancelled", "{snap}");
+    assert_eq!(snap["thread"]["status"], "idle");
+    assert!(snap["thread"].get("run").is_none());
+    // None is still open (the subagent's was cancelled with it).
+    assert!(open_requests(&snap).is_empty(), "{snap}");
+    assert_eq!(of_type(&snap, "turn_result").len(), 1);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn stops_a_running_background_subagent_whose_run_was_lost() {
+    let _one = serial().await;
+    stops_a_lost_runs_background_subagent(false).await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn stops_a_background_subagent_waiting_on_its_request_whose_run_was_lost() {
+    let _one = serial().await;
+    stops_a_lost_runs_background_subagent(true).await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn takes_up_a_background_subagents_request_after_a_restart_with_no_turn_running() {
+    let _one = serial().await;
+    let s = mini_scene(&[("POLICY", "ask")]);
+    let mut a = s.start();
+    let thread = a.call("create", json!({"harness": "claude", "cwd": s.cwd})).await;
+    let id = thread["id"].as_str().unwrap().to_string();
+    a.call(
+        "handle",
+        json!({"type": "send", "thread_id": id, "text": "background 200 apple"}),
+    )
+    .await;
+    snapshot_until(&mut a, &id, |s| {
+        of_type(s, "turn_result").len() == 1 && s["thread"]["status"] == "waiting"
+    })
+    .await;
+    a.call("saved", json!(id)).await;
+    a.call("close", json!({"stop": false})).await;
+    a.exited().await;
+
+    let mut b = s.start();
+    assert_eq!(
+        b.call("recover", json!(null)).await,
+        json!({"reattached": [id], "lost": []})
+    );
+    let snap = b.call("snapshot", json!(id)).await;
+    assert_eq!(snap["thread"]["status"], "waiting");
+    let open = open_requests(&snap);
+    assert_eq!(open.len(), 1, "{snap}");
+    let from = b.events.lock().unwrap().len();
+    let respond =
+        json!({"type": "respond", "thread_id": id, "request_id": open[0]["id"], "resolution": {"outcome": "allow"}});
+    b.call("handle", respond).await;
+    // Answered with no turn running, the thread is idle; then Claude's report is a turn of its own.
+    let events = b.events.clone();
+    until(move || {
+        events.lock().unwrap()[from..]
+            .iter()
+            .any(|e| e["type"] == "turn.completed")
+    })
+    .await;
+    let snap = b.call("snapshot", json!(id)).await;
+    b.call("close", json!({"stop": true})).await;
+    let after: Vec<Value> = b.events.lock().unwrap()[from..].to_vec();
+    b.exited().await;
+    let statuses: Vec<&Value> = after
+        .iter()
+        .filter(|e| e["type"] == "thread.updated")
+        .map(|e| &e["thread"]["status"])
+        .collect();
+    assert_eq!(statuses[0], "idle");
+    assert_eq!(after.iter().filter(|e| e["type"] == "turn.started").count(), 1);
+    let results = of_type(&snap, "turn_result");
+    assert_eq!(results.len(), 2);
+    assert_ne!(results[0]["turn_id"], results[1]["turn_id"]);
 }

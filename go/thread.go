@@ -74,6 +74,7 @@ type threadRuntime struct {
 	id      string
 	loop    *loop
 	config  ThreadConfig
+	launch  LaunchOptions // how its harness process is started: stored with the thread
 	policy  PermissionPolicy
 	session Session
 	turn    *turnState
@@ -122,15 +123,19 @@ type threadRuntime struct {
 	// run was left going instead.
 	sessionDone chan struct{}
 	detached    bool
+	// raw is the harness message being handled, which events made now have as their raw (with the
+	// Raw option).
+	raw json.RawMessage
 }
 
-func newRuntime(sdk *AgentThreads, state protocol.Snapshot, config ThreadConfig, policy PermissionPolicy) *threadRuntime {
+func newRuntime(sdk *AgentThreads, state protocol.Snapshot, config ThreadConfig, launch LaunchOptions, policy PermissionPolicy) *threadRuntime {
 	rt := &threadRuntime{
 		sdk:        sdk,
 		id:         state.Thread.ID,
 		state:      state,
 		saved:      state,
 		config:     config,
+		launch:     launch,
 		policy:     policy,
 		requests:   map[string]*openRequest{},
 		always:     map[string]Decision{},
@@ -155,6 +160,8 @@ func (rt *threadRuntime) ThreadID() string { return rt.id }
 func (rt *threadRuntime) Thread() protocol.Thread { return rt.state.Thread }
 
 func (rt *threadRuntime) Config() ThreadConfig { return rt.config }
+
+func (rt *threadRuntime) Launch() LaunchOptions { return rt.launch }
 
 func (rt *threadRuntime) Spawner() Spawner { return rt.sdk.spawner }
 
@@ -189,6 +196,17 @@ func (rt *threadRuntime) liveThread() protocol.Thread {
 
 func (rt *threadRuntime) emit(v protocol.ThreadEventValue) {
 	e := protocol.ThreadEvent{Value: v}
+	// An item or request has the harness message it came from, and its event doesn't as well.
+	if rt.raw != nil {
+		switch x := v.(type) {
+		case *protocol.ItemAddedEvent:
+			x.Item.SetRaw(rt.raw)
+		case *protocol.RequestOpenedEvent:
+			x.Request.SetRaw(rt.raw)
+		default:
+			e.SetRaw(rt.raw)
+		}
+	}
 	saved := e.Saved()
 	seq := rt.state.Seq
 	if saved {
@@ -219,7 +237,7 @@ func (rt *threadRuntime) take() {
 	b.runs = rt.runs()
 	if rt.threadChanged {
 		rt.threadChanged = false
-		t := clone(rt.saved.Thread)
+		t := withLaunch(clone(rt.saved.Thread), rt.launch)
 		b.thread = &t
 	}
 	if rt.snapshotDue {
@@ -694,6 +712,65 @@ func (rt *threadRuntime) SetThread(change func(*protocol.Thread)) {
 	rt.emit(&protocol.ThreadUpdatedEvent{Thread: next})
 }
 
+func (rt *threadRuntime) RateLimits(limits []protocol.RateLimit) {
+	if len(limits) == 0 {
+		return
+	}
+	rt.SetThread(func(t *protocol.Thread) {
+		all := map[string]protocol.RateLimit{}
+		for _, l := range t.RateLimits {
+			all[l.ID] = l
+		}
+		for _, l := range limits {
+			all[l.ID] = l
+		}
+		out := make([]protocol.RateLimit, 0, len(all))
+		for _, id := range sortedKeys(all) {
+			out = append(out, all[id])
+		}
+		t.RateLimits = out
+	})
+}
+
+func (rt *threadRuntime) FromHarness(runID, line string, handle func()) {
+	var message json.RawMessage
+	if json.Valid([]byte(line)) {
+		message = json.RawMessage(line)
+	}
+	before := rt.raw
+	if rt.sdk.options.Raw && message != nil {
+		rt.raw = message
+	}
+	func() {
+		defer func() { rt.raw = before }()
+		handle()
+	}()
+	if fn := rt.sdk.options.OnHarnessMessage; fn != nil {
+		m := HarnessMessage{ThreadID: rt.id, RunID: runID, Harness: rt.state.Thread.Harness, Line: line, Message: message}
+		func() {
+			defer func() {
+				if r := recover(); r != nil {
+					rt.sdk.reportError(fmt.Errorf("agentthreads: OnHarnessMessage panicked: %v", r))
+				}
+			}()
+			fn(m)
+		}()
+	}
+}
+
+// setLaunch changes how the harness process is started, from the next one; it's saved with the
+// thread.
+func (rt *threadRuntime) setLaunch(launch LaunchOptions) {
+	if sameJSONValue(launch, rt.launch) {
+		return
+	}
+	rt.launch = clone(launch)
+	rt.threadChanged = true
+	rt.flushQueued = true
+	// Its process is started with them: the next turn needs another.
+	rt.session.ConfigChanged()
+}
+
 func sameJSONValue(a, b any) bool {
 	x, err1 := json.Marshal(a)
 	y, err2 := json.Marshal(b)
@@ -798,23 +875,29 @@ func (rt *threadRuntime) endTurn(end TurnEnd, carry bool) {
 	if turn == nil {
 		return
 	}
+	// What a background subagent that's still running does carries on after the turn: its text
+	// still streaming, its calls (and their structured output, still to go with their results)
+	// and its requests.
+	ending := func(id string) bool { return !inBackground(rt.Item, id) }
 	// Text streamed but never finished (its process went first) is kept as it was shown.
-	for _, it := range rt.state.Items {
-		text, ok := it.Text()
-		if !ok {
-			continue
-		}
-		if saved, ok := rt.Item(it.ID()); ok {
-			if st, _ := saved.Text(); st != text {
-				rt.UpdateItem(it.ID(), Patch{"text": text})
-			}
+	rt.finishText(ending)
+	for id := range rt.structured {
+		if ending(id) {
+			delete(rt.structured, id)
 		}
 	}
-	clear(rt.streaming)
-	clear(rt.structured)
 	for _, it := range rt.state.Items {
-		if c, ok := it.Value.(*protocol.ToolCall); ok && c.TurnID == turn.ID && (c.Status == protocol.ToolStatusRunning || c.Status == protocol.ToolStatusPending) {
-			rt.UpdateItem(c.ID, Patch{"status": protocol.ToolStatusCancelled})
+		if c, ok := it.Value.(*protocol.ToolCall); ok && c.TurnID == turn.ID && (c.Status == protocol.ToolStatusRunning || c.Status == protocol.ToolStatusPending) && !inBackground(rt.Item, c.ID) {
+			patch := Patch{"status": protocol.ToolStatusCancelled}
+			// A subagent cut short (by an interrupt, or its process ending) is stopped with its call.
+			if saved, ok := rt.Item(c.ID); ok {
+				if s := saved.Value.(*protocol.ToolCall).Subagent; s != nil && s.Status == protocol.SubagentStatusRunning {
+					stopped := *s
+					stopped.Status = protocol.SubagentStatusStopped
+					patch["subagent"] = stopped
+				}
+			}
+			rt.UpdateItem(c.ID, patch)
 		}
 	}
 	for _, id := range append([]string(nil), rt.requestOrder...) {
@@ -823,6 +906,9 @@ func (rt *threadRuntime) endTurn(end TurnEnd, carry bool) {
 			continue
 		}
 		if t := r.request.TurnID(); t != "" && t != turn.ID {
+			continue
+		}
+		if call := r.request.ToolCallID(); call != "" && inBackground(rt.Item, call) {
 			continue
 		}
 		rt.dropRequest(id)
@@ -862,6 +948,8 @@ func (rt *threadRuntime) endTurn(end TurnEnd, carry bool) {
 		status := protocol.ThreadStatusIdle
 		if errText != "" {
 			status = protocol.ThreadStatusError
+		} else if len(rt.requests) > 0 {
+			status = protocol.ThreadStatusWaiting
 		}
 		rt.SetThread(func(t *protocol.Thread) { t.Status = status; t.Error = errText; t.Usage = usage })
 		if len(left) > 0 && carry && !rt.closing && rt.session != nil {
@@ -885,6 +973,118 @@ func (rt *threadRuntime) endTurn(end TurnEnd, carry bool) {
 		msgs = append(msgs, toMessage(q))
 	}
 	rt.session.CarryOver(msgs)
+}
+
+// finishText keeps text streamed into the items which picks, but never finished, as it was shown.
+func (rt *threadRuntime) finishText(which func(id string) bool) {
+	for _, it := range rt.state.Items {
+		text, ok := it.Text()
+		if !ok || !which(it.ID()) {
+			continue
+		}
+		if saved, ok := rt.Item(it.ID()); ok {
+			if st, _ := saved.Text(); st != text {
+				rt.UpdateItem(it.ID(), Patch{"text": text})
+			}
+		}
+	}
+	for id := range rt.streaming {
+		if which(id) {
+			delete(rt.streaming, id)
+		}
+	}
+}
+
+func (rt *threadRuntime) BeginTurn() {
+	if rt.turn != nil || rt.closing || rt.disposed {
+		return
+	}
+	rt.turn = &turnState{ID: NewID("turn")}
+	rt.emit(&protocol.TurnStartedEvent{TurnID: rt.turn.ID})
+	rt.SetThread(func(t *protocol.Thread) { t.Status = protocol.ThreadStatusRunning; t.Error = "" })
+}
+
+func (rt *threadRuntime) StopSubagents(ids []string) {
+	stopped := map[string]bool{}
+	for _, id := range ids {
+		it, ok := rt.Item(id)
+		c, isCall := it.Value.(*protocol.ToolCall)
+		if !ok || !isCall || c.Subagent == nil || c.Subagent.Status != protocol.SubagentStatusRunning || stopped[id] {
+			continue
+		}
+		stopped[id] = true
+		s := *c.Subagent
+		s.Status = protocol.SubagentStatusStopped
+		rt.UpdateItem(id, Patch{"subagent": s})
+	}
+	if len(stopped) == 0 {
+		return
+	}
+	within := func(id string) bool {
+		for _, a := range ancestors(rt.Item, id) {
+			if stopped[a.ID()] {
+				return true
+			}
+		}
+		return false
+	}
+	rt.finishText(within)
+	for id := range rt.structured {
+		if within(id) {
+			delete(rt.structured, id)
+		}
+	}
+	for _, it := range rt.state.Items {
+		if c, ok := it.Value.(*protocol.ToolCall); ok && (c.Status == protocol.ToolStatusRunning || c.Status == protocol.ToolStatusPending) && within(c.ID) {
+			rt.UpdateItem(c.ID, Patch{"status": protocol.ToolStatusCancelled})
+		}
+	}
+	for _, id := range append([]string(nil), rt.requestOrder...) {
+		r := rt.requests[id]
+		if r == nil || r.request.ToolCallID() == "" || !within(r.request.ToolCallID()) {
+			continue
+		}
+		rt.dropRequest(id)
+		rt.emit(&protocol.RequestResolvedEvent{RequestID: id, Resolution: protocol.Resolution{Outcome: protocol.ResolutionOutcomeCancel}})
+	}
+	if len(rt.requests) == 0 && rt.turn == nil && rt.state.Thread.Status == protocol.ThreadStatusWaiting {
+		rt.SetThread(func(t *protocol.Thread) { t.Status = protocol.ThreadStatusIdle })
+	}
+}
+
+// ancestors is the calls of the subagents an item is inside, innermost first.
+func ancestors(item func(string) (protocol.Item, bool), id string) []protocol.Item {
+	var out []protocol.Item
+	seen := map[string]bool{}
+	it, ok := item(id)
+	for ok {
+		p := it.ParentID()
+		if p == "" || seen[p] {
+			break
+		}
+		seen[p] = true
+		if it, ok = item(p); ok {
+			out = append(out, it)
+		}
+	}
+	return out
+}
+
+// runningInBackground says whether an item is a background subagent's call that's still running.
+func runningInBackground(it protocol.Item) bool {
+	c, ok := it.Value.(*protocol.ToolCall)
+	return ok && c.Subagent != nil && c.Subagent.Background && c.Subagent.Status == protocol.SubagentStatusRunning
+}
+
+// inBackground says whether an item is inside a background subagent that's still running: what it
+// does carries on after the turn it was started in has ended.
+func inBackground(item func(string) (protocol.Item, bool), id string) bool {
+	for _, a := range ancestors(item, id) {
+		if runningInBackground(a) {
+			return true
+		}
+	}
+	return false
 }
 
 func (rt *threadRuntime) undelivered(n int) {
@@ -955,7 +1155,8 @@ func (rt *threadRuntime) Reopen(requestID string, answered func(protocol.Resolut
 		return false
 	}
 	for _, r := range rt.state.Requests {
-		if r.ID() == requestID {
+		// One that's been resolved stays in the state, with its resolution, but can't be reopened.
+		if r.ID() == requestID && r.Resolution() == nil {
 			rt.addRequest(requestID, &openRequest{request: r, answered: answered, standing: standing})
 			return true
 		}
@@ -971,9 +1172,7 @@ func (rt *threadRuntime) respond(requestID string, res protocol.Resolution) {
 	rt.dropRequest(requestID)
 	// The answers to secret questions go only to the harness: what's sent and saved hides them.
 	rt.emit(&protocol.RequestResolvedEvent{RequestID: requestID, Resolution: redact(open.request, res)})
-	if len(rt.requests) == 0 && rt.turn != nil {
-		rt.SetThread(func(t *protocol.Thread) { t.Status = protocol.ThreadStatusRunning })
-	}
+	rt.requestsDone()
 	if res.Always && open.standing != "" {
 		switch res.Outcome {
 		case protocol.ResolutionOutcomeAllow:
@@ -991,8 +1190,19 @@ func (rt *threadRuntime) CancelRequest(id string) {
 	}
 	rt.dropRequest(id)
 	rt.emit(&protocol.RequestResolvedEvent{RequestID: id, Resolution: protocol.Resolution{Outcome: protocol.ResolutionOutcomeCancel}})
-	if len(rt.requests) == 0 && rt.turn != nil {
+	rt.requestsDone()
+}
+
+// requestsDone sets the thread running again once it has no open requests, or idle if no turn is
+// running (a background subagent's request can be answered after its turn).
+func (rt *threadRuntime) requestsDone() {
+	if len(rt.requests) > 0 {
+		return
+	}
+	if rt.turn != nil {
 		rt.SetThread(func(t *protocol.Thread) { t.Status = protocol.ThreadStatusRunning })
+	} else if rt.state.Thread.Status == protocol.ThreadStatusWaiting {
+		rt.SetThread(func(t *protocol.Thread) { t.Status = protocol.ThreadStatusIdle })
 	}
 }
 

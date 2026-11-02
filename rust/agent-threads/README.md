@@ -58,6 +58,8 @@ tokio::spawn(async move {
 });
 sdk.handle_json(command_from_a_client).await?;        // send / interrupt / respond / set_options
 let snapshot = sdk.snapshot(&thread.id).await?;       // for a client that just connected
+let window = sdk.snapshot_window(&thread.id, 50).await?; // or its last 50 items, and what they need
+let page = sdk.items_before(&thread.id, window.start.unwrap_or(0), 50).await?; // as it scrolls back
 let missed = sdk.events_since(&thread.id, seq, None).await?; // for one catching up
 ```
 
@@ -75,6 +77,14 @@ after a restart; a `CapabilitiesUpdate` changes only what it gives) and `close` 
 than `Options::event_capacity` (4096) events behind gets `RecvError::Lagged`: it should catch up with
 `events_since`, as a client that sees a gap in `seq` does. `reducer::apply_event` folds events into a
 `Snapshot` by the protocol's rules, for a Rust client.
+
+`snapshot` is a thread's state now, including text streamed so far and answered requests with their
+`resolution` (`reducer::open_requests` gives the open ones). A thread can run to thousands of items:
+`snapshot_window(id, limit)` is a window of its last `limit` items, and what they need from before
+them, and `items_before(id, before, limit)` a page of the items before a window's `start`, for a
+client loading earlier ones (spec/PROTOCOL.md, "Windows"). The `window` module has the same as
+functions of a `Snapshot` (`snapshot_window`, `item_page`), and `with_page` to put a page into a
+window, for a Rust client.
 
 Each thread runs on a task of its own, which owns its state and its driver and does one thing at a
 time, as Node's event loop does for the Node backend: what the harness says, commands, timers and
@@ -98,6 +108,28 @@ resolves if the harness process goes away first (`is_cancelled()` asks without w
 title, command (shell calls), MCP server and the call it's for. An answer given `always` stands for
 the thread, per tool. Claude's AskUserQuestion and Codex's requestUserInput are always questions to
 the user.
+
+## What the protocol leaves out
+
+See [Pass-through](../../spec/PROTOCOL.md#pass-through) in the protocol:
+
+```rust
+let sdk = AgentThreads::new(Options {
+    raw: true, // events, items and requests carry the harness message they came from
+    on_harness_message: Some(Arc::new(|m: &HarnessMessage| {
+        // every line a harness writes (m.line, and m.message parsed), e.g. Claude's system
+        // messages or Codex's token usage
+    })),
+    ..Default::default()
+});
+let usage = sdk.control(&id, json!({"subtype": "get_context_usage"})).await?; // Claude Code
+let limits = sdk.control(&id, json!({"method": "account/rateLimits/read"})).await?; // Codex
+```
+
+`control` needs the thread's process to be running (it is from the first `send` until the SDK
+closes): it's an `Error::Command` when it isn't, and an `Error::Control` when the harness refuses the
+request or exits first. Usage limits are in each thread's `rate_limits`, and Claude's API retries
+and hooks are `notice` items (codes `retry` and `hook`).
 
 ## Stores
 
@@ -123,6 +155,12 @@ and the project's skills); and isolated config: Claude runs with `--setting-sour
 the graces: `stop_grace` (10s) for an interrupt to end the turn, `close_grace` (5s) for a process to
 exit after its input closes, and Claude's `steer_grace` (30s) to take in steered messages after a
 turn.
+
+A thread's own `LaunchOptions` (`CreateOptions::launch`, or `ThreadOptions::launch` with
+`set_options`) add arguments, environment changes, directories (`--add-dir`, or Codex's writable
+roots) and a config directory (CLAUDE_CONFIG_DIR, or a CODEX_HOME used as it is) to those its
+process starts with. They're stored with the thread, but not sent to clients, and apply from its
+next process ([docs/tools.md](../../docs/tools.md#per-thread-launch-options)).
 
 Both drivers' Codex and Claude messages are handled as `serde_json::Value`s; Codex's app-server
 types aren't generated for Rust (the Node backend generates them for TypeScript).

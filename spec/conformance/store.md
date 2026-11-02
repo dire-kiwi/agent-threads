@@ -8,7 +8,9 @@ reference in-memory store and runner that pass them.
 
 ## What a store holds
 
-- **Threads**: each thread's `Thread` (as in the protocol), by id.
+- **Threads**: each thread's `Thread` (as in the protocol), by id. A backend may add fields of its
+  own that clients aren't sent: a thread's launch options (its harness process's extra arguments,
+  environment, directories and config directory) are its `launch`.
 - **Events**: each thread's saved events (every event but `delta`), in `seq` order. They're the
   source of truth: a thread's state is what folding its events gives.
 - **A snapshot** per thread, optionally: the latest one the backend saved, so it needn't fold every

@@ -84,6 +84,24 @@ function hunks(patch) {
   return patch.map((h) => `@@ -${h.oldStart},${h.oldLines} +${h.newStart},${h.newLines} @@\n${h.lines.join("\n")}\n`).join("");
 }
 
+/** How Claude's task_* messages and Agent results say a subagent ended, as a SubagentStatus. */
+const SUBAGENT_END = {
+  completed: "completed", success: "completed",
+  failed: "failed", error: "failed",
+  killed: "stopped", stopped: "stopped", cancelled: "stopped", interrupted: "stopped",
+};
+
+/** Whether an item is inside a background subagent that's still running (its call is an ancestor). */
+function inBackground(items, id) {
+  const seen = new Set();
+  for (let p = items.get(id)?.parent_id; p && !seen.has(p); p = items.get(p)?.parent_id) {
+    seen.add(p);
+    const s = items.get(p)?.subagent;
+    if (s?.background && s.status === "running") return true;
+  }
+  return false;
+}
+
 /** Codex wraps commands in a login shell: `/usr/bin/bash -lc 'cmd'` is shown as cmd. */
 export function unwrapCommand(command) {
   const m = /^(?:\S*\/)?(?:bash|zsh|sh) -lc (?:'((?:[^']|'\\'')*)'|"((?:[^"\\]|\\.)*)")$/s.exec(command);
@@ -154,12 +172,31 @@ class Draft {
     return bind;
   }
 
+  /** A control request the app sends (with `control`), and the harness's answer: `{result}` or `{error}`. */
+  control(request, answer) {
+    if (this.events.length > 1 || this.steps.length) this.waitForLast();
+    this.steps.push({ control: request, ...answer, from: this.events.length });
+  }
+
+  /** The harness reported usage limits: they replace the thread's with the same ids. */
+  rateLimits(limits) {
+    if (!limits.length) return;
+    const all = new Map((this.thread.rate_limits ?? []).map((l) => [l.id, l]));
+    for (const l of limits) all.set(l.id, l);
+    this.setThread({ rate_limits: [...all.values()].sort((a, b) => (a.id < b.id ? -1 : a.id > b.id ? 1 : 0)) });
+  }
+
   waitForLast() {
-    const e = this.events[this.events.length - 1];
-    const step = { wait: pattern(e) };
+    // The last event whose pattern an earlier one (since the step before) doesn't match too. The
+    // events after it don't depend on the command (a rate limit reported meanwhile, say).
+    const last = this.steps[this.steps.length - 1];
+    const start = !last ? 0 : last.wait ? last.at + 1 : last.from;
+    let at = this.events.length - 1;
+    while (at > start && this.events.findIndex((e, i) => i >= start && matches(e, pattern(this.events[at]))) !== at) at--;
+    const step = { wait: pattern(this.events[at]) };
     const prev = this.steps.findLast?.((s) => s.wait);
-    if (prev && JSON.stringify(prev.wait) === JSON.stringify(step.wait) && prev.at === this.events.length - 1) return;
-    step.at = this.events.length - 1;
+    if (prev && JSON.stringify(prev.wait) === JSON.stringify(step.wait) && prev.at === at) return;
+    step.at = at;
     this.steps.push(step);
   }
 
@@ -242,17 +279,39 @@ class Draft {
     this.command({ type: "respond", resolution });
     this.emit({ type: "request.resolved", request_id: r.id, resolution });
     r.resolved = true;
-    if (![...this.requests.values()].some((x) => !x.resolved)) this.setThread({ status: "running" });
+    if (![...this.requests.values()].some((x) => !x.resolved)) this.setThread({ status: this.turn ? "running" : "idle" });
+  }
+
+  /** The harness started a turn by itself (Claude does, to tell the agent a background subagent ended). */
+  beginTurn() {
+    // The steps wait for the turn before it to end and for it to start, so that a wait after it
+    // is met by what this turn brings.
+    const end = this.events.findLastIndex((e) => e.type === "thread.updated");
+    if (end >= 0 && !this.steps.some((s) => s.at === end)) this.steps.push({ wait: pattern(this.events[end]), at: end });
+    this.turn = { id: this.ph("t"), interrupted: false, usage: null };
+    this.emit({ type: "turn.started", turn_id: this.turn.id });
+    this.steps.push({ wait: { type: "turn.started" }, at: this.events.length - 1 });
+    this.setThread({ status: "running", error: undefined });
+  }
+
+  /** Changes a subagent call's subagent fields (undefined leaves one out). */
+  subagent(id, change, extra = {}) {
+    const it = this.items.get(id);
+    if (!it) return;
+    const next = { ...it.subagent, ...change };
+    for (const [k, v] of Object.entries(next)) if (v === undefined) delete next[k];
+    this.update(id, { ...extra, subagent: next });
   }
 
   endTurn({ ok, error, usage, duration_ms }) {
+    // What a background subagent that's still running is doing carries on after the turn.
     for (const it of this.items.values()) {
-      if (it.type === "tool_call" && it.turn_id === this.turn.id && (it.status === "running" || it.status === "pending")) {
-        this.update(it.id, { status: "cancelled" });
+      if (it.type === "tool_call" && it.turn_id === this.turn.id && (it.status === "running" || it.status === "pending") && !inBackground(this.items, it.id)) {
+        this.update(it.id, { status: "cancelled", ...(it.subagent?.status === "running" ? { subagent: { ...it.subagent, status: "stopped" } } : {}) });
       }
     }
     for (const r of this.requests.values()) {
-      if (!r.resolved) {
+      if (!r.resolved && !(r.tool_call_id && inBackground(this.items, r.tool_call_id))) {
         r.resolved = true;
         this.emit({ type: "request.resolved", request_id: r.id, resolution: { outcome: "cancel" } });
       }
@@ -343,6 +402,9 @@ function draftClaude(d, runs) {
     const streamed = new Map(); // block key -> item id, for blocks that got deltas
     let summaryNext = null;
     let interrupted = false;
+    const tasks = new Map(); // a subagent's task_id -> its call's id
+    let autoTurn = null; // the turn Claude started by itself
+    let held = null; // the usage of Claude's own turns held for a turn of the user's
     // The message that starts a run is sent before the process starts (backends start it then).
     const opener = entries.find((e) => e.dir === "in" && e.msg.type === "user");
     // set_model and set_permission_mode requests in a row are one set_options command.
@@ -368,6 +430,10 @@ function draftClaude(d, runs) {
         } else if (m.type === "control_request" && m.request.subtype === "interrupt") {
           d.interrupt();
           interrupted = true;
+        } else if (m.type === "control_request" && m.request.subtype !== "initialize") {
+          // The app's own, sent with control().
+          const reply = entries.find((x) => x.dir === "out" && x.msg?.type === "control_response" && x.msg.response?.request_id === m.request_id)?.msg.response;
+          d.control(m.request, reply?.subtype === "success" ? { result: reply.response ?? {} } : { error: reply?.error ?? "" });
         } else if (m.type === "control_response") {
           const req = asked.get(m.response.request_id);
           const r = d.requests.get(m.response.request_id);
@@ -395,14 +461,60 @@ function draftClaude(d, runs) {
       }
       if (e.dir !== "out") continue;
       const parent = m.parent_tool_use_id ?? undefined;
+      // A message refused for the usage limit says which limit, before anything else it leads to.
+      if (["assistant", "user", "result"].includes(m.type) && m.api_error === "usage_limit_reached" && m.api_error_params?.rate_limit_info) {
+        d.rateLimits(claudeLimits(m.api_error_params.rate_limit_info));
+      }
       switch (m.type) {
-        case "system":
+        case "rate_limit_event":
+          d.rateLimits(claudeLimits(m.rate_limit_info ?? {}));
+          break;
+        case "system": {
+          // Claude starts a turn by itself to tell the agent a background subagent ended.
+          if (m.subtype === "init" && !d.turn) {
+            d.beginTurn();
+            autoTurn = d.turn.id;
+          }
           if (m.subtype === "init" && m.session_id !== d.thread.session_id) d.setThread({ session_id: m.session_id });
+          if (m.subtype === "api_retry") d.item({ id: d.ph("n"), type: "notice", level: "warning", code: "retry", text: retryText(m), parent_id: parent });
+          if (m.subtype === "hook_response") {
+            const n = hookNotice(m);
+            if (n) d.item({ id: d.ph("n"), type: "notice", ...n, code: "hook", parent_id: parent });
+          }
           if (m.subtype === "compact_boundary") {
             d.item({ id: m.uuid, type: "compaction", trigger: m.compact_metadata.trigger, tokens_before: m.compact_metadata.pre_tokens });
             summaryNext = m.uuid;
           }
+          if (m.subtype === "task_started" && m.task_type === "local_agent" && d.items.get(m.tool_use_id)?.type === "tool_call") {
+            // An Agent call's subagent, or a skill's forked one (whose Skill call becomes a subagent call).
+            const it = d.items.get(m.tool_use_id);
+            tasks.set(m.task_id, it.id);
+            const extra = it.kind === "subagent" ? {} : { kind: "subagent", ...(!it.title && m.description ? { title: m.description } : {}) };
+            d.subagent(it.id, {
+              status: "running",
+              ...(m.is_backgrounded ? { background: true } : {}),
+              ...(m.subagent_type ? { agent_type: m.subagent_type } : {}),
+              ...(m.model || it.input?.model ? { model: m.model || it.input.model } : {}),
+            }, extra);
+          }
+          const task = d.items.get(m.tool_use_id ?? tasks.get(m.task_id));
+          if (!task?.subagent || !m.subtype?.startsWith("task_")) break;
+          const s = task.subagent;
+          if (m.subtype === "task_progress") {
+            d.subagent(task.id, { ...(m.description ? { activity: m.description } : {}), ...(typeof m.usage?.tool_uses === "number" ? { tool_uses: m.usage.tool_uses } : {}) });
+          } else if (m.subtype === "task_updated") {
+            // Continued (with SendMessage) after it ended, it runs again.
+            if (m.patch?.status === "running") d.subagent(task.id, { status: "running", summary: undefined });
+            else if (SUBAGENT_END[m.patch?.status] && s.status === "running") d.subagent(task.id, { status: SUBAGENT_END[m.patch.status] });
+          } else if (m.subtype === "task_notification") {
+            d.subagent(task.id, {
+              ...(SUBAGENT_END[m.status] && s.status === "running" ? { status: SUBAGENT_END[m.status] } : {}),
+              ...(typeof m.usage?.tool_uses === "number" ? { tool_uses: m.usage.tool_uses } : {}),
+              ...(s.background && m.summary ? { summary: m.summary } : {}),
+            });
+          }
           break;
+        }
         case "stream_event": {
           const ev = m.event;
           if (ev.type === "message_start") msgOfParent.set(parent, ev.message.id);
@@ -463,6 +575,19 @@ function draftClaude(d, runs) {
             if (it.kind === "edit" && tur && Array.isArray(tur.structuredPatch) && !b.is_error) {
               patch.changes = [{ path: tur.filePath ?? it.changes?.[0]?.path, op: tur.type === "create" ? "add" : "update", diff: tur.type === "create" ? tur.content : hunks(tur.structuredPatch) }];
             }
+            // A subagent's call: what its result says of the subagent. One that never started (its
+            // call failed, or was denied) has none.
+            if (it.kind === "subagent" && (it.subagent || !b.is_error)) {
+              const meta = tur && typeof tur === "object" ? tur : {};
+              const s = { status: "running", ...it.subagent };
+              if (meta.resolvedModel) s.model = meta.resolvedModel;
+              if (meta.agentType) s.agent_type = meta.agentType;
+              if (typeof meta.totalToolUseCount === "number") s.tool_uses = meta.totalToolUseCount;
+              // A background subagent's call returns as soon as it has started it.
+              if (meta.isAsync || meta.status === "async_launched" || /^\s*Async agent launched/.test(patch.result.content)) s.background = true;
+              else if (s.status === "running") s.status = b.is_error ? (interrupted ? "stopped" : "failed") : (SUBAGENT_END[meta.status] ?? "completed");
+              patch.subagent = s;
+            }
             d.update(b.tool_use_id, patch);
           }
           break;
@@ -494,10 +619,17 @@ function draftClaude(d, runs) {
           break;
         }
         case "result": {
+          // Claude's own turn, ended while a turn of the user's waited for it: that turn goes on.
+          if (m.origin?.kind === "task-notification" && d.turn && d.turn.id !== autoTurn) {
+            held = addUsage(held, claudeUsage(m));
+            break;
+          }
+          const usage = addUsage(held, claudeUsage(m));
+          held = null;
           d.endTurn({
             ok: !m.is_error,
             error: m.is_error ? (m.result || (m.errors ?? []).join("\n") || m.subtype) : undefined,
-            usage: claudeUsage(m),
+            usage,
             duration_ms: m.duration_ms,
           });
           interrupted = false;
@@ -537,6 +669,37 @@ function codexMode(approvalPolicy, sandbox) {
   return approvalPolicy === "on-request" ? "accept_edits" : "default";
 }
 
+/** A Claude rate_limit_info as the rate limits it reports (none, or one). */
+export function claudeLimits(info) {
+  const overage = info.isUsingOverage === true || info.overageStatus === "allowed" || info.overageStatus === "allowed_warning";
+  const status = { allowed: "allowed", allowed_warning: "warning", rejected: overage ? "warning" : "rejected" }[info.status];
+  if (!status) return [];
+  const l = { id: info.rateLimitType || "unknown", status };
+  if (typeof info.utilization === "number") l.used_percent = info.utilization * 100;
+  if (typeof info.resetsAt === "number") l.resets_at = unixTime(info.resetsAt);
+  return [l];
+}
+
+/** Unix seconds as YYYY-MM-DDTHH:MM:SSZ. */
+const unixTime = (s) => new Date(Math.floor(s) * 1000).toISOString().replace(/\.\d{3}Z$/, "Z");
+
+/** An api_retry's notice text. */
+function retryText(m) {
+  const why = [m.error ? String(m.error) : "", m.error_status != null ? `status ${m.error_status}` : ""].filter(Boolean).join(", ");
+  return `API request failed${why ? ` (${why})` : ""}; retrying in ${Math.ceil((m.retry_delay_ms ?? 0) / 1000)}s (attempt ${m.attempt} of ${m.max_retries}).`;
+}
+
+/** A hook_response's notice (level, text and detail), if it makes one. */
+function hookNotice(m) {
+  const output = typeof m.output === "string" ? m.output.trim() : "";
+  if (m.outcome === "error") {
+    const detail = (typeof m.stderr === "string" ? m.stderr.trim() : "") || output;
+    const code = typeof m.exit_code === "number" ? ` (exit code ${m.exit_code})` : "";
+    return { level: "warning", text: `Hook ${m.hook_name} failed${code}`, ...(detail ? { detail } : {}) };
+  }
+  return output ? { level: "info", text: `Hook ${m.hook_name} ran`, detail: output } : null;
+}
+
 const userText = (m) => {
   const c = m.message.content;
   return typeof c === "string" ? c : c.filter((b) => b.type === "text").map((b) => b.text).join("\n");
@@ -551,6 +714,26 @@ function title(t) {
 }
 
 // ---------- Codex ----------
+
+/** The requests a Codex driver sends itself: any other is the app's. */
+const DRIVER_METHODS = new Set(["initialize", "skills/list", "skills/extraRoots/set", "thread/start", "thread/resume", "turn/start", "turn/steer", "turn/interrupt", "thread/compact/start"]);
+
+/** A Codex rate limit snapshot as the rate limits it reports: its primary and secondary windows. */
+export function codexLimits(rl) {
+  const prefix = rl.limitId && rl.limitId !== "codex" ? `${rl.limitId}:` : "";
+  const out = [];
+  for (const key of ["primary", "secondary"]) {
+    const w = rl[key];
+    if (!w || typeof w !== "object") continue;
+    const credits = rl.credits?.hasCredits === true || rl.credits?.unlimited === true;
+    const l = { id: prefix + key, status: typeof w.usedPercent === "number" && w.usedPercent >= 100 ? (credits ? "warning" : "rejected") : "allowed" };
+    if (typeof w.usedPercent === "number") l.used_percent = w.usedPercent;
+    if (typeof w.resetsAt === "number") l.resets_at = unixTime(w.resetsAt);
+    if (typeof w.windowDurationMins === "number") l.window_minutes = w.windowDurationMins;
+    out.push(l);
+  }
+  return out;
+}
 
 function draftCodex(d, runs) {
   let first = true;
@@ -601,6 +784,12 @@ function draftCodex(d, runs) {
             if (e !== opener) d.send(m.method === "turn/start" ? text(m) : "/compact");
           } else if (m.method === "turn/steer") d.send(text(m));
           else if (m.method === "turn/interrupt") d.interrupt();
+          else if (m.id !== undefined && !DRIVER_METHODS.has(m.method)) {
+            // The app's own, sent with control().
+            const reply = entries.find((x) => x.dir === "out" && x.msg?.id === m.id && x.msg.method === undefined)?.msg;
+            const request = { method: m.method, ...(m.params !== undefined ? { params: m.params } : {}) };
+            d.control(request, reply?.error ? { error: reply.error.message ?? "" } : { result: reply?.result ?? null });
+          }
           continue;
         }
         const req = asked.get(m.id);
@@ -744,6 +933,9 @@ function draftCodex(d, runs) {
           break;
         case "thread/tokenUsage/updated":
           if (!child) total = p.tokenUsage.total;
+          break;
+        case "account/rateLimits/updated":
+          d.rateLimits(codexLimits(p.rateLimits ?? {}));
           break;
         case "turn/completed": {
           if (child) {

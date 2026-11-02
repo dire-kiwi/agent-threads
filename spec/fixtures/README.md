@@ -9,6 +9,8 @@ No CLI or login is needed.
 They were recorded on 2026-10-31 with claude 2.1.312 (model `haiku`, which is claude-haiku-5-5) and
 codex-cli 0.165.0 (model `gpt-5.6-luna`, effort `low`), by `spec/tools/record.mjs`.
 
+`background-subagent` and `skill-fork` were added on 2026-11-02, with the same claude 2.1.312.
+
 The Codex sessions' `skills/list` exchange was added afterwards (on 2026-11-01), with the response
 codex-cli 0.165.0 gives in a fresh CODEX_HOME and a working directory and home with no skills;
 `spec/tools/scenarios/codex.mjs` records it from now on.
@@ -16,6 +18,11 @@ codex-cli 0.165.0 gives in a fresh CODEX_HOME and a working directory and home w
 The `plan` and `set-options` scenarios were recorded on 2026-11-02 with the same CLIs. Their Codex
 sessions' `skills/list` response is the one the others have: the machine they were recorded on has
 skills of its own, which were taken out (with the `skills.config` entries thread/start had for them).
+
+The `pass-through` sessions (2026-11-02) are made by hand from the `plain-reply` recordings, since
+what they add (an API retry, hooks, a usage limit that's been reached, rate limit windows, the
+answers to control requests) can't be recorded on demand: their messages are shaped as Claude Code
+2.1.312 and codex-cli 0.165.0 send them, with made-up values. They aren't re-recorded.
 
 ## Layout
 
@@ -38,7 +45,9 @@ Each fixture is a directory `spec/fixtures/<harness>/<scenario>/`:
 | `ask-user-question` | A question the user answers | AskUserQuestion via `can_use_tool` | `item/tool/requestUserInput` |
 | `app-tool` | A tool the app defines (`lookup_order`) | the in-process `app` MCP server, over `mcp_message` | `dynamicTools` and `item/tool/call` |
 | `mcp-tool` | A tool on an external stdio MCP server (`echo`, [../tools/mcp-echo.mjs](../tools/mcp-echo.mjs)) | `--mcp-config` | `mcp_servers` in `thread/start`'s config, approved through an elicitation |
-| `subagent` | A subagent and what it does | the Agent tool, with `parent_tool_use_id` | `spawnAgent` and a child thread |
+| `subagent` | A subagent and what it does | the Agent tool, with `parent_tool_use_id` and `task_*` messages | `spawnAgent` and a child thread |
+| `background-subagent` | A subagent that runs in the background, past its turn | the Agent tool with `run_in_background`; when it's done, Claude starts a turn by itself | |
+| `skill-fork` | A skill run in a forked subagent | a skill with `context: fork` (its Skill call's `task_started` is a `local_agent`'s) | |
 | `steer` | A message sent while a turn runs | stdin, echoed back when it's taken in | `turn/steer` |
 | `interrupt` | Stopping a turn while a command runs | `control_request` interrupt | `turn/interrupt` |
 | `resume` | A turn, a backend restart, then a turn in a new process | `--resume <session_id>` | `thread/resume` |
@@ -46,6 +55,7 @@ Each fixture is a directory `spec/fixtures/<harness>/<scenario>/`:
 | `error` | A turn that fails (the model doesn't exist) | an error result | a failed turn, after a warning |
 | `plan` | Plan mode: a plan the user sends back with feedback, then one they approve in `accept_edits`, which the agent carries out without asking | `--permission-mode plan`, ExitPlanMode via `can_use_tool`, approved with `updatedPermissions` `setMode` | `collaborationMode` `plan`, the turn's `plan` item; the feedback and "Implement the plan." are `turn/start`s |
 | `set-options` | `set_options` between turns, changing the model and the permission mode (`accept_edits`), so the next turn's edit isn't asked about, in the same process | `set_model` and `set_permission_mode` control requests | `turn/start`'s `model`, `approvalPolicy` and `sandboxPolicy` |
+| `pass-through` | What the protocol leaves out ([PROTOCOL.md](../PROTOCOL.md#pass-through)): `raw`, the harness message handler and control requests, plus rate limits and notices | `api_retry` and `hook_response` notices, a rejected `rate_limit_event`, a line the driver doesn't know, and `get_context_usage` (and one Claude refuses) | `account/rateLimits/updated` windows, `account/rateLimits/read`, a method answered with a `null` result, and one Codex refuses |
 
 Some things the recordings show that a backend has to deal with: Claude Code echoes the backend's
 own `control_response`s back on stdout; it loads app and MCP tools lazily, so the agent calls
@@ -65,6 +75,8 @@ What a backend's conformance test does with each fixture:
    environment. Give it the fixture's `tools` (each tool returns its `result` text), its
    `mcp_servers` (the fake CLI never starts them), and a permission policy from `permissions`:
    `allow` allows every tool without asking, `ask` asks the user (opens a request) for every one.
+   If the fixture has `"raw": true`, turn the SDK's `raw` option on, and give it a harness message
+   handler that keeps what it's called with.
 2. **Create the thread** with `thread`'s options (`harness`, `model`, `effort`...) and the working
    directory, and collect every event the SDK sends for it, deltas included.
 3. **Run the steps** in order:
@@ -79,12 +91,21 @@ What a backend's conformance test does with each fixture:
    - `{"restart": true}`: close the SDK as an app shutting down would (closing its harness
      processes) and make a new one on the same store. Don't create the thread again; the next
      `send` resumes it.
+   - `{"control": {...}, "result": ...}`: call `control` with the thread's id and the request, and
+     check that it returns `result` (equal as JSON). With `"error": "<text>"` instead of `result`,
+     check that it fails, with an error whose message contains the text.
 4. **Finish.** After the last step, close the SDK and wait for the fake CLI processes to exit.
 5. **Check.** The state directory has a report `run-<n>.json` for each of the session's runs, and
    each says `"ok": true` (see [../tools/README.md](../tools/README.md#reports)); and the events
    match `expected.jsonl` by the rules below (`node spec/tools/check-events.mjs <fixture dir>
    <events.jsonl>` does it, or a backend implements them natively). It's also worth checking that
    `snapshot(thread_id)` equals folding the events with `applyEvent`.
+6. **Pass-through.** If the fixture has `harness_messages`, each of them (a pattern, matched as a
+   wait's is) matches the `message` of at least one call of the harness message handler for the
+   thread. If it has `raw_checks`, each `{"event": <pattern>, "raw": <pattern or null>}` has at
+   least one event that matches `event`, and every event that does has a `raw` that matches `raw`
+   (or none, when it's `null`). An `item.added`'s or `request.opened`'s `raw` is its item's or
+   request's.
 
 A wait is always on the last event the backend makes before the command, so once it's seen the
 fake CLI is waiting for that command and nothing else can happen in between: the event order is the
@@ -102,7 +123,9 @@ backend drives each CLI:
   resumes the session.
 - **Claude Code.** Arguments `-p --output-format stream-json --verbose --include-partial-messages
   --input-format stream-json --replay-user-messages --permission-prompt-tool stdio
-  --strict-mcp-config --forward-subagent-text --model <model>`, plus `--resume <session_id>`, and
+  --strict-mcp-config --forward-subagent-text --include-hook-events --model <model>` (the fake CLI
+  doesn't check `--include-hook-events`, which the recordings don't have; it makes Claude Code
+  report hooks, for their notices), plus `--resume <session_id>`, and
   `--mcp-config` with the thread's MCP servers (stdio ones as `type: stdio`) and, when it has app
   tools, an in-process server named `app` (`{"type": "sdk", "name": "app"}`). It sends a
   `control_request` `initialize` first (with `sdkMcpServers: ["app"]` when there are app tools),
@@ -153,16 +176,17 @@ backend drives each CLI:
   `item.updated` sets its `status` and `result` when it ends.
 - **A permission request** (when the policy asks): an `item.updated` sets the call `pending`, then
   `request.opened` and a `thread.updated` that's `waiting`. The answer sends `request.resolved`, a
-  `thread.updated` that's `running`, and an `item.updated` that sets the call `running` (or
-  `denied`). A denied call's later result only sets its `result`. With the `allow` policy, nothing
+  `thread.updated` that's `running` (`idle` if no turn is running, for a background subagent's),
+  and an `item.updated` that sets the call `running` (or `denied`). A denied call's later result only sets its `result`. With the `allow` policy, nothing
   of this is sent.
 - **A question**: the same, with a `question` request.
 - **A plan**: the same, with a `plan` request, whatever the policy. When the user approves it, the
   `thread.updated` that's `running` is followed by one with the thread's new `permission_mode`.
-- **The end of a turn**: calls still `running` or `pending` become `cancelled`, open requests are
-  resolved with `cancel`, then a `turn_result` item is added, `turn.completed` is sent, and a
-  `thread.updated` sets the thread `idle` (or `error`, with the turn's `error`) and adds the
-  turn's usage to the thread's.
+- **The end of a turn**: calls still `running` or `pending` become `cancelled` (and a running
+  subagent of one `stopped`) and open requests are resolved with `cancel`, except those of a
+  background subagent that's still running, which carry on; then a `turn_result` item is added,
+  `turn.completed` is sent, and a `thread.updated` sets the thread `idle` (`waiting` while such a
+  request is open, or `error`, with the turn's `error`) and adds the turn's usage to the thread's.
 - **An interrupt** sends nothing itself. Its turn's `turn_result` has `ok: false` and
   `interrupted: true`, and the calls it cut short are `cancelled`.
 - An `item.updated` is only sent when it changes something, and a `thread.updated` only when the
@@ -189,17 +213,64 @@ backend drives each CLI:
   `[image]`, tool references their tool's name). `is_error` makes it `failed`, or `cancelled`
   after an interrupt.
 - **Subagents**: messages with `parent_tool_use_id` are the subagent's, with that as `parent_id`.
-  The subagent's own prompt (its first user message) isn't an item.
+  The subagent's own prompt (its first user message) isn't an item. A `system` `task_started`
+  whose `task_type` is `local_agent` sets its call's `subagent` (`status: running`, `background`
+  from `is_backgrounded`, `agent_type` from `subagent_type`, `model` from its `model` or the call's
+  input's); if the call (a Skill's) isn't a `subagent` call, it becomes one, with the
+  `description` as its `title` if it has none. The `task_*` messages after it name the call by
+  `tool_use_id`, or by the `task_id` its `task_started` gave: `task_progress` sets `activity`
+  (its `description`) and `tool_uses` (`usage.tool_uses`); `task_updated`'s `patch.status` and
+  `task_notification`'s `status` end a running subagent (`completed`/`success` is `completed`,
+  `failed`/`error` `failed`, and `killed`/`stopped`/`cancelled`/`interrupted` `stopped`), and
+  `task_updated` with `running` sets it running again (without its `summary`);
+  `task_notification` sets `tool_uses`, and a background subagent's `summary`. The call's
+  `tool_result` sets `model` (`resolvedModel`), `agent_type` (`agentType`) and `tool_uses`
+  (`totalToolUseCount`) from its `tool_use_result`; if that has `isAsync`, or `status:
+  async_launched`, or its text starts with "Async agent launched", the subagent is `background`,
+  and otherwise a running one ends (`failed` for an error, `stopped` after an interrupt, else the
+  `status` as above, or `completed`). A call whose subagent never started (an error result, and no
+  `task_started`) gets no `subagent`. Other tasks (`local_bash`...) aren't subagents.
+- **Background subagents**: at the end of a turn, the calls and requests of a background subagent
+  still running aren't cancelled. A call cancelled at a turn's end stops its running subagent. When
+  no turn is running, an `init` system message starts one (Claude telling the agent a background
+  subagent has ended), with no `user_message`. If a turn of the user's started first (Claude hadn't
+  taken its message in yet), Claude's own turn's items go in it, and its result (`origin.kind:
+  task-notification`) doesn't end it: the user's turn ends with its own result, with both results'
+  usage. When the process ends, or the backend restarts and can't pick it up again, its subagents
+  still running are `stopped`, and their calls still running `cancelled`; a turn is ended as lost
+  only if one was running (a thread can be `waiting` on a background subagent's request with none).
 - **Questions**: AskUserQuestion's `can_use_tool` is always a question (whatever the policy). Each
   question's `id` is its text, and `allow_other` is set (Claude Code always offers "Other").
 - **Plans**: ExitPlanMode's `can_use_tool` is always a `plan` request, with its input's `plan`. A
   plan sent back is `denied`, as a denied permission is.
 - **Options**: `set_options` sends the control requests and nothing else; Claude Code's echo of
   `set_model` (a replayed user message) is left out.
+- **Notices**: a `system` message `api_retry` is a `notice` with `level: warning` and `code:
+  retry`, whose `text` is `API request failed (<error>, status <error_status>); retrying in <n>s
+  (attempt <attempt> of <max_retries>).`, where `n` is `retry_delay_ms` divided by 1000 and rounded
+  up to a whole number; the parenthesis has whichever of the error and the status it has (with `error_status: null`,
+  just the error), and is left out (with the space before it) if it has neither. A `hook_response`
+  whose `outcome` is `error` is a `notice` with `level: warning` and `code: hook`, whose `text` is
+  `Hook <hook_name> failed` (with ` (exit code <exit_code>)` when it has one) and whose `detail` is
+  its `stderr`, trimmed, or if that's empty its `output`, trimmed (left out if that's empty too). Any other
+  `hook_response` whose `output`, trimmed, isn't empty is a `notice` with `level: info`, `code:
+  hook`, `text` `Hook <hook_name> ran` and that output as its `detail`; the rest aren't notices.
+  Either has the message's `parent_tool_use_id` as its `parent_id`.
+- **Rate limits**: a `rate_limit_event`'s `rate_limit_info` reports one limit, and so does the
+  `api_error_params.rate_limit_info` of a message (an `assistant`, `user` or `result`) whose
+  `api_error` is `usage_limit_reached`, before anything else that message leads to. Its `id` is the
+  `rateLimitType` (`unknown` when there's none). Its `status`: `allowed` is `allowed`;
+  `allowed_warning` is `warning`; `rejected` is `rejected`, unless extra usage carries on
+  (`isUsingOverage` is true, or `overageStatus` is `allowed` or `allowed_warning`), which makes it
+  `warning`; any other (or none) reports nothing. `utilization` times 100 is `used_percent`, and
+  `resetsAt` (Unix seconds) is `resets_at`, as `YYYY-MM-DDTHH:MM:SSZ`. The thread's `rate_limits`
+  take it in as [PROTOCOL.md](../PROTOCOL.md#threads) says, with a `thread.updated` if that changes
+  them.
 - **Left out**: `assistant` messages from the `<synthetic>` model (the error is in the turn's
-  result), user messages that aren't a replay or a tool result, system messages other than `init`
-  and `compact_boundary`, `rate_limit_event`, stream events other than text and thinking deltas,
-  and the echoes of the backend's own control responses. A replayed (`isReplay`) user message
+  result), user messages that aren't a replay or a tool result, system messages other than `init`,
+  `compact_boundary`, `api_retry`, `hook_response` and `task_*`, stream events other than text and
+  thinking deltas, the echoes of the backend's own control responses, and messages of types the
+  driver doesn't know. A replayed (`isReplay`) user message
   takes in the queued message with the same text, if there is one.
 - **The result**: `ok` is `!is_error`; `error` is the result's text; `duration_ms` is the
   result's. `usage` is the result's `model_usage_since_last_result`, summed over its models:
@@ -237,6 +308,14 @@ backend drives each CLI:
   a new Codex turn in plan mode.
 - **Notices**: a `warning` notification is a `notice` with `level: warning`; an `error` that will
   be retried is a `notice` with `code: retry`. One that won't is the turn's `error`.
+- **Rate limits**: an `account/rateLimits/updated` notification's `rateLimits` reports a limit for
+  each of its `primary` and `secondary` windows that isn't null or missing, named `primary` and
+  `secondary` (with its `limitId` and `:` in front, when it has a `limitId` other than `codex`):
+  `usedPercent` is `used_percent`, and makes the `status` `rejected` when it's 100 or more (but
+  `warning` if the notification's `credits` has `hasCredits` or `unlimited` true, since credits carry
+  on past it) and `allowed` otherwise; `resetsAt` (Unix seconds) is `resets_at`, as `YYYY-MM-DDTHH:MM:SSZ`;
+  `windowDurationMins` is `window_minutes`. The thread's `rate_limits` take them in as
+  [PROTOCOL.md](../PROTOCOL.md#threads) says, with a `thread.updated` if that changes them.
 - **Usage**: Codex reports the thread's running totals, so a turn's usage is how far the last
   totals in the turn are past the thread's usage before it. `input_tokens` leaves out the cached
   ones (`cache_read_tokens`), as Claude's do. `duration_ms` is the turn's `durationMs`.

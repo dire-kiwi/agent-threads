@@ -8,16 +8,17 @@ source of truth for the shapes, and this document says what they mean. See
 
 | Schema | Defines |
 | --- | --- |
-| [thread.schema.json](schema/thread.schema.json) | `Thread`, `ThreadStatus`, `PermissionMode`, `Run`, `Usage` |
+| [thread.schema.json](schema/thread.schema.json) | `Thread`, `ThreadStatus`, `PermissionMode`, `Run`, `RateLimit`, `Usage` |
 | [item.schema.json](schema/item.schema.json) | `Item` and its variants, `ToolKind`, `ToolStatus`, `ToolResult`, `FileChange`, `Todo`, `Attachment` |
 | [request.schema.json](schema/request.schema.json) | `ThreadRequest` (`PermissionRequest`, `QuestionRequest`, `PlanRequest`), `Question`, `Resolution` |
 | [event.schema.json](schema/event.schema.json) | `ThreadEvent` and its variants |
 | [command.schema.json](schema/command.schema.json) | `Command` and its variants |
-| [snapshot.schema.json](schema/snapshot.schema.json) | `Snapshot` |
+| [snapshot.schema.json](schema/snapshot.schema.json) | `Snapshot`, `ItemPage` |
 
 `protocol.schema.json` bundles them into one schema, and the TS, Go and Rust types are generated
 from it: run `make gen` after changing a schema. [examples/](examples/) has a whole thread's events,
-the snapshot they fold into, and one of each command; every language's tests read them.
+the snapshot they fold into, a window of it and a page before that window, and one of each command;
+every language's tests read them.
 [fixtures/](fixtures/README.md) has recorded Claude and Codex sessions with the events a backend
 must make of them, which is where the translation from each harness is pinned down.
 
@@ -34,8 +35,9 @@ must make of them, which is where the translation from each harness is pinned do
 - Timestamps are RFC 3339 strings, in UTC.
 - Receivers ignore fields they don't know, so a field can be added without breaking anyone. A new
   item, event or command type is a breaking change, until 1.0 at least.
-- `raw`, on items, requests and events, is the harness payload something came from, for debugging.
-  A backend can leave it out (and can be told to), and clients mustn't depend on it.
+- `raw`, on items, requests and events, is the harness message something came from. Backends
+  leave it out unless the app turns it on ([Pass-through](#pass-through) has the rules), and
+  clients mustn't depend on it.
 
 ## Threads
 
@@ -53,6 +55,16 @@ of the backend and ends with it; a `shim` run is supervised by `agent-threads-sh
 backend restart, and its `reattached_at` is set when a restarted backend picks it up again
 ([RUNDIR.md](RUNDIR.md) has how backends and the shim share a run).
 `usage` sums the thread's turns. `metadata` is the app's own, given when it created the thread.
+
+`rate_limits` are the usage limits of the account the harness runs on (a subscription's session and
+weekly limits), as the harness last reported them in this thread: each has the harness's `id` for
+it, a `status` (`allowed`; `warning` when it's nearly used up, or used up with extra usage carrying
+on; `rejected` when the harness refuses turns until it resets), and `used_percent`, `resets_at` and
+`window_minutes` when the harness says. A report replaces the limits it names and leaves the others,
+and they're kept sorted by `id`. They're the account's, so a thread's can be out of date when
+another thread (or app) used the account since; an app that queues work until a limit resets, or
+switches logins, reads them from whichever thread reported last. How each harness's reports map onto
+them is in [fixtures/README.md](fixtures/README.md#the-expected-events).
 
 Threads are created, listed and deleted through each backend's API, not through commands.
 
@@ -85,7 +97,7 @@ A `tool_call` has the harness's `name` for the tool and its `input` as the harne
 | `web` | Fetching or searching the web | `url`, `query` |
 | `mcp` | A tool on an external MCP server | `server`; `name` is the tool's own name |
 | `app` | A tool the app defined | |
-| `subagent` | Starting a subagent (Claude's Agent/Task, Codex's child threads) | `title` (its description) |
+| `subagent` | Starting a subagent (Claude's Agent/Task, Codex's child threads) | `title` (its description), `subagent` |
 | `todo` | Updating the agent's plan or todo list (TodoWrite, Codex's plan updates) | `todos`: the whole list |
 | `other` | Anything else | |
 
@@ -103,11 +115,33 @@ reasoning and tool calls) is an item whose `parent_id` is that call's id, in the
 the same item list. Requests from a subagent have its `parent_id` too. The call's `result` is what
 the subagent returned.
 
+Where the harness says how the subagent itself is getting on, the call has a `subagent` with its
+`status` (`running`, `completed`, `failed` or `stopped`), `agent_type`, `model`, `tool_uses`, its
+latest `activity`, and whether it runs in the `background`. A call that starts a subagent some
+other way (a skill Claude runs in a forked subagent) becomes a `subagent` call once the subagent
+starts.
+
+A **background** subagent's call completes as soon as it has started the subagent, which carries
+on: its `subagent.status` stays `running`, and its items keep coming, after its turn has ended
+too. Its calls and requests aren't cancelled when its turn ends, so the thread can be `waiting`
+(on one of its requests) with no turn running; answering it leaves the thread `idle`. When it ends,
+its `subagent.summary` is its report (its call's `result` only says it started). A subagent still
+running when its harness process ends is `stopped`, and its calls still running are `cancelled`.
+
+The harness can start a **turn by itself**, with no `user_message`: Claude Code does when a
+background subagent ends, to tell the agent. It goes as any turn does (`turn.started`, the thread
+`running`, a `turn_result`, `turn.completed`). If the user sent a message just before (so a turn of
+theirs is running), what the harness does by itself goes in the user's turn, which ends when the
+harness is done with the user's message. A backend that restarts and can't pick up a thread's run
+stops its subagents that were running.
+
 ## Requests
 
 A request is something the agent is waiting on the user for. It's open from `request.opened` until
 `request.resolved`, and the user answers it with a `respond` command. A thread can have several
-open at once (e.g. from parallel subagents).
+open at once (e.g. from parallel subagents). Once it's resolved, the thread's state keeps it with
+its `resolution` set, so a UI can go on showing what was asked and how it was answered; a request
+without a `resolution` is open.
 
 - `permission`: the agent wants to call a tool and the app's permission policy said "ask". It has
   the tool's `name`, `kind` and `input`, the `tool_call_id` of the call when there is one, a `title`
@@ -142,7 +176,7 @@ Every event has `type`, `thread_id` and `seq`, and may have `raw`.
 | `item.updated` | `item_id`, `patch` | Fields of an item changed: each of the patch's fields replaces the item's, and one set to `null` is removed. `id` and `type` never change. |
 | `delta` | `item_id`, `kind`, `offset`, `text` | Streamed text to append to an `assistant_message` (`kind: text`) or `reasoning` (`kind: reasoning`) item's `text`, which was `offset` long before it. |
 | `request.opened` | `request` | A request was opened. |
-| `request.resolved` | `request_id`, `resolution` | A request was answered or cancelled. |
+| `request.resolved` | `request_id`, `resolution` | A request was answered or cancelled. It stays in the state, with this `resolution`. |
 
 The backend changes the thread's `status` with `thread.updated` alongside these (to `running` when
 a turn starts, `waiting` while a request is open, and back), and doesn't leave a client to infer it.
@@ -171,8 +205,10 @@ the same rules:
 2. A saved event whose `seq` is at or below the state's is already in it, and changes nothing. So
    events can be delivered more than once.
 3. Otherwise the event is applied as described above, and the state's `seq` becomes the event's.
-   (`turn.*` events change nothing else.) An `item.updated` or `request.resolved` for an id the
-   state doesn't have only advances `seq`.
+   (`turn.*` events change nothing else.) A `request.opened` adds its request at the end of
+   `requests`, or replaces the one with its id in place. A `request.resolved` sets its request's
+   `resolution` (replacing one it had), leaving it where it is in `requests`. An `item.updated` or
+   `request.resolved` for an id the state doesn't have only advances `seq`.
 4. A `delta` is applied when the state has its item, the item is the delta's `kind`'s type, and
    the delta's `seq` isn't below the state's (one from before the last saved event the state has
    is already in it). Its `text` goes at `offset` in the item's text: what's already there (the
@@ -184,6 +220,55 @@ A backend's live snapshot includes the deltas it has applied, so a client that c
 middle of a message gets the text so far. Deltas it gets after the snapshot that the snapshot
 already has (it subscribed first, so as to miss nothing) carry offsets the snapshot's text is
 already past, and are skipped rather than added twice.
+
+### Windows
+
+A thread can run to thousands of items, so a client needn't load them all: a backend's snapshot can
+be a **window** of the thread, taken with a limit, that has only its last items, and the client loads
+earlier ones a page at a time as the user scrolls back. Items are only ever added at the end of a
+thread's list (an `item.added` for an id it has replaces that item in place), so an item's index in
+the whole list never changes, and windows and pages are told where they are by index.
+
+A window of a state with `n` items and a limit `limit` (less than `n`; with a limit of `n` or more it
+is the whole state) has:
+
+- `start`: `n - limit`, the index of the first item of the window. The window has the items from
+  `start` to the end.
+- `context`: the indices of the items from before `start` the window needs, ascending: the
+  `parent_id` of each of its items, and of each open request, and the request's `tool_call_id`, and
+  each subagent call (a `tool_call` of kind `subagent`) that's still `pending` or `running` (it may
+  add items to the window later, which would have no call to belong to), and then each of those
+  items' own `parent_id`, and so on (the subagent calls they belong to, however nested), where
+  they're before `start`. `items` starts with these, in that order, followed by the
+  window's items. Left out when there are none.
+- `requests`: the open requests, and the resolved requests whose **anchor** is at `start` or after,
+  or that have none, in the state's order. A request's anchor is the index of its `tool_call_id`'s
+  item if the state has one, or else that of the last item with its `turn_id`.
+- `thread` and `seq` as the state's.
+
+A **page** (`ItemPage`) is the thread's items before an index `before` (a window's `start`), at most
+`limit` of them: it has `start`, `max(0, before - limit)`; `items`, the items from before `start`
+that its items need (`context`, worked out as for a window from its own items' `parent_id`s), then
+the items from `start` up to `before`; `requests`, the requests whose anchor is in that range; and
+`seq`, that of the state it was taken from. `start` 0 means there's nothing before it.
+
+Events apply to a window as to any state (an event about an item or request it doesn't have only
+advances `seq`), and leave `start` and `context` as they are. A client puts a page into its window
+by putting the page's items in front of its own (`withPage` in `@dire-kiwi/agent-threads-protocol`):
+the context items of both, ordered by index (the page's version of one they share), those of them
+the page's own items include dropped, then the page's items from its `start`, then its own from its
+old `start`. Its `start` becomes the page's, and `context` the indices of the context items it kept
+(left out once `start` is 0). The page's requests go in front of its own, a page's version of one
+it has replacing it in place. (So a window with pages put in it may not have its requests in the
+state's order: a resolved request from a page can come before an open one the window had. A UI
+places resolved requests by their anchor.)
+
+A page may be taken from a later state than the client's (its `seq` is higher), and that's fine:
+events the client applies after it set what they set again. One taken from an earlier state can't
+be: the backend takes it after the client asked for it, so it has every event the client had then.
+A client applies the saved events it applies while it waits for the page (those with a `seq` above
+the page's) to the page's items and requests too, before putting it in, leaving out events that
+would add one the page doesn't have.
 
 ### Reconnecting
 
@@ -215,3 +300,73 @@ which it can't be told, starts a new process at the next turn, with Codex's own.
 
 A backend's `handle(command)` reports a command it can't carry out (an unknown thread, a malformed
 command) to its caller, rather than as an event.
+
+## Pass-through
+
+The protocol is what every app needs from a harness, the same for each. For what it leaves out,
+every backend has three ways through to the harness itself, in its API rather than in the protocol
+(an app's server uses them; it can forward what it likes to its clients). They're the same in each
+backend, with each language's names; the fixtures' `pass-through` scenarios check them.
+
+### Raw payloads
+
+With the backend's `raw` option on (it's off by default), `raw` is filled in:
+
+- An event made while the backend handles a message from the harness has that message as its
+  `raw`, as the harness sent it: one of Claude Code's stdout lines, or one of Codex's JSON-RPC
+  messages, parsed. That includes `delta`s, and every event a message leads to (a `result` ends the
+  turn: its `turn_result` item, `turn.completed` and the `thread.updated` all have the `result`).
+- An item or request made that way has the message as its `raw` too, and an `item.added` or
+  `request.opened` has it only there, not on the event as well. `item.updated` events don't change
+  an item's `raw`.
+- Events, items and requests the backend makes itself have none: creating a thread, a `send`'s
+  `user_message` and `turn.started`, answering a request, a turn ended because its process exited,
+  `run.reattached` and `run.lost` notices. Nor do ones a backend makes later, after waiting on
+  something (a permission policy that answers asynchronously, say).
+
+`raw` is saved with the events, so a thread's events and snapshots get bigger with it on.
+
+### Harness messages
+
+A backend calls the app's harness message handler (`onHarnessMessage` in Node, `OnHarnessMessage`
+in Go, `on_harness_message` in Rust) with each line a thread's harness process writes to stdout, in
+order, once its driver has dealt with it, whether or not the driver made anything of it. So an app
+can read what the protocol leaves out: Claude Code's `system` messages (`status`, `task_*`...),
+`rate_limit_event`s in full, a result's `modelUsage`, Codex's `thread/tokenUsage/updated` and
+`account/rateLimits/updated` notifications, and messages a newer CLI sends that the driver doesn't
+know. It gets:
+
+| Field | |
+| --- | --- |
+| thread id | The thread. |
+| run id | The process (the thread's `run.id` while it runs). |
+| harness | `claude` or `codex`. |
+| line | The line as it was written, without its newline. |
+| message | The line parsed as JSON; absent for a line that isn't JSON. |
+
+It's called on the backend's reading of the process's output, so it should return quickly (and not
+call back into the backend and wait). It's called for every line, including Claude Code's echoes of
+the backend's own control responses and Codex's responses to the driver's requests. After a
+restart, the backend reads a shim run's output again from where it last saved it, so lines after
+that point can be passed twice.
+
+### Control requests
+
+`control(thread_id, request)` sends the thread's running harness process a request and returns its
+answer:
+
+- **Claude Code**: `request` is a `control_request`'s `request`, e.g. `{"subtype":
+  "get_context_usage"}`. The backend sends it with a `request_id` of its own and returns the
+  `control_response`'s `response` when its `subtype` is `success`; when it's `error`, the call fails
+  with its `error`.
+- **Codex**: `request` is `{"method": ..., "params": ...}` (`params` may be left out), e.g.
+  `{"method": "account/rateLimits/read"}`. The backend sends it as a JSON-RPC request with an `id` of
+  its own and returns its `result`, or fails with its `error`'s `message`.
+
+It fails at once if the thread doesn't exist, has no running process (a thread's process starts at
+its first `send` and is kept between turns, but not across a restart without the shim) or runs on a
+harness that doesn't take requests; and if the process exits, or the backend closes, before it
+answers. It doesn't wait for a turn to end, and it doesn't time out. The backend doesn't look at the
+request or the answer, so the app mustn't use it to do what the driver does itself (start or steer a
+turn, interrupt, answer the harness's requests), which would leave the driver out of step with the
+process. Neither the request nor its answer is an event.

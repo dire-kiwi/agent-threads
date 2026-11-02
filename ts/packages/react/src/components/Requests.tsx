@@ -1,8 +1,9 @@
-// The thread's open requests, as cards: a permission to allow or deny, questions to answer, and a
-// plan to approve or send back.
-// A request goes once it's resolved (request.resolved), and its card with it.
+// The thread's requests, as cards: a permission to allow or deny, questions to answer, and a plan
+// to approve or send back. Open ones are at the end of the thread (OpenRequests); once one's
+// resolved, its card is drawn where it was asked (see groupRows), greyed out, with how it was
+// answered.
 
-import type { PermissionMode, PermissionRequest, PlanRequest, Question, QuestionRequest, ThreadRequest, ToolCall } from "@dire-kiwi/agent-threads-protocol";
+import type { PermissionMode, PermissionRequest, PlanRequest, Question, QuestionRequest, Resolution, ThreadRequest, ToolCall } from "@dire-kiwi/agent-threads-protocol";
 import { memo, useEffect, useRef, useState, type ReactNode, type RefObject } from "react";
 import { useRespond, useReveal, useThreadConfig, useThreadState } from "../hooks.js";
 import type { ThreadState } from "../store.js";
@@ -17,7 +18,7 @@ const NO_REQUESTS: readonly ThreadRequest[] = [];
 /** The thread's open requests, oldest first: all of them, or those from one subagent (`parentId`, "" for the main thread's own). */
 export const OpenRequests = memo(function OpenRequests({ parentId, className }: { parentId?: string; className?: string }) {
   const requests = useThreadState((s) => s.snapshot.requests ?? NO_REQUESTS);
-  const shown = parentId === undefined ? requests : requests.filter((r) => (r.parent_id ?? "") === parentId);
+  const shown = requests.filter((r) => !r.resolution && (parentId === undefined || (r.parent_id ?? "") === parentId));
   if (!shown.length) return null;
   return (
     <div className={cx("at-requests", className)}>
@@ -27,6 +28,34 @@ export const OpenRequests = memo(function OpenRequests({ parentId, className }: 
     </div>
   );
 });
+
+/** A request's card: a permission's, questions' or plan's, open or answered. */
+export function RequestCard({ request, className }: { request: ThreadRequest; className?: string }) {
+  return request.type === "permission" ? (
+    <PermissionCard request={request} className={className} />
+  ) : request.type === "plan" ? (
+    <PlanCard request={request} className={className} />
+  ) : (
+    <QuestionCard request={request} className={className} />
+  );
+}
+
+/** How a resolved request was answered, as a badge (a plan's: approved, or sent back). */
+function Outcome({ resolution, plan }: { resolution: Resolution; plan?: boolean }) {
+  const [text, tone] =
+    plan && resolution.outcome === "allow"
+      ? ["Approved", "good"]
+      : plan && resolution.outcome === "deny"
+        ? ["Kept planning", "plain"]
+        : resolution.outcome === "allow"
+      ? [resolution.always ? "Always allowed" : "Allowed", "good"]
+      : resolution.outcome === "deny"
+        ? [resolution.always ? "Always denied" : "Denied", "bad"]
+        : resolution.outcome === "answer"
+          ? ["Answered", "good"]
+          : ["Not answered", "plain"];
+  return <span className={cx("at-outcome", `at-outcome-${tone}`)}>{text}</span>;
+}
 
 /** Who's asking: "Claude", "Codex", or the harness's own name. */
 const asker = (harness: string) => (harness === "claude" ? "Claude" : harness === "codex" ? "Codex" : harness);
@@ -97,6 +126,20 @@ export const PermissionCard = memo(function PermissionCard({ request, className 
   const { busy, error, run } = useSending();
   const [noting, setNoting] = useState(false);
   const [note, setNote] = useState("");
+  if (request.resolution)
+    return (
+      <div className={cx("at-card", "at-permission", "at-card-done", className)} role="group" aria-label={`Permission for ${request.name}`}>
+        <div className="at-card-head">
+          <ShieldIcon size={15} className="at-faint" />
+          <span>
+            {asker(harness)} asked to use <span className="at-mono">{request.name}</span>
+          </span>
+          {meta.summary && <span className="at-permission-summary at-card-done-summary">{meta.summary}</span>}
+          <Outcome resolution={request.resolution} />
+        </div>
+        {request.resolution.message && <div className="at-card-note">{request.resolution.message}</div>}
+      </div>
+    );
   const decide = (outcome: "allow" | "deny", always = false) =>
     run(() => respond(request.id, { outcome, ...(always ? { always } : {}), ...(outcome === "deny" && note.trim() ? { message: note.trim() } : {}) }));
   return (
@@ -177,9 +220,22 @@ export const PlanCard = memo(function PlanCard({ request, className }: { request
   // The feedback being written, once the user's chosen to keep planning.
   const [feedback, setFeedback] = useState<string | null>(null);
   const { busy, error, run } = useSending();
+  const title = planTitle(request.plan);
+  if (request.resolution)
+    return (
+      <div className={cx("at-card", "at-plan-card", "at-card-done", className)} role="group" aria-label={`Plan from ${asker(harness)}`}>
+        <div className="at-card-head">
+          <MapIcon size={15} className="at-faint" />
+          <span>
+            {asker(harness)}'s plan{title && <span className="at-plan-title">: {title}</span>}
+          </span>
+          <Outcome resolution={request.resolution} plan />
+        </div>
+        {request.resolution.message && <div className="at-card-note">{request.resolution.message}</div>}
+      </div>
+    );
   const approve = () => run(() => respond(request.id, { outcome: "allow", permission_mode: mode }));
   const keepPlanning = () => run(() => respond(request.id, { outcome: "deny", ...(feedback?.trim() ? { message: feedback.trim() } : {}) }));
-  const title = planTitle(request.plan);
   return (
     <div className={cx("at-card", "at-plan-card", className)} role="group" aria-label={`Plan from ${asker(harness)}`}>
       <div className="at-card-head">
@@ -288,11 +344,12 @@ export const QuestionCard = memo(function QuestionCard({ request, className }: {
     const after = questions.findIndex((qq, j) => j > i && !answerOf(qq, next[j] ?? NO_DRAFT).length);
     setCurrent(after >= 0 ? after : i);
   };
-  useDigitKeys(!busy, ref, (n) => {
+  useDigitKeys(!busy && !request.resolution, ref, (n) => {
     const o = questions[current]?.options?.[n - 1];
     if (o) pick(current, o.label);
   });
   const who = asker(harness);
+  if (request.resolution) return <AnsweredQuestions request={request} resolution={request.resolution} who={who} className={className} />;
   return (
     <div ref={ref} className={cx("at-card", "at-question", className)} role="group" aria-label={`Questions from ${who}`}>
       <div className="at-card-head">
@@ -374,14 +431,54 @@ export const QuestionCard = memo(function QuestionCard({ request, className }: {
   );
 });
 
-/** One of a question's options: a numbered row (its number is its key), ticked when it's picked. */
+/** Questions that have been answered (or weren't): each with the options picked ticked, and any typed answer. */
+function AnsweredQuestions({ request, resolution, who, className }: { request: QuestionRequest; resolution: Resolution; who: string; className?: string }) {
+  const questions = request.questions;
+  return (
+    <div className={cx("at-card", "at-question", "at-card-done", className)} role="group" aria-label={`Questions from ${who}`}>
+      <div className="at-card-head">
+        <QuestionIcon size={15} className="at-faint" />
+        <span>
+          {who} {questions.length === 1 ? "asked" : `asked ${questions.length} questions`}
+        </span>
+        <Outcome resolution={resolution} />
+      </div>
+      <div className="at-questions">
+        {questions.map((q) => {
+          const answer = resolution.answers?.[q.id] ?? [];
+          const options = q.options ?? [];
+          const typed = answer.filter((a) => !options.some((o) => o.label === a));
+          return (
+            <div key={q.id} className={cx("at-q", questions.length > 1 && "at-q-many")}>
+              <div className="at-q-title">
+                {q.header && <span className="at-q-header">{q.header}</span>}
+                <span className="at-q-text">{q.question}</span>
+              </div>
+              {options.length > 0 && (
+                <div className="at-choices" role={q.multi_select ? "group" : "radiogroup"} aria-label={q.question}>
+                  {options.map((o, j) => (
+                    <Choice key={o.label} label={o.label} description={o.description} n={j + 1} multi={!!q.multi_select} picked={answer.includes(o.label)} keys={false} />
+                  ))}
+                </div>
+              )}
+              {typed.length > 0 && <div className="at-card-note">{q.secret ? "••••••" : typed.join("\n")}</div>}
+            </div>
+          );
+        })}
+      </div>
+      {resolution.message && <div className="at-card-note">{resolution.message}</div>}
+    </div>
+  );
+}
+
+/** One of a question's options: a numbered row (its number is its key), ticked when it's picked; without onPick, it's only shown. */
 function Choice({ label, description, n, picked, multi, onPick, disabled, keys }: {
   label: string;
   description?: string;
   n: number;
   picked: boolean;
   multi: boolean;
-  onPick: () => void;
+  onPick?: () => void;
   disabled?: boolean;
   keys: boolean;
 }): ReactNode {
@@ -390,7 +487,7 @@ function Choice({ label, description, n, picked, multi, onPick, disabled, keys }
       type="button"
       role={multi ? "checkbox" : "radio"}
       aria-checked={picked}
-      disabled={disabled}
+      disabled={disabled || !onPick}
       onClick={onPick}
       className={cx("at-choice", picked && "at-choice-picked")}
     >
