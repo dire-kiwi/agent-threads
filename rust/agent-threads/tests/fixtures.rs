@@ -186,6 +186,7 @@ async fn run_fixture(scenario: &str, spawner_name: &str) {
             harness: t["harness"].as_str().map(String::from),
             model: t["model"].as_str().map(String::from),
             effort: t["effort"].as_str().map(String::from),
+            session_id: t["session_id"].as_str().map(String::from),
             permission_mode: t
                 .get("permission_mode")
                 .map(|m| serde_json::from_value(m.clone()).unwrap()),
@@ -210,6 +211,23 @@ async fn run_fixture(scenario: &str, spawner_name: &str) {
                 let snap = sdk.snapshot(&thread.id).await.unwrap();
                 assert_eq!(snap.requests.len(), 1, "{at}: open requests");
                 command["request_id"] = json!(snap.requests[0].id());
+            }
+            if command["type"] == "rewind" {
+                // {{tN}}: the thread's Nth turn.
+                let n: usize = command["turn_id"]
+                    .as_str()
+                    .and_then(|t| t.strip_prefix("{{t")?.strip_suffix("}}")?.parse().ok())
+                    .unwrap_or_else(|| panic!("{at}: turn_id isn't {{{{tN}}}}"));
+                let turns: Vec<String> = events
+                    .pump()
+                    .iter()
+                    .filter_map(|e| match e {
+                        ThreadEvent::TurnStarted(e) => Some(e.turn_id.clone()),
+                        _ => None,
+                    })
+                    .collect();
+                assert!(turns.len() >= n, "{at}: the thread has {} turns", turns.len());
+                command["turn_id"] = json!(turns[n - 1]);
             }
             from = events.pump().len();
             sdk.handle_json(command).await.unwrap_or_else(|e| panic!("{at}: {e}"));
@@ -329,29 +347,37 @@ macro_rules! fixtures {
 }
 
 fixtures! {
+    claude_adopt: "claude/adopt",
     claude_app_tool: "claude/app-tool",
     claude_ask_user_question: "claude/ask-user-question",
+    claude_compact: "claude/compact",
     claude_compaction: "claude/compaction",
     claude_error: "claude/error",
     claude_interrupt: "claude/interrupt",
     claude_mcp_tool: "claude/mcp-tool",
+    claude_new_session: "claude/new-session",
     claude_permission_allow: "claude/permission-allow",
     claude_permission_deny: "claude/permission-deny",
     claude_plain_reply: "claude/plain-reply",
     claude_resume: "claude/resume",
+    claude_rewind: "claude/rewind",
     claude_steer: "claude/steer",
     claude_subagent: "claude/subagent",
     claude_tool_calls: "claude/tool-calls",
+    codex_adopt: "codex/adopt",
     codex_app_tool: "codex/app-tool",
     codex_ask_user_question: "codex/ask-user-question",
+    codex_compact: "codex/compact",
     codex_compaction: "codex/compaction",
     codex_error: "codex/error",
     codex_interrupt: "codex/interrupt",
     codex_mcp_tool: "codex/mcp-tool",
+    codex_new_session: "codex/new-session",
     codex_permission_allow: "codex/permission-allow",
     codex_permission_deny: "codex/permission-deny",
     codex_plain_reply: "codex/plain-reply",
     codex_resume: "codex/resume",
+    codex_rewind: "codex/rewind",
     codex_steer: "codex/steer",
     codex_subagent: "codex/subagent",
     codex_tool_calls: "codex/tool-calls",

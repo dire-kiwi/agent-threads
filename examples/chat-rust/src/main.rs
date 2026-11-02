@@ -416,8 +416,8 @@ async fn call(app: &App, method: &str, p: Value) -> Result<Value, String> {
             let seq = p["seq"].as_u64().unwrap_or(0);
             Ok(json!(sdk.events_since(&thread_id()?, seq, None).await.map_err(text)?))
         }
-        // Commands in: send, interrupt, respond and set_options, checked and carried out by the
-        // backend.
+        // Commands in: send, interrupt, respond, set_options, rewind, new_session and compact,
+        // checked and carried out by the backend.
         "command" => {
             sdk.handle_json(p["command"].clone()).await.map_err(text)?;
             Ok(Value::Null)

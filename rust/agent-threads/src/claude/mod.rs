@@ -21,7 +21,8 @@ use crate::attachments::{Part, message_parts, path_text};
 use crate::harness::{BoxFuture, Harness, HarnessSession, Message, RunCheckpoint, TurnEnd};
 use crate::ids::{new_id, now_iso, now_ms, private_temp_dir};
 use crate::permissions::{Decided, PermissionDecision, PermissionQuery, permission_key};
-use crate::protocol::{DeltaEventKind, Item, Resolution, ResolutionOutcome, ToolKind, ToolStatus};
+use crate::protocol::{DeltaEventKind, Item, Resolution, ResolutionOutcome, ToolKind, ToolStatus, TurnSession};
+use crate::sessions::{RewindError, RewindPoint, resume_at_point};
 use crate::skills::write_skills;
 use crate::spawner::{ExitStatus, HarnessProcess, ProcessEvent, Signal, SpawnOptions};
 use crate::store::RunRecord;
@@ -135,6 +136,12 @@ struct RunState {
     sent: Vec<Sent>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     plugin_dir: Option<String>,
+    /// The running turn's mark: the main conversation's last message in it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    at: Option<String>,
+    /// The message it was started to resume its session at (the thread's resume_at then).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    resume_at: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     launched: Option<Launched>,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
@@ -177,6 +184,10 @@ struct Run {
     sent: Vec<Sent>,
     /// The generated plugin with the thread's skills, for this run only.
     plugin_dir: Option<PathBuf>,
+    /// The running turn's mark: the uuid of the main conversation's last message in it.
+    at: Option<String>,
+    /// The message it was started to resume its session at (--resume-session-at).
+    resume_at: Option<String>,
     launched: Option<Launched>,
     /// Left running when the backend shut down: nothing more is read or written.
     detached: bool,
@@ -205,6 +216,8 @@ impl Run {
             open: Vec::new(),
             sent: Vec::new(),
             plugin_dir: None,
+            at: None,
+            resume_at: None,
             launched: None,
             detached: false,
         }
@@ -291,6 +304,8 @@ impl Run {
             open: self.open.clone(),
             sent: self.sent.clone(),
             plugin_dir: self.plugin_dir.as_ref().map(|p| p.to_string_lossy().into()),
+            at: self.at.clone(),
+            resume_at: self.resume_at.clone(),
             launched: self.launched.clone(),
             stale: false,
             steer_at: None,
@@ -311,6 +326,8 @@ impl Run {
         self.open = st.open.clone();
         self.sent = st.sent.clone();
         self.plugin_dir = st.plugin_dir.as_ref().map(PathBuf::from);
+        self.at = st.at.clone();
+        self.resume_at = st.resume_at.clone();
         self.launched = st.launched.clone();
     }
 
@@ -655,6 +672,14 @@ impl ClaudeSession {
         if let Some(s) = &t.session_id {
             args.extend(["--resume".into(), s.clone()]);
         }
+        // After a rewind: the session as it was at the end of the turn it went back to.
+        let resume_at = t.session_id.as_ref().and(t.resume_at.clone());
+        if let Some(at) = &resume_at {
+            args.extend(["--resume-session-at".into(), at.clone()]);
+        }
+        if let Some(r) = self.runs.get_mut(id) {
+            r.resume_at = resume_at;
+        }
         let mut servers = Map::new();
         if !config.tools.is_empty() {
             servers.insert(APP_SERVER.into(), json!({"type": "sdk", "name": APP_SERVER}));
@@ -730,6 +755,7 @@ impl ClaudeSession {
         run.pending.clear();
         let retired = run.retired;
         let error = exit_error(&status, &run.stderr);
+        let at = run.at.clone();
         if self.current.as_deref() == Some(id) {
             self.current = None;
             if let Some(last) = self.last.replace(id.to_string())
@@ -750,6 +776,7 @@ impl ClaudeSession {
                 TurnEnd {
                     ok: false,
                     error: Some(error),
+                    session_at: at,
                     ..Default::default()
                 },
                 live,
@@ -859,14 +886,35 @@ impl ClaudeSession {
             }
             item
         };
+        // The main conversation's messages (replayed ones too): the turn's last is where a rewind to
+        // after it resumes the session.
+        if matches!(m["type"].as_str(), Some("user" | "assistant"))
+            && parent.is_none()
+            && let Some(uuid) = m["uuid"].as_str()
+        {
+            self.run(id).unwrap().at = Some(uuid.to_string());
+        }
         match m["type"].as_str().unwrap_or("") {
             "system" => {
-                if m["subtype"] == "init"
-                    && let Some(sid) = m["session_id"].as_str().filter(|s| !s.is_empty())
-                    && ctx.thread().session_id.as_deref() != Some(sid)
-                {
-                    let sid = sid.to_string();
-                    ctx.set_thread(|t| t.session_id = Some(sid));
+                if m["subtype"] == "init" {
+                    // The session it runs in; and a rewind's resume_at is done with once it has
+                    // resumed there.
+                    let sid = m["session_id"]
+                        .as_str()
+                        .filter(|s| !s.is_empty() && ctx.thread().session_id.as_deref() != Some(*s))
+                        .map(String::from);
+                    let resumed = self.run(id).unwrap().resume_at.clone();
+                    let done = resumed.is_some() && ctx.thread().resume_at == resumed;
+                    if sid.is_some() || done {
+                        ctx.set_thread(|t| {
+                            if let Some(sid) = sid {
+                                t.session_id = Some(sid);
+                            }
+                            if done {
+                                t.resume_at = None;
+                            }
+                        });
+                    }
                 }
                 if m["subtype"] == "compact_boundary" {
                     let meta = &m["compact_metadata"];
@@ -988,6 +1036,7 @@ impl ClaudeSession {
                 run.msg_of_parent.clear();
                 run.block_count.clear();
                 run.streamed.clear();
+                let at = run.at.take();
                 if ctx.turn_id().is_none() {
                     return;
                 }
@@ -1014,6 +1063,7 @@ impl ClaudeSession {
                     error,
                     usage: serde_json::from_value(claude_usage(m)).ok(),
                     duration_ms: m["duration_ms"].as_f64().map(|d| d as u64),
+                    session_at: at,
                 };
                 let live = self.live_id().is_some();
                 ctx.end_turn(end, live);
@@ -1458,6 +1508,26 @@ impl HarnessSession for ClaudeSession {
         let id = self.ensure(ctx, false);
         let msg = self.user_message(ctx, std::slice::from_ref(&message));
         self.run(&id).unwrap().send(vec![message.id], msg);
+    }
+
+    fn can_compact(&self) -> bool {
+        true
+    }
+
+    fn compact(&mut self, ctx: &mut ThreadContext) {
+        // Claude Code compacts when it's sent /compact, which is its turn.
+        let id = self.ensure(ctx, true);
+        let message = Message {
+            id: String::new(),
+            text: "/compact".into(),
+            attachments: Vec::new(),
+        };
+        let msg = self.user_message(ctx, &[message]);
+        self.run(&id).unwrap().send(Vec::new(), msg);
+    }
+
+    fn rewind_point(&self, sessions: &[Option<TurnSession>], index: usize) -> Option<Result<RewindPoint, RewindError>> {
+        Some(resume_at_point(sessions, index))
     }
 
     fn carry_over(&mut self, ctx: &mut ThreadContext, messages: Vec<Message>) {

@@ -1,9 +1,9 @@
 //! agent-threads: run threads of agents on Claude Code and Codex.
 //!
 //! [`AgentThreads`] is the backend an app embeds: it creates threads, takes [`Command`]s (send,
-//! interrupt, respond, set_options), runs each thread's harness, and sends every thread's
-//! [`ThreadEvent`]s to its subscribers, which the app carries over its own transport. See
-//! docs/design.md and spec/PROTOCOL.md in the repository.
+//! interrupt, respond, set_options, rewind, new_session, compact), runs each thread's harness, and
+//! sends every thread's [`ThreadEvent`]s to its subscribers, which the app carries over its own
+//! transport. See docs/design.md and spec/PROTOCOL.md in the repository.
 //!
 //! [`protocol`] has the types of the shared spec (`spec/`): items, requests, events, commands and
 //! snapshots, and [`reducer`] folds events into a thread's state.
@@ -21,6 +21,7 @@ mod harness;
 mod ids;
 mod mcp_http;
 mod permissions;
+mod sessions;
 #[cfg(unix)]
 mod shim;
 #[cfg(not(unix))]
@@ -42,6 +43,7 @@ pub use harness::{
 };
 pub use permissions::{Decided, PermissionContext, PermissionDecision, PermissionPolicy, PermissionQuery};
 pub use protocol::{Command, Item, Snapshot, Thread, ThreadEvent};
+pub use sessions::{RewindError, RewindPoint, resume_at_point, revert_point};
 #[doc(hidden)]
 pub use shim::kill_runs;
 pub use shim::{RUN_FORMAT, ShimOptions, shim};

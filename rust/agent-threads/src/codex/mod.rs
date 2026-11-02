@@ -28,7 +28,8 @@ use crate::harness::{BoxFuture, Harness, HarnessSession, Message, RunCheckpoint,
 use crate::ids::{new_id, now_iso, now_ms, private_temp_dir};
 use crate::mcp_http::{LoopbackMcp, ToolServer, serve_tools};
 use crate::permissions::{Decided, PermissionDecision, PermissionQuery, permission_key};
-use crate::protocol::{DeltaEventKind, Item, Resolution, ResolutionOutcome, ToolKind, ToolStatus};
+use crate::protocol::{DeltaEventKind, Item, Resolution, ResolutionOutcome, ToolKind, ToolStatus, TurnSession};
+use crate::sessions::{RewindError, RewindPoint, revert_point};
 use crate::skills::write_skills;
 use crate::spawner::{ExitStatus, HarnessProcess, ProcessEvent, Signal, SpawnOptions};
 use crate::store::RunRecord;
@@ -815,6 +816,7 @@ impl CodexSession {
         if self.runs.get(run).is_none_or(|r| r.exited || r.retired) || self.current.as_deref() != Some(run) {
             return;
         }
+        let at = self.runs.get(run).and_then(|r| r.turn_id.clone());
         self.turn_ended(ctx, run);
         if ctx.turn_id().is_some() {
             let live = self.live_id().is_some();
@@ -822,6 +824,7 @@ impl CodexSession {
                 TurnEnd {
                     ok: false,
                     error: Some(error.to_string()),
+                    session_at: at,
                     ..Default::default()
                 },
                 live,
@@ -1115,7 +1118,7 @@ impl CodexSession {
             params,
             None,
             Box::new(|s, ctx, run, r| match r {
-                Ok(r) => s.thread_started(ctx, run, &r),
+                Ok(r) => s.resumed(ctx, run, r),
                 Err(e) => {
                     let m = e.message.to_lowercase();
                     if !["not found", "no rollout", "unknown thread", "does not exist"].iter().any(|x| m.contains(x)) {
@@ -1127,6 +1130,30 @@ impl CodexSession {
                     );
                     s.notice(ctx, &text);
                     s.new_thread(ctx, run);
+                }
+            }),
+        );
+    }
+
+    /// The session was resumed: after a rewind, it's reverted to before the turn it went back to
+    /// before, first.
+    fn resumed(&mut self, ctx: &mut ThreadContext, run: &str, r: Value) {
+        let (Some(at), Some(session)) = (ctx.thread().resume_at.clone(), ctx.thread().session_id.clone()) else {
+            return self.thread_started(ctx, run, &r);
+        };
+        self.request(
+            ctx,
+            run,
+            "thread/revert",
+            json!({"threadId": session, "beforeTurnId": at}),
+            None,
+            Box::new(move |s, ctx, run, reverted| match reverted {
+                Err(e) => s.start_failed(ctx, run, e.message),
+                Ok(_) => {
+                    if ctx.thread().resume_at.as_deref() == Some(at.as_str()) {
+                        ctx.set_thread(|t| t.resume_at = None);
+                    }
+                    s.thread_started(ctx, run, &r);
                 }
             }),
         );
@@ -1201,9 +1228,13 @@ impl CodexSession {
             return self.start_failed(ctx, run, "Codex didn't say which thread it started".into());
         };
         self.run(run).unwrap().thread_id = Some(thread_id.clone());
+        // A rewind's resume_at was for the session it had, which this isn't if it couldn't be resumed.
         if ctx.thread().session_id.as_deref() != Some(thread_id.as_str()) {
             let sid = thread_id.clone();
-            ctx.set_thread(|t| t.session_id = Some(sid));
+            ctx.set_thread(|t| {
+                t.session_id = Some(sid);
+                t.resume_at = None;
+            });
         }
         self.set_ready(ctx, run, Ok(thread_id));
     }
@@ -1355,6 +1386,7 @@ impl CodexSession {
         }
         let retired = run.retired;
         let error = exit_error(&status, &run.stderr, true);
+        let at = run.turn_id.clone();
         self.turn_ended(ctx, id);
         if self.current.as_deref() == Some(id) {
             self.current = None;
@@ -1375,6 +1407,7 @@ impl CodexSession {
                 TurnEnd {
                     ok: false,
                     error: Some(error),
+                    session_at: at,
                     ..Default::default()
                 },
                 live,
@@ -1830,6 +1863,10 @@ impl CodexSession {
 
     fn turn_completed(&mut self, ctx: &mut ThreadContext, run: &str, turn: &Value) {
         let error = self.run(run).unwrap().error.clone();
+        let at = turn["id"]
+            .as_str()
+            .map(String::from)
+            .or_else(|| self.runs.get(run).and_then(|r| r.turn_id.clone()));
         self.turn_ended(ctx, run);
         let r = self.run(run).unwrap();
         r.error = None;
@@ -1866,6 +1903,7 @@ impl CodexSession {
             }),
             usage: usage.and_then(|u| serde_json::from_value(u).ok()),
             duration_ms: turn["durationMs"].as_f64().map(|d| d as u64),
+            session_at: at,
         };
         let live = self.live_id().is_some();
         ctx.end_turn(end, live);
@@ -2542,33 +2580,45 @@ fn turn_started(sent: Sent) -> Then {
 
 impl HarnessSession for CodexSession {
     fn start(&mut self, ctx: &mut ThreadContext, messages: Vec<Message>) {
-        let run = self.ensure(ctx, true);
         if messages.len() == 1 && messages[0].text.trim() == "/compact" && messages[0].attachments.is_empty() {
-            let r = self.run(&run).unwrap();
-            r.starting = true;
-            r.compacting = true;
-            self.when_ready(
-                ctx,
-                &run.clone(),
-                Box::new(move |s, ctx, ready| match ready {
-                    Err(e) => s.turn_failed(ctx, &run, &e),
-                    Ok(thread_id) => s.request(
-                        ctx,
-                        &run,
-                        "thread/compact/start",
-                        json!({"threadId": thread_id}),
-                        None,
-                        Box::new(|s, ctx, run, r| {
-                            if let Err(e) = r {
-                                s.turn_failed(ctx, run, &e.message);
-                            }
-                        }),
-                    ),
-                }),
-            );
-            return;
+            return self.compact(ctx);
         }
+        let run = self.ensure(ctx, true);
         self.turn_start(ctx, &run, &messages);
+    }
+
+    fn can_compact(&self) -> bool {
+        true
+    }
+
+    fn compact(&mut self, ctx: &mut ThreadContext) {
+        let run = self.ensure(ctx, true);
+        let r = self.run(&run).unwrap();
+        r.starting = true;
+        r.compacting = true;
+        self.when_ready(
+            ctx,
+            &run.clone(),
+            Box::new(move |s, ctx, ready| match ready {
+                Err(e) => s.turn_failed(ctx, &run, &e),
+                Ok(thread_id) => s.request(
+                    ctx,
+                    &run,
+                    "thread/compact/start",
+                    json!({"threadId": thread_id}),
+                    None,
+                    Box::new(|s, ctx, run, r| {
+                        if let Err(e) = r {
+                            s.turn_failed(ctx, run, &e.message);
+                        }
+                    }),
+                ),
+            }),
+        );
+    }
+
+    fn rewind_point(&self, sessions: &[Option<TurnSession>], index: usize) -> Option<Result<RewindPoint, RewindError>> {
+        Some(Ok(revert_point(sessions, index)))
     }
 
     fn steer(&mut self, ctx: &mut ThreadContext, message: Message) {

@@ -56,20 +56,31 @@ tokio::spawn(async move {
         }
     }
 });
-sdk.handle_json(command_from_a_client).await?;        // send / interrupt / respond / set_options
+sdk.handle_json(command_from_a_client).await?;        // send / interrupt / respond / set_options / rewind / new_session / compact
 let snapshot = sdk.snapshot(&thread.id).await?;       // for a client that just connected
 let missed = sdk.events_since(&thread.id, seq, None).await?; // for one catching up
 ```
 
 ## Threads
 
-`create` makes a thread (idle); its process starts at its first message. `handle(Command)` (or
+`create` makes a thread (idle); its process starts at its first message. With
+`CreateOptions::session_id` (Claude Code's session id, or Codex's thread id) it adopts a
+conversation the harness already has: its first turn resumes it. `handle(Command)` (or
 `handle_json`, which checks the JSON is a command first) carries out the protocol's commands, and
-`send`, `interrupt`, `respond` and `set_options` are the same from code. A command it can't carry
-out (an unknown thread, a malformed command, an AgentThreads that's closed) is an `Error::Command`,
-for the app to tell its client; the store failing is an `Error::Store`. `get`, `list`, `delete`,
+`send`, `interrupt`, `respond`, `set_options`, `rewind`, `new_session` and `compact` are the same
+from code. A command it can't carry out (an unknown thread, a malformed command, an AgentThreads
+that's closed) is an `Error::Command`, for the app to tell its client; the store failing is an
+`Error::Store`. `get`, `list`, `delete`,
 `configure` (a thread's own tools, servers, skills and policy, which aren't stored: give them again
 after a restart; a `CapabilitiesUpdate` changes only what it gives) and `close` round it off.
+
+`rewind(id, turn_id)` takes the conversation back to before a turn (the harness forgets it and the
+turns after, whose items are removed), `new_session(id)` has the next turn start a new
+conversation, and `compact(id)` compacts the harness's context in a turn of its own
+([spec/PROTOCOL.md](../../spec/PROTOCOL.md#sessions)). They're refused while a turn runs. Each
+`turn_result` records the session the turn ended in (`session`), which is what a rewind works from;
+a custom `HarnessSession` takes part with `rewind_point` (`resume_at_point` or `revert_point`, or its
+own) and `can_compact`/`compact`, and without them refuses both.
 
 `subscribe()` is a `tokio::sync::broadcast` receiver of every thread's events. One that falls more
 than `Options::event_capacity` (4096) events behind gets `RecvError::Lagged`: it should catch up with

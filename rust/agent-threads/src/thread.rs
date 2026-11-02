@@ -24,9 +24,10 @@ use crate::ids::{new_id, now_iso};
 use crate::permissions::{Decided, PermissionContext, PermissionDecision, PermissionPolicy, PermissionQuery, decide};
 use crate::protocol::{
     Attachment, DeltaEventKind, Item, Resolution, ResolutionOutcome, Snapshot, Thread, ThreadEvent, ThreadRequest,
-    Usage, UserMessage,
+    TurnSession, Usage, UserMessage,
 };
 use crate::reducer::{apply_event, utf16_len};
+use crate::sessions::RewindError;
 use crate::spawner::Spawner;
 use crate::store::{RunRecord, Store, StoreError, StoreErrorKind};
 
@@ -42,6 +43,9 @@ type Persisted = Box<dyn FnOnce(&mut Actor, Result<(), StoreError>) + Send>;
 pub struct Turn {
     pub id: String,
     pub interrupted: bool,
+    /// The thread's session_id when it started (none: it starts a new session).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session: Option<String>,
     /// How many turns in a row (this one included) are retries for messages left queued that took
     /// none in: carried over from the turn before, or sent again with an explicit message.
     #[serde(default, skip_serializing_if = "is_zero")]
@@ -81,6 +85,7 @@ enum Effect {
     Interrupt,
     Release,
     OptionsChanged,
+    Compact,
 }
 
 /// Something waiting for the next save.
@@ -421,6 +426,7 @@ impl ThreadContext {
             let turn = Turn {
                 id: new_id("turn"),
                 interrupted: false,
+                session: self.session_now(),
                 carried: !left.is_empty() as u32,
                 progressed: false,
             };
@@ -451,6 +457,45 @@ impl ThreadContext {
             text: message.text,
             attachments: message.attachments,
         }));
+    }
+
+    /// The session a turn starting now starts in, for its Turn.
+    fn session_now(&self) -> Option<String> {
+        self.state.thread.session_id.clone()
+    }
+
+    /// Compacts the harness's context: a turn with no message. The caller checks one can start.
+    pub(crate) fn compact(&mut self) {
+        let turn = Turn {
+            id: new_id("turn"),
+            interrupted: false,
+            session: self.session_now(),
+            carried: 0,
+            progressed: false,
+        };
+        let turn_id = turn.id.clone();
+        self.turn = Some(turn);
+        self.emit(json!({"type": "turn.started", "turn_id": turn_id}));
+        self.set_thread(|t| {
+            t.status = crate::protocol::ThreadStatus::Running;
+            t.error = None;
+        });
+        self.effects.push_back(Effect::Compact);
+    }
+
+    /// The next turn starts a new session. The caller checks no turn is running.
+    pub(crate) fn new_session(&mut self) {
+        if self.state.thread.session_id.is_none() {
+            return;
+        }
+        self.set_thread(|t| {
+            t.session_id = None;
+            t.resume_at = None;
+        });
+        self.add_item(
+            json!({"id": new_id("n"), "type": "notice", "level": "info", "code": "session.new", "text": NEW_SESSION_TEXT}),
+        );
+        self.effects.push_back(Effect::OptionsChanged);
     }
 
     pub(crate) fn interrupt(&mut self) {
@@ -546,6 +591,16 @@ impl ThreadContext {
         if let Some(d) = end.duration_ms {
             result["duration_ms"] = json!(d);
         }
+        if let Some(id) = &self.state.thread.session_id {
+            let mut session = json!({"id": id});
+            if let Some(at) = end.session_at.as_ref().filter(|a| !a.is_empty()) {
+                session["at"] = json!(at);
+            }
+            if turn.session.is_none() {
+                session["started"] = json!(true);
+            }
+            result["session"] = session;
+        }
         self.add_item(result);
         self.emit(json!({"type": "turn.completed", "turn_id": turn.id}));
         self.turn = None;
@@ -591,6 +646,7 @@ impl ThreadContext {
         let next = Turn {
             id: new_id("turn"),
             interrupted: false,
+            session: self.session_now(),
             carried: carried + 1,
             progressed: false,
         };
@@ -1003,8 +1059,68 @@ impl Actor {
                 Effect::Interrupt => s.interrupt(c),
                 Effect::Release => s.release(c),
                 Effect::OptionsChanged => s.options_changed(c),
+                Effect::Compact => s.compact(c),
             }
         }
+    }
+
+    /// Takes the conversation back to before the turn `turn_id`: its items and every later turn's
+    /// go, and the session goes where the harness says (see sessions.rs). An error for a turn the
+    /// thread hasn't, or one the harness can't rewind to. The caller checks no turn is running.
+    pub(crate) fn rewind(&mut self, turn_id: &str) -> Result<(), RewindError> {
+        let c = &mut self.core;
+        let items = &c.saved.items;
+        let mut order: Vec<&str> = Vec::new();
+        for t in items.iter().filter_map(Item::turn_id) {
+            if !order.contains(&t) {
+                order.push(t);
+            }
+        }
+        let results: Vec<&crate::protocol::TurnResult> = items
+            .iter()
+            .filter_map(|i| match i {
+                Item::TurnResult(r) if r.parent_id.is_none() => Some(r),
+                _ => None,
+            })
+            .collect();
+        let Some(index) = results.iter().position(|r| r.turn_id.as_deref() == Some(turn_id)) else {
+            return Err(RewindError(format!("there's no turn {turn_id} in the thread")));
+        };
+        let sessions: Vec<Option<TurnSession>> = results.iter().map(|r| r.session.clone()).collect();
+        let point = match self.session.rewind_point(&sessions, index) {
+            None => {
+                return Err(RewindError(format!(
+                    "{} threads can't be rewound",
+                    c.state.thread.harness
+                )));
+            }
+            Some(p) => p?,
+        };
+        let from = order.iter().position(|t| *t == turn_id).unwrap_or(order.len());
+        let dropped: HashSet<&str> = order[from..].iter().copied().collect();
+        let first = items
+            .iter()
+            .position(|i| i.turn_id().is_some_and(|t| dropped.contains(t)));
+        let gone: Vec<String> = items
+            .iter()
+            .enumerate()
+            .filter(|(i, it)| match it.turn_id() {
+                Some(t) => dropped.contains(t),
+                None => first.is_some_and(|f| *i > f),
+            })
+            .map(|(_, it)| it.id().to_string())
+            .collect();
+        c.queue.retain(|id| !gone.contains(id));
+        c.emit(json!({"type": "items.removed", "item_ids": gone}));
+        c.set_thread(|t| {
+            t.session_id = point.session_id;
+            t.resume_at = point.resume_at;
+        });
+        c.add_item(
+            json!({"id": new_id("n"), "type": "notice", "level": "info", "code": "rewind", "text": REWIND_TEXT}),
+        );
+        c.effects.push_back(Effect::OptionsChanged);
+        Ok(())
     }
 
     /// Answers an open request; does nothing if it isn't open.
@@ -1164,6 +1280,10 @@ fn cancel() -> Resolution {
         outcome: ResolutionOutcome::Cancel,
     }
 }
+
+/// The notices a rewind and a new session add.
+const REWIND_TEXT: &str = "The conversation was rewound to here: the agent doesn't remember what came after.";
+const NEW_SESSION_TEXT: &str = "A new conversation starts here: the agent doesn't remember what came before.";
 
 /// What a secret answer is shown as.
 pub(crate) const SECRET: &str = "[secret]";

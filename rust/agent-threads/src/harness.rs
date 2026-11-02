@@ -11,7 +11,8 @@ use std::sync::Arc;
 
 use serde_json::Value;
 
-use crate::protocol::{Attachment, Usage};
+use crate::protocol::{Attachment, TurnSession, Usage};
+use crate::sessions::{RewindError, RewindPoint};
 use crate::store::RunRecord;
 use crate::thread::ThreadContext;
 use crate::tools::Tool;
@@ -128,6 +129,9 @@ pub struct TurnEnd {
     pub error: Option<String>,
     pub usage: Option<Usage>,
     pub duration_ms: Option<u64>,
+    /// The harness's own mark for the turn, in its session: Claude Code's last message in it, Codex's
+    /// id for the turn (the turn_result's `session.at`).
+    pub session_at: Option<String>,
 }
 
 /// What a driver needs saved to carry on with its run after the backend restarts.
@@ -161,6 +165,25 @@ pub trait HarnessSession: Send + Any {
     fn carry_over(&mut self, ctx: &mut ThreadContext, messages: Vec<Message>);
     /// Stop the running turn.
     fn interrupt(&mut self, ctx: &mut ThreadContext);
+    /// Whether it can compact the harness's context ([`compact`](Self::compact)). Without it, the
+    /// `compact` command is refused.
+    fn can_compact(&self) -> bool {
+        false
+    }
+    /// A turn started (with no messages) to compact the harness's context.
+    fn compact(&mut self, _ctx: &mut ThreadContext) {}
+    /// Where a rewind to before turn `index` of `sessions` (each turn's session, in order) takes the
+    /// session (see [`resume_at_point`](crate::resume_at_point) and
+    /// [`revert_point`](crate::revert_point)), or an error if it can't be rewound there; none if it
+    /// can't be rewound at all. The core then sets the thread's session_id and resume_at, and calls
+    /// options_changed().
+    fn rewind_point(
+        &self,
+        _sessions: &[Option<TurnSession>],
+        _index: usize,
+    ) -> Option<Result<RewindPoint, RewindError>> {
+        None
+    }
     /// Whether a harness process is running that has the queued messages (it was sent them).
     fn live(&self) -> bool;
     /// The core gave up carrying the queued messages over: make sure nothing acts on them (stop a
