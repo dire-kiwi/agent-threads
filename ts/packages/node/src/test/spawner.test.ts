@@ -2,12 +2,12 @@
 // and for the shim, reading whole lines from an offset, re-attaching, and noticing a run that's gone.
 
 import { execFileSync, spawn as spawnChild } from "node:child_process";
-import { existsSync, mkdirSync, readdirSync, readFileSync, rmSync, utimesSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readdirSync, readFileSync, realpathSync, rmSync, utimesSync, writeFileSync } from "node:fs";
 import { uptime } from "node:os";
 import { join, relative } from "node:path";
 import { describe, expect, it } from "vitest";
 import { identityForTests, shim, type ShimOptions } from "../shim.js";
-import { direct, type ExitStatus, type HarnessProcess, type Spawner } from "../spawner.js";
+import { direct, type ExitStatus, type HarnessProcess, type SpawnOptions, type Spawner } from "../spawner.js";
 import { MemoryStore } from "../stores/memory.js";
 import { shimPath, tempDir } from "./spec.js";
 
@@ -506,3 +506,30 @@ function alive(pid: number): boolean {
     return false;
   }
 }
+
+describe.skipIf(process.platform === "win32")("both spawners", () => {
+  /** Starts `sh -c script` with these arguments after it ($0 first), only this environment, in `cwd`. */
+  const exact = (runId: string, cwd: string): SpawnOptions => ({
+    command: "sh",
+    args: ["-c", 'for a in "$0" "$@"; do echo "arg:$a"; done; echo "env:$AT_SET:${AT_EMPTY-unset}:${HOME-unset}"; pwd', "zero", "a b", "", "--add-dir", '--settings={"x": "$HOME"}'],
+    cwd,
+    env: { PATH: process.env.PATH ?? "", AT_SET: "x y", AT_EMPTY: "" },
+    threadId: "th",
+    runId,
+  });
+  const shown = (cwd: string) => ["arg:zero", "arg:a b", "arg:", "arg:--add-dir", 'arg:--settings={"x": "$HOME"}', "env:x y::unset", realpathSync(cwd)];
+
+  it("direct() starts a process with exactly its arguments, environment and working directory", async () => {
+    const cwd = tempDir();
+    const p = follow((h) => direct().spawn(exact("run", cwd), h));
+    expect(await wait(p.exit)).toBe(true);
+    expect(p.lines).toEqual(shown(cwd));
+  });
+
+  it("shim() starts a run with exactly its arguments, environment and working directory", async () => {
+    const cwd = tempDir();
+    const p = follow((h) => shim(shimPath(), { runsDir: tempDir(), pollMs: 20 }).spawn(exact("run_exact", cwd), h));
+    expect(await wait(p.exit)).toBe(true);
+    expect(p.lines).toEqual(shown(cwd));
+  });
+});

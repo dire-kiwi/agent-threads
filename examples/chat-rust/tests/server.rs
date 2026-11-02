@@ -205,6 +205,29 @@ async fn runs_a_thread_over_the_websocket_as_the_frontend_does() {
         .await
         .unwrap();
     assert_eq!(since.as_array().unwrap().last().unwrap()["seq"], snap["seq"]);
+    // A window of its last items (the frontend opens a thread with one), and the page before it.
+    let all = snap["items"].as_array().unwrap();
+    let n = all.len();
+    assert!(n > 4, "{n} items");
+    let window = c.call("snapshot", json!({"thread_id": id, "limit": 2})).await.unwrap();
+    assert_eq!(
+        (&window["start"], &window["seq"], &window["items"]),
+        (&json!(n - 2), &snap["seq"], &json!(all[n - 2..]))
+    );
+    let page = c
+        .call("items_before", json!({"thread_id": id, "before": n - 2, "limit": 2}))
+        .await
+        .unwrap();
+    assert_eq!(
+        page,
+        json!({"thread_id": id, "items": all[n - 4..n - 2], "requests": [], "start": n - 4, "context": [], "seq": snap["seq"]})
+    );
+    assert!(
+        c.call("items_before", json!({"thread_id": id, "before": 2}))
+            .await
+            .unwrap_err()
+            .contains("limit")
+    );
     // Every pushed event was the thread's, deltas included.
     assert!(c.events.iter().any(|e| e["type"] == "delta"));
     assert_eq!(c.call("list", json!({})).await.unwrap()[0]["id"], json!(id));

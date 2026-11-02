@@ -4,7 +4,9 @@ import (
 	"encoding/json"
 	"fmt"
 	"math"
+	"strconv"
 	"strings"
+	"unicode"
 
 	"github.com/dire-kiwi/agent-threads/go/protocol"
 )
@@ -127,6 +129,126 @@ func resultText(content json.RawMessage) string {
 }
 
 // slim is a result's content, cut short if it's long (counting as JavaScript does).
+// subagentEnd is how Claude says a subagent ended (in its task_* messages and the Agent call's
+// result) as a SubagentStatus, or "" if what it says isn't an end.
+func subagentEnd(status string) protocol.SubagentStatus {
+	switch status {
+	case "completed", "success":
+		return protocol.SubagentStatusCompleted
+	case "failed", "error":
+		return protocol.SubagentStatusFailed
+	case "killed", "stopped", "cancelled", "interrupted":
+		return protocol.SubagentStatusStopped
+	}
+	return ""
+}
+
+// count is a field that's a count (a whole number, not negative), or nil.
+func count(m jmap, k string) *int64 {
+	f, ok := m.num(k)
+	if !ok || f < 0 || f != math.Trunc(f) {
+		return nil
+	}
+	n := int64(f)
+	return &n
+}
+
+// subagentStarted is a subagent call's subagent, as a task_started (of a local_agent) says it has
+// started.
+func subagentStarted(call *protocol.ToolCall, m jmap) protocol.SubagentState {
+	var s protocol.SubagentState
+	if call.Subagent != nil {
+		s = *call.Subagent
+	}
+	s.Status = protocol.SubagentStatusRunning
+	if m.bool("is_backgrounded") {
+		s.Background = true
+	}
+	if t := m.str("subagent_type"); t != "" {
+		s.AgentType = t
+	}
+	model := m.str("model")
+	if model == "" {
+		model = parseObj(call.Input).str("model")
+	}
+	if model != "" {
+		s.Model = model
+	}
+	return s
+}
+
+// subagentTask is a subagent after a task_progress, task_updated or task_notification about it.
+func subagentTask(s protocol.SubagentState, m jmap) protocol.SubagentState {
+	next := s
+	switch m.str("subtype") {
+	case "task_progress":
+		if d := m.str("description"); d != "" {
+			next.Activity = d
+		}
+		if n := count(m.obj("usage"), "tool_uses"); n != nil {
+			next.ToolUses = n
+		}
+	case "task_updated":
+		// Continued (with SendMessage) after it ended, it runs again.
+		status := m.obj("patch").str("status")
+		if status == "running" {
+			next.Status, next.Summary = protocol.SubagentStatusRunning, ""
+		} else if end := subagentEnd(status); end != "" && s.Status == protocol.SubagentStatusRunning {
+			next.Status = end
+		}
+	case "task_notification":
+		if end := subagentEnd(m.str("status")); end != "" && s.Status == protocol.SubagentStatusRunning {
+			next.Status = end
+		}
+		if n := count(m.obj("usage"), "tool_uses"); n != nil {
+			next.ToolUses = n
+		}
+		// A foreground subagent's report is its call's result.
+		if summary := m.str("summary"); s.Background && summary != "" {
+			next.Summary = slim(summary).Content
+		}
+	}
+	return next
+}
+
+// subagentResult is a subagent call's subagent, as its result says (meta is the result's
+// tool_use_result, text its content); nil for a call whose subagent never started (it failed, or
+// was denied).
+func subagentResult(call *protocol.ToolCall, isError, interrupted bool, meta jmap, text string) *protocol.SubagentState {
+	if call.Kind != protocol.ToolKindSubagent || (call.Subagent == nil && isError) {
+		return nil
+	}
+	s := protocol.SubagentState{Status: protocol.SubagentStatusRunning}
+	if call.Subagent != nil {
+		s = *call.Subagent
+	}
+	if m := meta.str("resolvedModel"); m != "" {
+		s.Model = m
+	}
+	if t := meta.str("agentType"); t != "" {
+		s.AgentType = t
+	}
+	if n := count(meta, "totalToolUseCount"); n != nil {
+		s.ToolUses = n
+	}
+	// A background subagent's call returns as soon as it has started it.
+	if meta.bool("isAsync") || meta.str("status") == "async_launched" || strings.HasPrefix(strings.TrimLeftFunc(text, unicode.IsSpace), "Async agent launched") {
+		s.Background = true
+	} else if s.Status == protocol.SubagentStatusRunning {
+		switch end := subagentEnd(meta.str("status")); {
+		case isError && interrupted:
+			s.Status = protocol.SubagentStatusStopped
+		case isError:
+			s.Status = protocol.SubagentStatusFailed
+		case end != "":
+			s.Status = end
+		default:
+			s.Status = protocol.SubagentStatusCompleted
+		}
+	}
+	return &s
+}
+
 func slim(text string) protocol.ToolResult {
 	if protocol.TextLen(text) <= maxResult {
 		return protocol.ToolResult{Content: text}
@@ -251,4 +373,86 @@ func claudePermissionMode(mode protocol.PermissionMode) string {
 		return "bypassPermissions"
 	}
 	return ""
+}
+
+// claudeRateLimits is the limit a rate_limit_info reports (from a rate_limit_event, or a message
+// refused for the usage limit), if it says how it stands.
+func claudeRateLimits(info jmap) []protocol.RateLimit {
+	overage := info.bool("isUsingOverage") || info.str("overageStatus") == "allowed" || info.str("overageStatus") == "allowed_warning"
+	var status protocol.RateLimitStatus
+	switch info.str("status") {
+	case "allowed":
+		status = protocol.RateLimitStatusAllowed
+	case "allowed_warning":
+		status = protocol.RateLimitStatusWarning
+	case "rejected":
+		status = protocol.RateLimitStatusRejected
+		if overage {
+			status = protocol.RateLimitStatusWarning
+		}
+	default:
+		return nil
+	}
+	limit := protocol.RateLimit{ID: info.str("rateLimitType"), Status: status}
+	if limit.ID == "" {
+		limit.ID = "unknown"
+	}
+	if u, ok := info.num("utilization"); ok {
+		p := u * 100
+		limit.UsedPercent = &p
+	}
+	if t, ok := info.num("resetsAt"); ok {
+		limit.ResetsAt = unixTime(t)
+	}
+	return []protocol.RateLimit{limit}
+}
+
+// retryText is an api_retry system message's notice text.
+func retryText(m jmap) string {
+	var why []string
+	if e := m.str("error"); e != "" {
+		why = append(why, e)
+	}
+	if n, ok := m.num("error_status"); ok {
+		why = append(why, "status "+strconv.FormatFloat(n, 'f', -1, 64))
+	}
+	text := "API request failed"
+	if len(why) > 0 {
+		text += " (" + strings.Join(why, ", ") + ")"
+	}
+	delay, _ := m.num("retry_delay_ms")
+	return fmt.Sprintf("%s; retrying in %ds (attempt %s of %s).", text, int64(math.Ceil(delay/1000)), jsonText(m["attempt"]), jsonText(m["max_retries"]))
+}
+
+// jsonText is a JSON value as JavaScript's template strings show it: a number's digits,
+// "undefined" for none.
+func jsonText(v json.RawMessage) string {
+	if len(v) == 0 {
+		return "undefined"
+	}
+	if isStr(v) {
+		return rawStr(v)
+	}
+	return string(v)
+}
+
+// hookNotice is a hook_response system message's notice (its level, text and detail), if it makes
+// one: a hook that failed, or said something.
+func hookNotice(m jmap) *protocol.Notice {
+	output := strings.TrimSpace(m.str("output"))
+	if m.str("outcome") == "error" {
+		detail := strings.TrimSpace(m.str("stderr"))
+		if detail == "" {
+			detail = output
+		}
+		text := "Hook " + m.str("hook_name") + " failed"
+		if n, ok := m.num("exit_code"); ok {
+			text += " (exit code " + strconv.FormatFloat(n, 'f', -1, 64) + ")"
+		}
+		return &protocol.Notice{Level: protocol.NoticeLevelWarning, Text: text, Detail: detail}
+	}
+	if output == "" {
+		return nil
+	}
+	return &protocol.Notice{Level: protocol.NoticeLevelInfo, Text: "Hook " + m.str("hook_name") + " ran", Detail: output}
 }

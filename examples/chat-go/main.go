@@ -1,8 +1,8 @@
 // Command chat-go is the chat example's server in Go: agent-threads' Go backend, and the app's own
 // transport, a WebSocket. The SDK has no network layer, so this file is the whole "seam": events
 // out (sdk.Subscribe → every client), commands in (a client's command → sdk.HandleJSON), plus
-// snapshots and EventsSince for clients that connect or reconnect. It speaks examples/PROTOCOL.md,
-// so chat-node's React frontend talks to it unchanged.
+// snapshots (or windows of them), ItemsBefore and EventsSince for clients that connect, scroll back
+// or reconnect. It speaks examples/PROTOCOL.md, so chat-node's React frontend talks to it unchanged.
 //
 //	go run .               the server (see the README)
 //	go run . supervise     the server, started again when it exits for a restart
@@ -393,6 +393,8 @@ func (a *app) call(ctx context.Context, method string, raw json.RawMessage) (any
 		Title    string          `json:"title"`
 		ThreadID string          `json:"thread_id"`
 		Seq      int64           `json:"seq"`
+		Before   int64           `json:"before"`
+		Limit    *int            `json:"limit"`
 		Command  json.RawMessage `json:"command"`
 	}
 	if len(raw) > 0 && json.Unmarshal(raw, &p) != nil {
@@ -426,7 +428,16 @@ func (a *app) call(ctx context.Context, method string, raw json.RawMessage) (any
 		}
 		return nil, &agentthreads.CommandError{Message: fmt.Sprintf("there's no harness %q", p.Harness)}
 	case "snapshot":
+		// With a limit, a window of its latest items; the client loads earlier ones with items_before.
+		if p.Limit != nil {
+			return a.sdk.SnapshotWindow(ctx, p.ThreadID, max(0, *p.Limit))
+		}
 		return a.sdk.Snapshot(ctx, p.ThreadID)
+	case "items_before":
+		if p.Limit == nil {
+			return nil, &agentthreads.CommandError{Message: "items_before needs a limit"}
+		}
+		return a.sdk.ItemsBefore(ctx, p.ThreadID, p.Before, *p.Limit)
 	case "events_since":
 		return a.sdk.EventsSince(ctx, p.ThreadID, p.Seq, 0)
 	case "command":

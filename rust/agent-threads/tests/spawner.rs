@@ -482,3 +482,64 @@ async fn shim_sends_sigterm_once_when_its_signalled_during_a_stop_whose_sigterm_
     assert_eq!(p.exit().unwrap().signal.as_deref(), Some("SIGKILL"));
     assert_eq!(p.lines(), ["ready", "term"]);
 }
+
+/// Starts `sh -c script` with these arguments after it ($0 first), only this environment, in `cwd`.
+fn exact(script: &str, run_id: &str, cwd: &std::path::Path) -> SpawnOptions {
+    let path = std::env::var("PATH").unwrap_or_default();
+    SpawnOptions {
+        command: "sh".into(),
+        args: [
+            "-c",
+            script,
+            "zero",
+            "a b",
+            "",
+            "--add-dir",
+            "--settings={\"x\": \"$HOME\"}",
+        ]
+        .map(String::from)
+        .to_vec(),
+        cwd: Some(cwd.to_path_buf()),
+        env: [("PATH", path.as_str()), ("AT_SET", "x y"), ("AT_EMPTY", "")]
+            .into_iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect(),
+        thread_id: "th".into(),
+        run_id: run_id.into(),
+    }
+}
+
+const SHOW: &str =
+    r#"for a in "$0" "$@"; do echo "arg:$a"; done; echo "env:$AT_SET:${AT_EMPTY-unset}:${HOME-unset}"; pwd"#;
+
+fn shown(cwd: &std::path::Path) -> Vec<String> {
+    [
+        "arg:zero",
+        "arg:a b",
+        "arg:",
+        "arg:--add-dir",
+        "arg:--settings={\"x\": \"$HOME\"}",
+        "env:x y::unset",
+    ]
+    .map(String::from)
+    .into_iter()
+    .chain([cwd.canonicalize().unwrap().to_string_lossy().to_string()])
+    .collect()
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn direct_starts_a_process_with_exactly_its_arguments_environment_and_working_directory() {
+    let cwd = common::temp_dir();
+    let p = Followed::new(direct().spawn(exact(SHOW, "run", &cwd)).unwrap());
+    assert!(wait(|| p.exit().is_some()).await);
+    assert_eq!(p.lines(), shown(&cwd));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn shim_starts_a_run_with_exactly_its_arguments_environment_and_working_directory() {
+    let s = shim_setup();
+    let cwd = common::temp_dir();
+    let p = Followed::new(s.spawner.spawn(exact(SHOW, "run_exact", &cwd)).unwrap());
+    assert!(wait(|| p.exit().is_some()).await);
+    assert_eq!(p.lines(), shown(&cwd));
+}

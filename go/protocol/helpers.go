@@ -1,5 +1,7 @@
 package protocol
 
+import "encoding/json"
+
 // Accessors for the fields every variant of a union has.
 
 // ThreadID is the event's thread_id.
@@ -208,6 +210,39 @@ func (u ThreadRequest) TurnID() string {
 	return ""
 }
 
+// ParentID is the request's parent_id: the subagent call that's asking, if one is.
+func (u ThreadRequest) ParentID() string {
+	switch r := u.Value.(type) {
+	case *PermissionRequest:
+		return r.ParentID
+	case *QuestionRequest:
+		return r.ParentID
+	}
+	return ""
+}
+
+// ToolCallID is the request's tool_call_id: the tool call it's about, if there is one.
+func (u ThreadRequest) ToolCallID() string {
+	switch r := u.Value.(type) {
+	case *PermissionRequest:
+		return r.ToolCallID
+	case *QuestionRequest:
+		return r.ToolCallID
+	}
+	return ""
+}
+
+// Resolution is how the request was resolved, or nil while it's open.
+func (u ThreadRequest) Resolution() *Resolution {
+	switch r := u.Value.(type) {
+	case *PermissionRequest:
+		return r.Resolution
+	case *QuestionRequest:
+		return r.Resolution
+	}
+	return nil
+}
+
 // ThreadID is the command's thread_id.
 func (u Command) ThreadID() string {
 	switch c := u.Value.(type) {
@@ -254,4 +289,111 @@ func textFrom(s string, at int64) string {
 		}
 	}
 	return ""
+}
+
+// SetRaw sets the event's raw: the harness payload it came from.
+func (u ThreadEvent) SetRaw(raw json.RawMessage) {
+	switch e := u.Value.(type) {
+	case *ThreadUpdatedEvent:
+		e.Raw = raw
+	case *TurnStartedEvent:
+		e.Raw = raw
+	case *TurnCompletedEvent:
+		e.Raw = raw
+	case *ItemAddedEvent:
+		e.Raw = raw
+	case *ItemUpdatedEvent:
+		e.Raw = raw
+	case *DeltaEvent:
+		e.Raw = raw
+	case *RequestOpenedEvent:
+		e.Raw = raw
+	case *RequestResolvedEvent:
+		e.Raw = raw
+	}
+}
+
+// Raw is the event's raw, if it has one.
+func (u ThreadEvent) Raw() json.RawMessage {
+	switch e := u.Value.(type) {
+	case *ThreadUpdatedEvent:
+		return e.Raw
+	case *TurnStartedEvent:
+		return e.Raw
+	case *TurnCompletedEvent:
+		return e.Raw
+	case *ItemAddedEvent:
+		return e.Raw
+	case *ItemUpdatedEvent:
+		return e.Raw
+	case *DeltaEvent:
+		return e.Raw
+	case *RequestOpenedEvent:
+		return e.Raw
+	case *RequestResolvedEvent:
+		return e.Raw
+	}
+	return nil
+}
+
+// SetRaw sets the item's raw: the harness payload it came from.
+func (u Item) SetRaw(raw json.RawMessage) {
+	switch i := u.Value.(type) {
+	case *UserMessage:
+		i.Raw = raw
+	case *AssistantMessage:
+		i.Raw = raw
+	case *Reasoning:
+		i.Raw = raw
+	case *ToolCall:
+		i.Raw = raw
+	case *Compaction:
+		i.Raw = raw
+	case *Notice:
+		i.Raw = raw
+	case *TurnResult:
+		i.Raw = raw
+	}
+}
+
+// Raw is the item's raw, if it has one.
+func (u Item) Raw() json.RawMessage {
+	switch i := u.Value.(type) {
+	case *UserMessage:
+		return i.Raw
+	case *AssistantMessage:
+		return i.Raw
+	case *Reasoning:
+		return i.Raw
+	case *ToolCall:
+		return i.Raw
+	case *Compaction:
+		return i.Raw
+	case *Notice:
+		return i.Raw
+	case *TurnResult:
+		return i.Raw
+	}
+	return nil
+}
+
+// SetRaw sets the request's raw: the harness payload it came from.
+func (u ThreadRequest) SetRaw(raw json.RawMessage) {
+	switch r := u.Value.(type) {
+	case *PermissionRequest:
+		r.Raw = raw
+	case *QuestionRequest:
+		r.Raw = raw
+	}
+}
+
+// Raw is the request's raw, if it has one.
+func (u ThreadRequest) Raw() json.RawMessage {
+	switch r := u.Value.(type) {
+	case *PermissionRequest:
+		return r.Raw
+	case *QuestionRequest:
+		return r.Raw
+	}
+	return nil
 }

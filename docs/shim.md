@@ -29,13 +29,12 @@ or when the harness can't outlive the backend anyway:
 ## Getting the binary
 
 `agent-threads-shim` is a small Rust binary in [shim/](../shim/README.md), with no dependency but
-libc. Build it from the repository, or install it from git (the repository is private, so Cargo
-fetches it with git's own credentials):
+libc. Build it from the repository, or install it from git:
 
 ```sh
 make shim                                   # shim/target/debug/agent-threads-shim
 (cd shim && cargo build --release)          # shim/target/release/agent-threads-shim
-CARGO_NET_GIT_FETCH_WITH_CLI=true cargo install --git https://github.com/dire-kiwi/agent-threads agent-threads-shim   # into ~/.cargo/bin
+cargo install --git https://github.com/dire-kiwi/agent-threads agent-threads-shim   # into ~/.cargo/bin
 ```
 
 Ship it with the app and give the backend its path. Running shims aren't upgraded when the app is:

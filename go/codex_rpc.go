@@ -14,6 +14,8 @@ type rpcError struct {
 	method  string
 	message string
 	code    *int
+	// data is the error response's error object, if it was one.
+	data json.RawMessage
 }
 
 func (e *rpcError) Error() string { return e.message }
@@ -23,6 +25,8 @@ type rpcPending struct {
 	meta    json.RawMessage
 	resolve func(jmap)
 	reject  func(error)
+	// resolveRaw, when it's set, is given the result as it came instead of resolve.
+	resolveRaw func(json.RawMessage)
 }
 
 // rpcPendingState is a request of ours not yet answered, as a checkpoint keeps it.
@@ -77,6 +81,19 @@ func (c *rpcClient) request(method string, params any, meta any, resolve func(jm
 	c.write(msg)
 }
 
+// requestRaw sends a request of the app's own: its result goes to resolve as it came.
+func (c *rpcClient) requestRaw(method string, params json.RawMessage, resolve func(json.RawMessage), reject func(error)) {
+	var p any
+	if params != nil {
+		p = params
+	}
+	c.request(method, p, nil, nil, reject)
+	// Its answer comes later, on this goroutine: there's time to say where it goes.
+	if c.closed == nil {
+		c.pending[fmt.Sprint(c.next-1)].resolveRaw = resolve
+	}
+}
+
 func (c *rpcClient) notify(method string, params any) {
 	if c.closed != nil {
 		return
@@ -123,7 +140,15 @@ func (c *rpcClient) take(msg jmap) bool {
 			x := int(n)
 			code = &x
 		}
-		p.reject(&rpcError{method: p.method, message: text, code: code})
+		p.reject(&rpcError{method: p.method, message: text, code: code, data: msg.raw("error")})
+		return true
+	}
+	if p.resolveRaw != nil {
+		r := msg.raw("result")
+		if r == nil {
+			r = json.RawMessage("null")
+		}
+		p.resolveRaw(r)
 		return true
 	}
 	if r := msg.obj("result"); r != nil {

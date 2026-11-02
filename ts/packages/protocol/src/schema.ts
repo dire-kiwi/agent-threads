@@ -556,6 +556,9 @@ export const schema: { readonly $defs: { readonly [name: string]: unknown } } = 
             "$ref": "#/$defs/Todo"
           }
         },
+        "subagent": {
+          "$ref": "#/$defs/SubagentState"
+        },
         "parent_id": {
           "type": "string"
         },
@@ -613,6 +616,46 @@ export const schema: { readonly $defs: { readonly [name: string]: unknown } } = 
           "type": "integer"
         }
       }
+    },
+    "SubagentState": {
+      "type": "object",
+      "required": [
+        "status"
+      ],
+      "properties": {
+        "status": {
+          "$ref": "#/$defs/SubagentStatus"
+        },
+        "background": {
+          "type": "boolean",
+          "default": false
+        },
+        "agent_type": {
+          "type": "string"
+        },
+        "model": {
+          "type": "string"
+        },
+        "activity": {
+          "type": "string"
+        },
+        "tool_uses": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "summary": {
+          "type": "string"
+        }
+      }
+    },
+    "SubagentStatus": {
+      "type": "string",
+      "enum": [
+        "running",
+        "completed",
+        "failed",
+        "stopped"
+      ]
     },
     "FileChange": {
       "type": "object",
@@ -862,6 +905,9 @@ export const schema: { readonly $defs: { readonly [name: string]: unknown } } = 
         "parent_id": {
           "type": "string"
         },
+        "resolution": {
+          "$ref": "#/$defs/Resolution"
+        },
         "turn_id": {
           "type": "string"
         },
@@ -898,6 +944,9 @@ export const schema: { readonly $defs: { readonly [name: string]: unknown } } = 
         },
         "parent_id": {
           "type": "string"
+        },
+        "resolution": {
+          "$ref": "#/$defs/Resolution"
         },
         "turn_id": {
           "type": "string"
@@ -1019,6 +1068,60 @@ export const schema: { readonly $defs: { readonly [name: string]: unknown } } = 
         "seq": {
           "type": "integer",
           "minimum": 0
+        },
+        "start": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "context": {
+          "type": "array",
+          "items": {
+            "type": "integer",
+            "minimum": 0
+          }
+        }
+      }
+    },
+    "ItemPage": {
+      "type": "object",
+      "required": [
+        "thread_id",
+        "items",
+        "requests",
+        "start",
+        "context",
+        "seq"
+      ],
+      "properties": {
+        "thread_id": {
+          "type": "string"
+        },
+        "items": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/Item"
+          }
+        },
+        "requests": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/ThreadRequest"
+          }
+        },
+        "start": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "context": {
+          "type": "array",
+          "items": {
+            "type": "integer",
+            "minimum": 0
+          }
+        },
+        "seq": {
+          "type": "integer",
+          "minimum": 0
         }
       }
     },
@@ -1066,6 +1169,12 @@ export const schema: { readonly $defs: { readonly [name: string]: unknown } } = 
         },
         "run": {
           "$ref": "#/$defs/Run"
+        },
+        "rate_limits": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/RateLimit"
+          }
         },
         "metadata": {
           "type": "object",
@@ -1123,6 +1232,38 @@ export const schema: { readonly $defs: { readonly [name: string]: unknown } } = 
         "reattached_at": {
           "type": "string",
           "format": "date-time"
+        }
+      }
+    },
+    "RateLimit": {
+      "type": "object",
+      "required": [
+        "id",
+        "status"
+      ],
+      "properties": {
+        "id": {
+          "type": "string"
+        },
+        "status": {
+          "type": "string",
+          "enum": [
+            "allowed",
+            "warning",
+            "rejected"
+          ]
+        },
+        "used_percent": {
+          "type": "number",
+          "minimum": 0
+        },
+        "resets_at": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "window_minutes": {
+          "type": "integer",
+          "minimum": 0
         }
       }
     },

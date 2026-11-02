@@ -622,6 +622,10 @@
           },
           "description": "todo: the whole list after the call."
         },
+        "subagent": {
+          "$ref": "#/$defs/SubagentState",
+          "description": "subagent: the subagent itself, once the harness says it has started. Its status is the subagent's, which a background subagent's call (completed as soon as it has started it) doesn't show."
+        },
         "parent_id": {
           "type": "string",
           "description": "The id of the subagent tool_call this item belongs to. Absent for the main conversation."
@@ -691,6 +695,54 @@
           "description": "shell: the command's exit code."
         }
       }
+    },
+    "SubagentState": {
+      "type": "object",
+      "description": "A subagent, as its call (a tool_call of kind subagent) shows it: how it's getting on, and how it ended.",
+      "required": [
+        "status"
+      ],
+      "properties": {
+        "status": {
+          "$ref": "#/$defs/SubagentStatus"
+        },
+        "background": {
+          "type": "boolean",
+          "default": false,
+          "description": "It runs in the background: its call returned as soon as it started, and it carries on (its items keep arriving, after its turn has ended too) until it ends."
+        },
+        "agent_type": {
+          "type": "string",
+          "description": "What kind of agent it is (Claude's subagent_type, e.g. general-purpose)."
+        },
+        "model": {
+          "type": "string",
+          "description": "The model it runs on."
+        },
+        "activity": {
+          "type": "string",
+          "description": "What it's doing, as of its latest progress report (e.g. Reading notes.txt)."
+        },
+        "tool_uses": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "How many tool calls it has made."
+        },
+        "summary": {
+          "type": "string",
+          "description": "A background subagent's final report, once it has ended. (A foreground one's is its call's result.)"
+        }
+      }
+    },
+    "SubagentStatus": {
+      "type": "string",
+      "description": "running: it's working. completed: it finished. failed: it ended with an error. stopped: it was stopped (killed, interrupted, or its harness process ended) before it finished.",
+      "enum": [
+        "running",
+        "completed",
+        "failed",
+        "stopped"
+      ]
     },
     "FileChange": {
       "type": "object",
@@ -929,7 +981,7 @@
       }
     },
     "ThreadRequest": {
-      "description": "An open request, told apart by type.",
+      "description": "A request, told apart by type: open, or resolved (with its resolution).",
       "oneOf": [
         {
           "$ref": "#/$defs/PermissionRequest"
@@ -982,6 +1034,10 @@
           "type": "string",
           "description": "The subagent tool_call that's asking, if one is."
         },
+        "resolution": {
+          "$ref": "#/$defs/Resolution",
+          "description": "How it was resolved, once it is (request.resolved): the state keeps resolved requests with this set. Absent while it's open."
+        },
         "turn_id": {
           "type": "string"
         },
@@ -1023,6 +1079,10 @@
         "parent_id": {
           "type": "string",
           "description": "The subagent tool_call that's asking, if one is."
+        },
+        "resolution": {
+          "$ref": "#/$defs/Resolution",
+          "description": "How it was resolved, once it is (request.resolved): the state keeps resolved requests with this set. Absent while it's open."
         },
         "turn_id": {
           "type": "string"
@@ -1133,7 +1193,7 @@
     },
     "Snapshot": {
       "type": "object",
-      "description": "A thread's whole state as of seq: what applying its events, in order, from the start gives.",
+      "description": "A thread's state as of seq: what applying its events, in order, from the start gives. A window (a snapshot taken with a limit) has only its last items, and what they need from before them (start, context).",
       "required": [
         "thread",
         "items",
@@ -1155,12 +1215,74 @@
           "items": {
             "$ref": "#/$defs/ThreadRequest"
           },
-          "description": "The open requests, oldest first."
+          "description": "The thread's requests, oldest first: the open ones, and the resolved ones with their resolution. A window has the open ones, and the resolved ones its items have (see PROTOCOL.md, Windows)."
         },
         "seq": {
           "type": "integer",
           "minimum": 0,
           "description": "The seq of the last saved event it includes; 0 for none."
+        },
+        "start": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "A window: the index, in the thread's whole list of items, of the first item of the window. The items before it are left out, but for those in context. Absent (or 0): items has them all."
+        },
+        "context": {
+          "type": "array",
+          "items": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "description": "A window: the indices, in the thread's whole list of items, of the items from before start it has anyway because the window needs them (the subagent calls its items and open requests belong to, the open requests' tool calls, and the subagents still running, with the subagents those belong to). They're the first context.length of items, in order; the rest are the thread's items from start on."
+        }
+      }
+    },
+    "ItemPage": {
+      "type": "object",
+      "description": "The thread's items before an index (a window's start), a page at a time, for a client that has a window to load earlier items into.",
+      "required": [
+        "thread_id",
+        "items",
+        "requests",
+        "start",
+        "context",
+        "seq"
+      ],
+      "properties": {
+        "thread_id": {
+          "type": "string"
+        },
+        "items": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/Item"
+          },
+          "description": "The items of context, then the thread's items from start up to the index asked for."
+        },
+        "requests": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/ThreadRequest"
+          },
+          "description": "The requests its items (after the context ones) have, oldest first."
+        },
+        "start": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "The index, in the thread's whole list of items, of its first item after the context ones. 0: there are none before it."
+        },
+        "context": {
+          "type": "array",
+          "items": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "description": "The indices of the items from before start it has anyway because its items need them (the subagent calls they belong to): the first context.length of items, in order."
+        },
+        "seq": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "The seq of the last saved event its items and requests include."
         }
       }
     },
@@ -1222,6 +1344,13 @@
         "run": {
           "$ref": "#/$defs/Run",
           "description": "The harness process running the thread, if one is. Absent when it's idle with no process."
+        },
+        "rate_limits": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/RateLimit"
+          },
+          "description": "The usage limits of the account the harness runs on, as it last reported them in this thread, sorted by id. Absent until it reports one."
         },
         "metadata": {
           "type": "object",
@@ -1286,6 +1415,44 @@
           "type": "string",
           "format": "date-time",
           "description": "When a restarted backend last re-attached to the run. Absent if it never has."
+        }
+      }
+    },
+    "RateLimit": {
+      "type": "object",
+      "description": "A usage limit of the account the harness runs on (a subscription's session or weekly limit, say), as the harness last reported it.",
+      "required": [
+        "id",
+        "status"
+      ],
+      "properties": {
+        "id": {
+          "type": "string",
+          "description": "Which limit, by the harness's name for it: Claude Code's rateLimitType (five_hour, seven_day, seven_day_opus...), Codex's primary and secondary windows."
+        },
+        "status": {
+          "type": "string",
+          "enum": [
+            "allowed",
+            "warning",
+            "rejected"
+          ],
+          "description": "allowed: there's room. warning: it's nearly used up, or used up with extra usage carrying on. rejected: the harness refuses turns until it resets."
+        },
+        "used_percent": {
+          "type": "number",
+          "minimum": 0,
+          "description": "How much of it is used, from 0 to 100, when the harness says."
+        },
+        "resets_at": {
+          "type": "string",
+          "format": "date-time",
+          "description": "When it resets, when the harness says."
+        },
+        "window_minutes": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "How long its window is, when the harness says."
         }
       }
     },

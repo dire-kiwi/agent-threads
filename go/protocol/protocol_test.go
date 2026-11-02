@@ -24,6 +24,16 @@ func TestExamplesRoundTrip(t *testing.T) {
 		t.Fatal(err)
 	}
 	roundTrip[protocol.Snapshot](t, snapshot)
+	window, err := os.ReadFile("../../spec/examples/thread.window.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	roundTrip[protocol.Snapshot](t, window)
+	page, err := os.ReadFile("../../spec/examples/thread.page.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	roundTrip[protocol.ItemPage](t, page)
 }
 
 func TestUnionVariants(t *testing.T) {
