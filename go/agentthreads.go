@@ -64,6 +64,9 @@ type CreateOptions struct {
 	Metadata map[string]any
 	// ID is the thread's id; a new one by default.
 	ID string
+	// SessionID is the harness's own session to adopt (Claude Code's session id, Codex's thread id):
+	// the thread's first turn resumes it. Its messages so far aren't made into items.
+	SessionID string
 }
 
 // SendOptions are a message's attachments and the client's id for it.
@@ -185,7 +188,7 @@ func (a *AgentThreads) Create(ctx context.Context, o CreateOptions) (protocol.Th
 	}
 	thread := protocol.Thread{
 		ID: id, Harness: harness, Status: protocol.ThreadStatusIdle, Title: o.Title, Model: o.Model,
-		Effort: o.Effort, PermissionMode: mode, Cwd: cwd, CreatedAt: now(),
+		Effort: o.Effort, SessionID: o.SessionID, PermissionMode: mode, Cwd: cwd, CreatedAt: now(),
 	}
 	if len(o.Metadata) > 0 {
 		thread.Metadata = map[string]json.RawMessage{}
@@ -528,6 +531,12 @@ func (a *AgentThreads) Handle(ctx context.Context, command protocol.Command) err
 			o.PermissionMode = &c.PermissionMode
 		}
 		return a.SetOptions(ctx, c.ThreadID, o)
+	case *protocol.RewindCommand:
+		return a.Rewind(ctx, c.ThreadID, c.TurnID)
+	case *protocol.NewSessionCommand:
+		return a.NewSession(ctx, c.ThreadID)
+	case *protocol.CompactCommand:
+		return a.Compact(ctx, c.ThreadID)
 	}
 	return commandErr("that isn't a command")
 }
@@ -615,8 +624,76 @@ func (a *AgentThreads) SetOptions(ctx context.Context, threadID string, o Thread
 	})
 }
 
+// Rewind takes the conversation back to before the turn turnID: the harness forgets it and every
+// turn after it (from the next turn, which resumes the session there), and their items are removed.
+// It's refused (with a *CommandError) while a turn is running, for a turn the thread hasn't, and
+// where the harness can't go back (a Claude Code session the thread adopted, to before its first
+// turn in it).
+func (a *AgentThreads) Rewind(ctx context.Context, threadID, turnID string) error {
+	return a.doErr(ctx, threadID, func(rt *threadRuntime) error {
+		if err := idle(rt, "rewound"); err != nil {
+			return err
+		}
+		if err := rt.rewind(turnID); err != nil {
+			var re *RewindError
+			if errors.As(err, &re) {
+				return commandErr("the thread can't be rewound to before that turn: %s", re.Message)
+			}
+			return err
+		}
+		return nil
+	})
+}
+
+// NewSession has the thread's next turn start a new conversation with the harness; the thread's
+// items stay. It does nothing if the thread has no session, and is refused while a turn is running.
+func (a *AgentThreads) NewSession(ctx context.Context, threadID string) error {
+	return a.doErr(ctx, threadID, func(rt *threadRuntime) error {
+		if err := idle(rt, "given a new session"); err != nil {
+			return err
+		}
+		rt.newSession()
+		return nil
+	})
+}
+
+// Compact compacts the harness's context now, in a turn of its own. It's refused while a turn is
+// running, and when the thread has no session yet.
+func (a *AgentThreads) Compact(ctx context.Context, threadID string) error {
+	return a.doErr(ctx, threadID, func(rt *threadRuntime) error {
+		if err := idle(rt, "compacted"); err != nil {
+			return err
+		}
+		if rt.state.Thread.SessionID == "" {
+			return commandErr("the thread has no conversation to compact yet")
+		}
+		session, ok := rt.session.(CompactingSession)
+		if !ok {
+			return commandErr("%s threads can't be compacted", rt.state.Thread.Harness)
+		}
+		rt.compact(session)
+		return nil
+	})
+}
+
+// idle refuses a command that needs the thread idle: one that's running a turn.
+func idle(rt *threadRuntime, what string) error {
+	if rt.turn != nil {
+		return commandErr("a turn is running: the thread can't be %s until it ends (interrupt it first)", what)
+	}
+	return nil
+}
+
 // do runs fn on the live thread a command is for, once the AgentThreads is known to be open.
 func (a *AgentThreads) do(ctx context.Context, threadID string, fn func(rt *threadRuntime)) error {
+	return a.doErr(ctx, threadID, func(rt *threadRuntime) error {
+		fn(rt)
+		return nil
+	})
+}
+
+// doErr is do for a command fn may refuse, with the error it returns.
+func (a *AgentThreads) doErr(ctx context.Context, threadID string, fn func(rt *threadRuntime) error) error {
 	if err := a.open(); err != nil {
 		return err
 	}
@@ -636,7 +713,7 @@ func (a *AgentThreads) do(ctx context.Context, threadID string, fn func(rt *thre
 			}
 			return
 		}
-		fn(rt)
+		refused = fn(rt)
 	}); err != nil {
 		if errors.Is(err, errLoopStopped) {
 			return commandErr("this AgentThreads is closed")
@@ -980,7 +1057,7 @@ func (a *AgentThreads) reattach(rt *threadRuntime, record *RunRecord) (bool, *Ru
 			t := *data.Turn
 			rt.turn = &t
 		} else {
-			rt.turn = &turnState{ID: lastTurn(rt.state.Items)}
+			rt.turn = &turnState{ID: lastTurn(rt.state.Items), Session: rt.state.Thread.SessionID}
 		}
 	}
 	rt.adoptRun(*record)
@@ -1027,7 +1104,8 @@ func lastTurn(items []protocol.Item) string {
 func recoverLost(rt *threadRuntime) {
 	s := rt.state.Thread.Status
 	if s == protocol.ThreadStatusRunning || s == protocol.ThreadStatusWaiting {
-		rt.turn = &turnState{ID: lastTurn(rt.state.Items)}
+		// Its session as it is now, which is as it was when it started unless the turn started it.
+		rt.turn = &turnState{ID: lastTurn(rt.state.Items), Session: rt.state.Thread.SessionID}
 		for _, r := range rt.state.Requests {
 			rt.emit(&protocol.RequestResolvedEvent{RequestID: r.ID(), Resolution: protocol.Resolution{Outcome: protocol.ResolutionOutcomeCancel}})
 		}

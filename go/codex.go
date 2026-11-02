@@ -398,19 +398,27 @@ type codexSession struct {
 // ---------- the core's side ----------
 
 func (s *codexSession) Start(messages []Message) {
-	run := s.ensure(true)
 	if len(messages) == 1 && strings.TrimSpace(messages[0].Text) == "/compact" && len(messages[0].Attachments) == 0 {
-		run.starting, run.compacting = true, true
-		run.whenReady(func(threadID string, err error) {
-			if err != nil {
-				s.turnFailed(run, err)
-				return
-			}
-			run.rpc.request("thread/compact/start", map[string]any{"threadId": threadID}, nil, nil, func(e error) { s.turnFailed(run, e) })
-		})
+		s.Compact()
 		return
 	}
-	s.turnStart(run, messages)
+	s.turnStart(s.ensure(true), messages)
+}
+
+func (s *codexSession) Compact() {
+	run := s.ensure(true)
+	run.starting, run.compacting = true, true
+	run.whenReady(func(threadID string, err error) {
+		if err != nil {
+			s.turnFailed(run, err)
+			return
+		}
+		run.rpc.request("thread/compact/start", map[string]any{"threadId": threadID}, nil, nil, func(e error) { s.turnFailed(run, e) })
+	})
+}
+
+func (s *codexSession) RewindPoint(sessions []*protocol.TurnSession, index int) (RewindPoint, error) {
+	return RevertPoint(sessions, index)
 }
 
 func (s *codexSession) Steer(m Message) {
@@ -768,9 +776,10 @@ func (s *codexSession) turnFailed(run *codexRun, err error) {
 	if run.exited || run.retired || run != s.run {
 		return
 	}
+	at := run.turnID
 	run.turnEnded()
 	if s.ctx.TurnID() != "" {
-		s.ctx.EndTurn(TurnEnd{Error: err.Error()})
+		s.ctx.EndTurn(TurnEnd{Error: err.Error(), SessionAt: at})
 	}
 }
 
@@ -883,8 +892,9 @@ func (s *codexSession) spawn(run *codexRun) {
 	}
 	started := func(r jmap) {
 		run.threadID = r.obj("thread").str("id")
+		// A rewind's resume_at was for the session it had, which this isn't if it couldn't be resumed.
 		if ctx.Thread().SessionID != run.threadID {
-			ctx.SetThread(func(t *protocol.Thread) { t.SessionID = run.threadID })
+			ctx.SetThread(func(t *protocol.Thread) { t.SessionID, t.ResumeAt = run.threadID, "" })
 		}
 		run.setReady(run.threadID, nil)
 	}
@@ -983,7 +993,21 @@ func (s *codexSession) startThread(run *codexRun, ok func(jmap), fail func(error
 	}
 	params["threadId"] = session
 	params["excludeTurns"] = true
-	run.rpc.request("thread/resume", params, nil, ok, func(e error) {
+	resumed := func(r jmap) {
+		// After a rewind: the session as it was before the turn it went back to before.
+		at := s.ctx.Thread().ResumeAt
+		if at == "" {
+			ok(r)
+			return
+		}
+		run.rpc.request("thread/revert", map[string]any{"threadId": session, "beforeTurnId": at}, nil, func(jmap) {
+			if s.ctx.Thread().ResumeAt == at {
+				s.ctx.SetThread(func(t *protocol.Thread) { t.ResumeAt = "" })
+			}
+			ok(r)
+		}, fail)
+	}
+	run.rpc.request("thread/resume", params, nil, resumed, func(e error) {
 		var re *rpcError
 		if !errors.As(e, &re) || !resumeMissing.MatchString(re.message) {
 			fail(e)
@@ -1189,6 +1213,7 @@ func (s *codexSession) exited(run *codexRun, status ExitStatus) {
 	run.exited = true
 	run.abort()
 	run.rpc.close(errors.New(codexExitError(status, run.stderr, false)))
+	at := run.turnID
 	run.turnEnded()
 	run.mcp.close()
 	if run.skillsDir != "" {
@@ -1205,7 +1230,7 @@ func (s *codexSession) exited(run *codexRun, status ExitStatus) {
 	// A run that ends while its turn is running ends the turn (as interrupted, if it was).
 	if !run.retired && ctx.TurnID() != "" {
 		s.clearStop()
-		ctx.EndTurn(TurnEnd{Error: codexExitError(status, run.stderr, true)})
+		ctx.EndTurn(TurnEnd{Error: codexExitError(status, run.stderr, true), SessionAt: at})
 	}
 	run.finish()
 }
@@ -1528,6 +1553,10 @@ func (s *codexSession) tookIn(run *codexRun, key string) {
 func (s *codexSession) turnCompleted(run *codexRun, turn jmap) {
 	ctx := s.ctx
 	errText := run.errText
+	at := turn.str("id")
+	if at == "" {
+		at = run.turnID
+	}
 	run.turnEnded()
 	run.errText = nil
 	// The turn's requests are moot now; its open ones are cancelled with it.
@@ -1551,7 +1580,7 @@ func (s *codexSession) turnCompleted(run *codexRun, turn jmap) {
 		return
 	}
 	s.clearStop()
-	end := TurnEnd{OK: turn.str("status") == "completed", Usage: usage}
+	end := TurnEnd{OK: turn.str("status") == "completed", Usage: usage, SessionAt: at}
 	if turn.str("status") == "failed" {
 		end.Error = turn.obj("error").str("message")
 		if end.Error == "" && errText != nil {

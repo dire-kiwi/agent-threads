@@ -20,6 +20,8 @@ import (
 type turnState struct {
 	ID          string `json:"id"`
 	Interrupted bool   `json:"interrupted"`
+	// Session is the thread's session_id when it started ("": it starts a new session).
+	Session string `json:"session,omitempty"`
 	// Carried is how many turns in a row (this one included) are retries for messages left queued
 	// that took none in: carried over from the turn before, or sent again with an explicit message.
 	Carried int `json:"carried,omitempty"`
@@ -709,7 +711,7 @@ func (rt *threadRuntime) send(m outgoing) {
 		// Messages still queued from before weren't delivered: they go first, in this turn, and stay
 		// queued until the harness takes them in. Such a turn is a retry for them.
 		left := rt.Queued()
-		rt.turn = &turnState{ID: NewID("turn")}
+		rt.turn = &turnState{ID: NewID("turn"), Session: rt.state.Thread.SessionID}
 		if len(left) > 0 {
 			rt.turn.Carried = 1
 		}
@@ -836,7 +838,11 @@ func (rt *threadRuntime) endTurn(end TurnEnd, carry bool) {
 			errText = "The turn failed."
 		}
 	}
-	rt.AddItem(&protocol.TurnResult{ID: NewID("tr"), OK: ok, Interrupted: turn.Interrupted, Error: errText, Usage: end.Usage, DurationMs: end.DurationMs})
+	var session *protocol.TurnSession
+	if id := rt.state.Thread.SessionID; id != "" {
+		session = &protocol.TurnSession{ID: id, At: end.SessionAt, Started: turn.Session == ""}
+	}
+	rt.AddItem(&protocol.TurnResult{ID: NewID("tr"), OK: ok, Interrupted: turn.Interrupted, Error: errText, Usage: end.Usage, DurationMs: end.DurationMs, Session: session})
 	rt.emit(&protocol.TurnCompletedEvent{TurnID: turn.ID})
 	rt.turn = nil
 	usage := addUsage(rt.state.Thread.Usage, end.Usage)
@@ -874,7 +880,7 @@ func (rt *threadRuntime) endTurn(end TurnEnd, carry bool) {
 		return
 	}
 	// The next turn starts straight away, so the thread doesn't go idle in between.
-	rt.turn = &turnState{ID: NewID("turn"), Carried: carried + 1}
+	rt.turn = &turnState{ID: NewID("turn"), Session: rt.state.Thread.SessionID, Carried: carried + 1}
 	for _, q := range left {
 		rt.UpdateItem(q.ID, Patch{"turn_id": rt.turn.ID})
 	}
@@ -885,6 +891,100 @@ func (rt *threadRuntime) endTurn(end TurnEnd, carry bool) {
 		msgs = append(msgs, toMessage(q))
 	}
 	rt.session.CarryOver(msgs)
+}
+
+// The notices a rewind and a new session add.
+const (
+	rewindText     = "The conversation was rewound to here: the agent doesn't remember what came after."
+	newSessionText = "A new conversation starts here: the agent doesn't remember what came before."
+)
+
+// compact compacts the harness's context: a turn with no message. The caller checks one can start.
+func (rt *threadRuntime) compact(session CompactingSession) {
+	rt.turn = &turnState{ID: NewID("turn"), Session: rt.state.Thread.SessionID}
+	rt.emit(&protocol.TurnStartedEvent{TurnID: rt.turn.ID})
+	rt.SetThread(func(t *protocol.Thread) { t.Status = protocol.ThreadStatusRunning; t.Error = "" })
+	session.Compact()
+}
+
+// newSession has the next turn start a new session. The caller checks no turn is running.
+func (rt *threadRuntime) newSession() {
+	if rt.state.Thread.SessionID == "" {
+		return
+	}
+	rt.SetThread(func(t *protocol.Thread) { t.SessionID, t.ResumeAt = "", "" })
+	rt.AddItem(&protocol.Notice{ID: NewID("n"), Level: protocol.NoticeLevelInfo, Code: "session.new", Text: newSessionText})
+	rt.session.OptionsChanged()
+}
+
+// rewind takes the conversation back to before the turn turnID: its items and every later turn's
+// go, and the session goes where the harness says (see sessions.go). It returns a *RewindError for a
+// turn the thread hasn't, or one the harness can't rewind to. The caller checks no turn is running.
+func (rt *threadRuntime) rewind(turnID string) error {
+	items := rt.saved.Items
+	var order []string
+	seen := map[string]bool{}
+	var sessions []*protocol.TurnSession
+	index := -1
+	for _, it := range items {
+		if t := it.TurnID(); t != "" && !seen[t] {
+			seen[t] = true
+			order = append(order, t)
+		}
+		if r, ok := it.Value.(*protocol.TurnResult); ok && r.ParentID == "" {
+			if r.TurnID == turnID && index < 0 {
+				index = len(sessions)
+			}
+			sessions = append(sessions, r.Session)
+		}
+	}
+	if index < 0 {
+		return &RewindError{Message: fmt.Sprintf("there's no turn %s in the thread", turnID)}
+	}
+	rewinder, ok := rt.session.(RewindingSession)
+	if !ok {
+		return &RewindError{Message: fmt.Sprintf("%s threads can't be rewound", rt.state.Thread.Harness)}
+	}
+	point, err := rewinder.RewindPoint(sessions, index)
+	if err != nil {
+		return err
+	}
+	dropped := map[string]bool{}
+	for i, t := range order {
+		if t == turnID {
+			for _, d := range order[i:] {
+				dropped[d] = true
+			}
+			break
+		}
+	}
+	first := -1
+	for i, it := range items {
+		if t := it.TurnID(); t != "" && dropped[t] {
+			first = i
+			break
+		}
+	}
+	gone := []string{}
+	goneSet := map[string]bool{}
+	for i, it := range items {
+		if t := it.TurnID(); (t != "" && dropped[t]) || (t == "" && i > first) {
+			gone = append(gone, it.ID())
+			goneSet[it.ID()] = true
+		}
+	}
+	queue := rt.queue[:0:0]
+	for _, id := range rt.queue {
+		if !goneSet[id] {
+			queue = append(queue, id)
+		}
+	}
+	rt.queue = queue
+	rt.emit(&protocol.ItemsRemovedEvent{ItemIDs: gone})
+	rt.SetThread(func(t *protocol.Thread) { t.SessionID, t.ResumeAt = point.SessionID, point.ResumeAt })
+	rt.AddItem(&protocol.Notice{ID: NewID("n"), Level: protocol.NoticeLevelInfo, Code: "rewind", Text: rewindText})
+	rt.session.OptionsChanged()
+	return nil
 }
 
 func (rt *threadRuntime) undelivered(n int) {

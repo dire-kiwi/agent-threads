@@ -48,7 +48,7 @@ sdk := agentthreads.New(agentthreads.Options{
 
 thread, _ := sdk.Create(ctx, agentthreads.CreateOptions{Model: "sonnet", Cwd: "/srv/work", Metadata: map[string]any{"user": "u1"}})
 stop := sdk.Subscribe(func(e protocol.ThreadEvent) { broadcast(e) }) // every thread's events, deltas included
-err := sdk.HandleJSON(ctx, frame)         // send / interrupt / respond / set_options, from a client
+err := sdk.HandleJSON(ctx, frame)         // send / interrupt / respond / set_options / rewind / new_session / compact, from a client
 snap, _ := sdk.Snapshot(ctx, thread.ID)   // for a client that just connected
 events, _ := sdk.EventsSince(ctx, thread.ID, seq, 0) // for one catching up
 sdk.Close(ctx) // on shutdown: stops the harness processes (or with the shim, leaves them going) and saves everything
@@ -60,10 +60,18 @@ sdk.Close(ctx) // on shutdown: stops the harness processes (or with the shim, le
 - `Create` makes a thread (harness, model, effort, permission mode, cwd, title, metadata) and sends
   its first `thread.updated`. It can have its own `Capabilities` (tools, MCP servers, skills,
   policy, system prompt), on top of the instance's; `Configure` sets them again after a restart.
+  With `SessionID` (Claude Code's session id, or Codex's thread id) it adopts a conversation the
+  harness already has: its first turn resumes it.
 - `Handle(ctx, protocol.Command)` and `HandleJSON(ctx, []byte)` carry out a command, after checking
   it against the protocol's schema (`protocol.Validate`), and return a `*CommandError` for one they
-  can't (an unknown thread, a malformed command, a closed instance). `Send`, `Interrupt`, `Respond`
-  and `SetOptions` do the same from code. They return once the thread has taken the command.
+  can't (an unknown thread, a malformed command, a closed instance). `Send`, `Interrupt`, `Respond`,
+  `SetOptions`, `Rewind`, `NewSession` and `Compact` do the same from code. They return once the
+  thread has taken the command.
+- `Rewind(ctx, id, turnID)` takes the conversation back to before a turn (the harness forgets it and
+  the turns after, whose items are removed), `NewSession(ctx, id)` has the next turn start a new
+  conversation, and `Compact(ctx, id)` compacts the harness's context in a turn of its own
+  ([spec/PROTOCOL.md](../spec/PROTOCOL.md#sessions)). They're refused while a turn runs. A harness
+  of the app's own supports them by implementing `RewindingSession` and `CompactingSession`.
 - `Subscribe(func(protocol.ThreadEvent))` calls the function with every thread's events, in order,
   one at a time, on a goroutine of the SDK's own (so it may call the SDK); `Events(ctx)` is the same
   as a channel. `Snapshot` is the thread's state now, text streamed so far included, and

@@ -33,6 +33,7 @@ type fixture struct {
 		Model          string                  `json:"model"`
 		Effort         string                  `json:"effort"`
 		PermissionMode protocol.PermissionMode `json:"permission_mode"`
+		SessionID      string                  `json:"session_id"`
 	} `json:"thread"`
 	Permissions string `json:"permissions"`
 	Tools       []struct {
@@ -226,6 +227,7 @@ func runFixture(t *testing.T, scenario, spawnerName string) {
 	sdk := make()
 	thread, err := sdk.Create(ctx, agentthreads.CreateOptions{
 		Harness: fx.Thread.Harness, Model: fx.Thread.Model, Effort: fx.Thread.Effort, PermissionMode: fx.Thread.PermissionMode, Cwd: cwd,
+		SessionID: fx.Thread.SessionID,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -258,6 +260,23 @@ func runFixture(t *testing.T, scenario, spawnerName string) {
 					t.Fatalf("%s: %d requests open, not 1", where, len(snap.Requests))
 				}
 				cmd["request_id"] = snap.Requests[0].ID()
+			}
+			if cmd["type"] == "rewind" {
+				// {{tN}}: the thread's Nth turn.
+				var n int
+				if _, err := fmt.Sscanf(fmt.Sprint(cmd["turn_id"]), "{{t%d}}", &n); err != nil {
+					t.Fatalf("%s: a rewind's turn_id %v isn't {{tN}}", where, cmd["turn_id"])
+				}
+				var turns []string
+				for _, e := range rec.all() {
+					if s, ok := e.Value.(*protocol.TurnStartedEvent); ok {
+						turns = append(turns, s.TurnID)
+					}
+				}
+				if n < 1 || len(turns) < n {
+					t.Fatalf("%s: there's no turn %d (%d turns)", where, n, len(turns))
+				}
+				cmd["turn_id"] = turns[n-1]
 			}
 			from = rec.len()
 			if err := sdk.HandleJSON(ctx, mustMarshal(cmd)); err != nil {

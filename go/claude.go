@@ -103,6 +103,8 @@ type claudeRunState struct {
 	Open        [][2]any        `json:"open"`
 	Sent        []sentMessage   `json:"sent"`
 	PluginDir   string          `json:"pluginDir,omitempty"`
+	At          string          `json:"at,omitempty"`       // the running turn's mark: the main conversation's last message in it
+	ResumeAt    string          `json:"resumeAt,omitempty"` // the thread's resume_at it was started with
 	Launched    *launched       `json:"launched,omitempty"`
 	Stale       bool            `json:"stale,omitempty"`
 	SteerAt     *int64          `json:"steerAt,omitempty"`
@@ -148,7 +150,11 @@ type claudeRun struct {
 	sent []sentMessage
 	// pluginDir is the generated plugin with the thread's skills, for this run only.
 	pluginDir string
-	launched  *launched
+	// at is the running turn's mark: the uuid of the main conversation's last message in it.
+	at string
+	// resumeAt is the message it was started to resume its session at (--resume-session-at).
+	resumeAt string
+	launched *launched
 }
 
 func newClaudeRun(id string) *claudeRun {
@@ -228,7 +234,7 @@ func without(list []string, x string) []string {
 }
 
 func (r *claudeRun) state() claudeRunState {
-	st := claudeRunState{V: 1, Ready: r.ready, Waiting: append([]string{}, r.waiting...), Next: r.nextRequest, Streamed: []string{}, Sent: append([]sentMessage{}, r.sent...), PluginDir: r.pluginDir, Launched: r.launched}
+	st := claudeRunState{V: 1, Ready: r.ready, Waiting: append([]string{}, r.waiting...), Next: r.nextRequest, Streamed: []string{}, Sent: append([]sentMessage{}, r.sent...), PluginDir: r.pluginDir, At: r.at, ResumeAt: r.resumeAt, Launched: r.launched}
 	st.Pending = [][2]string{}
 	for _, id := range r.pendingOrder {
 		st.Pending = append(st.Pending, [2]string{id, r.pending[id].subtype})
@@ -305,6 +311,7 @@ func (r *claudeRun) restore(st claudeRunState, answered func(subtype string) fun
 	}
 	r.sent = append([]sentMessage{}, st.Sent...)
 	r.pluginDir = st.PluginDir
+	r.at, r.resumeAt = st.At, st.ResumeAt
 	r.launched = st.Launched
 }
 
@@ -493,6 +500,15 @@ func (s *claudeSession) steerAfter(run *claudeRun, d time.Duration) {
 func (s *claudeSession) clearSteer() {
 	s.steerTimer.stop()
 	s.steerTimer = nil
+}
+
+func (s *claudeSession) Compact() {
+	// Claude Code compacts when it's sent /compact, which is its turn.
+	s.ensure(true).send([]string{}, s.userMessage([]Message{{Text: "/compact"}}))
+}
+
+func (s *claudeSession) RewindPoint(sessions []*protocol.TurnSession, index int) (RewindPoint, error) {
+	return ResumeAtPoint(sessions, index)
 }
 
 func (s *claudeSession) Interrupt() {
@@ -933,6 +949,14 @@ func (s *claudeSession) args(run *claudeRun) ([]string, error) {
 	if t.SessionID != "" {
 		args = append(args, "--resume", t.SessionID)
 	}
+	// After a rewind: the session as it was at the end of the turn it went back to.
+	run.resumeAt = ""
+	if t.SessionID != "" {
+		run.resumeAt = t.ResumeAt
+	}
+	if run.resumeAt != "" {
+		args = append(args, "--resume-session-at", run.resumeAt)
+	}
 	servers := map[string]any{}
 	if len(cfg.Tools) > 0 {
 		servers[appServer] = map[string]any{"type": "sdk", "name": appServer}
@@ -1014,7 +1038,7 @@ func (s *claudeSession) exited(run *claudeRun, status ExitStatus) {
 	if !run.retired && ctx.TurnID() != "" {
 		s.clearStop()
 		s.clearSteer()
-		ctx.EndTurn(TurnEnd{Error: claudeExitError(status, run.stderr)})
+		ctx.EndTurn(TurnEnd{Error: claudeExitError(status, run.stderr), SessionAt: run.at})
 	}
 	run.finish()
 }
@@ -1049,11 +1073,29 @@ func (s *claudeSession) line(run *claudeRun, line string) {
 func (s *claudeSession) message(run *claudeRun, m jmap) {
 	ctx := s.ctx
 	parent := m.str("parent_tool_use_id")
+	// The main conversation's messages (replayed ones too): the turn's last is where a rewind to after
+	// it resumes the session.
+	if typ := m.str("type"); (typ == "user" || typ == "assistant") && parent == "" && m.str("uuid") != "" {
+		run.at = m.str("uuid")
+	}
 	switch m.str("type") {
 	case "system":
-		sid := m.str("session_id")
-		if m.str("subtype") == "init" && sid != "" && sid != ctx.Thread().SessionID {
-			ctx.SetThread(func(t *protocol.Thread) { t.SessionID = sid })
+		if m.str("subtype") == "init" {
+			// The session it runs in; and a rewind's resume_at is done with once it has resumed there.
+			thread := ctx.Thread()
+			sid := m.str("session_id")
+			setSession := sid != "" && sid != thread.SessionID
+			doneAt := run.resumeAt != "" && thread.ResumeAt == run.resumeAt
+			if setSession || doneAt {
+				ctx.SetThread(func(t *protocol.Thread) {
+					if setSession {
+						t.SessionID = sid
+					}
+					if doneAt {
+						t.ResumeAt = ""
+					}
+				})
+			}
 		}
 		if m.str("subtype") == "compact_boundary" {
 			meta := m.obj("compact_metadata")
@@ -1160,12 +1202,14 @@ func (s *claudeSession) message(run *claudeRun, m jmap) {
 		run.open, run.openOrder = map[string]*claudeOpen{}, nil
 		// Its messages are done with: what was kept to translate them needn't be any more.
 		run.msgOfParent, run.blockCount, run.streamed = map[string]string{}, map[string]int{}, map[string]bool{}
+		at := run.at
+		run.at = ""
 		if ctx.TurnID() == "" {
 			return
 		}
 		s.clearStop()
 		failed := m.bool("is_error")
-		end := TurnEnd{OK: !failed, Usage: claudeUsage(m)}
+		end := TurnEnd{OK: !failed, Usage: claudeUsage(m), SessionAt: at}
 		if failed {
 			end.Error = m.str("result")
 			if end.Error == "" {
