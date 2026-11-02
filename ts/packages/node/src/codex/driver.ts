@@ -9,12 +9,13 @@
 
 import { mkdtempSync, realpathSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join, resolve, sep } from "node:path";
+import { isAbsolute, join, resolve, sep } from "node:path";
 import type { Resolution, ToolCall, Usage } from "@dire-kiwi/agent-threads-protocol";
 import { messageParts } from "../attachments.js";
 import { title } from "../claude/translate.js";
 import type { Harness, HarnessSession, Message, RunCheckpoint, ThreadContext } from "../harness.js";
 import { newId } from "../ids.js";
+import { applyLaunchEnv, launchedNow, launchedOf, withEnv, type Launched } from "../launch.js";
 import { serveTools, type LoopbackMcp } from "../mcp-http.js";
 import { permissionKey, type PermissionDecision, type PermissionQuery } from "../permissions.js";
 import { writeSkills } from "../skills.js";
@@ -103,9 +104,6 @@ interface OpenRequest {
 
 /** A message sent (by turn/start or turn/steer), by what Codex echoes when it takes it in. */
 type Sent = { ids: string[]; key: string };
-
-/** The thread's options a process is started with: a different one needs another. */
-type Launched = { model?: string; effort?: string; permission_mode?: string };
 
 /**
  * What a run's checkpoint holds (see HarnessSession.checkpoint): what's needed to carry on reading
@@ -484,9 +482,7 @@ class CodexSession implements HarnessSession {
       );
     }
     // A process started with other options than the thread's now is replaced at the next turn.
-    const t = ctx.thread;
-    const l = st.launched;
-    this.#stale = !!st.stale || !l || l.model !== t.model || l.effort !== t.effort || l.permission_mode !== t.permission_mode;
+    this.#stale = !!st.stale || !launchedNow(st.launched, ctx);
     // Codex's requests that were open: the user's questions are taken up again, an app tool that
     // was running is answered (not run again), and the rest are dealt with again. One answered
     // before the restart, though that wasn't saved, is closed: Codex has its answer.
@@ -645,9 +641,12 @@ class CodexSession implements HarnessSession {
     }
     const ctx = this.#ctx;
     const o = this.#o;
+    const launch = ctx.launch;
     let home: string;
     try {
-      home = o.userConfig ? userCodexHome() : prepareCodexHome(o.home ?? defaultCodexHome(), o.login ?? userCodexHome());
+      // The thread's own CODEX_HOME is used as it is.
+      if (launch.configDir) home = resolve(launch.configDir);
+      else home = o.userConfig ? userCodexHome() : prepareCodexHome(o.home ?? defaultCodexHome(), o.login ?? userCodexHome());
     } catch (e) {
       this.#exited(run, { code: null, signal: null, error: e instanceof Error ? e : new Error(String(e)) });
       throw e;
@@ -657,9 +656,9 @@ class CodexSession implements HarnessSession {
       proc = ctx.spawner.spawn(
         {
           command: o.bin ?? "codex",
-          args: [...(o.binArgs ?? []), "app-server", ...(o.args ?? [])],
+          args: [...(o.binArgs ?? []), "app-server", ...(o.args ?? []), ...(launch.args ?? [])],
           ...(ctx.thread.cwd ? { cwd: ctx.thread.cwd } : {}),
-          env: { ...process.env, ...o.env, CODEX_HOME: home },
+          env: { ...applyLaunchEnv(withEnv(o.env), launch), CODEX_HOME: home },
           threadId: ctx.threadId,
           runId: run.id,
         },
@@ -670,7 +669,7 @@ class CodexSession implements HarnessSession {
       throw e;
     }
     run.proc = proc;
-    run.launched = { model: ctx.thread.model, effort: ctx.thread.effort, permission_mode: ctx.thread.permission_mode };
+    run.launched = launchedOf(ctx);
     ctx.setThread({ run: { id: run.id, spawner: ctx.spawner.name, started_at: new Date().toISOString() } });
 
     try {
@@ -805,6 +804,7 @@ class CodexSession implements HarnessSession {
       "features.default_mode_request_user_input": true,
       suppress_unstable_features_warning: true,
       ...(Object.keys(servers).length ? { mcp_servers: servers } : {}),
+      ...writableRoots(this.#o.config, ctx.launch.addDirs, t.cwd),
       ...(run.hiddenSkills.length ? { skills: { config: run.hiddenSkills.map((path) => ({ path, enabled: false })) } } : {}),
     };
     const dynamic = fresh ? [...(run.dynamic?.values() ?? [])] : [];
@@ -1327,6 +1327,21 @@ class CodexSession implements HarnessSession {
 
 type ToolSpec = { name: string; description: string; inputSchema: unknown };
 type Totals = NonNullable<SessionState["totals"]>;
+
+/** Where Codex's sandbox lets the agent write besides the working directory (a dotted config key). */
+const WRITABLE_ROOTS = "sandbox_workspace_write.writable_roots";
+
+/**
+ * The thread's other directories, as config: writable as its working directory is (relative ones
+ * are in it), after any the options' config gives. Nothing if it has none.
+ */
+function writableRoots(config: { [k: string]: unknown } | undefined, addDirs: string[] | undefined, cwd: string | undefined): { [k: string]: unknown } {
+  if (!addDirs?.length) return {};
+  const given = config?.[WRITABLE_ROOTS];
+  const roots = Array.isArray(given) ? [...given] : [];
+  for (const d of addDirs) roots.push(cwd && !isAbsolute(d) ? join(cwd, d) : d);
+  return { [WRITABLE_ROOTS]: roots };
+}
 
 /** A tool as Codex has it as a dynamic tool. */
 function toolSpec(t: Tool): ToolSpec {
