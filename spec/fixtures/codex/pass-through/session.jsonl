@@ -38,5 +38,7 @@
 {"run":1,"t":3510,"dir":"out","msg":{"id":5,"result":{"rateLimits":{"limitId":"codex","limitName":null,"primary":{"usedPercent":43,"windowDurationMins":300,"resetsAt":1800000000},"secondary":{"usedPercent":100,"windowDurationMins":10080,"resetsAt":1800500000},"credits":{"hasCredits":false,"unlimited":false,"balance":null},"planType":"plus","rateLimitReachedType":"rate_limit_reached"},"rateLimitsByLimitId":{"codex":{"limitId":"codex","limitName":null,"primary":{"usedPercent":43,"windowDurationMins":300,"resetsAt":1800000000},"secondary":{"usedPercent":100,"windowDurationMins":10080,"resetsAt":1800500000},"credits":{"hasCredits":false,"unlimited":false,"balance":null},"planType":"plus","rateLimitReachedType":"rate_limit_reached"}}}}}
 {"run":1,"t":3515,"dir":"in","msg":{"id":6,"method":"no/such/method","params":{"x":1}}}
 {"run":1,"t":3517,"dir":"out","msg":{"id":6,"error":{"code":-32600,"message":"Invalid request: unknown variant `no/such/method`"}}}
+{"run":1,"t":3522,"dir":"in","msg":{"id":7,"method":"thread/name/set","params":{"threadId":"01a19253-7717-7920-8c01-110b76d4845e","name":"pass-through"}}}
+{"run":1,"t":3524,"dir":"out","msg":{"id":7,"result":null}}
 {"run":1,"t":3565,"dir":"close"}
 {"run":1,"t":3625,"dir":"exit","code":0,"signal":null}

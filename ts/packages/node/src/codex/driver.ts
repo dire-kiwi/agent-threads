@@ -527,7 +527,7 @@ class CodexSession implements HarnessSession {
         reject(e);
       };
       this.#controls.add(fail);
-      run.rpc.request(r.method as string, r.params).then(
+      run.rpc.requestRaw(r.method as string, r.params).then(
         (result) => {
           if (!this.#controls.has(fail)) return;
           this.#controls.delete(fail);

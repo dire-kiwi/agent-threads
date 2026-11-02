@@ -142,6 +142,8 @@ struct Pending {
     method: String,
     meta: Option<Value>,
     then: Then,
+    /// The app's (control): its result is passed on as it came, null included.
+    raw: bool,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -622,6 +624,21 @@ impl CodexSession {
         meta: Option<Value>,
         then: Then,
     ) {
+        self.send_request(ctx, run, method, params, meta, then, false);
+    }
+
+    /// Sends a request; `raw` passes its result on as it came (a null one too), for the app's.
+    #[allow(clippy::too_many_arguments)]
+    fn send_request(
+        &mut self,
+        ctx: &ThreadContext,
+        run: &str,
+        method: &str,
+        params: Value,
+        meta: Option<Value>,
+        then: Then,
+        raw: bool,
+    ) {
         let fail = |message: String, then: Then| {
             let run = run.to_string();
             ctx.post::<CodexSession>(move |s, ctx| then(s, ctx, &run, Err(RpcError { message, error: None })));
@@ -639,6 +656,7 @@ impl CodexSession {
             method: method.to_string(),
             meta,
             then,
+            raw,
         });
         r.write(&if params.is_null() {
             json!({"id": id, "method": method})
@@ -668,6 +686,8 @@ impl CodexSession {
             })
         } else {
             Ok(match msg.get("result") {
+                Some(r) if p.raw => r.clone(),
+                None if p.raw => Value::Null,
                 Some(Value::Null) | None => json!({}),
                 Some(r) => r.clone(),
             })
@@ -2799,6 +2819,7 @@ impl HarnessSession for CodexSession {
                 method: p.method.clone(),
                 meta: p.meta.clone(),
                 then,
+                raw: false,
             });
         }
         let (proc, rx) = match ctx.spawner().attach(record) {
@@ -2903,7 +2924,7 @@ impl HarnessSession for CodexSession {
         let slot = Arc::new(StdMutex::new(Some(reply)));
         self.controls.retain(|s| s.lock().unwrap().is_some());
         self.controls.push(slot.clone());
-        self.request(
+        self.send_request(
             ctx,
             &id,
             &method,
@@ -2917,6 +2938,7 @@ impl HarnessSession for CodexSession {
                     }));
                 }
             }),
+            true,
         );
     }
 

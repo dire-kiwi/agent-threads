@@ -87,6 +87,16 @@
         }
       },
       "error": "Invalid request: unknown variant `no/such/method`"
+    },
+    {
+      "control": {
+        "method": "thread/name/set",
+        "params": {
+          "threadId": "01a19253-7717-7920-8c01-110b76d4845e",
+          "name": "pass-through"
+        }
+      },
+      "result": null
     }
   ],
   "harness_messages": [

@@ -36,7 +36,7 @@ export interface PendingRequest {
 export class Rpc {
   #write: (msg: object) => void;
   #next = 1;
-  #pending = new Map<RequestId, { method: string; meta?: unknown; resolve: (r: any) => void; reject: (e: Error) => void }>();
+  #pending = new Map<RequestId, { method: string; meta?: unknown; raw?: boolean; resolve: (r: any) => void; reject: (e: Error) => void }>();
   #closed: Error | null = null;
 
   constructor(write: (msg: object) => void) {
@@ -48,6 +48,15 @@ export class Rpc {
     if (this.#closed) return Promise.reject(this.#closed);
     const id = this.#next++;
     const p = new Promise<R>((resolve, reject) => this.#pending.set(id, { method, ...(meta !== undefined ? { meta } : {}), resolve, reject }));
+    this.#write(params === undefined ? { id, method } : { id, method, params });
+    return p;
+  }
+
+  /** Sends a request whose result is passed on as it came, null included (the app's, with control()). */
+  requestRaw(method: string, params?: unknown): Promise<unknown> {
+    if (this.#closed) return Promise.reject(this.#closed);
+    const id = this.#next++;
+    const p = new Promise<unknown>((resolve, reject) => this.#pending.set(id, { method, raw: true, resolve, reject }));
     this.#write(params === undefined ? { id, method } : { id, method, params });
     return p;
   }
@@ -72,7 +81,7 @@ export class Rpc {
     if (!p) return true;
     this.#pending.delete(msg.id);
     if (msg.error) p.reject(new RpcError(p.method, msg.error.message ?? `${p.method} failed`, msg.error.code, msg.error));
-    else p.resolve(msg.result ?? {});
+    else p.resolve(p.raw ? (msg.result ?? null) : (msg.result ?? {}));
     return true;
   }
 

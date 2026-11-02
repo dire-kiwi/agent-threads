@@ -45,7 +45,7 @@ Each fixture is a directory `spec/fixtures/<harness>/<scenario>/`:
 | `resume` | A turn, a backend restart, then a turn in a new process | `--resume <session_id>` | `thread/resume` |
 | `compaction` | A turn, then `/compact` | sent as a message | sent as `thread/compact/start` |
 | `error` | A turn that fails (the model doesn't exist) | an error result | a failed turn, after a warning |
-| `pass-through` | What the protocol leaves out ([PROTOCOL.md](../PROTOCOL.md#pass-through)): `raw`, the harness message handler and control requests, plus rate limits and notices | `api_retry` and `hook_response` notices, a rejected `rate_limit_event`, a line the driver doesn't know, and `get_context_usage` (and one Claude refuses) | `account/rateLimits/updated` windows, and `account/rateLimits/read` (and a method Codex refuses) |
+| `pass-through` | What the protocol leaves out ([PROTOCOL.md](../PROTOCOL.md#pass-through)): `raw`, the harness message handler and control requests, plus rate limits and notices | `api_retry` and `hook_response` notices, a rejected `rate_limit_event`, a line the driver doesn't know, and `get_context_usage` (and one Claude refuses) | `account/rateLimits/updated` windows, `account/rateLimits/read`, a method answered with a `null` result, and one Codex refuses |
 
 Some things the recordings show that a backend has to deal with: Claude Code echoes the backend's
 own `control_response`s back on stdout; it loads app and MCP tools lazily, so the agent calls
