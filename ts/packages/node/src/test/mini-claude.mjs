@@ -9,6 +9,10 @@
 //   app <name> <json>     calls an app tool over mcp_message, says what it returned, and ends the turn
 //   sleep <ms> <text>     waits (or until it's interrupted), then replies with <text> and ends the turn
 //   cancelled <tool>      asks can_use_tool, then cancels the request and ends the turn
+//   twice <tool> <json>   calls a tool twice at once (asking can_use_tool for both), says how each
+//                         went, and ends the turn
+//   asking <tool> <json>  calls a tool as `tool` does, but an interrupt while it's asking cancels the
+//                         request (as Claude does) and ends the turn as interrupted
 //   slow                  waits for an interrupt, then ends the turn as interrupted
 //   stubborn              ignores interrupts, and a closed stdin (saying "not stopping"), until
 //                         it's signalled
@@ -158,6 +162,40 @@ async function step(text) {
     out({ type: "control_request", request_id, request: { subtype: "can_use_tool", tool_name: rest[0], input: {}, tool_use_id: id } });
     out({ type: "control_cancel_request", request_id });
     out({ type: "user", message: { role: "user", content: [{ type: "tool_result", tool_use_id: id, content: "cancelled", is_error: true }] }, parent_tool_use_id: null, session_id: session });
+  } else if (cmd === "twice") {
+    const [name, json = "{}"] = rest;
+    const input = JSON.parse(json);
+    const calls = [`toolu_${++ids}`, `toolu_${++ids}`];
+    out({ type: "assistant", message: { id: `msg_${process.pid}_${++msgs}`, model: "mini", content: calls.map((id) => ({ type: "tool_use", id, name, input })) }, parent_tool_use_id: null, session_id: session });
+    const answers = await Promise.all(calls.map((id) => ask({ subtype: "can_use_tool", tool_name: name, input, tool_use_id: id })));
+    calls.forEach((id, i) => {
+      const r = answers[i];
+      const allowed = r.response.behavior === "allow";
+      out({ type: "user", message: { role: "user", content: [{ type: "tool_result", tool_use_id: id, content: allowed ? "done" : r.response.message, is_error: !allowed }] }, parent_tool_use_id: null, session_id: session });
+      say(allowed ? `ran with ${JSON.stringify(r.response.updatedInput)}` : `denied: ${r.response.message}`);
+    });
+  } else if (cmd === "asking") {
+    const [name, json = "{}"] = rest;
+    const id = `toolu_${++ids}`;
+    const input = JSON.parse(json);
+    out({ type: "assistant", message: { id: `msg_${process.pid}_${++msgs}`, model: "mini", content: [{ type: "tool_use", id, name, input }] }, parent_tool_use_id: null, session_id: session });
+    const request_id = `cli_${++ids}`;
+    const answer = new Promise((resolve) => waiting.set(request_id, resolve));
+    out({ type: "control_request", request_id, request: { subtype: "can_use_tool", tool_name: name, input, tool_use_id: id } });
+    const r = await Promise.race([answer, new Promise((r) => (interrupted = r))]);
+    if (wasInterrupted) {
+      waiting.delete(request_id);
+      out({ type: "control_cancel_request", request_id });
+      return;
+    }
+    const allowed = r.response.behavior === "allow";
+    out({
+      type: "user",
+      message: { role: "user", content: [{ type: "tool_result", tool_use_id: id, content: allowed ? "done" : r.response.message, is_error: !allowed }] },
+      parent_tool_use_id: null,
+      session_id: session,
+    });
+    say(allowed ? `ran with ${JSON.stringify(r.response.updatedInput)}` : `denied: ${r.response.message}`);
   } else if (cmd === "tool") {
     const [name, json = "{}"] = rest;
     const id = `toolu_${++ids}`;

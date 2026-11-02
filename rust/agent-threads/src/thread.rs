@@ -21,10 +21,13 @@ use tokio::sync::{broadcast, mpsc, oneshot};
 use crate::agent_threads::Error;
 use crate::harness::{HarnessSession, Message, RunCheckpoint, ThreadConfig, TurnEnd};
 use crate::ids::{new_id, now_iso};
-use crate::permissions::{Decided, PermissionContext, PermissionDecision, PermissionPolicy, PermissionQuery, decide};
+use crate::permissions::{
+    DONT_ASK_DENIAL, Decided, PermissionContext, PermissionDecision, PermissionPolicy, PermissionQuery, StandingKey,
+    decide, mode_decision, permission_key,
+};
 use crate::protocol::{
-    Attachment, DeltaEventKind, Item, Resolution, ResolutionOutcome, Snapshot, Thread, ThreadEvent, ThreadRequest,
-    Usage, UserMessage,
+    Attachment, DeltaEventKind, Item, PermissionMode, QuestionRequest, Resolution, ResolutionOutcome, Snapshot,
+    StandingAnswerOutcome, Thread, ThreadEvent, ThreadRequest, Usage, UserMessage,
 };
 use crate::reducer::{apply_event, utf16_len};
 use crate::spawner::Spawner;
@@ -70,7 +73,10 @@ struct OpenRequest {
     request: ThreadRequest,
     answered: Answered,
     /// The tool it's about (permission_key), for an answer given `always`.
-    standing: Option<String>,
+    standing: Option<StandingKey>,
+    /// A question kept open after its turn ended (Options::late_answers): its answer is sent as
+    /// the next message, unless a turn starts first.
+    late: bool,
 }
 
 /// What the core asks of the session, once the job that asked is done with it.
@@ -105,6 +111,8 @@ pub(crate) struct Host {
     pub spawner: Arc<dyn Spawner>,
     pub events: broadcast::Sender<ThreadEvent>,
     pub on_error: Arc<dyn Fn(Error) + Send + Sync>,
+    /// Options::late_answers.
+    pub late_answers: bool,
 }
 
 /// A thread on its task: the core and the driver's session.
@@ -132,7 +140,6 @@ pub struct ThreadContext {
     saved: Snapshot,
     queue: Vec<String>,
     requests: Vec<(String, OpenRequest)>,
-    always: HashMap<String, bool>,
     unsaved: Vec<ThreadEvent>,
     thread_changed: bool,
     flush_queued: bool,
@@ -415,6 +422,8 @@ impl ThreadContext {
     pub(crate) fn send(&mut self, message: Outgoing) {
         let id = new_id("um");
         if self.turn.is_none() {
+            // The conversation moves on: questions kept open after their turns can't be answered.
+            self.cancel_late();
             // Messages still queued from before weren't delivered: they go first, in this turn, and
             // stay queued until the harness takes them in. Such a turn is a retry for them.
             let left = self.queued();
@@ -516,15 +525,12 @@ impl ThreadContext {
         for id in cut {
             self.update_item(&id, json!({"status": "cancelled"}));
         }
-        let mut i = 0;
-        while i < self.requests.len() {
-            let r = &self.requests[i].1.request;
-            if r.turn_id().is_some_and(|t| t != turn.id) {
-                i += 1;
-                continue;
+        for (id, open) in std::mem::take(&mut self.requests) {
+            if open.late || open.request.turn_id().is_some_and(|t| t != turn.id) {
+                self.requests.push((id, open));
+            } else if !self.keep_late(&id, &open.request) {
+                self.emit_resolved(&id, &cancel());
             }
-            let (id, _) = self.requests.remove(i);
-            self.emit_resolved(&id, &cancel());
         }
         let ok = end.ok && !turn.interrupted;
         let error = (!ok && !turn.interrupted).then(|| {
@@ -623,36 +629,85 @@ impl ThreadContext {
     // ---------- requests ----------
 
     /// The permission policy's answer: at once when it has one, or later.
+    /// The thread's standing answers come first, then the policy; what the policy would ask the user
+    /// about, the thread's permission mode may decide instead (bypass allows it, dont_ask denies it).
     pub fn decide(&self, query: PermissionQuery) -> Decided {
-        let key = crate::permissions::permission_key(query.kind, query.server.as_deref(), &query.name);
-        if let Some(&allow) = self.always.get(&key) {
-            return Decided::Now(if allow {
-                PermissionDecision::Allow
-            } else {
-                PermissionDecision::Deny(None)
+        let key = permission_key(query.kind, query.server.as_deref(), &query.name);
+        if let Some(Resolution { outcome, message, .. }) = self.standing(&key) {
+            return Decided::Now(match outcome {
+                ResolutionOutcome::Allow => PermissionDecision::Allow,
+                _ => PermissionDecision::Deny(message),
             });
         }
         let thread = self.state.thread.clone();
+        let mode = thread.permission_mode;
         let ctx = PermissionContext {
             thread_id: self.thread_id.clone(),
             metadata: thread.metadata.clone(),
             thread,
         };
-        decide(&self.policy, query, ctx)
+        // (An async policy's Ask is decided by the mode as it is when the request would be opened:
+        // see ask().)
+        match decide(&self.policy, query, ctx) {
+            Decided::Now(d) => Decided::Now(mode_decision(mode, d)),
+            later => later,
+        }
+    }
+
+    /// The thread's standing answer for a tool, if it has one.
+    fn standing(&self, key: &StandingKey) -> Option<Resolution> {
+        let a = self
+            .state
+            .thread
+            .standing_answers
+            .iter()
+            .rev()
+            .find(|a| key.matches(a))?;
+        Some(match a.outcome {
+            StandingAnswerOutcome::Allow => resolution(ResolutionOutcome::Allow, None),
+            StandingAnswerOutcome::Deny => resolution(ResolutionOutcome::Deny, Some(STANDING_DENIAL)),
+        })
+    }
+
+    /// How a request is answered without asking the user, if it is: a permission request by the
+    /// thread's standing answer for its tool, or else by its permission mode (bypass allows it,
+    /// dont_ask denies it); a question by dont_ask, which dismisses it.
+    fn settled(&self, question: bool, standing: Option<&StandingKey>) -> Option<Resolution> {
+        if !question && let Some(r) = standing.and_then(|k| self.standing(k)) {
+            return Some(r);
+        }
+        match (self.state.thread.permission_mode, question) {
+            (Some(PermissionMode::Bypass), false) => Some(resolution(ResolutionOutcome::Allow, None)),
+            (Some(PermissionMode::DontAsk), false) => Some(resolution(ResolutionOutcome::Deny, Some(DONT_ASK_DENIAL))),
+            (Some(PermissionMode::DontAsk), true) => Some(resolution(ResolutionOutcome::Cancel, Some(DONT_ASK_DENIAL))),
+            _ => None,
+        }
     }
 
     /// Opens a request (a `ThreadRequest` as JSON, without its id; for the tool call `tool_call_id`,
     /// which is set `pending`), and calls `answered` when the user responds. It isn't called when
     /// the request is cancelled because its turn ended. `standing` (the tool's permission_key) lets
-    /// an answer given `always` stand for the thread.
+    /// an answer given `always` stand for the thread. A request the thread's standing answers or
+    /// permission mode answer (see settled()) isn't opened: `answered` is called with their answer,
+    /// in a job of its own.
     pub fn ask(
         &mut self,
         mut request: Value,
         tool_call_id: Option<&str>,
         answered: Answered,
-        standing: Option<String>,
+        standing: Option<StandingKey>,
     ) -> String {
-        let id = new_id(if request["type"] == "question" { "q" } else { "perm" });
+        let question = request["type"] == "question";
+        let id = new_id(if question { "q" } else { "perm" });
+        if let Some(r) = self.settled(question, standing.as_ref()) {
+            let _ = self.tx.send(Box::new(move |a: &mut Actor| answered(a, r)));
+            return id;
+        }
+        if let Some(server) = standing.as_ref().and_then(|k| k.server.as_ref())
+            && !question
+        {
+            request["server"] = json!(server);
+        }
         request["id"] = json!(id);
         if let Some(turn) = &self.turn {
             request["turn_id"] = json!(turn.id);
@@ -682,6 +737,7 @@ impl ThreadContext {
                 request: parsed,
                 answered,
                 standing,
+                late: false,
             },
         ));
         self.emit(json!({"type": "request.opened", "request": request}));
@@ -691,7 +747,12 @@ impl ThreadContext {
 
     /// Takes up a request opened before the backend restarted, which is still open: `answered` is
     /// called when the user responds, as for ask(). If it isn't open, `answered` is given back.
-    pub fn reopen(&mut self, request_id: &str, answered: Answered, standing: Option<String>) -> Result<(), Answered> {
+    pub fn reopen(
+        &mut self,
+        request_id: &str,
+        answered: Answered,
+        standing: Option<StandingKey>,
+    ) -> Result<(), Answered> {
         if self.requests.iter().any(|(id, _)| id == request_id) {
             return Err(answered);
         }
@@ -704,6 +765,7 @@ impl ThreadContext {
                 request,
                 answered,
                 standing,
+                late: false,
             },
         ));
         Ok(())
@@ -717,7 +779,7 @@ impl ThreadContext {
         request: Value,
         tool_call_id: Option<&str>,
         answered: Answered,
-        standing: Option<String>,
+        standing: Option<StandingKey>,
     ) -> String {
         let answered = match existing {
             Some(id) => match self.reopen(id, answered, standing.clone()) {
@@ -729,20 +791,96 @@ impl ThreadContext {
         self.ask(request, tool_call_id, answered, standing)
     }
 
-    /// Closes a request the harness no longer wants answered.
+    /// Closes a request the harness no longer wants answered. (A question kept open after its turn
+    /// isn't the harness's any more, and stays open; so does one the harness gives up on because
+    /// the user interrupted its turn, with late_answers.)
     pub fn cancel_request(&mut self, id: &str) {
-        let Some(at) = self.requests.iter().position(|(r, _)| r == id) else {
+        let Some(at) = self.requests.iter().position(|(r, o)| r == id && !o.late) else {
             return;
         };
-        self.requests.remove(at);
-        self.emit_resolved(id, &cancel());
-        if self.requests.is_empty() && self.turn.is_some() {
+        let (_, open) = self.requests.remove(at);
+        if !(self.interrupted() && self.keep_late(id, &open.request)) {
+            self.emit_resolved(id, &cancel());
+        }
+        if !self.waiting() && self.turn.is_some() {
             self.set_thread(|t| t.status = crate::protocol::ThreadStatus::Running);
         }
     }
 
+    /// Whether the turn waits on a request (one that isn't kept open after its turn).
+    fn waiting(&self) -> bool {
+        self.requests.iter().any(|(_, o)| !o.late)
+    }
+
+    /// The open requests, but for questions kept open after their turns.
     pub(crate) fn open_request_ids(&self) -> Vec<String> {
-        self.requests.iter().map(|(id, _)| id.clone()).collect()
+        self.requests
+            .iter()
+            .filter(|(_, o)| !o.late)
+            .map(|(id, _)| id.clone())
+            .collect()
+    }
+
+    /// Keeps a question open after its turn ended, with late_answers, if it can be: not a secret one
+    /// (its answer would be shown, as a message), and not when messages are queued (the
+    /// conversation has moved on). Whether it did.
+    fn keep_late(&mut self, id: &str, request: &ThreadRequest) -> bool {
+        let ThreadRequest::Question(q) = request else {
+            return false;
+        };
+        if !self.host.late_answers || !self.queue.is_empty() || q.questions.iter().any(|q| q.secret) {
+            return false;
+        }
+        self.requests.push((
+            id.to_string(),
+            OpenRequest {
+                request: request.clone(),
+                answered: late_answered(q.clone()),
+                standing: None,
+                late: true,
+            },
+        ));
+        true
+    }
+
+    /// Cancels the questions kept open after their turns.
+    fn cancel_late(&mut self) {
+        for (id, open) in std::mem::take(&mut self.requests) {
+            if open.late {
+                self.emit_resolved(&id, &cancel());
+            } else {
+                self.requests.push((id, open));
+            }
+        }
+    }
+
+    /// Takes up, as a thread is loaded, the requests open in its state that nothing will answer:
+    /// those of turns that ended (`ended`, or all of them), which aren't taken up already. A
+    /// question is kept open after its turn as finish_turn() keeps it; the others are cancelled.
+    pub(crate) fn take_up_requests(&mut self, all: bool) {
+        let ended: HashSet<String> = self
+            .state
+            .items
+            .iter()
+            .filter_map(|i| match i {
+                Item::TurnResult(r) => r.turn_id.clone(),
+                _ => None,
+            })
+            .collect();
+        let open: Vec<ThreadRequest> = self
+            .state
+            .requests
+            .iter()
+            .filter(|r| all || r.turn_id().is_some_and(|t| ended.contains(t)))
+            .filter(|r| !self.requests.iter().any(|(id, _)| id == r.id()))
+            .cloned()
+            .collect();
+        for r in open {
+            let id = r.id().to_string();
+            if !self.keep_late(&id, &r) {
+                self.emit_resolved(&id, &cancel());
+            }
+        }
     }
 
     /// Saves the thread's run as it is now (with a spawner whose runs outlive the backend), before
@@ -942,7 +1080,6 @@ impl Actor {
             state,
             queue,
             requests: Vec::new(),
-            always: HashMap::new(),
             unsaved: Vec::new(),
             thread_changed: false,
             flush_queued: false,
@@ -1016,18 +1153,44 @@ impl Actor {
         let (_, open) = c.requests.remove(at);
         // The answers to secret questions go only to the harness: what's sent and saved hides them.
         c.emit_resolved(request_id, &redact(&open.request, &resolution));
-        if c.requests.is_empty() && c.turn.is_some() {
+        if !c.waiting() && c.turn.is_some() {
             c.set_thread(|t| t.status = crate::protocol::ThreadStatus::Running);
         }
-        if resolution.always
-            && let Some(standing) = open.standing
-            && matches!(resolution.outcome, ResolutionOutcome::Allow | ResolutionOutcome::Deny)
-        {
-            c.always
-                .insert(standing, resolution.outcome == ResolutionOutcome::Allow);
+        let standing = match (resolution.always, &open.standing, resolution.outcome) {
+            (true, Some(key), ResolutionOutcome::Allow) => Some(key.answer(StandingAnswerOutcome::Allow)),
+            (true, Some(key), ResolutionOutcome::Deny) => Some(key.answer(StandingAnswerOutcome::Deny)),
+            _ => None,
+        };
+        if let (Some(answer), Some(key)) = (&standing, &open.standing) {
+            c.set_thread(|t| {
+                t.standing_answers.retain(|a| !key.matches(a));
+                t.standing_answers.push(answer.clone());
+            });
         }
         (open.answered)(self, resolution);
         self.drain();
+        // It stands for the requests open for the same tool too.
+        if standing.is_some() {
+            self.settle();
+        }
+    }
+
+    /// Answers the open requests the thread's standing answers or permission mode now answer (see
+    /// ThreadContext::settled), after either changed.
+    pub(crate) fn settle(&mut self) {
+        let c = &self.core;
+        let settled: Vec<(String, Resolution)> = c
+            .requests
+            .iter()
+            .filter(|(_, o)| !o.late)
+            .filter_map(|(id, o)| {
+                let question = matches!(o.request, ThreadRequest::Question(_));
+                c.settled(question, o.standing.as_ref()).map(|r| (id.clone(), r))
+            })
+            .collect();
+        for (id, r) in settled {
+            self.respond(&id, r);
+        }
     }
 
     /// Appends the unsaved events, then the thread. Events stay unsaved until the store has them,
@@ -1157,12 +1320,62 @@ impl Actor {
 }
 
 fn cancel() -> Resolution {
+    resolution(ResolutionOutcome::Cancel, None)
+}
+
+fn resolution(outcome: ResolutionOutcome, message: Option<&str>) -> Resolution {
     Resolution {
         always: false,
         answers: Default::default(),
-        message: None,
-        outcome: ResolutionOutcome::Cancel,
+        message: message.map(String::from),
+        outcome,
     }
+}
+
+/// What the agent is told when a standing answer denies a call.
+const STANDING_DENIAL: &str = "The user has denied this tool for the rest of the thread.";
+
+/// What's done with the answer to a question kept open after its turn: it's sent as the next
+/// message (a dismissal sends nothing).
+fn late_answered(q: QuestionRequest) -> Answered {
+    Box::new(move |a: &mut Actor, r: Resolution| {
+        if r.outcome != ResolutionOutcome::Answer {
+            return;
+        }
+        let text = late_answer_text(&q, &r);
+        a.core.send(Outgoing {
+            text,
+            ..Default::default()
+        });
+    })
+}
+
+/// The message a late answer is sent as: each question, with its answers (and the note with them).
+pub(crate) fn late_answer_text(q: &QuestionRequest, r: &Resolution) -> String {
+    let lines: Vec<String> = q
+        .questions
+        .iter()
+        .map(|question| {
+            let answers = r.answers.get(&question.id).map(Vec::as_slice).unwrap_or_default();
+            let answer = if answers.is_empty() {
+                "(no answer)".to_string()
+            } else {
+                answers.join(", ")
+            };
+            format!("- {}\n  {answer}", question.question)
+        })
+        .collect();
+    let what = if lines.len() == 1 {
+        "answer to the question"
+    } else {
+        "answers to the questions"
+    };
+    let mut text = format!("My {what} you asked:\n\n{}", lines.join("\n"));
+    if let Some(m) = r.message.as_deref().filter(|m| !m.is_empty()) {
+        text.push_str("\n\n");
+        text.push_str(m);
+    }
+    text
 }
 
 /// What a secret answer is shown as.

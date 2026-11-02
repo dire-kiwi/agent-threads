@@ -21,6 +21,7 @@
         "tool_call_id": { "type": "string", "description": "The tool_call item it's for, when there is one." },
         "name": { "type": "string", "description": "The tool's name, as in ToolCall.name." },
         "kind": { "$ref": "item.schema.json#/$defs/ToolKind" },
+        "server": { "type": "string", "description": "The MCP server, for a tool of kind mcp, as in ToolCall.server." },
         "input": { "description": "The tool's arguments, as in ToolCall.input." },
         "title": { "type": "string", "description": "A short summary of what's asked, e.g. the command line." },
         "reason": { "type": "string", "description": "Why the harness asks, when it says." },
@@ -72,7 +73,7 @@
       "required": ["outcome"],
       "properties": {
         "outcome": { "type": "string", "enum": ["allow", "deny", "answer", "cancel"], "description": "allow, deny: for a permission. answer: for a question. cancel: for either, when the user dismisses it or the turn ends first." },
-        "always": { "type": "boolean", "default": false, "description": "allow, deny: apply the same answer to matching calls for the rest of the thread, without asking." },
+        "always": { "type": "boolean", "default": false, "description": "allow, deny: apply the same answer to matching calls for the rest of the thread, without asking. It's kept in the thread's standing_answers." },
         "message": { "type": "string", "description": "deny: why, which the agent is told. answer: a note with the answers." },
         "answers": {
           "type": "object",

@@ -417,7 +417,7 @@ impl ::std::convert::TryFrom<::std::string::String> for NoticeLevel {
         value.parse()
     }
 }
-///default: ask (via the permission policy) for anything the harness would ask about. accept_edits: file edits in cwd are allowed without asking. plan: the agent plans and doesn't change anything. bypass: nothing is asked.
+///default: ask (via the permission policy) for anything the harness would ask about. accept_edits: file edits in cwd are allowed without asking. plan: the agent plans and doesn't change anything. bypass: nothing is asked, and what would be is allowed. dont_ask: nothing is asked, and what would be (a question included) is denied.
 #[derive(::serde::Deserialize, ::serde::Serialize, Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub enum PermissionMode {
     #[serde(rename = "default")]
@@ -428,6 +428,8 @@ pub enum PermissionMode {
     Plan,
     #[serde(rename = "bypass")]
     Bypass,
+    #[serde(rename = "dont_ask")]
+    DontAsk,
 }
 impl ::std::fmt::Display for PermissionMode {
     fn fmt(&self, f: &mut ::std::fmt::Formatter<'_>) -> ::std::fmt::Result {
@@ -436,6 +438,7 @@ impl ::std::fmt::Display for PermissionMode {
             Self::AcceptEdits => f.write_str("accept_edits"),
             Self::Plan => f.write_str("plan"),
             Self::Bypass => f.write_str("bypass"),
+            Self::DontAsk => f.write_str("dont_ask"),
         }
     }
 }
@@ -447,6 +450,7 @@ impl ::std::str::FromStr for PermissionMode {
             "accept_edits" => Ok(Self::AcceptEdits),
             "plan" => Ok(Self::Plan),
             "bypass" => Ok(Self::Bypass),
+            "dont_ask" => Ok(Self::DontAsk),
             _ => Err("invalid value".into()),
         }
     }
@@ -483,6 +487,9 @@ pub struct PermissionRequest {
     ///Why the harness asks, when it says.
     #[serde(skip_serializing_if = "::std::option::Option::is_none")]
     pub reason: ::std::option::Option<::std::string::String>,
+    ///The MCP server, for a tool of kind mcp, as in ToolCall.server.
+    #[serde(skip_serializing_if = "::std::option::Option::is_none")]
+    pub server: ::std::option::Option<::std::string::String>,
     ///A short summary of what's asked, e.g. the command line.
     #[serde(skip_serializing_if = "::std::option::Option::is_none")]
     pub title: ::std::option::Option<::std::string::String>,
@@ -582,7 +589,7 @@ pub struct RequestResolvedEvent {
 ///How a request was answered: sent in respond, and repeated in request.resolved.
 #[derive(::serde::Deserialize, ::serde::Serialize, Clone, Debug)]
 pub struct Resolution {
-    ///allow, deny: apply the same answer to matching calls for the rest of the thread, without asking.
+    ///allow, deny: apply the same answer to matching calls for the rest of the thread, without asking. It's kept in the thread's standing_answers.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub always: bool,
     ///answer: for each question id, the chosen option labels or the free text.
@@ -718,6 +725,9 @@ pub struct SetOptionsCommand {
     pub model: ::std::option::Option<::std::string::String>,
     #[serde(skip_serializing_if = "::std::option::Option::is_none")]
     pub permission_mode: ::std::option::Option<PermissionMode>,
+    ///Replaces the thread's standing answers ([] clears them).
+    #[serde(default, skip_serializing_if = "::std::option::Option::is_none")]
+    pub standing_answers: ::std::option::Option<::std::vec::Vec<StandingAnswer>>,
     pub thread_id: ::std::string::String,
 }
 ///A thread's whole state as of seq: what applying its events, in order, from the start gives.
@@ -729,6 +739,55 @@ pub struct Snapshot {
     ///The seq of the last saved event it includes; 0 for none.
     pub seq: u64,
     pub thread: Thread,
+}
+///An answer that stands for a tool: its kind, its MCP server (for an mcp tool) and its name, as in a PermissionRequest.
+#[derive(::serde::Deserialize, ::serde::Serialize, Clone, Debug)]
+pub struct StandingAnswer {
+    pub kind: ToolKind,
+    ///The tool's name, as in PermissionRequest.name.
+    pub name: ::std::string::String,
+    pub outcome: StandingAnswerOutcome,
+    ///The MCP server, for a tool of kind mcp.
+    #[serde(skip_serializing_if = "::std::option::Option::is_none")]
+    pub server: ::std::option::Option<::std::string::String>,
+}
+///`StandingAnswerOutcome`
+#[derive(::serde::Deserialize, ::serde::Serialize, Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub enum StandingAnswerOutcome {
+    #[serde(rename = "allow")]
+    Allow,
+    #[serde(rename = "deny")]
+    Deny,
+}
+impl ::std::fmt::Display for StandingAnswerOutcome {
+    fn fmt(&self, f: &mut ::std::fmt::Formatter<'_>) -> ::std::fmt::Result {
+        match *self {
+            Self::Allow => f.write_str("allow"),
+            Self::Deny => f.write_str("deny"),
+        }
+    }
+}
+impl ::std::str::FromStr for StandingAnswerOutcome {
+    type Err = self::error::ConversionError;
+    fn from_str(value: &str) -> ::std::result::Result<Self, self::error::ConversionError> {
+        match value {
+            "allow" => Ok(Self::Allow),
+            "deny" => Ok(Self::Deny),
+            _ => Err("invalid value".into()),
+        }
+    }
+}
+impl ::std::convert::TryFrom<&str> for StandingAnswerOutcome {
+    type Error = self::error::ConversionError;
+    fn try_from(value: &str) -> ::std::result::Result<Self, self::error::ConversionError> {
+        value.parse()
+    }
+}
+impl ::std::convert::TryFrom<::std::string::String> for StandingAnswerOutcome {
+    type Error = self::error::ConversionError;
+    fn try_from(value: ::std::string::String) -> ::std::result::Result<Self, self::error::ConversionError> {
+        value.parse()
+    }
 }
 ///A thread's own state. Sent whole in thread.updated and in snapshots.
 #[derive(::serde::Deserialize, ::serde::Serialize, Clone, Debug)]
@@ -761,6 +820,9 @@ pub struct Thread {
     ///The harness's own session or thread id, used to resume it.
     #[serde(skip_serializing_if = "::std::option::Option::is_none")]
     pub session_id: ::std::option::Option<::std::string::String>,
+    ///Answers that stand for the rest of the thread: a permission request for a tool one matches gets its outcome without asking. Added by a respond with always, and set by the app (when it creates the thread, or with set_options).
+    #[serde(default, skip_serializing_if = "::std::vec::Vec::is_empty")]
+    pub standing_answers: ::std::vec::Vec<StandingAnswer>,
     pub status: ThreadStatus,
     #[serde(skip_serializing_if = "::std::option::Option::is_none")]
     pub title: ::std::option::Option<::std::string::String>,

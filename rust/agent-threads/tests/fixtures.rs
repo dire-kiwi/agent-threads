@@ -149,6 +149,7 @@ fn make(s: &Setup) -> AgentThreads {
         },
         on_error: Some(Arc::new(move |e| errors.lock().unwrap().push(e.to_string()))),
         event_capacity: 1 << 16,
+        late_answers: false,
     })
 }
 

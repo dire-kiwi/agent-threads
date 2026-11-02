@@ -96,8 +96,10 @@ resolves if the harness process goes away first (`is_cancelled()` asks without w
 `PermissionPolicy` is `allow()`, `ask()` (the default), `deny()`, `from_fn` (decided at once) or
 `from_async` (one that looks something up). A `PermissionQuery` has the tool's name, kind, input,
 title, command (shell calls), MCP server and the call it's for. An answer given `always` stands for
-the thread, per tool. Claude's AskUserQuestion and Codex's requestUserInput are always questions to
-the user.
+the thread, per tool: it's kept in the thread's `standing_answers`, which `CreateOptions` and
+`ThreadOptions` can set. Claude's AskUserQuestion and Codex's requestUserInput are always questions to
+the user; with `Options::late_answers`, one left open when its turn ends can still be answered, and
+the answer is sent as the next message.
 
 ## Stores
 

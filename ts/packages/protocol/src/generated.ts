@@ -6,9 +6,13 @@
  */
 export type Command = SendCommand | InterruptCommand | RespondCommand | SetOptionsCommand;
 /**
- * default: ask (via the permission policy) for anything the harness would ask about. accept_edits: file edits in cwd are allowed without asking. plan: the agent plans and doesn't change anything. bypass: nothing is asked.
+ * default: ask (via the permission policy) for anything the harness would ask about. accept_edits: file edits in cwd are allowed without asking. plan: the agent plans and doesn't change anything. bypass: nothing is asked, and what would be is allowed. dont_ask: nothing is asked, and what would be (a question included) is denied.
  */
-export type PermissionMode = "default" | "accept_edits" | "plan" | "bypass";
+export type PermissionMode = "default" | "accept_edits" | "plan" | "bypass" | "dont_ask";
+/**
+ * What a tool does, for permission policies and for picking a renderer. shell: runs a command. read: reads files. edit: writes or patches files. search: finds files or text (glob, grep). web: fetches or searches the web. mcp: a tool on an external MCP server. app: a tool the app defined. subagent: starts a subagent. todo: updates the agent's plan or todo list. other: anything else.
+ */
+export type ToolKind = "shell" | "read" | "edit" | "search" | "web" | "mcp" | "app" | "subagent" | "todo" | "other";
 /**
  * An event, told apart by type. All but delta are saved, and each saved event's seq is one more than the one before it in the thread.
  */
@@ -29,10 +33,6 @@ export type ThreadStatus = "idle" | "running" | "waiting" | "error";
  * One entry in a thread, told apart by type.
  */
 export type Item = UserMessage | AssistantMessage | Reasoning | ToolCall | Compaction | Notice | TurnResult;
-/**
- * What a tool does, for permission policies and for picking a renderer. shell: runs a command. read: reads files. edit: writes or patches files. search: finds files or text (glob, grep). web: fetches or searches the web. mcp: a tool on an external MCP server. app: a tool the app defined. subagent: starts a subagent. todo: updates the agent's plan or todo list. other: anything else.
- */
-export type ToolKind = "shell" | "read" | "edit" | "search" | "web" | "mcp" | "app" | "subagent" | "todo" | "other";
 /**
  * pending: called, not started (e.g. waiting for permission). running: started, no result yet. completed: it returned. failed: it returned an error. denied: permission was refused. cancelled: the turn ended (e.g. was interrupted) before it returned.
  */
@@ -90,7 +90,7 @@ export interface Resolution {
    */
   outcome: "allow" | "deny" | "answer" | "cancel";
   /**
-   * allow, deny: apply the same answer to matching calls for the rest of the thread, without asking.
+   * allow, deny: apply the same answer to matching calls for the rest of the thread, without asking. It's kept in the thread's standing_answers.
    */
   always?: boolean;
   /**
@@ -113,6 +113,25 @@ export interface SetOptionsCommand {
   model?: string;
   effort?: string;
   permission_mode?: PermissionMode;
+  /**
+   * Replaces the thread's standing answers ([] clears them).
+   */
+  standing_answers?: StandingAnswer[];
+}
+/**
+ * An answer that stands for a tool: its kind, its MCP server (for an mcp tool) and its name, as in a PermissionRequest.
+ */
+export interface StandingAnswer {
+  kind: ToolKind;
+  /**
+   * The MCP server, for a tool of kind mcp.
+   */
+  server?: string;
+  /**
+   * The tool's name, as in PermissionRequest.name.
+   */
+  name: string;
+  outcome: "allow" | "deny";
 }
 /**
  * The thread's own state changed (status, model, usage, run...). Carries all of it.
@@ -164,6 +183,10 @@ export interface Thread {
    */
   error?: string;
   run?: Run;
+  /**
+   * Answers that stand for the rest of the thread: a permission request for a tool one matches gets its outcome without asking. Added by a respond with always, and set by the app (when it creates the thread, or with set_options).
+   */
+  standing_answers?: StandingAnswer[];
   /**
    * The app's own data, given when the thread was created. Backends store it and pass it to tools; they don't read it.
    */
@@ -575,6 +598,10 @@ export interface PermissionRequest {
    */
   name: string;
   kind: ToolKind;
+  /**
+   * The MCP server, for a tool of kind mcp, as in ToolCall.server.
+   */
+  server?: string;
   /**
    * The tool's arguments, as in ToolCall.input.
    */

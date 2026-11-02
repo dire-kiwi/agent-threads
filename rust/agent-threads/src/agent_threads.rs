@@ -16,7 +16,7 @@ use crate::harness::{Harness, McpServer, Skill, ThreadConfig, TurnEnd};
 use crate::ids::{new_id, now_iso};
 use crate::permissions::PermissionPolicy;
 use crate::protocol::{
-    Attachment, Command, Item, PermissionMode, Resolution, Snapshot, Thread, ThreadEvent, ThreadStatus,
+    Attachment, Command, Item, PermissionMode, Resolution, Snapshot, StandingAnswer, Thread, ThreadEvent, ThreadStatus,
 };
 use crate::reducer::{apply_event, initial_state};
 use crate::spawner::{Spawner, direct};
@@ -112,6 +112,11 @@ pub struct Options {
     /// How many events a subscriber may fall behind by before it misses some (and gets
     /// `RecvError::Lagged`, after which it catches up with `events_since`). 4096 by default.
     pub event_capacity: usize,
+    /// Questions still open when their turn ends (it was interrupted, say) stay open, rather than
+    /// being cancelled: an answer is sent to the agent as the user's next message, unless the
+    /// conversation has moved on first (a turn started, or a message was queued). Secret ones are
+    /// cancelled still.
+    pub late_answers: bool,
 }
 
 impl Default for Options {
@@ -123,6 +128,7 @@ impl Default for Options {
             capabilities: Capabilities::default(),
             on_error: None,
             event_capacity: 4096,
+            late_answers: false,
         }
     }
 }
@@ -140,6 +146,9 @@ pub struct CreateOptions {
     pub title: Option<String>,
     /// The app's own data about the thread (e.g. the user it's for); tools and the policy get it.
     pub metadata: Map<String, Value>,
+    /// Answers that stand from the start (from the app's own rules, say), as answers given with
+    /// `always` do.
+    pub standing_answers: Vec<StandingAnswer>,
     /// The thread's id; a new one by default.
     pub id: Option<String>,
     /// The thread's own tools, MCP servers, skills, policy and system prompt, on top of the
@@ -163,6 +172,8 @@ pub struct ThreadOptions {
     /// `Some("")` clears it.
     pub effort: Option<String>,
     pub permission_mode: Option<PermissionMode>,
+    /// Replaces the thread's standing answers; `Some(vec![])` clears them.
+    pub standing_answers: Option<Vec<StandingAnswer>>,
 }
 
 /// What [`recover`](AgentThreads::recover) did.
@@ -261,6 +272,7 @@ struct Inner {
     spawner: Arc<dyn Spawner>,
     capabilities: Capabilities,
     on_error: Arc<dyn Fn(Error) + Send + Sync>,
+    late_answers: bool,
     events: broadcast::Sender<ThreadEvent>,
     threads: StdMutex<Threads>,
     configs: StdMutex<HashMap<String, Capabilities>>,
@@ -302,6 +314,7 @@ impl AgentThreads {
                 harnesses,
                 spawner: options.spawner.unwrap_or_else(direct),
                 capabilities: options.capabilities,
+                late_answers: options.late_answers,
                 on_error,
                 events,
                 threads: StdMutex::new(Threads::default()),
@@ -361,6 +374,9 @@ impl AgentThreads {
         }
         if !options.metadata.is_empty() {
             thread["metadata"] = Value::Object(options.metadata);
+        }
+        if !options.standing_answers.is_empty() {
+            thread["standing_answers"] = json!(options.standing_answers);
         }
         let typed: Thread = serde_json::from_value(thread.clone()).map_err(|e| Error::Command(e.to_string()))?;
         i.configs.lock().unwrap().insert(typed.id.clone(), options.capabilities);
@@ -664,6 +680,7 @@ impl AgentThreads {
                     model: c.model,
                     effort: c.effort,
                     permission_mode: c.permission_mode,
+                    standing_answers: c.standing_answers,
                 };
                 self.set_options(&c.thread_id, o).await
             }
@@ -713,13 +730,19 @@ impl AgentThreads {
             .await
     }
 
-    /// Changes the thread's model, effort or permission mode, from its next turn.
+    /// Changes the thread's model, effort or permission mode, from its next turn, or its standing
+    /// answers. Open permission requests the new mode or standing answers answer (bypass allows
+    /// them, dont_ask denies them) are answered at once.
     pub async fn set_options(&self, thread_id: &str, options: ThreadOptions) -> Result<()> {
         self.ready(thread_id)
             .await?
             .call(move |a| {
-                let before = serde_json::to_value(a.core.thread()).ok();
+                let options_of = |t: &Thread| (t.model.clone(), t.effort.clone(), t.permission_mode);
+                let before = options_of(a.core.thread());
                 a.core.set_thread(|t| {
+                    if let Some(s) = options.standing_answers {
+                        t.standing_answers = s;
+                    }
                     if let Some(m) = options.model {
                         t.model = Some(m).filter(|m| !m.is_empty());
                     }
@@ -730,9 +753,10 @@ impl AgentThreads {
                         t.permission_mode = Some(p);
                     }
                 });
-                if serde_json::to_value(a.core.thread()).ok() != before {
+                if options_of(a.core.thread()) != before {
                     a.core.options_changed();
                 }
+                a.settle();
             })
             .await
     }
@@ -950,6 +974,7 @@ impl AgentThreads {
             spawner: i.spawner.clone(),
             events: i.events.clone(),
             on_error: i.on_error.clone(),
+            late_answers: i.late_answers,
         })
     }
 
@@ -1084,6 +1109,9 @@ impl AgentThreads {
             state = initial_state(thread);
         }
         let (handle, mut actor, rx) = self.actor(state)?;
+        // Questions kept open after their turns ended are taken up again (or cancelled, if they
+        // can't be any more).
+        actor.core.take_up_requests(false);
         if !self.reattach(&mut actor).await? {
             // The process that ran its turn went with the backend before this one, or can't be
             // followed.
@@ -1244,10 +1272,8 @@ fn recover_lost(c: &mut ThreadContext) {
             carried: 0,
             progressed: false,
         });
-        let requests: Vec<String> = c.snapshot().requests.iter().map(|r| r.id().to_string()).collect();
-        for id in requests {
-            c.emit_resolved(&id, &cancel_resolution());
-        }
+        // Its requests can't be answered (but for questions that can be answered late).
+        c.take_up_requests(true);
         c.add_item(json!({
             "id": new_id("n"), "type": "notice", "level": "warning", "code": "run.lost",
             "text": "The backend stopped while this turn was running, and couldn't pick its run up again.",

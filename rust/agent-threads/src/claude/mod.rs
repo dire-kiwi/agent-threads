@@ -20,7 +20,7 @@ use crate::agent_threads::Error;
 use crate::attachments::{Part, message_parts, path_text};
 use crate::harness::{BoxFuture, Harness, HarnessSession, Message, RunCheckpoint, TurnEnd};
 use crate::ids::{new_id, now_iso, now_ms, private_temp_dir};
-use crate::permissions::{Decided, PermissionDecision, PermissionQuery, permission_key};
+use crate::permissions::{Decided, PermissionDecision, PermissionQuery, StandingKey, permission_key};
 use crate::protocol::{DeltaEventKind, Item, Resolution, ResolutionOutcome, ToolKind, ToolStatus};
 use crate::skills::write_skills;
 use crate::spawner::{ExitStatus, HarnessProcess, ProcessEvent, Signal, SpawnOptions};
@@ -331,7 +331,7 @@ struct CanUse {
     kind: ToolKind,
     title: String,
     reason: Option<String>,
-    standing: String,
+    standing: StandingKey,
     existing: Option<String>,
 }
 

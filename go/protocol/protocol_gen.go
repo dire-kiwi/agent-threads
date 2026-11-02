@@ -215,12 +215,15 @@ type SetOptionsCommand struct {
 	Effort         string         `json:"effort,omitempty"`
 	PermissionMode PermissionMode `json:"permission_mode,omitempty"`
 
+	// Replaces the thread's standing answers ([] clears them).
+	StandingAnswers []StandingAnswer `json:"standing_answers,omitempty"`
+
 	// Extra has the fields the spec doesn't name, as they came, so that they're written again
 	// unchanged (receivers ignore fields they don't know, and stores keep them).
 	Extra map[string]json.RawMessage `json:"-"`
 }
 
-var knownSetOptionsCommand = fieldSet("type", "thread_id", "model", "effort", "permission_mode")
+var knownSetOptionsCommand = fieldSet("type", "thread_id", "model", "effort", "permission_mode", "standing_answers")
 
 func (v SetOptionsCommand) MarshalJSON() ([]byte, error) {
 	type plain SetOptionsCommand
@@ -1596,6 +1599,9 @@ type PermissionRequest struct {
 	Name string   `json:"name"`
 	Kind ToolKind `json:"kind"`
 
+	// The MCP server, for a tool of kind mcp, as in ToolCall.server.
+	Server string `json:"server,omitempty"`
+
 	// The tool's arguments, as in ToolCall.input.
 	Input json.RawMessage `json:"input"`
 
@@ -1618,7 +1624,7 @@ type PermissionRequest struct {
 	Extra map[string]json.RawMessage `json:"-"`
 }
 
-var knownPermissionRequest = fieldSet("type", "id", "tool_call_id", "name", "kind", "input", "title", "reason", "parent_id", "turn_id", "created_at", "raw")
+var knownPermissionRequest = fieldSet("type", "id", "tool_call_id", "name", "kind", "server", "input", "title", "reason", "parent_id", "turn_id", "created_at", "raw")
 
 func (v PermissionRequest) MarshalJSON() ([]byte, error) {
 	type plain PermissionRequest
@@ -1816,6 +1822,7 @@ type Resolution struct {
 	Outcome ResolutionOutcome `json:"outcome"`
 
 	// allow, deny: apply the same answer to matching calls for the rest of the thread, without asking.
+	// It's kept in the thread's standing_answers.
 	Always bool `json:"always,omitempty"`
 
 	// deny: why, which the agent is told. answer: a note with the answers.
@@ -1956,6 +1963,11 @@ type Thread struct {
 	// The harness process running the thread, if one is. Absent when it's idle with no process.
 	Run *Run `json:"run,omitempty"`
 
+	// Answers that stand for the rest of the thread: a permission request for a tool one matches gets
+	// its outcome without asking. Added by a respond with always, and set by the app (when it creates
+	// the thread, or with set_options).
+	StandingAnswers []StandingAnswer `json:"standing_answers,omitempty"`
+
 	// The app's own data, given when the thread was created. Backends store it and pass it to tools;
 	// they don't read it.
 	Metadata  map[string]json.RawMessage `json:"metadata,omitempty"`
@@ -1967,7 +1979,7 @@ type Thread struct {
 	Extra map[string]json.RawMessage `json:"-"`
 }
 
-var knownThread = fieldSet("id", "harness", "status", "title", "model", "effort", "permission_mode", "cwd", "session_id", "usage", "error", "run", "metadata", "created_at", "updated_at")
+var knownThread = fieldSet("id", "harness", "status", "title", "model", "effort", "permission_mode", "cwd", "session_id", "usage", "error", "run", "standing_answers", "metadata", "created_at", "updated_at")
 
 func (v Thread) MarshalJSON() ([]byte, error) {
 	type plain Thread
@@ -2011,7 +2023,8 @@ const (
 
 // PermissionMode: default: ask (via the permission policy) for anything the harness would ask
 // about. accept_edits: file edits in cwd are allowed without asking. plan: the agent plans and
-// doesn't change anything. bypass: nothing is asked.
+// doesn't change anything. bypass: nothing is asked, and what would be is allowed. dont_ask:
+// nothing is asked, and what would be (a question included) is denied.
 type PermissionMode string
 
 const (
@@ -2019,6 +2032,61 @@ const (
 	PermissionModeAcceptEdits PermissionMode = "accept_edits"
 	PermissionModePlan        PermissionMode = "plan"
 	PermissionModeBypass      PermissionMode = "bypass"
+	PermissionModeDontAsk     PermissionMode = "dont_ask"
+)
+
+// StandingAnswer: An answer that stands for a tool: its kind, its MCP server (for an mcp tool) and
+// its name, as in a PermissionRequest.
+type StandingAnswer struct {
+	Kind ToolKind `json:"kind"`
+
+	// The MCP server, for a tool of kind mcp.
+	Server string `json:"server,omitempty"`
+
+	// The tool's name, as in PermissionRequest.name.
+	Name    string                `json:"name"`
+	Outcome StandingAnswerOutcome `json:"outcome"`
+
+	// Extra has the fields the spec doesn't name, as they came, so that they're written again
+	// unchanged (receivers ignore fields they don't know, and stores keep them).
+	Extra map[string]json.RawMessage `json:"-"`
+}
+
+var knownStandingAnswer = fieldSet("kind", "server", "name", "outcome")
+
+func (v StandingAnswer) MarshalJSON() ([]byte, error) {
+	type plain StandingAnswer
+	p := plain(v)
+	data, err := json.Marshal(p)
+	if err != nil {
+		return nil, err
+	}
+	return withExtra(data, v.Extra, knownStandingAnswer)
+}
+
+func (v *StandingAnswer) UnmarshalJSON(data []byte) error {
+	if isNull(data) {
+		return nil
+	}
+	type plain StandingAnswer
+	var p plain
+	if err := json.Unmarshal(data, &p); err != nil {
+		return err
+	}
+	extra, err := extraFields(data, knownStandingAnswer)
+	if err != nil {
+		return err
+	}
+	p.Extra = extra
+	*v = StandingAnswer(p)
+	return nil
+}
+
+type StandingAnswerOutcome string
+
+const (
+	StandingAnswerOutcomeAllow StandingAnswerOutcome = "allow"
+	StandingAnswerOutcomeDeny  StandingAnswerOutcome = "deny"
 )
 
 // Run: A harness process. A run started under the shim can outlive the backend: after a restart the

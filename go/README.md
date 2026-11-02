@@ -80,7 +80,10 @@ sdk.Close(ctx) // on shutdown: stops the harness processes (or with the shim, le
 - **Permission policies** implement `PermissionPolicy`: a `Decision` (`Allow`, `Deny`, `Ask`) is
   one that always gives itself, and `PolicyFunc` is a function. A policy runs on the thread's
   goroutine, before the harness hears more about the thread, so it should be quick: to leave it to
-  the user, return `Ask`. An answer given `always` stands for that tool for the rest of the thread.
+  the user, return `Ask`. An answer given `always` stands for that tool for the rest of the thread:
+  it's kept in the thread's `StandingAnswers`, which `CreateOptions` and `ThreadOptions` can set.
+  With `Options.LateAnswers`, a question left open when its turn ends can still be answered, and the
+  answer is sent as the next message.
 
 The types of the spec are in [protocol](protocol), generated from `spec/schema` (`make gen`), with
 `ApplyEvent` (the reducer the snapshots are made with) and `Validate`. Their `Extra` keeps the

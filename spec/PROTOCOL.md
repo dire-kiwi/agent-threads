@@ -53,6 +53,7 @@ of the backend and ends with it; a `shim` run is supervised by `agent-threads-sh
 backend restart, and its `reattached_at` is set when a restarted backend picks it up again
 ([RUNDIR.md](RUNDIR.md) has how backends and the shim share a run).
 `usage` sums the thread's turns. `metadata` is the app's own, given when it created the thread.
+`standing_answers` are the answers that stand for the rest of the thread (see [Requests](#requests)).
 
 Threads are created, listed and deleted through each backend's API, not through commands.
 
@@ -110,8 +111,9 @@ A request is something the agent is waiting on the user for. It's open from `req
 open at once (e.g. from parallel subagents).
 
 - `permission`: the agent wants to call a tool and the app's permission policy said "ask". It has
-  the tool's `name`, `kind` and `input`, the `tool_call_id` of the call when there is one, a `title`
-  and the harness's `reason`. Policies that answer `allow` or `deny` themselves don't open one.
+  the tool's `name`, `kind`, `server` (for an `mcp` tool) and `input`, the `tool_call_id` of the
+  call when there is one, a `title` and the harness's `reason`. Policies that answer `allow` or
+  `deny` themselves don't open one.
 - `question`: the agent asks one or more `questions` (Claude's AskUserQuestion, Codex's
   requestUserInput). Each has an `id`, the `question`, an optional `header`, and `options` to choose
   from (`multi_select` for more than one). With no options, or with `allow_other`, the answer is
@@ -122,6 +124,18 @@ give the same answer to matching calls for the rest of the thread, and an option
 deny, the agent is told it). For a question it's `answer`, with `answers` mapping each question's
 id to the chosen option labels or the free text. `cancel` dismisses either; the backend also
 resolves its open requests with `cancel` when their turn ends first.
+
+An answer given with `always` is kept in the thread's `standing_answers`, as a `StandingAnswer`:
+the tool's `kind`, `server` and `name`, and the `outcome`. A permission request for a tool with a
+standing answer isn't opened: the call gets its outcome. The app can set a thread's standing answers
+when it creates it, and replace or clear them with `set_options`; open requests a new standing
+answer is for are answered with it straight away.
+
+A backend can be set to keep **questions open after their turn**: one still open when its turn
+ends isn't cancelled (unless it has a `secret` question, or a message was left queued), and stays
+open while the thread is idle. Answering it sends the answers to the agent as the user's next
+message, as a `send` would, which starts a turn. It's cancelled when a turn starts first: the
+conversation has moved on.
 
 ## Events
 
@@ -194,11 +208,16 @@ Every command has `type` and `thread_id`.
 | `send` | `text`, `attachments?`, `client_id?` | Send the agent a message. With no turn running it starts one; with one running it steers it (the message joins the running turn, as a `user_message` with `steered`). A steered message the harness doesn't take in before the turn ends starts the next turn. |
 | `interrupt` | | Stop the running turn. Its `turn_result` has `interrupted`. Does nothing if no turn is running. |
 | `respond` | `request_id`, `resolution` | Answer an open request. Answering one that isn't open does nothing. |
-| `set_options` | `model?`, `effort?`, `permission_mode?` | Change the thread's options; ones left out stay as they are. They apply from the next turn, or straight away where the harness allows, and a `thread.updated` follows. |
+| `set_options` | `model?`, `effort?`, `permission_mode?`, `standing_answers?` | Change the thread's options; ones left out stay as they are. They apply from the next turn, or straight away where the harness allows, and a `thread.updated` follows. `standing_answers` replaces the thread's (`[]` clears them). |
 
 `permission_mode` is `default` (ask via the permission policy), `accept_edits` (file edits in the
-thread's `cwd` are allowed without asking), `plan` (the agent plans and changes nothing) or
-`bypass` (nothing is asked). `effort` is the harness's own name for a reasoning effort.
+thread's `cwd` are allowed without asking), `plan` (the agent plans and changes nothing), `bypass`
+(nothing is asked: what would be is allowed) or `dont_ask` (nothing is asked: what would be is
+denied, and questions are dismissed). The mode the thread has now decides what a harness process
+started under another one asks about, and a `set_options` that changes it to `bypass` or
+`dont_ask` answers the thread's open requests as that mode would: `bypass` allows its permission
+requests (not its questions, which only the user answers), and `dont_ask` denies them and cancels
+its questions. `effort` is the harness's own name for a reasoning effort.
 
 A backend's `handle(command)` reports a command it can't carry out (an unknown thread, a malformed
 command) to its caller, rather than as an event.

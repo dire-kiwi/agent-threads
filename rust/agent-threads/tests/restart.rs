@@ -681,6 +681,7 @@ async fn backend() {
         },
         on_error: Some(Arc::new(|e| eprintln!("backend error: {e}"))),
         event_capacity: 1 << 16,
+        late_answers: false,
     });
     let out = Arc::new(Mutex::new(std::io::stdout()));
     let say = {

@@ -107,6 +107,12 @@ export const schema: { readonly $defs: { readonly [name: string]: unknown } } = 
         },
         "permission_mode": {
           "$ref": "#/$defs/PermissionMode"
+        },
+        "standing_answers": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/StandingAnswer"
+          }
         }
       }
     },
@@ -852,6 +858,9 @@ export const schema: { readonly $defs: { readonly [name: string]: unknown } } = 
         "kind": {
           "$ref": "#/$defs/ToolKind"
         },
+        "server": {
+          "type": "string"
+        },
         "input": {},
         "title": {
           "type": "string"
@@ -1067,6 +1076,12 @@ export const schema: { readonly $defs: { readonly [name: string]: unknown } } = 
         "run": {
           "$ref": "#/$defs/Run"
         },
+        "standing_answers": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/StandingAnswer"
+          }
+        },
         "metadata": {
           "type": "object",
           "additionalProperties": true
@@ -1096,8 +1111,35 @@ export const schema: { readonly $defs: { readonly [name: string]: unknown } } = 
         "default",
         "accept_edits",
         "plan",
-        "bypass"
+        "bypass",
+        "dont_ask"
       ]
+    },
+    "StandingAnswer": {
+      "type": "object",
+      "required": [
+        "kind",
+        "name",
+        "outcome"
+      ],
+      "properties": {
+        "kind": {
+          "$ref": "#/$defs/ToolKind"
+        },
+        "server": {
+          "type": "string"
+        },
+        "name": {
+          "type": "string"
+        },
+        "outcome": {
+          "type": "string",
+          "enum": [
+            "allow",
+            "deny"
+          ]
+        }
+      }
     },
     "Run": {
       "type": "object",

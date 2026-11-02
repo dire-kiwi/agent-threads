@@ -40,7 +40,9 @@ pub use codex::{AppTools, CodexOptions, codex};
 pub use harness::{
     BoxFuture, Harness, HarnessSession, McpServer, Message, RunCheckpoint, Skill, ThreadConfig, TurnEnd,
 };
-pub use permissions::{Decided, PermissionContext, PermissionDecision, PermissionPolicy, PermissionQuery};
+pub use permissions::{
+    DONT_ASK_DENIAL, Decided, PermissionContext, PermissionDecision, PermissionPolicy, PermissionQuery, StandingKey,
+};
 pub use protocol::{Command, Item, Snapshot, Thread, ThreadEvent};
 #[doc(hidden)]
 pub use shim::kill_runs;
