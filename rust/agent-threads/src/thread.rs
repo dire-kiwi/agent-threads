@@ -1074,15 +1074,13 @@ impl ThreadContext {
 
     /// Keeps a question open after its turn ended, with late_answers, if it can be: not a secret one
     /// (its answer would be shown, as a message), not under dont_ask (which dismisses questions),
-    /// and not when the conversation has moved on: messages are queued, or the user sent one since
-    /// it was opened (when there were `users`). Whether it did.
+    /// and not when the conversation has moved on (see moved_on()). Whether it did.
     fn keep_late(&mut self, id: &str, request: &ThreadRequest, users: Option<usize>) -> bool {
         let ThreadRequest::Question(q) = request else {
             return false;
         };
-        let moved_on = !self.queue.is_empty() || users.is_some_and(|n| self.user_messages() > n);
         if !self.host.late_answers
-            || moved_on
+            || self.moved_on(request, users)
             || q.questions.iter().any(|q| q.secret)
             || self.state.thread.permission_mode == Some(PermissionMode::DontAsk)
         {
@@ -1100,6 +1098,24 @@ impl ThreadContext {
             },
         ));
         true
+    }
+
+    /// Whether the conversation has moved on since a request was asked: messages are queued, or the
+    /// user sent one since. That's a user message after its tool call in the items, as saved (so
+    /// it's known after a restart too); or, for a request with no call, more of them than `users`
+    /// (how many there were when it was asked, if that's known).
+    fn moved_on(&self, request: &ThreadRequest, users: Option<usize>) -> bool {
+        if !self.queue.is_empty() {
+            return true;
+        }
+        let items = &self.saved.items;
+        match request
+            .tool_call_id()
+            .and_then(|c| items.iter().position(|i| i.id() == c))
+        {
+            Some(at) => items[at + 1..].iter().any(|i| matches!(i, Item::UserMessage(_))),
+            None => users.is_some_and(|n| self.user_messages() > n),
+        }
     }
 
     /// How many messages the user has sent.
@@ -1122,9 +1138,11 @@ impl ThreadContext {
         }
     }
 
-    /// Takes up, as a thread is loaded, the requests open in its state that nothing will answer:
-    /// those of turns that ended (`ended`, or all of them), which aren't taken up already. A
-    /// question is kept open after its turn as finish_turn() keeps it; the others are cancelled.
+    /// Takes up, as a thread is loaded, the requests open in its state that its session didn't take
+    /// up again (after it re-attached to its run, if it did), which nothing will answer. A question
+    /// whose turn is over (it has a result, or it's the turn running and was interrupted, so the
+    /// harness gave the question up), or any with `all` (the turn was lost), is kept open as
+    /// finish_turn() and cancel_request() keep it, if it can be; the others are cancelled.
     pub(crate) fn take_up_requests(&mut self, all: bool) {
         let ended: HashSet<String> = self
             .state
@@ -1135,14 +1153,17 @@ impl ThreadContext {
                 _ => None,
             })
             .collect();
+        let interrupted = self.turn.as_ref().filter(|t| t.interrupted).map(|t| t.id.clone());
         let open: Vec<ThreadRequest> = open_requests(&self.state)
-            .filter(|r| all || r.turn_id().is_some_and(|t| ended.contains(t)))
-            .filter(|r| !self.requests.iter().any(|(id, _)| id == r.id()))
+            .filter(|r| !self.is_taken_up(r.id()))
             .cloned()
             .collect();
         for r in open {
             let id = r.id().to_string();
-            if !self.keep_late(&id, &r, None) {
+            let over = all
+                || r.turn_id()
+                    .is_some_and(|t| ended.contains(t) || interrupted.as_deref() == Some(t));
+            if !(over && self.keep_late(&id, &r, None)) {
                 self.emit_resolved(&id, &cancel());
             }
         }

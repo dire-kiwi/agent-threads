@@ -976,6 +976,49 @@ async fn dont_ask_dismisses_questions_kept_open_after_their_turns_before_and_aft
     }
 }
 
+/// The conversation moved on from a question (the user sent a message, which the harness took in)
+/// before the backend stopped with its run: the question isn't kept open when the lost turn ends.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_question_isnt_kept_open_after_a_lost_run_once_the_user_sent_a_message() {
+    let state = MemoryState::new();
+    let make = |store: MemoryStore| {
+        setup(Setup {
+            store: Some(Arc::new(store)),
+            late_answers: true,
+            ..asking(PermissionPolicy::ask())
+        })
+    };
+    let env = make(MemoryStore::with_state(state.clone()));
+    let t = env.sdk.create(create()).await.unwrap();
+    env.sdk
+        .send(
+            &t.id,
+            &format!("asking AskUserQuestion {QUESTION}"),
+            SendOptions::default(),
+        )
+        .await
+        .unwrap();
+    let q = open_request(&env.sdk, &t.id, "question", None).await;
+    env.sdk.send(&t.id, "reply hi", SendOptions::default()).await.unwrap();
+    // Taken in: nothing's queued.
+    until(5, || async {
+        let s = serde_json::to_value(env.sdk.snapshot(&t.id).await.unwrap()).unwrap();
+        let messages = items(&s, "user_message").into_iter().cloned().collect::<Vec<_>>();
+        (messages.len() == 2 && messages.iter().all(|m| m.get("queued").is_none())).then_some(())
+    })
+    .await;
+    env.sdk.events_since(&t.id, 0, None).await.unwrap(); // saved
+    // As if the backend died with the run.
+    let crashed = MemoryStore::new();
+    copy_store(&MemoryStore::with_state(state), &crashed, &t.id).await;
+    env.sdk.close(false).await.unwrap();
+
+    let again = make(crashed);
+    let s = serde_json::to_value(again.sdk.snapshot(&t.id).await.unwrap()).unwrap();
+    assert!(open(&s).is_empty(), "{s}");
+    assert_eq!(resolution_of(&again.sdk, &t.id, &q).await, json!({"outcome": "cancel"}));
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn without_late_answers_a_turn_that_ends_cancels_its_questions() {
     let env = setup(asking(PermissionPolicy::ask()));

@@ -13,7 +13,8 @@
 //                         went, and ends the turn
 //   asking <tool> <json>  calls a tool as `tool` does, but an interrupt while it's asking cancels the
 //                         request (as Claude does) and ends the turn as interrupted
-//                         (MINI_CLAUDE_INTERRUPT_DELAY=<ms> after cancelling it)
+//                         (MINI_CLAUDE_INTERRUPT_DELAY=<ms> after cancelling it); a message that
+//                         comes while it's asking is taken in at once
 //   slow                  waits for an interrupt, then ends the turn as interrupted
 //   stubborn              ignores interrupts, and a closed stdin (saying "not stopping"), until
 //                         it's signalled
@@ -28,7 +29,8 @@
 //                         result has origin.kind task-notification). With
 //                         MINI_CLAUDE_BACKGROUND_APP=<name>, the subagent calls that app tool
 //                         instead, which is answered before the turn ends, and its tool_result
-//                         comes <ms> after. With MINI_CLAUDE_NOTIFY_FIRST=1, messages that come
+//                         comes <ms> after; with MINI_CLAUDE_BACKGROUND_ASK=<json>, it asks
+//                         AskUserQuestion with that input instead of calling Bash. With MINI_CLAUDE_NOTIFY_FIRST=1, messages that come
 //                         while a background subagent runs wait for the turn that reports it
 //
 // It answers every control request with success and an empty response, but a `never_answered` one.
@@ -172,7 +174,7 @@ async function step(text) {
     await Promise.race([sleep(Number(ms)), new Promise((r) => (interrupted = r))]);
     if (!wasInterrupted) say(words.join(" "));
   } else if (cmd === "cancelled") {
-    const id = `toolu_${++ids}`;
+    const id = `toolu_${process.pid}_${++ids}`;
     out({ type: "assistant", message: { id: `msg_${process.pid}_${++msgs}`, model: "mini", content: [{ type: "tool_use", id, name: rest[0], input: {} }] }, parent_tool_use_id: null, session_id: session });
     const request_id = `cli_${++ids}`;
     out({ type: "control_request", request_id, request: { subtype: "can_use_tool", tool_name: rest[0], input: {}, tool_use_id: id } });
@@ -181,7 +183,7 @@ async function step(text) {
   } else if (cmd === "twice") {
     const [name, json = "{}"] = rest;
     const input = JSON.parse(json);
-    const calls = [`toolu_${++ids}`, `toolu_${++ids}`];
+    const calls = [`toolu_${process.pid}_${++ids}`, `toolu_${process.pid}_${++ids}`];
     out({ type: "assistant", message: { id: `msg_${process.pid}_${++msgs}`, model: "mini", content: calls.map((id) => ({ type: "tool_use", id, name, input })) }, parent_tool_use_id: null, session_id: session });
     const answers = await Promise.all(calls.map((id) => ask({ subtype: "can_use_tool", tool_name: name, input, tool_use_id: id })));
     calls.forEach((id, i) => {
@@ -192,13 +194,21 @@ async function step(text) {
     });
   } else if (cmd === "asking") {
     const [name, json = "{}"] = rest;
-    const id = `toolu_${++ids}`;
+    const id = `toolu_${process.pid}_${++ids}`;
     const input = JSON.parse(json);
     out({ type: "assistant", message: { id: `msg_${process.pid}_${++msgs}`, model: "mini", content: [{ type: "tool_use", id, name, input }] }, parent_tool_use_id: null, session_id: session });
     const request_id = `cli_${++ids}`;
     const answer = new Promise((resolve) => waiting.set(request_id, resolve));
     out({ type: "control_request", request_id, request: { subtype: "can_use_tool", tool_name: name, input, tool_use_id: id } });
-    const r = await Promise.race([answer, new Promise((r) => (interrupted = r))]);
+    let r;
+    for (;;) {
+      r = await Promise.race([answer, new Promise((r) => (interrupted = r)), new Promise((r) => (wake = r))]);
+      wake = null;
+      if (r || wasInterrupted) break;
+      // A message that came meanwhile, taken in (as Claude takes in a steer between tool calls).
+      for (const w of inbox.filter((x) => x.during)) out({ type: "user", message: w.message, isReplay: true, session_id: session, parent_tool_use_id: null });
+      inbox.splice(0, inbox.length, ...inbox.filter((x) => !x.during));
+    }
     if (wasInterrupted) {
       waiting.delete(request_id);
       out({ type: "control_cancel_request", request_id });
@@ -215,7 +225,7 @@ async function step(text) {
     say(allowed ? `ran with ${JSON.stringify(r.response.updatedInput)}` : `denied: ${r.response.message}`);
   } else if (cmd === "tool") {
     const [name, json = "{}"] = rest;
-    const id = `toolu_${++ids}`;
+    const id = `toolu_${process.pid}_${++ids}`;
     const input = JSON.parse(json);
     out({ type: "assistant", message: { id: `msg_${process.pid}_${++msgs}`, model: "mini", content: [{ type: "tool_use", id, name, input }] }, parent_tool_use_id: null, session_id: session });
     await sleep(Number(process.env.MINI_CLAUDE_ASK_DELAY ?? 0));
@@ -231,7 +241,7 @@ async function step(text) {
     say(allowed ? `ran with ${JSON.stringify(r.response.updatedInput)}` : `denied: ${r.response.message}`);
   } else if (cmd === "app") {
     const [name, json = "{}"] = rest;
-    const id = `toolu_${++ids}`;
+    const id = `toolu_${process.pid}_${++ids}`;
     out({ type: "assistant", message: { id: `msg_${process.pid}_${++msgs}`, model: "mini", content: [{ type: "tool_use", id, name: `mcp__app__${name}`, input: JSON.parse(json) }] }, parent_tool_use_id: null, session_id: session });
     // As Claude does, a while later (so the backend has saved the call before it's asked to run it).
     await new Promise((r) => setTimeout(r, Number(process.env.MINI_CLAUDE_TOOL_DELAY ?? 0)));
@@ -242,12 +252,12 @@ async function step(text) {
     say(`app said ${res.content[0].text}`);
   } else if (cmd === "background") {
     const [ms, ...words] = rest;
-    const agent = `toolu_${++ids}`;
+    const agent = `toolu_${process.pid}_${++ids}`;
     const task = `task_${agent}`;
     out({ type: "assistant", message: { id: `msg_${process.pid}_${++msgs}`, model: "mini", content: [{ type: "tool_use", id: agent, name: "Agent", input: { description: "bg", prompt: "p", subagent_type: "general-purpose", run_in_background: true } }] }, parent_tool_use_id: null, session_id: session });
     out({ type: "system", subtype: "task_started", task_id: task, tool_use_id: agent, description: "bg", subagent_type: "general-purpose", is_backgrounded: true, task_type: "local_agent", session_id: session });
     out({ type: "user", message: { role: "user", content: [{ type: "tool_result", tool_use_id: agent, content: [{ type: "text", text: "Async agent launched successfully." }] }] }, parent_tool_use_id: null, session_id: session, tool_use_result: { isAsync: true, status: "async_launched", resolvedModel: "mini-1" } });
-    const call = `toolu_${++ids}`;
+    const call = `toolu_${process.pid}_${++ids}`;
     const app = process.env.MINI_CLAUDE_BACKGROUND_APP;
     let finish;
     if (app) {
@@ -260,9 +270,12 @@ async function step(text) {
         return { content: res.content, is_error: !!res.isError };
       };
     } else {
-      out({ type: "assistant", message: { id: `msg_${process.pid}_${++msgs}`, model: "mini", content: [{ type: "tool_use", id: call, name: "Bash", input: { command: "true" } }] }, parent_tool_use_id: agent, session_id: session });
+      // A question (MINI_CLAUDE_BACKGROUND_ASK: AskUserQuestion's input), or Bash.
+      const asking = process.env.MINI_CLAUDE_BACKGROUND_ASK;
+      const [name, input] = asking ? ["AskUserQuestion", JSON.parse(asking)] : ["Bash", { command: "true" }];
+      out({ type: "assistant", message: { id: `msg_${process.pid}_${++msgs}`, model: "mini", content: [{ type: "tool_use", id: call, name, input }] }, parent_tool_use_id: agent, session_id: session });
       // Asked now, so it's open when the turn ends.
-      const answer = ask({ subtype: "can_use_tool", tool_name: "Bash", input: { command: "true" }, tool_use_id: call });
+      const answer = ask({ subtype: "can_use_tool", tool_name: name, input, tool_use_id: call });
       finish = async () => {
         const r = await answer;
         const allowed = r.response.behavior === "allow";

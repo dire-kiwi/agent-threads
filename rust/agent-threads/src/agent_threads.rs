@@ -21,7 +21,7 @@ use crate::protocol::{
     Attachment, Command, Item, ItemPage, PermissionMode, Resolution, Snapshot, StandingAnswer, SubagentStatus, Thread,
     ThreadEvent, ThreadStatus,
 };
-use crate::reducer::{apply_event, initial_state, open_requests};
+use crate::reducer::{apply_event, initial_state};
 use crate::spawner::{Spawner, direct};
 use crate::store::{RunRecord, Store, StoreError};
 use crate::stores::memory::MemoryStore;
@@ -1195,9 +1195,6 @@ impl AgentThreads {
             state = initial_state(thread);
         }
         let (handle, mut actor, rx) = self.actor(state, launch)?;
-        // Questions kept open after their turns ended are taken up again (or cancelled, if they
-        // can't be any more).
-        actor.core.take_up_requests(false);
         if !self.reattach(&mut actor).await? {
             // The process that ran its turn went with the backend before this one, or can't be
             // followed.
@@ -1205,6 +1202,10 @@ impl AgentThreads {
             if matches!(t.status, ThreadStatus::Running | ThreadStatus::Waiting) || t.run.is_some() {
                 actor.core.lost_run = t.run.as_ref().map(|r| r.id.clone());
                 recover_lost(&mut actor.core);
+            } else {
+                // Questions kept open after their turns ended are taken up again (or cancelled,
+                // if they can't be any more).
+                actor.core.take_up_requests(false);
             }
         }
         self.run(&handle, actor, rx);
@@ -1268,15 +1269,11 @@ impl AgentThreads {
             return Ok(false);
         }
         let c = &mut actor.core;
-        // Requests the session didn't take up again can't be answered.
+        // Requests the session didn't take up again can't be answered by the harness: questions
+        // kept open after their turns (or given up by an interrupted one) stay open, the others
+        // are cancelled.
+        c.take_up_requests(false);
         let open = c.open_request_ids();
-        let stale: Vec<String> = open_requests(c.snapshot())
-            .map(|r| r.id().to_string())
-            .filter(|id| !c.is_taken_up(id))
-            .collect();
-        for id in stale {
-            c.emit_resolved(&id, &cancel_resolution());
-        }
         // With none left (one answered before the restart is closed, say), the turn runs on, or
         // the thread is idle if none was running.
         if open.is_empty() && c.thread().status == ThreadStatus::Waiting {
@@ -1344,10 +1341,6 @@ fn is_base64(s: &str) -> bool {
         && b[..b.len() - pad]
             .iter()
             .all(|c| c.is_ascii_alphanumeric() || *c == b'+' || *c == b'/')
-}
-
-fn cancel_resolution() -> Resolution {
-    serde_json::from_value(json!({"outcome": "cancel"})).unwrap()
 }
 
 /// The last turn the thread's items were made in.
