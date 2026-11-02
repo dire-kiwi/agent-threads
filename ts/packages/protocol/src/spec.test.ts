@@ -24,6 +24,8 @@ describe("spec/examples", () => {
     expectValid("Command", command),
   );
   it("thread.snapshot.json is a Snapshot", () => expectValid("Snapshot", readJson("examples/thread.snapshot.json")));
+  it("thread.window.json is a Snapshot", () => expectValid("Snapshot", readJson("examples/thread.window.json")));
+  it("thread.page.json is an ItemPage", () => expectValid("ItemPage", readJson("examples/thread.page.json")));
 });
 
 describe("the schemas", () => {

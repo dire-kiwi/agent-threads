@@ -1533,7 +1533,7 @@ const (
 	AttachmentKindFile  AttachmentKind = "file"
 )
 
-// ThreadRequest: An open request, told apart by type.
+// ThreadRequest: A request, told apart by type: open, or resolved (with its resolution).
 //
 // Value is one of *PermissionRequest, *QuestionRequest.
 type ThreadRequest struct {
@@ -1606,9 +1606,13 @@ type PermissionRequest struct {
 	Reason string `json:"reason,omitempty"`
 
 	// The subagent tool_call that's asking, if one is.
-	ParentID  string `json:"parent_id,omitempty"`
-	TurnID    string `json:"turn_id,omitempty"`
-	CreatedAt string `json:"created_at,omitempty"`
+	ParentID string `json:"parent_id,omitempty"`
+
+	// How it was resolved, once it is (request.resolved): the state keeps resolved requests with this
+	// set. Absent while it's open.
+	Resolution *Resolution `json:"resolution,omitempty"`
+	TurnID     string      `json:"turn_id,omitempty"`
+	CreatedAt  string      `json:"created_at,omitempty"`
 
 	// The harness's own payload, for debugging.
 	Raw json.RawMessage `json:"raw,omitempty"`
@@ -1618,7 +1622,7 @@ type PermissionRequest struct {
 	Extra map[string]json.RawMessage `json:"-"`
 }
 
-var knownPermissionRequest = fieldSet("type", "id", "tool_call_id", "name", "kind", "input", "title", "reason", "parent_id", "turn_id", "created_at", "raw")
+var knownPermissionRequest = fieldSet("type", "id", "tool_call_id", "name", "kind", "input", "title", "reason", "parent_id", "resolution", "turn_id", "created_at", "raw")
 
 func (v PermissionRequest) MarshalJSON() ([]byte, error) {
 	type plain PermissionRequest
@@ -1663,9 +1667,13 @@ type QuestionRequest struct {
 	ToolCallID string `json:"tool_call_id,omitempty"`
 
 	// The subagent tool_call that's asking, if one is.
-	ParentID  string `json:"parent_id,omitempty"`
-	TurnID    string `json:"turn_id,omitempty"`
-	CreatedAt string `json:"created_at,omitempty"`
+	ParentID string `json:"parent_id,omitempty"`
+
+	// How it was resolved, once it is (request.resolved): the state keeps resolved requests with this
+	// set. Absent while it's open.
+	Resolution *Resolution `json:"resolution,omitempty"`
+	TurnID     string      `json:"turn_id,omitempty"`
+	CreatedAt  string      `json:"created_at,omitempty"`
 
 	// The harness's own payload, for debugging.
 	Raw json.RawMessage `json:"raw,omitempty"`
@@ -1675,7 +1683,7 @@ type QuestionRequest struct {
 	Extra map[string]json.RawMessage `json:"-"`
 }
 
-var knownQuestionRequest = fieldSet("type", "id", "questions", "tool_call_id", "parent_id", "turn_id", "created_at", "raw")
+var knownQuestionRequest = fieldSet("type", "id", "questions", "tool_call_id", "parent_id", "resolution", "turn_id", "created_at", "raw")
 
 func (v QuestionRequest) MarshalJSON() ([]byte, error) {
 	type plain QuestionRequest
@@ -1870,24 +1878,36 @@ const (
 	ResolutionOutcomeCancel ResolutionOutcome = "cancel"
 )
 
-// Snapshot: A thread's whole state as of seq: what applying its events, in order, from the start
-// gives.
+// Snapshot: A thread's state as of seq: what applying its events, in order, from the start gives. A
+// window (a snapshot taken with a limit) has only its last items, and what they need from before
+// them (start, context).
 type Snapshot struct {
 	Thread Thread `json:"thread"`
 	Items  []Item `json:"items"`
 
-	// The open requests, oldest first.
+	// The thread's requests, oldest first: the open ones, and the resolved ones with their resolution.
+	// A window has the open ones, and the resolved ones its items have (see PROTOCOL.md, Windows).
 	Requests []ThreadRequest `json:"requests"`
 
 	// The seq of the last saved event it includes; 0 for none.
 	Seq int64 `json:"seq"`
+
+	// A window: the index, in the thread's whole list of items, of the first item of the window. The
+	// items before it are left out, but for those in context. Absent (or 0): items has them all.
+	Start *int64 `json:"start,omitempty"`
+
+	// A window: the indices, in the thread's whole list of items, of the items from before start it has
+	// anyway because the window needs them (the subagent calls its items and open requests belong to,
+	// and their open requests' tool calls). They're the first context.length of items, in order; the
+	// rest are the thread's items from start on.
+	Context []int64 `json:"context,omitempty"`
 
 	// Extra has the fields the spec doesn't name, as they came, so that they're written again
 	// unchanged (receivers ignore fields they don't know, and stores keep them).
 	Extra map[string]json.RawMessage `json:"-"`
 }
 
-var knownSnapshot = fieldSet("thread", "items", "requests", "seq")
+var knownSnapshot = fieldSet("thread", "items", "requests", "seq", "start", "context")
 
 func (v Snapshot) MarshalJSON() ([]byte, error) {
 	type plain Snapshot
@@ -1920,6 +1940,72 @@ func (v *Snapshot) UnmarshalJSON(data []byte) error {
 	}
 	p.Extra = extra
 	*v = Snapshot(p)
+	return nil
+}
+
+// ItemPage: The thread's items before an index (a window's start), a page at a time, for a client
+// that has a window to load earlier items into.
+type ItemPage struct {
+	ThreadID string `json:"thread_id"`
+
+	// The items of context, then the thread's items from start up to the index asked for.
+	Items []Item `json:"items"`
+
+	// The requests its items (after the context ones) have, oldest first.
+	Requests []ThreadRequest `json:"requests"`
+
+	// The index, in the thread's whole list of items, of its first item after the context ones. 0:
+	// there are none before it.
+	Start int64 `json:"start"`
+
+	// The indices of the items from before start it has anyway because its items need them (the
+	// subagent calls they belong to): the first context.length of items, in order.
+	Context []int64 `json:"context"`
+
+	// The seq of the last saved event its items and requests include.
+	Seq int64 `json:"seq"`
+
+	// Extra has the fields the spec doesn't name, as they came, so that they're written again
+	// unchanged (receivers ignore fields they don't know, and stores keep them).
+	Extra map[string]json.RawMessage `json:"-"`
+}
+
+var knownItemPage = fieldSet("thread_id", "items", "requests", "start", "context", "seq")
+
+func (v ItemPage) MarshalJSON() ([]byte, error) {
+	type plain ItemPage
+	p := plain(v)
+	if p.Items == nil {
+		p.Items = []Item{}
+	}
+	if p.Requests == nil {
+		p.Requests = []ThreadRequest{}
+	}
+	if p.Context == nil {
+		p.Context = []int64{}
+	}
+	data, err := json.Marshal(p)
+	if err != nil {
+		return nil, err
+	}
+	return withExtra(data, v.Extra, knownItemPage)
+}
+
+func (v *ItemPage) UnmarshalJSON(data []byte) error {
+	if isNull(data) {
+		return nil
+	}
+	type plain ItemPage
+	var p plain
+	if err := json.Unmarshal(data, &p); err != nil {
+		return err
+	}
+	extra, err := extraFields(data, knownItemPage)
+	if err != nil {
+		return err
+	}
+	p.Extra = extra
+	*v = ItemPage(p)
 	return nil
 }
 
