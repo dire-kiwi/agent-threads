@@ -388,7 +388,13 @@ class ClaudeSession implements HarnessSession {
     const spawner = this.#ctx.spawner;
     if (!st || st.v !== 1 || !spawner.attach || this.#run) return false;
     const run = new Run(record.id);
-    run.restore(st, (subtype) => (subtype === "initialize" ? (r) => this.#initialized(run, r) : () => {}));
+    // A new model or mode Claude refuses after the restart is the next process's, as before it.
+    const refused = (r: Json | null) => {
+      if (!r && this.#run === run) this.#stale = true;
+    };
+    run.restore(st, (subtype) =>
+      subtype === "initialize" ? (r) => this.#initialized(run, r) : subtype === "set_model" || subtype === "set_permission_mode" ? refused : () => {},
+    );
     this.#run = run;
     try {
       run.proc = spawner.attach(record, this.#handlers(run));

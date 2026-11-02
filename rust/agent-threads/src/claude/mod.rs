@@ -20,8 +20,8 @@ use crate::agent_threads::Error;
 use crate::attachments::{Part, message_parts, path_text};
 use crate::harness::{BoxFuture, Harness, HarnessSession, Message, RunCheckpoint, TurnEnd};
 use crate::ids::{new_id, now_iso, now_ms, private_temp_dir};
-use crate::permissions::{Decided, PermissionDecision, PermissionQuery, permission_key};
-use crate::protocol::{DeltaEventKind, Item, Resolution, ResolutionOutcome, ToolKind, ToolStatus};
+use crate::permissions::{Decided, PermissionDecision, PermissionQuery, mode_after_plan, permission_key};
+use crate::protocol::{DeltaEventKind, Item, PermissionMode, Resolution, ResolutionOutcome, ToolKind, ToolStatus};
 use crate::skills::write_skills;
 use crate::spawner::{ExitStatus, HarnessProcess, ProcessEvent, Signal, SpawnOptions};
 use crate::store::RunRecord;
@@ -29,7 +29,7 @@ use crate::thread::{ThreadContext, Timer};
 use crate::tools::{Cancellation, ToolContext, run_tool};
 
 pub(crate) use translate::{APP_SERVER, result_text, slim, title};
-use translate::{claude_permission_mode, claude_tool, claude_usage, edit_change, questions};
+use translate::{claude_mode, claude_permission_mode, claude_tool, claude_usage, edit_change, questions};
 
 /// How the Claude Code harness runs.
 #[derive(Clone, Debug)]
@@ -104,8 +104,10 @@ struct Sent {
     echo: String,
 }
 
-/// The thread's options a process is started with: a different one needs another.
-#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+/// The thread's options a process has: it's started with them, and takes a new model and permission
+/// mode as it runs (a new effort needs another process). `bypass`: it was started in bypass mode, so
+/// it can be switched to it (Claude Code refuses otherwise).
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
 struct Launched {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     model: Option<String>,
@@ -113,6 +115,8 @@ struct Launched {
     effort: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     permission_mode: Option<String>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    bypass: bool,
 }
 
 /// What a run's checkpoint holds: what's needed to carry on reading its output, as of the offset
@@ -177,6 +181,8 @@ struct Run {
     sent: Vec<Sent>,
     /// The generated plugin with the thread's skills, for this run only.
     plugin_dir: Option<PathBuf>,
+    /// The thread's options it has: those it was started with, and the model and permission mode
+    /// since.
     launched: Option<Launched>,
     /// Left running when the backend shut down: nothing more is read or written.
     detached: bool,
@@ -232,14 +238,27 @@ impl Run {
         }
     }
 
-    fn control(&mut self, request: Value) {
+    /// Sends a control request (`queue`: once Claude is ready).
+    fn control(&mut self, request: Value, queue: bool) {
         let request_id = format!("req_{}", self.next);
         self.next += 1;
         self.pending.push((
             request_id.clone(),
             request["subtype"].as_str().unwrap_or("").to_string(),
         ));
-        self.write(&json!({"type": "control_request", "request_id": request_id, "request": request}));
+        let msg = json!({"type": "control_request", "request_id": request_id, "request": request});
+        if queue && !self.ready {
+            // Ahead of the messages waiting (after the requests already queued), so they run with
+            // it.
+            let at = self
+                .waiting
+                .iter()
+                .position(|l| serde_json::from_str::<Value>(l).map_or(true, |m| m["type"] != "control_request"))
+                .unwrap_or(self.waiting.len());
+            self.waiting.insert(at, msg.to_string());
+        } else {
+            self.write(&msg);
+        }
     }
 
     fn is_open(&self, id: &str) -> bool {
@@ -342,7 +361,8 @@ pub(crate) struct ClaudeSession {
     current: Option<String>,
     /// The run before, once it has exited (for its last checkpoint).
     last: Option<String>,
-    /// The options changed since the run started: the next turn starts a new one.
+    /// The options or config changed since the run started, in a way it can't take as it runs: the
+    /// next turn starts a new one.
     stale: bool,
     steer_timer: Option<Timer>,
     stop_timer: Option<Timer>,
@@ -421,7 +441,7 @@ impl ClaudeSession {
 
     // ---------- the process ----------
 
-    /// The running process, or a new one. A new turn (`fresh`) restarts it if the options changed.
+    /// The running process, or a new one. A new turn (`fresh`) restarts it if it's stale.
     fn ensure(&mut self, ctx: &mut ThreadContext, fresh: bool) -> String {
         let live = self.live_id();
         if let Some(live) = &live
@@ -605,6 +625,7 @@ impl ClaudeSession {
             model: t.model.clone(),
             effort: t.effort.clone(),
             permission_mode: t.permission_mode.map(|m| m.to_string()),
+            bypass: t.permission_mode == Some(PermissionMode::Bypass),
         };
         let tools = !ctx.config().tools.is_empty();
         let run = self.run(id).unwrap();
@@ -620,7 +641,7 @@ impl ClaudeSession {
         if tools {
             init["sdkMcpServers"] = json!([APP_SERVER]);
         }
-        self.run(id).unwrap().control(init);
+        self.run(id).unwrap().control(init, false);
     }
 
     fn args(&mut self, ctx: &ThreadContext, id: &str) -> Vec<String> {
@@ -841,6 +862,12 @@ impl ClaudeSession {
                 };
                 if subtype == "initialize" {
                     self.initialized(ctx, id, response);
+                } else if matches!(subtype.as_str(), "set_model" | "set_permission_mode")
+                    && response.is_none()
+                    && self.current.as_deref() == Some(id)
+                {
+                    // Claude refused the option: it's the next process's.
+                    self.stale = true;
                 }
             }
             return;
@@ -1110,20 +1137,36 @@ impl ClaudeSession {
             && ctx.turn_id() == c.turn.as_deref()
     }
 
-    fn allow(&mut self, ctx: &ThreadContext, c: &CanUse, input: Value) {
+    /// Answers a `can_use_tool` request, if Claude still wants it answered.
+    fn answer(&mut self, ctx: &ThreadContext, c: &CanUse, response: Value) {
         if self.wanted(ctx, c) {
-            self.run(&c.run)
-                .unwrap()
-                .respond(&c.request, json!({"behavior": "allow", "updatedInput": input}));
+            self.run(&c.run).unwrap().respond(&c.request, response);
         }
     }
 
+    fn allow(&mut self, ctx: &ThreadContext, c: &CanUse, input: Value) {
+        self.answer(ctx, c, json!({"behavior": "allow", "updatedInput": input}));
+    }
+
     fn deny(&mut self, ctx: &ThreadContext, c: &CanUse, message: &str) {
-        if self.wanted(ctx, c) {
-            self.run(&c.run)
-                .unwrap()
-                .respond(&c.request, json!({"behavior": "deny", "message": message}));
+        self.answer(ctx, c, json!({"behavior": "deny", "message": message}));
+    }
+
+    /// Claude's name for a permission mode the running process `id` is switched to. One not started
+    /// in bypass mode can't be switched to it: it goes to acceptEdits, the driver allows what it
+    /// asks about (see can_use_tool), and the next turn has a new process, in bypass mode.
+    fn live_mode(&mut self, id: &str, mode: Option<PermissionMode>) -> &'static str {
+        if mode == Some(PermissionMode::Bypass)
+            && !self
+                .runs
+                .get(id)
+                .and_then(|r| r.launched.as_ref())
+                .is_some_and(|l| l.bypass)
+        {
+            self.stale = true;
+            return "acceptEdits";
         }
+        claude_mode(mode)
     }
 
     /// A tool Claude wants to use: the policy decides, or the user is asked. `existing` is the
@@ -1221,6 +1264,62 @@ impl ClaudeSession {
                 None,
             );
             self.run(id).unwrap().asked.insert(request_id.to_string(), ours);
+            return;
+        }
+
+        if tool_name == "ExitPlanMode" {
+            // A plan, which only the user approves. Approved, Claude leaves plan mode for the mode
+            // the thread carries on in (setMode), as does the thread; sent back, it plans again.
+            let plan = input["plan"].as_str().unwrap_or("").to_string();
+            let cu = c.clone();
+            let answered = ThreadContext::answered::<ClaudeSession>(move |s, ctx, res: Resolution| {
+                if !s.wanted(ctx, &cu) {
+                    return;
+                }
+                if res.outcome == ResolutionOutcome::Allow {
+                    let mode = mode_after_plan(ctx.thread().permission_mode, res.permission_mode);
+                    let live = s.live_mode(&cu.run, Some(mode));
+                    s.answer(
+                        ctx,
+                        &cu,
+                        json!({"behavior": "allow", "updatedInput": cu.input, "updatedPermissions": [{"type": "setMode", "mode": live, "destination": "session"}]}),
+                    );
+                    if let Some(l) = s.run(&cu.run).and_then(|r| r.launched.as_mut()) {
+                        l.permission_mode = Some(mode.to_string());
+                    }
+                    ctx.set_thread(|t| t.permission_mode = Some(mode));
+                    if let Some(t) = &cu.tool_use_id {
+                        ctx.update_item(t, json!({"status": "running"}));
+                    }
+                } else {
+                    s.deny(
+                        ctx,
+                        &cu,
+                        res.message
+                            .as_deref()
+                            .filter(|m| !m.is_empty())
+                            .unwrap_or("The user wants you to keep planning rather than start on this plan."),
+                    );
+                    if let Some(t) = &cu.tool_use_id {
+                        ctx.update_item(t, json!({"status": "denied"}));
+                    }
+                }
+            });
+            let ours = ctx.ask_again(
+                c.existing.as_deref(),
+                json!({"type": "plan", "plan": plan}),
+                tool_use_id.as_deref(),
+                answered,
+                None,
+            );
+            self.run(id).unwrap().asked.insert(request_id.to_string(), ours);
+            return;
+        }
+
+        // The thread is in bypass mode, which its process couldn't be switched to: nothing is
+        // asked.
+        if ctx.thread().permission_mode == Some(PermissionMode::Bypass) && c.existing.is_none() {
+            self.allow(ctx, &c, input);
             return;
         }
 
@@ -1492,7 +1591,7 @@ impl HarnessSession for ClaudeSession {
                 && let Some(run) = s.run(&id)
                 && !run.detached
             {
-                run.control(json!({"subtype": "interrupt"}));
+                run.control(json!({"subtype": "interrupt"}), false);
             }
         };
         // A run that outlives the backend is saved first, its turn interrupted and when it's
@@ -1517,7 +1616,38 @@ impl HarnessSession for ClaudeSession {
         }
     }
 
-    fn options_changed(&mut self, _ctx: &mut ThreadContext) {
+    fn options_changed(&mut self, ctx: &mut ThreadContext) {
+        // A process yet to start is started with them.
+        let Some(id) = self.live_id() else { return };
+        let Some(l) = self.runs[&id].launched.clone() else {
+            return;
+        };
+        let t = ctx.thread();
+        // Claude takes a new model and permission mode as it runs, even during a turn; a new effort
+        // needs a new process, at the next turn.
+        if l.effort != t.effort {
+            self.stale = true;
+        }
+        // Set as they're asked for, so a restart before the answer doesn't ask again; one Claude
+        // refuses is the next process's.
+        let (model, mode) = (t.model.clone(), t.permission_mode);
+        if l.model != model {
+            let run = self.run(&id).unwrap();
+            run.launched.as_mut().unwrap().model = model.clone();
+            run.control(
+                json!({"subtype": "set_model", "model": model.as_deref().unwrap_or("default")}),
+                true,
+            );
+        }
+        if l.permission_mode != mode.map(|m| m.to_string()) {
+            let live = self.live_mode(&id, mode);
+            let run = self.run(&id).unwrap();
+            run.launched.as_mut().unwrap().permission_mode = mode.map(|m| m.to_string());
+            run.control(json!({"subtype": "set_permission_mode", "mode": live}), true);
+        }
+    }
+
+    fn config_changed(&mut self, _ctx: &mut ThreadContext) {
         self.stale = true;
     }
 
@@ -1605,12 +1735,12 @@ impl HarnessSession for ClaudeSession {
         forward(ctx, &id, rx);
         // A process started with other options than the thread's now is replaced at the next turn.
         let t = ctx.thread();
-        let now = Launched {
-            model: t.model.clone(),
-            effort: t.effort.clone(),
-            permission_mode: t.permission_mode.map(|m| m.to_string()),
-        };
-        self.stale = st.stale || st.launched.as_ref() != Some(&now);
+        self.stale = st.stale
+            || st.launched.as_ref().is_none_or(|l| {
+                l.model != t.model
+                    || l.effort != t.effort
+                    || l.permission_mode != t.permission_mode.map(|m| m.to_string())
+            });
         // Claude's requests that were open: the user's questions are taken up again, and the rest
         // (a policy that hadn't decided, a tool that was running) are dealt with again.
         // One answered before the restart, though that wasn't saved, is closed: Claude has its

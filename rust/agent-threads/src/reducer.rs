@@ -187,6 +187,7 @@ impl ThreadRequest {
         match self {
             ThreadRequest::Permission(r) => &r.id,
             ThreadRequest::Question(r) => &r.id,
+            ThreadRequest::Plan(r) => &r.id,
         }
     }
 
@@ -194,6 +195,7 @@ impl ThreadRequest {
         match self {
             ThreadRequest::Permission(r) => r.turn_id.as_deref(),
             ThreadRequest::Question(r) => r.turn_id.as_deref(),
+            ThreadRequest::Plan(r) => r.turn_id.as_deref(),
         }
     }
 }

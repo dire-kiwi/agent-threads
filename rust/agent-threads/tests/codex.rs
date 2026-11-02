@@ -7,10 +7,10 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
-use agent_threads::protocol::ToolKind;
+use agent_threads::protocol::{PermissionMode, ToolKind};
 use agent_threads::{
-    AgentThreads, AppTools, Capabilities, CodexOptions, CreateOptions, McpServer, MemoryStore, Options,
-    PermissionDecision, PermissionPolicy, SendOptions, Skill, Store, ThreadEvent, ToolContext, codex, tool,
+    AgentThreads, AppTools, Capabilities, CapabilitiesUpdate, CodexOptions, CreateOptions, McpServer, MemoryStore,
+    Options, PermissionDecision, PermissionPolicy, SendOptions, Skill, Store, ThreadEvent, ToolContext, codex, tool,
 };
 use common::{items, mini_runs, settle, texts, until};
 use serde_json::{Value, json};
@@ -676,6 +676,315 @@ async fn sends_compact_as_thread_compact_start() {
     assert_eq!(env.sent("thread/compact/start").len(), 1);
     assert_eq!(items(&s, "compaction")[0]["trigger"], "manual");
     assert_eq!(results(&s).len(), 2);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn gives_the_process_new_options_with_its_next_turn() {
+    let env = setup(Capabilities::default(), plain(), &[]);
+    let t = env
+        .sdk
+        .create(CreateOptions {
+            model: Some("a".into()),
+            effort: Some("low".into()),
+            ..create()
+        })
+        .await
+        .unwrap();
+    env.sdk.send(&t.id, "reply one", SendOptions::default()).await.unwrap();
+    settle(&env.sdk, &t.id).await;
+    let cmd =
+        json!({"type": "set_options", "thread_id": t.id, "model": "b", "effort": "high", "permission_mode": "bypass"});
+    env.sdk.handle_json(cmd).await.unwrap();
+    env.sdk.send(&t.id, "reply two", SendOptions::default()).await.unwrap();
+    settle(&env.sdk, &t.id).await;
+    env.sdk
+        .send(&t.id, "reply three", SendOptions::default())
+        .await
+        .unwrap();
+    settle(&env.sdk, &t.id).await;
+    assert_eq!(mini_runs(&env.log).len(), 1);
+    let turns: Vec<Value> = env.sent("turn/start").iter().map(|m| m["params"].clone()).collect();
+    assert!(turns[0].get("model").is_none() && turns[0].get("approvalPolicy").is_none());
+    let p = &turns[1];
+    assert_eq!(
+        (
+            p["model"].clone(),
+            p["effort"].clone(),
+            p["approvalPolicy"].clone(),
+            p["sandboxPolicy"].clone()
+        ),
+        (
+            json!("b"),
+            json!("high"),
+            json!("never"),
+            json!({"type": "dangerFullAccess"})
+        )
+    );
+    // Codex keeps them.
+    assert!(turns[2].get("model").is_none() && turns[2].get("approvalPolicy").is_none());
+    assert!(turns.iter().all(|p| p.get("collaborationMode").is_none()));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn starts_a_new_process_resuming_the_session_when_the_config_changes() {
+    let env = setup(Capabilities::default(), plain(), &[]);
+    let t = env
+        .sdk
+        .create(CreateOptions {
+            model: Some("a".into()),
+            ..create()
+        })
+        .await
+        .unwrap();
+    env.sdk.send(&t.id, "reply one", SendOptions::default()).await.unwrap();
+    settle(&env.sdk, &t.id).await;
+    let cmd = json!({"type": "set_options", "thread_id": t.id, "model": "b", "permission_mode": "bypass"});
+    env.sdk.handle_json(cmd).await.unwrap();
+    let update = CapabilitiesUpdate {
+        system_prompt: Some("Be brief.".into()),
+        ..Default::default()
+    };
+    env.sdk.configure(&t.id, update).await.unwrap();
+    env.sdk.send(&t.id, "reply two", SendOptions::default()).await.unwrap();
+    settle(&env.sdk, &t.id).await;
+    assert_eq!(mini_runs(&env.log).len(), 2);
+    let resume = env.sent("thread/resume")[0]["params"].clone();
+    assert_eq!(
+        (
+            resume["model"].clone(),
+            resume["approvalPolicy"].clone(),
+            resume["sandbox"].clone()
+        ),
+        (json!("b"), json!("never"), json!("danger-full-access"))
+    );
+    // The new process has them: its turn doesn't override them.
+    let turn = env.sent("turn/start")[0]["params"].clone();
+    assert!(turn.get("model").is_none() && turn.get("approvalPolicy").is_none());
+}
+
+/// A thread in plan mode.
+async fn planning(env: &Env) -> String {
+    let t = env
+        .sdk
+        .create(CreateOptions {
+            permission_mode: Some(PermissionMode::Plan),
+            ..create()
+        })
+        .await
+        .unwrap();
+    t.id
+}
+
+fn turn_starts(env: &Env) -> Vec<Value> {
+    env.sent("turn/start").iter().map(|m| m["params"].clone()).collect()
+}
+
+fn respond(id: &str, request: &Value, resolution: Value) -> Value {
+    json!({"type": "respond", "thread_id": id, "request_id": request["id"], "resolution": resolution})
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn in_plan_mode_asks_the_user_about_a_proposed_plan_and_implements_it_in_the_same_turn_once_its_approved() {
+    let caps = Capabilities {
+        permissions: Some(PermissionPolicy::ask()),
+        ..Default::default()
+    };
+    let env = setup(caps, plain(), &[]);
+    let t = env
+        .sdk
+        .create(CreateOptions {
+            model: Some("m".into()),
+            permission_mode: Some(PermissionMode::Plan),
+            ..create()
+        })
+        .await
+        .unwrap();
+    env.sdk
+        .send(&t.id, "propose Change apple to apricot.", SendOptions::default())
+        .await
+        .unwrap();
+    let r = env.request(&t.id).await;
+    assert_eq!(
+        (r["type"].clone(), r["plan"].clone()),
+        (json!("plan"), json!("Change apple to apricot."))
+    );
+    let s = serde_json::to_value(env.sdk.snapshot(&t.id).await.unwrap()).unwrap();
+    assert_eq!(s["thread"]["status"], "waiting");
+    assert!(results(&s).is_empty());
+    env.sdk
+        .handle_json(respond(&t.id, &r, json!({"outcome": "allow"})))
+        .await
+        .unwrap();
+    let s = settle(&env.sdk, &t.id).await;
+    assert_eq!(s["thread"]["permission_mode"], "default");
+    assert_eq!(mini_runs(&env.log).len(), 1);
+    let turns = turn_starts(&env);
+    assert_eq!(turns[0]["collaborationMode"]["mode"], "plan");
+    assert_eq!(turns[0]["collaborationMode"]["settings"]["model"], "m");
+    assert_eq!(turns[1]["input"][0]["text"], "Implement the plan.");
+    assert_eq!(turns[1]["collaborationMode"]["mode"], "default");
+    assert_eq!(
+        (turns[1]["approvalPolicy"].clone(), turns[1]["sandboxPolicy"].clone()),
+        (json!("untrusted"), json!({"type": "workspaceWrite"}))
+    );
+    // One turn, of both Codex turns.
+    let r = results(&s);
+    assert_eq!(r.len(), 1);
+    assert_eq!(
+        (r[0]["ok"].clone(), r[0]["duration_ms"].clone()),
+        (json!(true), json!(14))
+    );
+    assert_eq!(
+        r[0]["usage"],
+        json!({"input_tokens": 120, "cache_read_tokens": 80, "output_tokens": 20, "cache_write_tokens": 0})
+    );
+    assert_eq!(texts(&s), ["Change apple to apricot."]);
+
+    // Codex stays in its default mode, which isn't sent again.
+    env.sdk.send(&t.id, "reply done", SendOptions::default()).await.unwrap();
+    settle(&env.sdk, &t.id).await;
+    assert!(turn_starts(&env)[2].get("collaborationMode").is_none());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn in_plan_mode_sends_the_users_feedback_and_plans_again_denied_without_any_the_turn_ends() {
+    let env = setup(Capabilities::default(), plain(), &[]);
+    let t = planning(&env).await;
+    env.sdk.send(&t, "propose One.", SendOptions::default()).await.unwrap();
+    let r = env.request(&t).await;
+    env.sdk
+        .handle_json(respond(&t, &r, json!({"outcome": "deny", "message": "propose Two."})))
+        .await
+        .unwrap();
+    let r2 = until(5, || async {
+        env.sdk
+            .snapshot(&t)
+            .await
+            .unwrap()
+            .requests
+            .iter()
+            .find(|x| x.id() != r["id"])
+            .map(|x| serde_json::to_value(x).unwrap())
+    })
+    .await;
+    assert_eq!((r2["type"].clone(), r2["plan"].clone()), (json!("plan"), json!("Two.")));
+    env.sdk
+        .handle_json(respond(&t, &r2, json!({"outcome": "deny"})))
+        .await
+        .unwrap();
+    let s = settle(&env.sdk, &t).await;
+    assert_eq!(s["thread"]["permission_mode"], "plan");
+    let r = results(&s);
+    assert_eq!((r.len(), r[0]["ok"].clone()), (1, json!(true)));
+    let turns = turn_starts(&env);
+    assert_eq!(turns.len(), 2);
+    assert_eq!(
+        (
+            turns[1]["input"][0]["text"].clone(),
+            turns[1]["collaborationMode"]["mode"].clone()
+        ),
+        (json!("propose Two."), json!("plan"))
+    );
+    assert!(turns[1].get("approvalPolicy").is_none());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn in_plan_mode_carries_on_in_the_mode_the_user_approves_the_plan_in() {
+    let env = setup(Capabilities::default(), plain(), &[]);
+    let t = planning(&env).await;
+    env.sdk.send(&t, "propose One.", SendOptions::default()).await.unwrap();
+    let r = env.request(&t).await;
+    env.sdk
+        .handle_json(respond(
+            &t,
+            &r,
+            json!({"outcome": "allow", "permission_mode": "accept_edits"}),
+        ))
+        .await
+        .unwrap();
+    let s = settle(&env.sdk, &t).await;
+    assert_eq!(s["thread"]["permission_mode"], "accept_edits");
+    let p = &turn_starts(&env)[1];
+    assert_eq!(
+        (
+            p["approvalPolicy"].clone(),
+            p["sandboxPolicy"].clone(),
+            p["collaborationMode"]["mode"].clone()
+        ),
+        (json!("on-request"), json!({"type": "workspaceWrite"}), json!("default"))
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn in_plan_mode_takes_a_message_sent_while_a_plan_waits_as_more_to_plan_with() {
+    let mut env = setup(Capabilities::default(), plain(), &[]);
+    let t = planning(&env).await;
+    env.sdk.send(&t, "propose One.", SendOptions::default()).await.unwrap();
+    let r = env.request(&t).await;
+    let o = SendOptions {
+        client_id: Some("more".into()),
+        ..Default::default()
+    };
+    env.sdk.send(&t, "reply And two.", o).await.unwrap();
+    let s = settle(&env.sdk, &t).await;
+    let mut cancelled = false;
+    while let Ok(e) = env.rx.try_recv() {
+        let e = serde_json::to_value(e).unwrap();
+        cancelled |= e["type"] == "request.resolved"
+            && e["request_id"] == r["id"]
+            && e["resolution"] == json!({"outcome": "cancel"});
+    }
+    assert!(cancelled);
+    let m = items(&s, "user_message")
+        .into_iter()
+        .find(|i| i["client_id"] == "more")
+        .unwrap()
+        .clone();
+    assert_eq!(m["steered"], true);
+    assert_eq!(texts(&s), ["One.", "And two."]);
+    assert_eq!(results(&s).len(), 1);
+    let p = &turn_starts(&env)[1];
+    assert_eq!(
+        (p["input"][0]["text"].clone(), p["collaborationMode"]["mode"].clone()),
+        (json!("reply And two."), json!("plan"))
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn in_plan_mode_ends_the_turn_when_its_interrupted_while_a_plan_waits() {
+    let mut env = setup(Capabilities::default(), plain(), &[]);
+    let t = planning(&env).await;
+    env.sdk.send(&t, "propose One.", SendOptions::default()).await.unwrap();
+    let r = env.request(&t).await;
+    env.sdk.interrupt(&t).await.unwrap();
+    let s = settle(&env.sdk, &t).await;
+    let res = results(&s);
+    assert_eq!(
+        (res.len(), res[0]["ok"].clone(), res[0]["interrupted"].clone()),
+        (1, json!(false), json!(true))
+    );
+    let mut cancelled = false;
+    while let Ok(e) = env.rx.try_recv() {
+        let e = serde_json::to_value(e).unwrap();
+        cancelled |= e["type"] == "request.resolved"
+            && e["request_id"] == r["id"]
+            && e["resolution"] == json!({"outcome": "cancel"});
+    }
+    assert!(cancelled);
+    assert_eq!(s["requests"], json!([]));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn in_plan_mode_doesnt_ask_about_a_plan_outside_plan_mode() {
+    let env = setup(Capabilities::default(), plain(), &[]);
+    let t = env.sdk.create(create()).await.unwrap();
+    env.sdk
+        .send(&t.id, "propose One.", SendOptions::default())
+        .await
+        .unwrap();
+    let s = settle(&env.sdk, &t.id).await;
+    let r = results(&s);
+    assert_eq!((r.len(), r[0]["ok"].clone()), (1, json!(true)));
 }
 
 #[tokio::test(flavor = "multi_thread")]

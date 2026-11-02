@@ -313,6 +313,15 @@ pub(crate) fn codex_policy(mode: Option<PermissionMode>) -> (&'static str, &'sta
     }
 }
 
+/// A sandbox mode as turn/start's sandboxPolicy has it.
+pub(crate) fn sandbox_policy(mode: &str) -> Value {
+    match mode {
+        "read-only" => json!({"type": "readOnly"}),
+        "danger-full-access" => json!({"type": "dangerFullAccess"}),
+        _ => json!({"type": "workspaceWrite"}),
+    }
+}
+
 /// An MCP server as Codex's `mcp_servers` config has it, or why it can't be.
 pub(crate) fn mcp_server_config(s: &McpServer) -> Result<Value, &'static str> {
     match s {

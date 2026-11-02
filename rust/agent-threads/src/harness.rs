@@ -166,8 +166,12 @@ pub trait HarnessSession: Send + Any {
     /// The core gave up carrying the queued messages over: make sure nothing acts on them (stop a
     /// process that has them). They're sent again with the next turn's start.
     fn release(&mut self, ctx: &mut ThreadContext);
-    /// The thread's options (model, effort, permission mode) or config changed.
+    /// The thread's options (model, effort, permission mode) changed: they go to the running process
+    /// where the harness takes them, and otherwise apply from the next turn.
     fn options_changed(&mut self, ctx: &mut ThreadContext);
+    /// The thread's config (tools, MCP servers, skills, system prompt) changed: the next turn needs a
+    /// new process.
+    fn config_changed(&mut self, ctx: &mut ThreadContext);
     /// Stop the harness process, if it's running; the future resolves once it has gone.
     fn close(&mut self, ctx: &mut ThreadContext) -> BoxFuture<()>;
 

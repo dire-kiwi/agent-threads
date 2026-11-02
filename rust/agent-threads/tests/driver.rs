@@ -10,7 +10,7 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use agent_threads::protocol::ToolKind;
+use agent_threads::protocol::{PermissionMode, ToolKind};
 use agent_threads::{
     AgentThreads, Capabilities, ClaudeCodeOptions, CreateOptions, Error, FileStore, McpServer, MemoryState,
     MemoryStore, Options, PermissionDecision, PermissionPolicy, RunRecord, SendOptions, Skill, SqliteStore, Store,
@@ -213,16 +213,188 @@ async fn starts_the_next_turn_with_a_steered_message_claude_takes_in_after_its_t
     );
 }
 
+/// The control requests a mini-claude run was sent.
+fn controls(run: &common::MiniRun) -> Vec<Value> {
+    run.sent
+        .iter()
+        .filter(|m| m["type"] == "control_request")
+        .map(|m| m["request"].clone())
+        .collect()
+}
+
+/// The first open request, once there is one.
+async fn first_request(env: &Env, id: &str) -> Value {
+    let r = until(5, || async {
+        env.sdk.snapshot(id).await.unwrap().requests.first().cloned()
+    })
+    .await;
+    serde_json::to_value(r).unwrap()
+}
+
+/// The first control_response a mini-claude run was sent: the answer to its first request.
+fn first_answer(run: &common::MiniRun) -> Value {
+    run.sent
+        .iter()
+        .find(|m| m["type"] == "control_response")
+        .map(|m| m["response"]["response"].clone())
+        .unwrap()
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn gives_a_running_process_a_new_model_and_permission_mode() {
+    let env = setup(Setup::default());
+    let t = env
+        .sdk
+        .create(CreateOptions {
+            model: Some("a".into()),
+            ..create()
+        })
+        .await
+        .unwrap();
+    env.sdk.send(&t.id, "reply one", SendOptions::default()).await.unwrap();
+    settle(&env.sdk, &t.id).await;
+    let cmd = json!({"type": "set_options", "thread_id": t.id, "model": "b", "permission_mode": "accept_edits"});
+    env.sdk.handle_json(cmd).await.unwrap();
+    env.sdk.send(&t.id, "reply two", SendOptions::default()).await.unwrap();
+    let s = settle(&env.sdk, &t.id).await;
+    assert_eq!(texts(&s), ["one", "two"]);
+    let runs = env.runs();
+    assert_eq!(runs.len(), 1);
+    let controls = controls(&runs[0]);
+    assert!(controls.contains(&json!({"subtype": "set_model", "model": "b"})));
+    assert!(controls.contains(&json!({"subtype": "set_permission_mode", "mode": "acceptEdits"})));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn asks_the_user_about_a_plan_and_approving_it_leaves_plan_mode_for_the_mode_they_pick() {
+    let env = setup(Setup {
+        capabilities: Capabilities {
+            permissions: Some(PermissionPolicy::ask()),
+            ..Default::default()
+        },
+        ..Default::default()
+    });
+    let t = env
+        .sdk
+        .create(CreateOptions {
+            permission_mode: Some(PermissionMode::Plan),
+            ..create()
+        })
+        .await
+        .unwrap();
+    env.sdk
+        .send(
+            &t.id,
+            r##"tool ExitPlanMode {"plan":"#Plan\n-one"}"##,
+            SendOptions::default(),
+        )
+        .await
+        .unwrap();
+    let r = first_request(&env, &t.id).await;
+    assert_eq!(
+        (r["type"].clone(), r["plan"].clone()),
+        (json!("plan"), json!("#Plan\n-one"))
+    );
+    assert!(r["id"].as_str().unwrap().starts_with("plan"));
+    let respond = json!({"type": "respond", "thread_id": t.id, "request_id": r["id"], "resolution": {"outcome": "allow", "permission_mode": "accept_edits"}});
+    env.sdk.handle_json(respond).await.unwrap();
+    let s = settle(&env.sdk, &t.id).await;
+    assert_eq!(s["thread"]["permission_mode"], "accept_edits");
+    let answer = first_answer(&env.runs()[0]);
+    assert_eq!(answer["behavior"], "allow");
+    assert_eq!(
+        answer["updatedPermissions"],
+        json!([{"type": "setMode", "mode": "acceptEdits", "destination": "session"}])
+    );
+    // The process has the mode: the next turn runs in it, and isn't told it again.
+    env.sdk.send(&t.id, "reply next", SendOptions::default()).await.unwrap();
+    settle(&env.sdk, &t.id).await;
+    let runs = env.runs();
+    assert_eq!(runs.len(), 1);
+    assert!(!controls(&runs[0]).iter().any(|c| c["subtype"] == "set_permission_mode"));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn sends_a_plan_back_with_the_users_feedback() {
+    let env = setup(Setup::default());
+    let t = env
+        .sdk
+        .create(CreateOptions {
+            permission_mode: Some(PermissionMode::Plan),
+            ..create()
+        })
+        .await
+        .unwrap();
+    env.sdk
+        .send(&t.id, r#"tool ExitPlanMode {"plan":"p"}"#, SendOptions::default())
+        .await
+        .unwrap();
+    let r = first_request(&env, &t.id).await;
+    let respond = json!({"type": "respond", "thread_id": t.id, "request_id": r["id"], "resolution": {"outcome": "deny", "message": "Not yet."}});
+    env.sdk.handle_json(respond).await.unwrap();
+    let s = settle(&env.sdk, &t.id).await;
+    assert_eq!(s["thread"]["permission_mode"], "plan");
+    let call = items(&s, "tool_call")[0];
+    assert_eq!(
+        (
+            call["name"].clone(),
+            call["status"].clone(),
+            call["result"]["content"].clone()
+        ),
+        (json!("ExitPlanMode"), json!("denied"), json!("Not yet."))
+    );
+    assert_eq!(
+        first_answer(&env.runs()[0]),
+        json!({"behavior": "deny", "message": "Not yet."})
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn allows_what_a_process_that_cant_be_switched_to_bypass_mode_asks_until_a_new_one_starts_in_it() {
+    let mut env = setup(Setup {
+        capabilities: Capabilities {
+            permissions: Some(PermissionPolicy::ask()),
+            ..Default::default()
+        },
+        env: vec![("MINI_CLAUDE_ASK_DELAY", "300".into())],
+        ..Default::default()
+    });
+    let t = env.sdk.create(create()).await.unwrap();
+    env.sdk
+        .send(&t.id, r#"tool Bash {"command":"ls"}"#, SendOptions::default())
+        .await
+        .unwrap();
+    let cmd = json!({"type": "set_options", "thread_id": t.id, "permission_mode": "bypass"});
+    env.sdk.handle_json(cmd).await.unwrap();
+    let s = settle(&env.sdk, &t.id).await;
+    assert!(!env.events().iter().any(|e| matches!(e, ThreadEvent::RequestOpened(_))));
+    let calls: Vec<(Value, Value)> = items(&s, "tool_call")
+        .iter()
+        .map(|c| (c["name"].clone(), c["status"].clone()))
+        .collect();
+    assert_eq!(calls, [(json!("Bash"), json!("completed"))]);
+    // It was put in acceptEdits mode, the nearest it could be.
+    let runs = env.runs();
+    assert!(controls(&runs[0]).contains(&json!({"subtype": "set_permission_mode", "mode": "acceptEdits"})));
+    // The next turn has a process started in bypass mode.
+    env.sdk.send(&t.id, "reply next", SendOptions::default()).await.unwrap();
+    settle(&env.sdk, &t.id).await;
+    let runs = env.runs();
+    assert_eq!(runs.len(), 2);
+    assert!(has(&runs[1].argv, "--permission-mode", "bypassPermissions"));
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn runs_a_carried_over_turn_with_options_changed_during_the_turn_before() {
     let env = setup(Setup {
         steer: "late",
         ..Default::default()
     });
+    // A new effort needs a new process (a model or permission mode doesn't).
     let t = env
         .sdk
         .create(CreateOptions {
-            model: Some("old-model".into()),
+            effort: Some("low".into()),
             ..create()
         })
         .await
@@ -240,7 +412,7 @@ async fn runs_a_carried_over_turn_with_options_changed_during_the_turn_before() 
         .set_options(
             &t.id,
             ThreadOptions {
-                model: Some("new-model".into()),
+                effort: Some("high".into()),
                 ..Default::default()
             },
         )
@@ -254,8 +426,8 @@ async fn runs_a_carried_over_turn_with_options_changed_during_the_turn_before() 
     .await;
     assert_eq!(texts(&s), ["steered"]);
     let runs = env.runs();
-    assert!(has(&runs[0].argv, "--model", "old-model"));
-    assert!(has(&runs[1].argv, "--model", "new-model"));
+    assert!(has(&runs[0].argv, "--effort", "low"));
+    assert!(has(&runs[1].argv, "--effort", "high"));
     assert!(has(
         &runs[1].argv,
         "--resume",

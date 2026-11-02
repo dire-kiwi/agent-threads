@@ -277,6 +277,11 @@ pub(crate) fn questions(input: &Value) -> Vec<Value> {
         .collect()
 }
 
+/// A permission mode as Claude Code names it, for set_permission_mode and setMode.
+pub(crate) fn claude_mode(mode: Option<crate::protocol::PermissionMode>) -> &'static str {
+    claude_permission_mode(mode).unwrap_or("default")
+}
+
 /// The permission mode as Claude Code names it, or nothing for the default.
 pub(crate) fn claude_permission_mode(mode: Option<crate::protocol::PermissionMode>) -> Option<&'static str> {
     use crate::protocol::PermissionMode::*;

@@ -672,8 +672,16 @@ func (s *claudeSession) Reattach(record RunRecord) bool {
 	}
 	run := newClaudeRun(record.ID)
 	run.restore(*st, func(subtype string) func(jmap) {
-		if subtype == "initialize" {
+		switch subtype {
+		case "initialize":
 			return func(r jmap) { s.initialized(run, r) }
+		case "set_model", "set_permission_mode":
+			// A new model or mode Claude refuses after the restart is the next process's, as before it.
+			return func(r jmap) {
+				if r == nil && s.run == run {
+					s.stale = true
+				}
+			}
 		}
 		return func(jmap) {}
 	})
