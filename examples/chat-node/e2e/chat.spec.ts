@@ -4,7 +4,7 @@
 
 import { expect, test, type Page } from "@playwright/test";
 import WebSocket from "ws";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, utimesSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, statSync, utimesSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { spawn, spawnSync } from "node:child_process";
@@ -227,6 +227,60 @@ for (const source of ["proc", "ps"] as const) {
       expect(exists(other.pid!)).toBe(true);
     } finally {
       other.kill("SIGKILL");
+    }
+  });
+
+  test(`a run whose pids have since gone to another run's shim and program takes nothing of that run's (${source})`, async () => {
+    test.skip(!existsSync(SHIM), "agent-threads-shim isn't built (make shim)");
+    // Another run, in another data directory: its program starts one more process, in its group.
+    const elsewhere = mkdtempSync(join(tmpdir(), "chat-e2e-"));
+    const otherDir = join(elsewhere, "runs", "run_other");
+    mkdirSync(otherDir, { recursive: true });
+    const ready = join(elsewhere, "ready");
+    const child = `require("fs").writeFileSync(${JSON.stringify(ready)}, String(process.pid)); setInterval(() => {}, 1000);`;
+    const program = `require("child_process").spawn(process.execPath, ["-e", ${JSON.stringify(child)}], { stdio: "ignore" }); setInterval(() => {}, 1000);`;
+    expect(spawnSync(SHIM, [otherDir, "--", process.execPath, "-e", program], { stdio: "ignore" }).status).toBe(0);
+    const pids: number[] = [];
+    try {
+      await expect.poll(() => existsSync(ready)).toBe(true);
+      const other = runs(elsewhere, source)[0]!;
+      pids.push(other.shim()!, other.program()!, Number(readFileSync(ready, "utf8")));
+      const [shim, prog, started] = pids as [number, number, number];
+      expect(other.left()).toEqual(expect.arrayContaining(pids));
+
+      const data = mkdtempSync(join(tmpdir(), "chat-e2e-"));
+      const dir = join(data, "runs", "run_stale");
+      mkdirSync(dir, { recursive: true });
+      const write = (name: string, content: string, at: Date) => {
+        writeFileSync(join(dir, name), content);
+        utimesSync(join(dir, name), at, at);
+      };
+      // Written a minute ago, before the other run's shim and program started: neither is the
+      // run's, nor is what's in their session and group.
+      const ago = new Date(Date.now() - 60_000);
+      write("exit", '{"code":0,"signal":null}', ago);
+      for (const [s, p] of [
+        [shim, prog],
+        [shim, spawnSync("true").pid!],
+      ]) {
+        write("shim.pid", String(s), ago);
+        write("pid", String(p), ago);
+        expect(runs(data, source)[0]!.left()).toEqual([]);
+        expect(await stopRuns(data, source)).toEqual([]);
+      }
+      // Its shim's written as the other's was: only the program's start tells its group isn't the run's.
+      write("shim.pid", String(shim), statSync(join(otherDir, "shim.pid")).mtime);
+      write("pid", String(prog), ago);
+      expect(runs(data, source)[0]!.left()).toEqual([shim]);
+      // Nothing was sent to them: they'd have gone on SIGTERM.
+      for (const pid of pids) expect(exists(pid)).toBe(true);
+
+      // While the other run is still stopped with what its program started.
+      expect(await stopRuns(elsewhere, source)).toEqual([]);
+      expect(other.left()).toEqual([]);
+      await expect.poll(() => exists(started), { timeout: 2_000 }).toBe(false);
+    } finally {
+      for (const pid of pids) if (exists(pid)) process.kill(pid, "SIGKILL");
     }
   });
 }

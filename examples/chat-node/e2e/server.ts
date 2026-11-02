@@ -145,21 +145,28 @@ export function runs(data: string, source: ProcessSource = SOURCE) {
      * own session and started before the file was written; the program is the one in `pid`, if it
      * started between that and `pid` being written; the rest of its group must be in the shim's
      * session, and have started since the shim did.
+     *
+     * A pid isn't given to a new process while it's still a session's or a group's id. So a process
+     * that has the shim's pid but isn't the shim means the run's session has gone, and all that's in
+     * a session with that id now is another's; and likewise for the program's pid and its group.
      */
     const left = (): number[] | undefined => {
       const shim = pidFile("shim.pid");
       if (!shim) return [];
       const all = processes(source);
       if (!all) return undefined;
+      const since = (p: Proc, at: number) => p.start >= at - SLACK_MS;
+      const before = (p: Proc, at: number) => p.start <= at + SLACK_MS;
+      const leader = all.find((p) => p.pid === shim.pid);
+      if (leader && !(leader.sid === shim.pid && since(leader, shim.at) && before(leader, shim.at))) return [];
+      const ours = leader ? [leader.pid] : [];
       const program = pidFile("pid");
-      return all
-        .filter((p) => {
-          if (p.sid !== shim.pid || p.start < shim.at - SLACK_MS) return false;
-          if (p.pid === shim.pid) return p.start <= shim.at + SLACK_MS;
-          if (!program || program.pid === shim.pid || p.pgrp !== program.pid) return false;
-          return p.pid !== program.pid || p.start <= program.at + SLACK_MS;
-        })
-        .map((p) => p.pid);
+      if (!program || program.pid === shim.pid) return ours;
+      const group = all.filter((p) => p.pgrp === program.pid);
+      const head = group.find((p) => p.pid === program.pid);
+      if (head && !before(head, program.at)) return ours;
+      // The program, if it's still there, and what it started that's still in its group.
+      return [...ours, ...group.filter((p) => p.sid === shim.pid && since(p, shim.at)).map((p) => p.pid)];
     };
     return {
       id,
