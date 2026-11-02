@@ -12,7 +12,8 @@ codex-cli 0.165.0 (model `gpt-5.6-luna`, effort `low`), by `spec/tools/record.mj
 The Codex sessions' `skills/list` exchange was added afterwards (on 2026-11-01), with the response
 codex-cli 0.165.0 gives in a fresh CODEX_HOME and a working directory and home with no skills;
 `spec/tools/scenarios/codex.mjs` records it from now on. The `adopt`, `rewind`, `new-session` and
-`compact` scenarios were recorded on 2026-11-02, with the same CLIs and models.
+`compact` scenarios were recorded on 2026-11-02, with the same CLIs and models (and their
+`skills/list` answer has only Codex's built-in skills, as the sanitizer now leaves it).
 
 ## Layout
 
