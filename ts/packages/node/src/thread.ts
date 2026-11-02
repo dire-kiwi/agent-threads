@@ -3,7 +3,7 @@
 // subscribers, and saved to the store in order (deltas aren't saved).
 
 import { applyEvent, type Attachment, type Item, type Resolution, type Snapshot, type SubagentState, type Thread, type ThreadEvent, type ThreadRequest, type Usage, type UserMessage } from "@dire-kiwi/agent-threads-protocol";
-import { ancestors, inBackground, type HarnessSession, type Message, type NewItem, type NewRequest, type ThreadConfig, type ThreadContext, type TurnEnd } from "./harness.js";
+import { ancestors, inBackground, requestInBackground, type HarnessSession, type Message, type NewItem, type NewRequest, type ThreadConfig, type ThreadContext, type TurnEnd } from "./harness.js";
 import { newId } from "./ids.js";
 import { decide, permissionKey, type PermissionDecision, type PermissionPolicy, type PermissionQuery } from "./permissions.js";
 import type { Spawner } from "./spawner.js";
@@ -457,7 +457,7 @@ export class ThreadRuntime implements ThreadContext {
     }
     for (const [id, r] of this.#requests) {
       if (r.request.turn_id !== undefined && r.request.turn_id !== turn.id) continue;
-      if (r.request.tool_call_id && inBackground(lookup, r.request.tool_call_id)) continue;
+      if (requestInBackground(lookup, r.request)) continue;
       this.#requests.delete(id);
       this.emit({ type: "request.resolved", request_id: id, resolution: { outcome: "cancel" } });
     }
@@ -554,8 +554,10 @@ export class ThreadRuntime implements ThreadContext {
     for (const it of this.#state.items) {
       if (it.type === "tool_call" && (it.status === "running" || it.status === "pending") && within(it.id)) this.updateItem(it.id, { status: "cancelled" });
     }
+    // Its requests: about its calls, or (about none) from it.
+    const from = (call: string | undefined) => !!call && (ends.has(call) || within(call));
     for (const [id, r] of this.#requests) {
-      if (!r.request.tool_call_id || !within(r.request.tool_call_id)) continue;
+      if (!(r.request.tool_call_id ? within(r.request.tool_call_id) : from(r.request.parent_id))) continue;
       this.#requests.delete(id);
       this.emit({ type: "request.resolved", request_id: id, resolution: { outcome: "cancel" } });
     }
@@ -583,9 +585,12 @@ export class ThreadRuntime implements ThreadContext {
   ask(request: NewRequest, toolCallId: string | undefined, answered: (resolution: Resolution) => void, standing?: string): string {
     const r = { ...request, id: newId(request.type === "question" ? "q" : "perm") } as ThreadRequest;
     if (this.turn) r.turn_id = this.turn.id;
+    // A request about a call is from the subagent the call is (or the thread itself); one about
+    // none says which it's from.
     const call = toolCallId ? this.item(toolCallId) : undefined;
     if (call) {
       r.tool_call_id = call.id;
+      delete r.parent_id;
       if (call.parent_id) r.parent_id = call.parent_id;
       this.updateItem(call.id, { status: "pending" });
     }

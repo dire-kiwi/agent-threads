@@ -1106,12 +1106,21 @@ class CodexSession implements HarnessSession {
     if (it?.type !== "tool_call" || !it.subagent) return;
     const next = change(it.subagent);
     if (!next) return;
+    // Its requests Codex no longer wants answered: the user's too, those that aren't about one of
+    // its calls (which ending it doesn't reach) included.
+    const asked: string[] = [];
     if (it.subagent.status === "running" && next.status !== "running") {
       const lookup = (id: string) => ctx.item(id);
       const within = (call: string | null | undefined) => !!call && (call === callId || [...ancestors(lookup, call)].some((a) => a.id === callId));
-      for (const id of [...run.open.keys()]) if (within(this.#parent(run, run.open.get(id)!.msg.params?.threadId))) run.open.delete(id);
+      for (const id of [...run.open.keys()]) {
+        if (!within(this.#parent(run, run.open.get(id)!.msg.params?.threadId))) continue;
+        run.open.delete(id);
+        const rid = run.asked.get(id);
+        if (rid) asked.push(rid);
+      }
     }
     ctx.endSubagent(callId, next);
+    for (const rid of asked) ctx.cancelRequest(rid);
   }
 
   /** Whether what comes from the child thread of this subagent call is a background subagent's, which carries on after its turn. */
@@ -1220,7 +1229,15 @@ class CodexSession implements HarnessSession {
       if (d === "allow") return done(true, "");
       if (d === "ask") {
         const id = ask(
-          { type: "permission", name: q.name, kind: q.kind, input: q.input, ...(q.title ? { title: q.title } : {}), ...(q.reason ? { reason: q.reason } : {}) },
+          {
+            type: "permission",
+            name: q.name,
+            kind: q.kind,
+            input: q.input,
+            ...(q.title ? { title: q.title } : {}),
+            ...(q.reason ? { reason: q.reason } : {}),
+            ...(q.parentId ? { parent_id: q.parentId } : {}),
+          },
           call,
           (res: Resolution) => {
             if (!wanted()) return;

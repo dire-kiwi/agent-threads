@@ -1615,6 +1615,7 @@ func (s *codexSession) subagent(run *codexRun, callID string, change func(protoc
 	if !ok {
 		return
 	}
+	var asked []string
 	if call.Subagent.Status == protocol.SubagentStatusRunning && next.Status != protocol.SubagentStatusRunning {
 		within := func(c string) bool {
 			if c == callID {
@@ -1627,13 +1628,21 @@ func (s *codexSession) subagent(run *codexRun, callID string, change func(protoc
 			}
 			return false
 		}
+		// Its requests Codex no longer wants answered: the user's too, those that aren't about one
+		// of its calls (which ending it doesn't reach) included.
 		for _, key := range append([]string(nil), run.openOrder...) {
 			if parent, _, _ := s.parent(run, orObj(run.open[key].Msg.obj("params")).raw("threadId")); parent != "" && within(parent) {
 				run.dropOpen(key)
+				if id := run.asked[key]; id != "" {
+					asked = append(asked, id)
+				}
 			}
 		}
 	}
 	s.ctx.EndSubagent(callID, next)
+	for _, id := range asked {
+		s.ctx.CancelRequest(id)
+	}
 }
 
 // inBackground says whether a request from the child thread of this subagent call is a background
@@ -1803,7 +1812,7 @@ func (s *codexSession) permit(run *codexRun, key string, q PermissionQuery, want
 		standing := permissionKey(q.Kind, q.Server, q.Name)
 		id := existing
 		if existing == "" || !ctx.Reopen(existing, answered, standing) {
-			id = ctx.Ask(&protocol.PermissionRequest{Name: q.Name, Kind: q.Kind, Input: q.Input, Title: q.Title, Reason: q.Reason}, call, answered, standing)
+			id = ctx.Ask(&protocol.PermissionRequest{Name: q.Name, Kind: q.Kind, Input: q.Input, Title: q.Title, Reason: q.Reason, ParentID: q.ParentID}, call, answered, standing)
 		}
 		if key != "" {
 			run.asked[key] = id

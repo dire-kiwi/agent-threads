@@ -469,3 +469,43 @@ func TestACodexChildsFollowUpWithNoReportHasNone(t *testing.T) {
 		t.Fatalf("the subagent after its follow-up: %s", got)
 	}
 }
+
+// A child's approval that's about none of its calls (two alike, which it can't be put down to) is
+// still the child's: it outlives the parent's turn, and goes when the child ends.
+func TestACodexChildsApprovalAboutNoneOfItsCallsGoesWithIt(t *testing.T) {
+	ctx := context.Background()
+	for _, end := range []string{"endchild interrupted", "closechild"} {
+		for _, late := range []string{"", " late"} {
+			t.Run(end+late, func(t *testing.T) {
+				sdk, rec := miniCodex(t, agentthreads.Ask)
+				th, _ := sdk.Create(ctx, agentthreads.CreateOptions{Harness: "codex", Cwd: t.TempDir()})
+				sdk.Send(ctx, th.ID, "bgmcp srv echo"+late, agentthreads.SendOptions{})
+				at := rec.waitFor(0, []byte(`{"type":"turn.completed"}`), waitFor)
+				if at < 0 {
+					t.Fatal("the turn didn't end")
+				}
+				var snap protocol.Snapshot
+				until(t, func() bool {
+					snap, _ = sdk.Snapshot(ctx, th.ID)
+					return len(snap.Requests) == 1 && snap.Thread.Status == protocol.ThreadStatusWaiting
+				})
+				r, _ := snap.Requests[0].Value.(*protocol.PermissionRequest)
+				if r == nil || r.ToolCallID != "" || r.ParentID != toolCalls(snap)[0].ID {
+					t.Fatalf("the request: %s", mustMarshal(snap.Requests[0]))
+				}
+				sdk.Send(ctx, th.ID, end, agentthreads.SendOptions{})
+				if rec.waitFor(at+1, []byte(`{"type":"turn.completed"}`), waitFor) < 0 {
+					t.Fatal("the second turn didn't end")
+				}
+				until(t, func() bool {
+					snap, _ = sdk.Snapshot(ctx, th.ID)
+					return snap.Thread.Status == protocol.ThreadStatusIdle
+				})
+				calls := toolCalls(snap)
+				if got := string(mustMarshal(calls[0].Subagent)); got != `{"status":"stopped","background":true,"model":"mini-child"}` || calls[1].Status != protocol.ToolStatusCancelled || calls[2].Status != protocol.ToolStatusCancelled || len(snap.Requests) != 0 {
+					t.Fatalf("after the child ended:\n%s", show(rec.all()))
+				}
+			})
+		}
+	}
+}

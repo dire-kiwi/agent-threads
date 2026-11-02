@@ -49,8 +49,11 @@ export interface TurnEnd {
   duration_ms?: number;
 }
 
-/** A request to open, without the fields the core fills in. */
-export type NewRequest = Omit<PermissionRequest, "id" | "turn_id" | "tool_call_id" | "parent_id"> | Omit<QuestionRequest, "id" | "turn_id" | "tool_call_id" | "parent_id">;
+/**
+ * A request to open, without the fields the core fills in. Its `parent_id` says which subagent's
+ * call it's from when it's about none of the calls (otherwise the call's is taken).
+ */
+export type NewRequest = Omit<PermissionRequest, "id" | "turn_id" | "tool_call_id"> | Omit<QuestionRequest, "id" | "turn_id" | "tool_call_id">;
 
 /** An item to add, without its turn (the core sets the running turn's). */
 export type NewItem = Item extends infer I ? (I extends Item ? Omit<I, "turn_id"> : never) : never;
@@ -140,6 +143,15 @@ export function* ancestors(item: (id: string) => Item | undefined, id: string): 
 /** Whether a tool_call is a background subagent's that's still running. */
 export function runningInBackground(it: Item | undefined): boolean {
   return it?.type === "tool_call" && !!it.subagent?.background && it.subagent.status === "running";
+}
+
+/**
+ * Whether a request is a background subagent's that's still running (about one of its calls, or
+ * from it): it carries on after the turn it was asked in has ended.
+ */
+export function requestInBackground(item: (id: string) => Item | undefined, r: { tool_call_id?: string; parent_id?: string }): boolean {
+  if (r.tool_call_id) return inBackground(item, r.tool_call_id);
+  return !!r.parent_id && (runningInBackground(item(r.parent_id)) || inBackground(item, r.parent_id));
 }
 
 /**

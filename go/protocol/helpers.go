@@ -219,6 +219,17 @@ func (u ThreadRequest) ToolCallID() string {
 	return ""
 }
 
+// ParentID is the request's parent_id.
+func (u ThreadRequest) ParentID() string {
+	switch r := u.Value.(type) {
+	case *PermissionRequest:
+		return r.ParentID
+	case *QuestionRequest:
+		return r.ParentID
+	}
+	return ""
+}
+
 // ThreadID is the command's thread_id.
 func (u Command) ThreadID() string {
 	switch c := u.Value.(type) {

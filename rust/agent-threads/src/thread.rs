@@ -244,6 +244,16 @@ impl ThreadContext {
         self.ancestors(id).into_iter().any(running_in_background)
     }
 
+    /// Whether a request is a background subagent's that's still running (about one of its calls,
+    /// or from it): it carries on after the turn it was asked in has ended.
+    pub fn request_in_background(&self, r: &ThreadRequest) -> bool {
+        match (r.tool_call_id(), r.parent_id()) {
+            (Some(c), _) => self.in_background(c),
+            (None, Some(p)) => self.item(p).is_some_and(running_in_background) || self.in_background(p),
+            (None, None) => false,
+        }
+    }
+
     // ---------- jobs ----------
 
     /// Runs `f` with the session (a `S`) as a job of its own, after the one running now.
@@ -554,7 +564,7 @@ impl ThreadContext {
         let mut i = 0;
         while i < self.requests.len() {
             let r = &self.requests[i].1.request;
-            if r.turn_id().is_some_and(|t| t != turn.id) || r.tool_call_id().is_some_and(|c| self.in_background(c)) {
+            if r.turn_id().is_some_and(|t| t != turn.id) || self.request_in_background(r) {
                 i += 1;
                 continue;
             }
@@ -755,14 +765,16 @@ impl ThreadContext {
         for id in cut {
             self.update_item(&id, json!({"status": "cancelled"}));
         }
+        // Its requests: about its calls, or (about none) from it.
+        let from = |ctx: &ThreadContext, r: &ThreadRequest| match r.tool_call_id() {
+            Some(c) => within(ctx, c),
+            None => r
+                .parent_id()
+                .is_some_and(|p| stopped.iter().any(|s| s == p) || within(ctx, p)),
+        };
         let mut i = 0;
         while i < self.requests.len() {
-            if !self.requests[i]
-                .1
-                .request
-                .tool_call_id()
-                .is_some_and(|c| within(self, c))
-            {
+            if !from(self, &self.requests[i].1.request) {
                 i += 1;
                 continue;
             }
@@ -841,8 +853,13 @@ impl ThreadContext {
         let call = tool_call_id
             .and_then(|c| self.item(c))
             .map(|i| (i.id().to_string(), i.parent_id().map(String::from)));
+        // A request about a call is from the subagent the call is (or the thread itself); one about
+        // none says which it's from.
         if let Some((call, parent)) = &call {
             request["tool_call_id"] = json!(call);
+            if let Some(o) = request.as_object_mut() {
+                o.remove("parent_id");
+            }
             if let Some(p) = parent {
                 request["parent_id"] = json!(p);
             }

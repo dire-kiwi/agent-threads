@@ -966,3 +966,59 @@ async fn doesnt_take_a_child_threads_earlier_report_for_a_follow_up_that_ends_wi
         json!({"status": "stopped", "background": true})
     );
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn cancels_a_child_threads_approval_about_none_of_its_calls_when_it_ends() {
+    for end in ["endchild interrupted", "closechild"] {
+        for late in ["", " late"] {
+            let env = setup(
+                Capabilities {
+                    permissions: Some(PermissionPolicy::ask()),
+                    ..Default::default()
+                },
+                plain(),
+                &[],
+            );
+            let t = env.sdk.create(create()).await.unwrap();
+            env.sdk
+                .send(&t.id, &format!("bgmcp srv echo{late}"), SendOptions::default())
+                .await
+                .unwrap();
+            // Two calls alike: the approval can't be put down to either. It's the child's, and
+            // outlives the turn.
+            let s = until(5, || async {
+                let s = serde_json::to_value(env.sdk.snapshot(&t.id).await.unwrap()).unwrap();
+                (results(&s).len() == 1 && s["requests"].as_array().unwrap().len() == 1).then_some(s)
+            })
+            .await;
+            let r = &s["requests"][0];
+            assert_eq!(
+                (
+                    r["tool_call_id"].clone(),
+                    r["parent_id"].clone(),
+                    s["thread"]["status"].clone()
+                ),
+                (Value::Null, calls(&s)[0]["id"].clone(), json!("waiting")),
+                "{end}{late}"
+            );
+            env.sdk.send(&t.id, end, SendOptions::default()).await.unwrap();
+            let s = until(5, || async {
+                let s = serde_json::to_value(env.sdk.snapshot(&t.id).await.unwrap()).unwrap();
+                (results(&s).len() == 2 && s["thread"]["status"] == "idle").then_some(s)
+            })
+            .await;
+            let c = calls(&s);
+            assert_eq!(
+                c[0]["subagent"],
+                json!({"status": "stopped", "background": true, "model": "mini-child"}),
+                "{end}{late}"
+            );
+            assert_eq!(
+                (c[1]["status"].clone(), c[2]["status"].clone()),
+                (json!("cancelled"), json!("cancelled")),
+                "{end}{late}"
+            );
+            assert_eq!(s["requests"], json!([]), "{end}{late}");
+        }
+    }
+}

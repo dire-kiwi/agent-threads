@@ -110,6 +110,13 @@ function inBackground(items, id) {
   return false;
 }
 
+/** Whether a request is a background subagent's that's still running (about one of its calls, or from it). */
+function requestInBackground(items, r) {
+  if (r.tool_call_id) return inBackground(items, r.tool_call_id);
+  const s = r.parent_id && items.get(r.parent_id)?.subagent;
+  return !!r.parent_id && ((s?.background && s.status === "running") || inBackground(items, r.parent_id));
+}
+
 /** Codex wraps commands in a login shell: `/usr/bin/bash -lc 'cmd'` is shown as cmd. */
 export function unwrapCommand(command) {
   const m = /^(?:\S*\/)?(?:bash|zsh|sh) -lc (?:'((?:[^']|'\\'')*)'|"((?:[^"\\]|\\.)*)")$/s.exec(command);
@@ -242,10 +249,12 @@ class Draft {
     if (this.turn) this.turn.interrupted = true;
   }
 
+  /** Opens a request; one about none of the calls can say which subagent's it is (parent_id). */
   open(request, toolCallId) {
     const r = { ...request, turn_id: this.turn?.id };
     if (toolCallId && this.items.has(toolCallId)) {
       r.tool_call_id = toolCallId;
+      delete r.parent_id;
       const parent = this.items.get(toolCallId).parent_id;
       if (parent) r.parent_id = parent;
       this.update(toolCallId, { status: "pending" });
@@ -306,7 +315,8 @@ class Draft {
       if (it.type === "tool_call" && (it.status === "running" || it.status === "pending") && within(it.id)) this.update(it.id, { status: "cancelled" });
     }
     for (const r of this.requests.values()) {
-      if (r.resolved || !r.tool_call_id || !within(r.tool_call_id)) continue;
+      // Its requests: about its calls, or (about none) from it.
+      if (r.resolved || !(r.tool_call_id ? within(r.tool_call_id) : !!r.parent_id && (r.parent_id === id || within(r.parent_id)))) continue;
       r.resolved = true;
       this.emit({ type: "request.resolved", request_id: r.id, resolution: { outcome: "cancel" } });
     }
@@ -321,7 +331,7 @@ class Draft {
       }
     }
     for (const r of this.requests.values()) {
-      if (!r.resolved && !(r.tool_call_id && inBackground(this.items, r.tool_call_id))) {
+      if (!r.resolved && !requestInBackground(this.items, r)) {
         r.resolved = true;
         this.emit({ type: "request.resolved", request_id: r.id, resolution: { outcome: "cancel" } });
       }
@@ -713,6 +723,7 @@ function draftCodex(d, runs) {
             const it = d.items.get(p.itemId) ?? [...d.items.values()].findLast((i) => i.type === "tool_call" && i.kind === "mcp" && i.server === p.serverName && i.status === "running");
             const r = { id: d.ph("p"), type: "permission", name: it?.name ?? "", kind: it?.kind ?? "other", input: it?.input ?? {}, title: it ? title(it) : p.message };
             if (p.reason) r.reason = p.reason;
+            if (parent) r.parent_id = parent;
             d.requests.set(m.id, d.open(r, it?.id));
             break;
           }

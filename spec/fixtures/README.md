@@ -246,9 +246,11 @@ backend drives each CLI:
   `message`, if any, as the `summary`. A child's `turn/started` (a follow-up sent to it) makes its
   subagent `running` again, with no `summary` (nor the last message of its turn before). A
   subagent that ends leaves nothing running: its calls still `running` or `pending` are
-  `cancelled`, and its open requests are resolved with `cancel`.
+  `cancelled`, and its open requests (those about none of its calls too) are resolved with
+  `cancel`.
 - **Requests**: an approval is a `permission` for the item it names (an MCP elicitation, for the
-  running call on that server). `item/tool/requestUserInput` adds a `tool_call` named
+  running call on that server). One from a child thread that isn't about a call it can be put down
+  to has the child's `spawnAgent` call as its `parent_id`. `item/tool/requestUserInput` adds a `tool_call` named
   `request_user_input` (`other`, `pending`) for it before the question; the answer completes it
   with one `<id>: <labels>` line per question.
 - **Notices**: a `warning` notification is a `notice` with `level: warning`; an `error` that will

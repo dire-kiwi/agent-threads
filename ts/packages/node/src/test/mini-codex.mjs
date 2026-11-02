@@ -24,6 +24,9 @@
 //   sub <prompt>        spawns a subagent (a child thread), which replies, and waits for it
 //   bg <command>        spawns a subagent that runs on after the turn: it runs the command (asking
 //                       first), replies, and ends (its turn fails if the command is declined)
+//   bgmcp <server> <tool> [late]  spawns a subagent that runs on after the turn: it starts two calls
+//                       of the tool alike, and elicits approval for one (which can't be told apart);
+//                       late: once the turn has ended
 //   endchild <status>   the last subagent's turn ends with that status (and no message)
 //   followup <status>   the last subagent takes up a turn again, which ends with that status (and
 //                       no message)
@@ -330,6 +333,35 @@ async function step(line) {
         const error = ok ? null : { message: "the child wasn't allowed to" };
         notify("turn/completed", { threadId: child, turn: { id: childTurn, status: ok ? "completed" : "failed", error, items: [] } });
       });
+      return message("started");
+    }
+    case "bgmcp": {
+      const [server, tool, late] = rest;
+      const id = uid("spawn");
+      const child = uid("child");
+      const base = { type: "collabAgentToolCall", id, tool: "spawnAgent", senderThreadId: thread.id, prompt: `call ${tool} twice`, model: "mini-child" };
+      item("item/started", { ...base, status: "inProgress", receiverThreadIds: [], agentsStates: {} });
+      item("item/completed", { ...base, status: "completed", receiverThreadIds: [child], agentsStates: { [child]: { status: "pendingInit", message: null } } });
+      const childTurn = uid("turn");
+      lastChild = { id: child, turn: childTurn };
+      notify("turn/started", { threadId: child, turn: { id: childTurn, status: "inProgress", items: [] } });
+      for (let i = 0; i < 2; i++) {
+        const it = { type: "mcpToolCall", id: uid("mcp"), server, tool, arguments: { x: 1 }, status: "inProgress" };
+        notify("item/started", { item: it, threadId: child, turnId: childTurn });
+      }
+      // The child carries on by itself: this turn doesn't wait for it.
+      const elicit = () =>
+        void request("mcpServer/elicitation/request", {
+          threadId: child,
+          turnId: childTurn,
+          serverName: server,
+          mode: "form",
+          message: `Allow the ${server} MCP server to run tool "${tool}"?`,
+          requestedSchema: { type: "object", properties: {} },
+          _meta: { codex_approval_kind: "mcp_tool_call", tool_params: { x: 1 } },
+        });
+      if (late) setTimeout(elicit, 50);
+      else elicit();
       return message("started");
     }
     case "followup":

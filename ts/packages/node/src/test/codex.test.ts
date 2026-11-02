@@ -439,6 +439,33 @@ describe("the Codex driver", () => {
     });
   }
 
+  for (const [how, end] of [
+    ["its turn is interrupted", "endchild interrupted"],
+    ["it's closed", "closechild"],
+  ]) {
+    for (const late of [false, true]) {
+      it(`cancels a child thread's approval that's about none of its calls, asked ${late ? "after" : "during"} its parent's turn, when ${how} after it`, async () => {
+        const { sdk, events } = setup({ permissions: "ask" });
+        const t = await sdk.create({ harness: "codex", cwd: tempDir() });
+        await sdk.send(t.id, `bgmcp srv echo${late ? " late" : ""}`);
+        await until(() => events.some((e) => e.type === "turn.completed"));
+        // Two calls alike: the approval can't be put down to either. It's the child's, and outlives the turn.
+        const r = await request(sdk, t.id);
+        const spawnId = calls((await sdk.snapshot(t.id)).items)[0]!.id;
+        expect(r).toMatchObject({ type: "permission", kind: "mcp", parent_id: spawnId });
+        expect(r.tool_call_id).toBeUndefined();
+        expect((await sdk.snapshot(t.id)).thread.status).toBe("waiting");
+        await sdk.send(t.id, end!);
+        const s = await settle(sdk, t.id);
+        const [spawn, ...mcp] = calls(s.items);
+        expect(spawn!.subagent).toEqual({ status: "stopped", background: true, model: "mini-child" });
+        expect(mcp.map((c) => c.status)).toEqual(["cancelled", "cancelled"]);
+        expect(s.requests).toEqual([]);
+        expect(events).toContainEqual(expect.objectContaining({ type: "request.resolved", request_id: r.id, resolution: { outcome: "cancel" } }));
+      });
+    }
+  }
+
   it("doesn't take a child thread's earlier report for a follow-up turn that ends without one", async () => {
     const { sdk } = setup();
     const t = await sdk.create({ harness: "codex", cwd: tempDir() });

@@ -203,6 +203,13 @@ impl ThreadRequest {
             ThreadRequest::Question(r) => r.tool_call_id.as_deref(),
         }
     }
+
+    pub fn parent_id(&self) -> Option<&str> {
+        match self {
+            ThreadRequest::Permission(r) => r.parent_id.as_deref(),
+            ThreadRequest::Question(r) => r.parent_id.as_deref(),
+        }
+    }
 }
 
 impl ThreadEvent {

@@ -1932,6 +1932,7 @@ impl CodexSession {
         };
         let Some(current) = c.subagent.clone() else { return };
         let Some(next) = change(&current) else { return };
+        let mut asked = Vec::new();
         if current.status == SubagentStatus::Running && next.status != SubagentStatus::Running {
             let within = |c: &str| c == call || ctx.ancestors(c).iter().any(|a| a.id() == call);
             let ended: Vec<Value> = self
@@ -1947,12 +1948,18 @@ impl CodexSession {
                 })
                 .map(|(id, _)| id.clone())
                 .collect();
+            // Its requests Codex no longer wants answered: the user's too, those that aren't
+            // about one of its calls (which ending it doesn't reach) included.
             let r = self.run(run).unwrap();
             for id in ended {
                 r.take_open(&id);
+                asked.extend(r.asked(&id));
             }
         }
         ctx.end_subagent(call, next);
+        for id in asked {
+            ctx.cancel_request(&id);
+        }
     }
 
     // ---------- the server's requests ----------
@@ -2174,6 +2181,9 @@ impl CodexSession {
                 }
                 if let Some(r) = &q.reason {
                     request["reason"] = json!(r);
+                }
+                if let Some(p) = &q.parent_id {
+                    request["parent_id"] = json!(p);
                 }
                 let standing = permission_key(q.kind, q.server.as_deref(), &q.name);
                 let (wanted, call2) = (p.wanted.clone(), call.clone());

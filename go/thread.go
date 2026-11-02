@@ -831,7 +831,7 @@ func (rt *threadRuntime) endTurn(end TurnEnd, carry bool) {
 		if t := r.request.TurnID(); t != "" && t != turn.ID {
 			continue
 		}
-		if call := r.request.ToolCallID(); call != "" && inBackground(rt.Item, call) {
+		if requestInBackground(rt.Item, r.request) {
 			continue
 		}
 		rt.dropRequest(id)
@@ -974,6 +974,10 @@ func (rt *threadRuntime) endSubagents(ends map[string]protocol.SubagentState, or
 		}
 		return false
 	}
+	from := func(call string) bool {
+		_, ended := ends[call]
+		return call != "" && (ended || within(call))
+	}
 	rt.finishText(within)
 	for id := range rt.structured {
 		if within(id) {
@@ -987,7 +991,15 @@ func (rt *threadRuntime) endSubagents(ends map[string]protocol.SubagentState, or
 	}
 	for _, id := range append([]string(nil), rt.requestOrder...) {
 		r := rt.requests[id]
-		if r == nil || r.request.ToolCallID() == "" || !within(r.request.ToolCallID()) {
+		if r == nil {
+			continue
+		}
+		// Its requests: about its calls, or (about none) from it.
+		if call := r.request.ToolCallID(); call != "" {
+			if !within(call) {
+				continue
+			}
+		} else if !from(r.request.ParentID()) {
 			continue
 		}
 		rt.dropRequest(id)
@@ -1022,6 +1034,20 @@ func runningInBackground(it protocol.Item) bool {
 	return ok && c.Subagent != nil && c.Subagent.Background && c.Subagent.Status == protocol.SubagentStatusRunning
 }
 
+// requestInBackground says whether a request is a background subagent's that's still running (about
+// one of its calls, or from it): it carries on after the turn it was asked in has ended.
+func requestInBackground(item func(string) (protocol.Item, bool), r protocol.ThreadRequest) bool {
+	if call := r.ToolCallID(); call != "" {
+		return inBackground(item, call)
+	}
+	p := r.ParentID()
+	if p == "" {
+		return false
+	}
+	it, ok := item(p)
+	return (ok && runningInBackground(it)) || inBackground(item, p)
+}
+
 // inBackground says whether an item is inside a background subagent that's still running: what it
 // does carries on after the turn it was started in has ended.
 func inBackground(item func(string) (protocol.Item, bool), id string) bool {
@@ -1054,7 +1080,9 @@ func (rt *threadRuntime) Decide(q PermissionQuery) Decision {
 func (rt *threadRuntime) Ask(request protocol.ThreadRequestValue, toolCallID string, answered func(protocol.Resolution), standing string) string {
 	turnID := rt.TurnID()
 	var id string
-	var parent string
+	// A request about a call is from the subagent the call is (or the thread itself); one about
+	// none says which it's from.
+	parent := protocol.ThreadRequest{Value: request}.ParentID()
 	if call, ok := rt.Item(toolCallID); ok && toolCallID != "" {
 		parent = call.ParentID()
 		rt.UpdateItem(call.ID(), Patch{"status": protocol.ToolStatusPending})
