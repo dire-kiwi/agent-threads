@@ -38,6 +38,10 @@ export type ToolKind = "shell" | "read" | "edit" | "search" | "web" | "mcp" | "a
  */
 export type ToolStatus = "pending" | "running" | "completed" | "failed" | "denied" | "cancelled";
 /**
+ * running: it's working. completed: it finished. failed: it ended with an error. stopped: it was stopped (killed, interrupted, or its harness process ended) before it finished.
+ */
+export type SubagentStatus = "running" | "completed" | "failed" | "stopped";
+/**
  * An open request, told apart by type.
  */
 export type ThreadRequest = PermissionRequest | QuestionRequest;
@@ -374,6 +378,7 @@ export interface ToolCall {
    * todo: the whole list after the call.
    */
   todos?: Todo[];
+  subagent?: SubagentState;
   /**
    * The id of the subagent tool_call this item belongs to. Absent for the main conversation.
    */
@@ -424,6 +429,36 @@ export interface FileChange {
 export interface Todo {
   text: string;
   status: "pending" | "in_progress" | "completed";
+}
+/**
+ * A subagent, as its call (a tool_call of kind subagent) shows it: how it's getting on, and how it ended.
+ */
+export interface SubagentState {
+  status: SubagentStatus;
+  /**
+   * It runs in the background: its call returned as soon as it started, and it carries on (its items keep arriving, after its turn has ended too) until it ends.
+   */
+  background?: boolean;
+  /**
+   * What kind of agent it is (Claude's subagent_type, e.g. general-purpose).
+   */
+  agent_type?: string;
+  /**
+   * The model it runs on.
+   */
+  model?: string;
+  /**
+   * What it's doing, as of its latest progress report (e.g. Reading notes.txt).
+   */
+  activity?: string;
+  /**
+   * How many tool calls it has made.
+   */
+  tool_uses?: number;
+  /**
+   * A background subagent's final report, once it has ended. (A foreground one's is its call's result.)
+   */
+  summary?: string;
 }
 /**
  * The harness compacted the conversation's context.
