@@ -385,6 +385,28 @@ func (a *AgentThreads) Snapshot(ctx context.Context, threadID string) (protocol.
 	return rt.snapshot(), nil
 }
 
+// SnapshotWindow is the thread's state now, as Snapshot, but a window of it: its last limit items
+// and what they need from before them, for a client that loads earlier ones with ItemsBefore
+// (spec/PROTOCOL.md, "Windows"). With a negative limit, or one it's within, it's the whole state.
+func (a *AgentThreads) SnapshotWindow(ctx context.Context, threadID string, limit int) (protocol.Snapshot, error) {
+	snap, err := a.Snapshot(ctx, threadID)
+	if err != nil {
+		return protocol.Snapshot{}, err
+	}
+	return protocol.SnapshotWindow(snap, limit), nil
+}
+
+// ItemsBefore is the thread's items before index before (a window's start), at most limit of them,
+// with the subagent calls they belong to and the requests they have: a page for a client that has
+// a window to load earlier items into.
+func (a *AgentThreads) ItemsBefore(ctx context.Context, threadID string, before int64, limit int) (protocol.ItemPage, error) {
+	snap, err := a.Snapshot(ctx, threadID)
+	if err != nil {
+		return protocol.ItemPage{}, err
+	}
+	return protocol.ItemsBefore(snap, before, limit), nil
+}
+
 // EventsSince is the thread's saved events after seq (at most limit of them, if limit > 0), for a
 // client catching up.
 func (a *AgentThreads) EventsSince(ctx context.Context, threadID string, seq int64, limit int) ([]protocol.ThreadEvent, error) {
@@ -1013,7 +1035,7 @@ func (a *AgentThreads) reattach(rt *threadRuntime, record *RunRecord) (bool, *Ru
 	}
 	// Requests the session didn't take up again can't be answered.
 	open := rt.openRequestIDs()
-	for _, r := range rt.state.Requests {
+	for _, r := range protocol.OpenRequests(rt.state) {
 		if !open[r.ID()] {
 			rt.emit(&protocol.RequestResolvedEvent{RequestID: r.ID(), Resolution: protocol.Resolution{Outcome: protocol.ResolutionOutcomeCancel}})
 		}
@@ -1049,7 +1071,7 @@ func recoverLost(rt *threadRuntime) {
 	s := rt.state.Thread.Status
 	if s == protocol.ThreadStatusRunning || s == protocol.ThreadStatusWaiting {
 		rt.turn = &turnState{ID: lastTurn(rt.state.Items)}
-		for _, r := range rt.state.Requests {
+		for _, r := range protocol.OpenRequests(rt.state) {
 			rt.emit(&protocol.RequestResolvedEvent{RequestID: r.ID(), Resolution: protocol.Resolution{Outcome: protocol.ResolutionOutcomeCancel}})
 		}
 		rt.AddItem(&protocol.Notice{

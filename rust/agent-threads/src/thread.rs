@@ -26,7 +26,7 @@ use crate::protocol::{
     Attachment, DeltaEventKind, Item, Resolution, ResolutionOutcome, Snapshot, Thread, ThreadEvent, ThreadRequest,
     Usage, UserMessage,
 };
-use crate::reducer::{apply_event, utf16_len};
+use crate::reducer::{apply_event, open_requests, utf16_len};
 use crate::spawner::Spawner;
 use crate::store::{RunRecord, Store, StoreError, StoreErrorKind};
 
@@ -703,7 +703,7 @@ impl ThreadContext {
         if self.requests.iter().any(|(id, _)| id == request_id) {
             return Err(answered);
         }
-        let Some(request) = self.state.requests.iter().find(|r| r.id() == request_id).cloned() else {
+        let Some(request) = open_requests(&self.state).find(|r| r.id() == request_id).cloned() else {
             return Err(answered);
         };
         self.requests.push((

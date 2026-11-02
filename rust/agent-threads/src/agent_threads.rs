@@ -16,14 +16,15 @@ use crate::harness::{Harness, LaunchOptions, McpServer, Skill, ThreadConfig, Tur
 use crate::ids::{new_id, now_iso};
 use crate::permissions::PermissionPolicy;
 use crate::protocol::{
-    Attachment, Command, Item, PermissionMode, Resolution, Snapshot, Thread, ThreadEvent, ThreadStatus,
+    Attachment, Command, Item, ItemPage, PermissionMode, Resolution, Snapshot, Thread, ThreadEvent, ThreadStatus,
 };
-use crate::reducer::{apply_event, initial_state};
+use crate::reducer::{apply_event, initial_state, open_requests};
 use crate::spawner::{Spawner, direct};
 use crate::store::{RunRecord, Store, StoreError};
 use crate::stores::memory::MemoryStore;
 use crate::thread::{Actor, Host, Job, Outgoing, ThreadContext, Turn};
 use crate::tools::Tool;
+use crate::window::{item_page, snapshot_window};
 
 /// What goes wrong.
 #[derive(Clone, Debug)]
@@ -549,6 +550,24 @@ impl AgentThreads {
     /// The thread's state now, including text streamed so far.
     pub async fn snapshot(&self, thread_id: &str) -> Result<Snapshot> {
         self.ready(thread_id).await?.call(|a| a.core.snapshot().clone()).await
+    }
+
+    /// A window of the thread's state now: its last `limit` items, and what they need from before
+    /// them (spec/PROTOCOL.md, "Windows"); the whole state if it has no more than `limit`.
+    pub async fn snapshot_window(&self, thread_id: &str, limit: usize) -> Result<Snapshot> {
+        self.ready(thread_id)
+            .await?
+            .call(move |a| snapshot_window(a.core.snapshot(), limit))
+            .await
+    }
+
+    /// The thread's items before index `before` (a window's `start`), at most `limit` of them, as
+    /// they are now, for a client loading earlier ones into its window.
+    pub async fn items_before(&self, thread_id: &str, before: u64, limit: usize) -> Result<ItemPage> {
+        self.ready(thread_id)
+            .await?
+            .call(move |a| item_page(a.core.snapshot(), before, limit))
+            .await
     }
 
     /// The thread's saved events after `seq` (at most `limit`), for a client catching up.
@@ -1171,10 +1190,7 @@ impl AgentThreads {
         let c = &mut actor.core;
         // Requests the session didn't take up again can't be answered.
         let open = c.open_request_ids();
-        let stale: Vec<String> = c
-            .snapshot()
-            .requests
-            .iter()
+        let stale: Vec<String> = open_requests(c.snapshot())
             .map(|r| r.id().to_string())
             .filter(|id| !open.contains(id))
             .collect();
@@ -1263,7 +1279,7 @@ fn recover_lost(c: &mut ThreadContext) {
             carried: 0,
             progressed: false,
         });
-        let requests: Vec<String> = c.snapshot().requests.iter().map(|r| r.id().to_string()).collect();
+        let requests: Vec<String> = open_requests(c.snapshot()).map(|r| r.id().to_string()).collect();
         for id in requests {
             c.emit_resolved(&id, &cancel_resolution());
         }

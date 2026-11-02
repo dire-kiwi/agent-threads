@@ -11,10 +11,11 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use agent_threads::protocol::ToolKind;
+use agent_threads::reducer::open_requests;
 use agent_threads::{
     AgentThreads, Capabilities, ClaudeCodeOptions, CreateOptions, Error, FileStore, LaunchOptions, McpServer,
-    MemoryState, MemoryStore, Options, PermissionDecision, PermissionPolicy, RunRecord, SendOptions, Skill, Spawner,
-    SqliteStore, Store, StoreError, StoreResult, ThreadEvent, ThreadOptions, ToolContext, tool,
+    MemoryState, MemoryStore, Options, PermissionDecision, PermissionPolicy, RunRecord, SendOptions, Skill, Snapshot,
+    Spawner, SqliteStore, Store, StoreError, StoreResult, ThreadEvent, ThreadOptions, ToolContext, tool,
 };
 use async_trait::async_trait;
 use common::{items, mini_runs, settle, texts, until};
@@ -393,7 +394,7 @@ async fn asks_the_policy_and_remembers_an_answer_given_always() {
         .await
         .unwrap();
     let r = until(5, || async {
-        env.sdk.snapshot(&t.id).await.unwrap().requests.first().cloned()
+        open_requests(&env.sdk.snapshot(&t.id).await.unwrap()).next().cloned()
     })
     .await;
     let r = serde_json::to_value(r).unwrap();
@@ -408,7 +409,12 @@ async fn asks_the_policy_and_remembers_an_answer_given_always() {
     );
     let respond = json!({"type": "respond", "thread_id": t.id, "request_id": r["id"], "resolution": {"outcome": "allow", "always": true}});
     env.sdk.handle_json(respond).await.unwrap();
-    settle(&env.sdk, &t.id).await;
+    let s = settle(&env.sdk, &t.id).await;
+
+    // The answered request stays, with its answer.
+    let mut answered = r.clone();
+    answered["resolution"] = json!({"outcome": "allow", "always": true});
+    assert_eq!(s["requests"], json!([answered]));
 
     env.sdk
         .send(&t.id, r#"tool Bash {"command":"pwd"}"#, SendOptions::default())
@@ -424,6 +430,46 @@ async fn asks_the_policy_and_remembers_an_answer_given_always() {
     );
     assert_eq!(*seen.lock().unwrap(), ["Read", "WebFetch", "Bash"]);
     assert_eq!(texts(&s).last().unwrap(), r#"ran with {"command":"pwd"}"#);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn gives_a_window_of_a_threads_last_items_and_pages_of_the_items_before_it() {
+    let env = setup(Setup::default());
+    let t = env.sdk.create(create()).await.unwrap();
+    for n in ["one", "two", "three"] {
+        env.sdk
+            .send(&t.id, &format!("reply {n}"), SendOptions::default())
+            .await
+            .unwrap();
+        settle(&env.sdk, &t.id).await;
+    }
+    let whole = serde_json::to_value(env.sdk.snapshot(&t.id).await.unwrap()).unwrap();
+    // A user message, the reply and the turn's result, for each turn.
+    let all = whole["items"].as_array().unwrap();
+    assert_eq!(all.len(), 9);
+    assert!(whole.get("start").is_none());
+    let value = |s| serde_json::to_value::<Snapshot>(s).unwrap();
+    assert_eq!(value(env.sdk.snapshot_window(&t.id, 20).await.unwrap()), whole);
+
+    let window = value(env.sdk.snapshot_window(&t.id, 4).await.unwrap());
+    assert_eq!(
+        (&window["start"], &window["seq"], &window["thread"]),
+        (&json!(5), &whole["seq"], &whole["thread"])
+    );
+    assert_eq!(window["items"], json!(all[5..]));
+    assert!(window.get("context").is_none());
+
+    let page = env.sdk.items_before(&t.id, 5, 3).await.unwrap();
+    assert_eq!(
+        serde_json::to_value(page).unwrap(),
+        json!({"thread_id": t.id, "items": all[2..5], "requests": [], "start": 2, "context": [], "seq": whole["seq"]})
+    );
+    let first = env.sdk.items_before(&t.id, 2, 3).await.unwrap();
+    assert_eq!(
+        (first.start, serde_json::to_value(first.items).unwrap()),
+        (0, json!(all[..2]))
+    );
+    assert!(env.sdk.items_before("nope", 2, 3).await.is_err());
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -649,7 +695,7 @@ async fn refuses_a_malformed_command_before_it_changes_anything() {
         .await
         .unwrap();
     let r = until(5, || async {
-        env.sdk.snapshot(&t.id).await.unwrap().requests.first().cloned()
+        open_requests(&env.sdk.snapshot(&t.id).await.unwrap()).next().cloned()
     })
     .await;
     let request_id = r.id().to_string();

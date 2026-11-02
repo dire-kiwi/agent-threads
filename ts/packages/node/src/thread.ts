@@ -566,7 +566,7 @@ export class ThreadRuntime implements ThreadContext {
   reopen(requestId: string, answered: (resolution: Resolution) => void, standing?: string): boolean {
     if (this.#requests.has(requestId)) return false;
     const request = this.#state.requests.find((r) => r.id === requestId);
-    if (!request) return false;
+    if (!request || request.resolution) return false;
     this.#requests.set(requestId, { request, answered, ...(standing ? { standing } : {}) });
     return true;
   }
