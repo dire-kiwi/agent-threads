@@ -545,9 +545,9 @@ async fn app_tool_not_run_again(h: &str, died: bool) {
         json!({"type": "send", "thread_id": id, "text": "app lookup {}"}),
     )
     .await;
-    // It has done what it does, and hasn't returned.
+    // It has done what it does, and hasn't returned. (The file is there before what's written to it.)
     let m = marker.clone();
-    until(move || m.exists()).await;
+    until(move || std::fs::read_to_string(&m).is_ok_and(|s| s.contains("ran\n"))).await;
     if died {
         a.crash().await;
     } else {
