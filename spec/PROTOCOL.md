@@ -10,7 +10,7 @@ source of truth for the shapes, and this document says what they mean. See
 | --- | --- |
 | [thread.schema.json](schema/thread.schema.json) | `Thread`, `ThreadStatus`, `PermissionMode`, `Run`, `Usage` |
 | [item.schema.json](schema/item.schema.json) | `Item` and its variants, `ToolKind`, `ToolStatus`, `ToolResult`, `FileChange`, `Todo`, `Attachment` |
-| [request.schema.json](schema/request.schema.json) | `ThreadRequest` (`PermissionRequest`, `QuestionRequest`), `Question`, `Resolution` |
+| [request.schema.json](schema/request.schema.json) | `ThreadRequest` (`PermissionRequest`, `QuestionRequest`, `PlanRequest`), `Question`, `Resolution` |
 | [event.schema.json](schema/event.schema.json) | `ThreadEvent` and its variants |
 | [command.schema.json](schema/command.schema.json) | `Command` and its variants |
 | [snapshot.schema.json](schema/snapshot.schema.json) | `Snapshot` |
@@ -116,10 +116,16 @@ open at once (e.g. from parallel subagents).
   requestUserInput). Each has an `id`, the `question`, an optional `header`, and `options` to choose
   from (`multi_select` for more than one). With no options, or with `allow_other`, the answer is
   free text. A `secret` answer mustn't be shown or logged.
+- `plan`: the agent has made a `plan` (Markdown) and asks to start on it: Claude's ExitPlanMode
+  (with the `tool_call_id` of its call), or the plan Codex proposes at the end of a turn in plan
+  mode. It's always the user's to answer, whatever the permission policy.
 
 A `Resolution` answers a request. `outcome` is `allow` or `deny` for a permission, with `always` to
 give the same answer to matching calls for the rest of the thread, and an optional `message` (for a
-deny, the agent is told it). For a question it's `answer`, with `answers` mapping each question's
+deny, the agent is told it). For a plan, `allow` starts on it: the thread's `permission_mode`
+becomes the resolution's `permission_mode` (the thread's own if that's left out, or `default` if the
+thread's is `plan`), and the harness leaves plan mode straight away, in the same turn. `deny` keeps
+it planning, and its `message` is the user's feedback on the plan. For a question it's `answer`, with `answers` mapping each question's
 id to the chosen option labels or the free text. `cancel` dismisses either; the backend also
 resolves its open requests with `cancel` when their turn ends first.
 
@@ -194,11 +200,17 @@ Every command has `type` and `thread_id`.
 | `send` | `text`, `attachments?`, `client_id?` | Send the agent a message. With no turn running it starts one; with one running it steers it (the message joins the running turn, as a `user_message` with `steered`). A steered message the harness doesn't take in before the turn ends starts the next turn. |
 | `interrupt` | | Stop the running turn. Its `turn_result` has `interrupted`. Does nothing if no turn is running. |
 | `respond` | `request_id`, `resolution` | Answer an open request. Answering one that isn't open does nothing. |
-| `set_options` | `model?`, `effort?`, `permission_mode?` | Change the thread's options; ones left out stay as they are. They apply from the next turn, or straight away where the harness allows, and a `thread.updated` follows. |
+| `set_options` | `model?`, `effort?`, `permission_mode?` | Change the thread's options; ones left out stay as they are. They apply straight away where the harness allows, and otherwise from the next turn, and a `thread.updated` follows. |
 
 `permission_mode` is `default` (ask via the permission policy), `accept_edits` (file edits in the
-thread's `cwd` are allowed without asking), `plan` (the agent plans and changes nothing) or
-`bypass` (nothing is asked). `effort` is the harness's own name for a reasoning effort.
+thread's `cwd` are allowed without asking), `plan` (the agent plans and changes nothing, and asks to
+start on its plan with a `plan` request) or `bypass` (nothing is asked). `effort` is the harness's own
+name for a reasoning effort.
+
+Claude Code takes a new model and permission mode in its running process (`set_model` and
+`set_permission_mode`), so they apply straight away, even to the running turn; a new effort applies
+from the next turn, in a new process. Codex takes all three with its next turn (`turn/start`'s
+overrides, and its plan collaboration mode), in the same process.
 
 A backend's `handle(command)` reports a command it can't carry out (an unknown thread, a malformed
 command) to its caller, rather than as an event.

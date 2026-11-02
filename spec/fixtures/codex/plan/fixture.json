@@ -1,0 +1,82 @@
+{
+  "description": "Plan mode (collaboration mode plan): the agent proposes a plan and its turn ends; the user's feedback is another plan-mode turn; they approve the second plan, which is a default-mode turn with Codex's own \"Implement the plan.\" and the accept_edits policy, in which the edit isn't asked about.",
+  "recorded": {
+    "cli": "codex-cli 0.165.0",
+    "model": "gpt-5.6-luna",
+    "date": "2026-11-02"
+  },
+  "thread": {
+    "harness": "codex",
+    "model": "gpt-5.6-luna",
+    "effort": "low",
+    "permission_mode": "plan"
+  },
+  "permissions": "ask",
+  "steps": [
+    {
+      "command": {
+        "type": "send",
+        "text": "Plan this change: in notes.txt, change the line apple to apricot. Don't ask me any questions, and keep the plan short.",
+        "client_id": "c1"
+      }
+    },
+    {
+      "wait": {
+        "type": "thread.updated",
+        "thread": {
+          "status": "waiting"
+        }
+      }
+    },
+    {
+      "command": {
+        "type": "respond",
+        "resolution": {
+          "outcome": "allow"
+        }
+      }
+    },
+    {
+      "wait": {
+        "type": "thread.updated",
+        "thread": {
+          "status": "waiting"
+        }
+      }
+    },
+    {
+      "command": {
+        "type": "respond",
+        "resolution": {
+          "outcome": "deny",
+          "message": "Also change the line banana to blueberry."
+        }
+      }
+    },
+    {
+      "wait": {
+        "type": "thread.updated",
+        "thread": {
+          "status": "waiting"
+        }
+      }
+    },
+    {
+      "command": {
+        "type": "respond",
+        "resolution": {
+          "outcome": "allow",
+          "permission_mode": "accept_edits"
+        }
+      }
+    },
+    {
+      "wait": {
+        "type": "thread.updated",
+        "thread": {
+          "status": "idle"
+        }
+      }
+    }
+  ]
+}

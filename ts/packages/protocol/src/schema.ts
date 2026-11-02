@@ -824,6 +824,9 @@ export const schema: { readonly $defs: { readonly [name: string]: unknown } } = 
         },
         {
           "$ref": "#/$defs/QuestionRequest"
+        },
+        {
+          "$ref": "#/$defs/PlanRequest"
         }
       ]
     },
@@ -892,6 +895,39 @@ export const schema: { readonly $defs: { readonly [name: string]: unknown } } = 
           "items": {
             "$ref": "#/$defs/Question"
           }
+        },
+        "tool_call_id": {
+          "type": "string"
+        },
+        "parent_id": {
+          "type": "string"
+        },
+        "turn_id": {
+          "type": "string"
+        },
+        "created_at": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "raw": {}
+      }
+    },
+    "PlanRequest": {
+      "type": "object",
+      "required": [
+        "id",
+        "type",
+        "plan"
+      ],
+      "properties": {
+        "id": {
+          "type": "string"
+        },
+        "type": {
+          "const": "plan"
+        },
+        "plan": {
+          "type": "string"
         },
         "tool_call_id": {
           "type": "string"
@@ -980,6 +1016,9 @@ export const schema: { readonly $defs: { readonly [name: string]: unknown } } = 
         },
         "message": {
           "type": "string"
+        },
+        "permission_mode": {
+          "$ref": "#/$defs/PermissionMode"
         },
         "answers": {
           "type": "object",
