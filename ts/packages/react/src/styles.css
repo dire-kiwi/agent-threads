@@ -557,6 +557,16 @@
   background: var(--at-accent-soft);
 }
 
+.at-subagent-tag {
+  flex-shrink: 0;
+  padding: 0 6px;
+  border: 1px solid var(--at-line-strong);
+  border-radius: 999px;
+  color: var(--at-muted);
+  font-size: 0.78em;
+  line-height: 1.5;
+}
+
 .at-subagent-activity {
   max-width: 16rem;
   overflow: hidden;

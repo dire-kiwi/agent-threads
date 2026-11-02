@@ -14,10 +14,11 @@ type Input = Record<string, unknown>;
 const inputOf = (call: ToolCall): Input => (call.input && typeof call.input === "object" ? (call.input as Input) : {});
 const str = (x: unknown): string => (typeof x === "string" ? x : "");
 
-/** What kind of subagent it is, e.g. "Explore"; "Subagent" for a general one. */
+/** What kind of subagent it is, e.g. "Explore"; "Skill" for a skill's forked one, "Subagent" for a general one. */
 export function subagentKind(call: ToolCall): string {
-  const type = str(inputOf(call).subagent_type);
-  return type && type !== "general-purpose" ? type : "Subagent";
+  const type = call.subagent?.agent_type || str(inputOf(call).subagent_type);
+  if (type && type !== "general-purpose") return type;
+  return call.name === "Skill" ? "Skill" : "Subagent";
 }
 
 /** Its title: its description, or the first line of its prompt. */
@@ -42,10 +43,10 @@ export function reportText(content: string): string {
   return lines.join("\n").trim();
 }
 
-/** What it's doing now: its latest tool call, or writing its reply. */
-function activity(items: readonly Item[], cwd?: string): string | undefined {
+/** What it's doing now: its latest tool call, or writing its reply (or its latest progress report, if it has no items). */
+function activity(call: ToolCall, items: readonly Item[], cwd?: string): string | undefined {
   const last = items[items.length - 1];
-  if (!last) return undefined;
+  if (!last) return call.subagent?.activity;
   if (last.type === "tool_call") {
     const m = toolMeta(last, cwd);
     return m.summary ? `${m.label} ${m.summary}` : m.label;
@@ -119,21 +120,30 @@ export const Subagent = memo(function Subagent({ call, className }: { call: Tool
         </span>
         <span className="at-tool-label">{subagentKind(call)}</span>
         <span className="at-tool-summary at-subagent-title">{subagentTitle(call)}</span>
-        <SubagentStatusBadge status={status} waiting={sub?.waiting} activity={status === "running" ? activity(items, cwd) : undefined} />
+        {sub?.background && (
+          <span className="at-subagent-tag" title="It runs in the background, after its call has returned">
+            background
+          </span>
+        )}
+        <SubagentStatusBadge status={status} waiting={sub?.waiting} activity={status === "running" ? activity(call, items, cwd) : undefined} />
       </button>
       {open && sub && <SubagentBody sub={sub} />}
     </div>
   );
 });
 
-/** What a subagent did, under its row: its prompt, its items and its report. */
+/**
+ * What a subagent did, under its row: its prompt, its items and its report. A background
+ * subagent's report is its summary (its call's result only says it started).
+ */
 function SubagentBody({ sub }: { sub: SubagentInfo }) {
   const { call } = sub;
   const input = inputOf(call);
-  const meta = [str(input.model), sub.toolUses > 0 && plural(sub.toolUses, "tool use")].filter(Boolean);
+  const meta = [call.subagent?.model || str(input.model), sub.background && "in the background", sub.toolUses > 0 && plural(sub.toolUses, "tool use")].filter(Boolean);
   const prompt = str(input.prompt);
   const hasText = sub.items.some((i) => i.type === "assistant_message" && i.text.trim());
-  const report = call.result && call.status === "completed" ? reportText(call.result.content) : "";
+  const report = sub.background ? (call.subagent?.summary ?? "") : call.result && call.status === "completed" ? reportText(call.result.content) : "";
+  const error = sub.background ? report : (call.result?.content ?? "");
   return (
     <div className="at-subagent-body">
       {meta.length > 0 && <div className="at-subagent-meta">{meta.join(" · ")}</div>}
@@ -145,11 +155,11 @@ function SubagentBody({ sub }: { sub: SubagentInfo }) {
       <MessageList parentId={sub.id} />
       {sub.status === "running" && (
         <div className="at-working">
-          <span className="at-dot" /> Working…
+          <span className="at-dot" /> {sub.background ? "Working in the background…" : "Working…"}
         </div>
       )}
-      {sub.status === "failed" && call.result ? (
-        <CodeBlock text={call.result.content} tone="error" />
+      {sub.status === "failed" && error ? (
+        <CodeBlock text={error} tone="error" />
       ) : (
         !hasText && report && <Markdown text={report} />
       )}
