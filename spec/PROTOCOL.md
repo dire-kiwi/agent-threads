@@ -210,7 +210,8 @@ name for a reasoning effort.
 Claude Code takes a new model and permission mode in its running process (`set_model` and
 `set_permission_mode`), so they apply straight away, even to the running turn; a new effort applies
 from the next turn, in a new process. Codex takes all three with its next turn (`turn/start`'s
-overrides, and its plan collaboration mode), in the same process.
+overrides, and its plan collaboration mode), in the same process; a model or effort that's cleared,
+which it can't be told, starts a new process at the next turn, with Codex's own.
 
 A backend's `handle(command)` reports a command it can't carry out (an unknown thread, a malformed
 command) to its caller, rather than as an event.

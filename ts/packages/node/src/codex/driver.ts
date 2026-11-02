@@ -446,7 +446,11 @@ class CodexSession implements HarnessSession {
   }
 
   optionsChanged(): void {
-    // Codex takes them with the next turn (#turnOptions).
+    // Codex takes them with the next turn (#turnOptions), and keeps them: a model or effort that's
+    // cleared, which turn/start can't say, needs a new process, which starts with Codex's own.
+    const l = this.#live()?.launched;
+    const t = this.#ctx.thread;
+    if (l && ((l.model && !t.model) || (l.effort && !t.effort))) this.#stale = true;
   }
 
   configChanged(): void {
@@ -659,8 +663,14 @@ class CodexSession implements HarnessSession {
   #turnFailed(run: Run, e: unknown): void {
     if (run.exited || run.retired || run !== this.#run) return;
     run.turnEnded();
+    if (this.#ctx.turnId) this.#ctx.endTurn({ ok: false, error: e instanceof Error ? e.message : String(e), ...this.#plannedSoFar(run) });
     run.planned = undefined;
-    if (this.#ctx.turnId) this.#ctx.endTurn({ ok: false, error: e instanceof Error ? e.message : String(e) });
+  }
+
+  /** What the turn's Codex turns that completed (its plans') used, for a turn that ends otherwise. */
+  #plannedSoFar(run: Run): { usage?: Usage; duration_ms?: number } {
+    const p = run.planned;
+    return { ...(p?.usage ? { usage: p.usage } : {}), ...(p?.duration_ms !== undefined ? { duration_ms: p.duration_ms } : {}) };
   }
 
   // ---------- the process ----------
@@ -935,8 +945,9 @@ class CodexSession implements HarnessSession {
     // A run that ends while its turn is running ends the turn (as interrupted, if it was).
     if (!run.retired && ctx.turnId) {
       this.#clearStop();
-      ctx.endTurn({ ok: false, error: exitError(status, run.stderr, true) });
+      ctx.endTurn({ ok: false, error: exitError(status, run.stderr, true), ...this.#plannedSoFar(run) });
     }
+    run.planned = undefined;
     run.finish();
   }
 

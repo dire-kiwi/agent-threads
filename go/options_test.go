@@ -444,6 +444,38 @@ func TestCodexGivesTheProcessNewOptionsWithItsNextTurn(t *testing.T) {
 	}
 }
 
+func TestCodexStartsANewProcessWhenTheModelOrEffortIsCleared(t *testing.T) {
+	// With Codex's own: turn/start can't clear one.
+	for _, option := range []string{"model", "effort"} {
+		t.Run(option, func(t *testing.T) {
+			t.Parallel()
+			m := newMini(t, agentthreads.Allow, nil)
+			id := m.create(agentthreads.CreateOptions{Harness: "codex", Model: "a", Effort: "high"})
+			m.send(id, "reply one")
+			m.settle(id)
+			cleared := agentthreads.ThreadOptions{Model: ptr("")}
+			if option == "effort" {
+				cleared = agentthreads.ThreadOptions{Effort: ptr("")}
+			}
+			m.setOptions(id, cleared)
+			m.send(id, "reply two")
+			m.settle(id)
+			runs := m.runs()
+			if len(runs) != 2 {
+				t.Fatalf("%d runs", len(runs))
+			}
+			if option == "model" {
+				if _, ok := runs[1].params("thread/resume")[0]["model"]; ok {
+					t.Fatalf("thread/resume %s", mustMarshal(runs[1].params("thread/resume")))
+				}
+			}
+			if turn := runs[1].params("turn/start")[0]; turn[option] != nil {
+				t.Fatalf("turn/start %s", mustMarshal(turn))
+			}
+		})
+	}
+}
+
 func TestCodexStartsANewProcessWhenTheConfigChanges(t *testing.T) {
 	// Resuming the session.
 	m := newMini(t, agentthreads.Allow, nil)
@@ -578,9 +610,8 @@ func TestCodexInPlanMode(t *testing.T) {
 		r := m.request(id)
 		m.send(id, "reply And two.", agentthreads.SendOptions{ClientID: "more"})
 		s := m.settle(id)
-		if !cancelled(m, r.ID()) {
-			t.Fatalf("the plan wasn't cancelled:\n%s", show(m.events.all()))
-		}
+		// Its event may reach the recorder after the thread's idle.
+		until(t, func() bool { return cancelled(m, r.ID()) })
 		var more *protocol.UserMessage
 		for _, it := range s.Items {
 			if u, ok := it.Value.(*protocol.UserMessage); ok && u.ClientID == "more" {
@@ -614,8 +645,26 @@ func TestCodexInPlanMode(t *testing.T) {
 		if rs := results(s.Items); len(rs) != 1 || rs[0].OK || !rs[0].Interrupted {
 			t.Fatalf("results %s", mustMarshal(rs))
 		}
-		if !cancelled(m, r.ID()) || len(s.Requests) != 0 {
+		if len(s.Requests) != 0 {
 			t.Fatalf("the plan wasn't cancelled: %s", mustMarshal(s.Requests))
+		}
+		until(t, func() bool { return cancelled(m, r.ID()) })
+	})
+
+	t.Run("keeps what the plans used when the turn fails after them", func(t *testing.T) {
+		t.Parallel()
+		m := newMini(t, agentthreads.Allow, nil)
+		id := m.create(agentthreads.CreateOptions{Harness: "codex", PermissionMode: *plan})
+		m.send(id, "propose One.")
+		r := m.request(id)
+		m.respond(id, r.ID(), protocol.Resolution{Outcome: protocol.ResolutionOutcomeDeny, Message: "crash"})
+		s := m.settle(id)
+		used := `{"input_tokens":60,"cache_read_tokens":40,"output_tokens":10}`
+		if rs := results(s.Items); len(rs) != 1 || rs[0].OK || !has(rs[0], `{"duration_ms":7,"usage":`+used+`}`) {
+			t.Fatalf("results %s", mustMarshal(rs))
+		}
+		if !has(s.Thread, `{"usage":`+used+`}`) {
+			t.Fatalf("thread %s", mustMarshal(s.Thread))
 		}
 	})
 

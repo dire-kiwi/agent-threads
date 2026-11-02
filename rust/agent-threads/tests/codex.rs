@@ -726,6 +726,33 @@ async fn gives_the_process_new_options_with_its_next_turn() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn starts_a_new_process_with_codexs_own_model_or_effort_when_the_threads_is_cleared() {
+    for option in ["model", "effort"] {
+        let env = setup(Capabilities::default(), plain(), &[]);
+        let t = env
+            .sdk
+            .create(CreateOptions {
+                model: Some("a".into()),
+                effort: Some("high".into()),
+                ..create()
+            })
+            .await
+            .unwrap();
+        env.sdk.send(&t.id, "reply one", SendOptions::default()).await.unwrap();
+        settle(&env.sdk, &t.id).await;
+        let cmd = json!({"type": "set_options", "thread_id": t.id, option: ""});
+        env.sdk.handle_json(cmd).await.unwrap();
+        env.sdk.send(&t.id, "reply two", SendOptions::default()).await.unwrap();
+        settle(&env.sdk, &t.id).await;
+        assert_eq!(mini_runs(&env.log).len(), 2, "{option}");
+        if option == "model" {
+            assert!(env.sent("thread/resume")[0]["params"].get("model").is_none());
+        }
+        assert!(env.sent("turn/start")[0]["params"].get(option).is_none(), "{option}");
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn starts_a_new_process_resuming_the_session_when_the_config_changes() {
     let env = setup(Capabilities::default(), plain(), &[]);
     let t = env
@@ -972,6 +999,31 @@ async fn in_plan_mode_ends_the_turn_when_its_interrupted_while_a_plan_waits() {
     }
     assert!(cancelled);
     assert_eq!(s["requests"], json!([]));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn in_plan_mode_keeps_what_the_plans_used_when_the_turn_fails_after_them() {
+    let env = setup(Capabilities::default(), plain(), &[]);
+    let t = planning(&env).await;
+    env.sdk.send(&t, "propose One.", SendOptions::default()).await.unwrap();
+    let r = env.request(&t).await;
+    env.sdk
+        .handle_json(respond(&t, &r, json!({"outcome": "deny", "message": "crash"})))
+        .await
+        .unwrap();
+    let s = settle(&env.sdk, &t).await;
+    let r = results(&s);
+    let used = json!({"input_tokens": 60, "cache_read_tokens": 40, "output_tokens": 10, "cache_write_tokens": 0});
+    assert_eq!(
+        (
+            r.len(),
+            r[0]["ok"].clone(),
+            r[0]["duration_ms"].clone(),
+            r[0]["usage"].clone()
+        ),
+        (1, json!(false), json!(7), used.clone())
+    );
+    assert_eq!(s["thread"]["usage"], used);
 }
 
 #[tokio::test(flavor = "multi_thread")]

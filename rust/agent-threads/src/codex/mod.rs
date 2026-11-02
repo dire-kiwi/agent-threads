@@ -205,6 +205,19 @@ struct Planned {
     request: Option<String>,
 }
 
+/// A turn's end with what its Codex turns that completed (its plans') used, for a turn that ends
+/// otherwise.
+fn with_planned(end: TurnEnd, planned: Option<Planned>) -> TurnEnd {
+    match planned {
+        Some(p) => TurnEnd {
+            usage: p.usage,
+            duration_ms: p.duration_ms,
+            ..end
+        },
+        None => end,
+    }
+}
+
 /// An MCP tool call running: for an elicitation (which only names its server) and the app's MCP
 /// tools.
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -928,15 +941,18 @@ impl CodexSession {
             return;
         }
         self.turn_ended(ctx, run);
-        self.run(run).unwrap().planned = None;
+        let planned = self.run(run).unwrap().planned.take();
         if ctx.turn_id().is_some() {
             let live = self.live_id().is_some();
             ctx.end_turn(
-                TurnEnd {
-                    ok: false,
-                    error: Some(error.to_string()),
-                    ..Default::default()
-                },
+                with_planned(
+                    TurnEnd {
+                        ok: false,
+                        error: Some(error.to_string()),
+                        ..Default::default()
+                    },
+                    planned,
+                ),
                 live,
             );
         }
@@ -1482,16 +1498,20 @@ impl CodexSession {
         if ctx.thread().run.as_ref().is_some_and(|r| r.id == id) {
             ctx.set_thread(|t| t.run = None);
         }
+        let planned = self.run(id).and_then(|r| r.planned.take());
         // A run that ends while its turn is running ends the turn (as interrupted, if it was).
         if !retired && ctx.turn_id().is_some() {
             self.clear_stop();
             let live = self.live_id().is_some();
             ctx.end_turn(
-                TurnEnd {
-                    ok: false,
-                    error: Some(error),
-                    ..Default::default()
-                },
+                with_planned(
+                    TurnEnd {
+                        ok: false,
+                        error: Some(error),
+                        ..Default::default()
+                    },
+                    planned,
+                ),
                 live,
             );
         }
@@ -2891,8 +2911,17 @@ impl HarnessSession for CodexSession {
         }
     }
 
-    fn options_changed(&mut self, _ctx: &mut ThreadContext) {
-        // Codex takes them with the next turn (turn_options).
+    fn options_changed(&mut self, ctx: &mut ThreadContext) {
+        // Codex takes them with the next turn (turn_options), and keeps them: a model or effort
+        // that's cleared, which turn/start can't say, needs a new process, which starts with
+        // Codex's own.
+        let Some(l) = self.live_id().and_then(|id| self.runs.get(&id)?.launched.clone()) else {
+            return;
+        };
+        let t = ctx.thread();
+        if (l.model.is_some() && t.model.is_none()) || (l.effort.is_some() && t.effort.is_none()) {
+            self.stale = true;
+        }
     }
 
     fn config_changed(&mut self, _ctx: &mut ThreadContext) {

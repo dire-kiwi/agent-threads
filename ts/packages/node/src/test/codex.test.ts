@@ -522,6 +522,19 @@ describe("the Codex driver", () => {
     expect(turns.map((p) => p.collaborationMode)).toEqual([undefined, undefined, undefined]);
   });
 
+  it.each(["model", "effort"] as const)("starts a new process, with Codex's own %s, when the thread's is cleared", async (option) => {
+    const { sdk, sent, runs } = setup();
+    const t = await sdk.create({ harness: "codex", model: "a", effort: "high", cwd: tempDir() });
+    await sdk.send(t.id, "reply one");
+    await settle(sdk, t.id);
+    await sdk.setOptions(t.id, { [option]: "" });
+    await sdk.send(t.id, "reply two");
+    await settle(sdk, t.id);
+    expect(runs()).toHaveLength(2);
+    if (option === "model") expect(sent("thread/resume")[0]!.params).not.toHaveProperty("model");
+    expect(sent("turn/start")[0]!.params).not.toHaveProperty(option);
+  });
+
   it("starts a new process, resuming the session, when the config changes", async () => {
     const { sdk, sent, runs } = setup();
     const t = await sdk.create({ harness: "codex", model: "a", cwd: tempDir() });
@@ -626,6 +639,17 @@ describe("the Codex driver", () => {
       expect(results(s.items)).toMatchObject([{ ok: false, interrupted: true }]);
       expect(events).toContainEqual(expect.objectContaining({ type: "request.resolved", request_id: r.id, resolution: { outcome: "cancel" } }));
       expect(s.requests).toEqual([]);
+    });
+
+    it("keeps what the plans used when the turn fails after them", async () => {
+      const { sdk } = setup();
+      const t = await sdk.create({ harness: "codex", permission_mode: "plan", cwd: tempDir() });
+      await sdk.send(t.id, "propose One.");
+      const r = await request(sdk, t.id);
+      await sdk.respond(t.id, r.id, { outcome: "deny", message: "crash" });
+      const s = await settle(sdk, t.id);
+      expect(results(s.items)).toMatchObject([{ ok: false, duration_ms: 7, usage: { input_tokens: 60, cache_read_tokens: 40, output_tokens: 10 } }]);
+      expect(s.thread.usage).toMatchObject({ input_tokens: 60, cache_read_tokens: 40, output_tokens: 10 });
     });
 
     it("doesn't ask about a plan outside plan mode", async () => {

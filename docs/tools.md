@@ -260,7 +260,8 @@ harness asks about at all:
 
 A new mode or model applies straight away where it can: Claude Code's running process is switched
 (`set_permission_mode`, `set_model`), even mid-turn, and Codex takes them with its next turn, in
-the same process. (A new effort starts a new Claude Code process at the next turn. Claude Code
+the same process. (A new effort starts a new Claude Code process at the next turn, as does clearing
+Codex's model or effort. Claude Code
 can't be switched to bypass mode unless it was started in it: until the next turn's new process,
 the driver allows what it asks about.)
 

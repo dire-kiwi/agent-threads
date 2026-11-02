@@ -534,7 +534,19 @@ func (s *codexSession) clearStop() {
 }
 
 // OptionsChanged: Codex takes them with the next turn (see turnOptions).
-func (s *codexSession) OptionsChanged() {}
+// OptionsChanged: Codex takes them with the next turn (turnOptions), and keeps them. A model or
+// effort that's cleared, which turn/start can't say, needs a new process, which starts with Codex's
+// own.
+func (s *codexSession) OptionsChanged() {
+	run := s.live()
+	if run == nil || run.launched == nil {
+		return
+	}
+	l, t := run.launched, s.ctx.Thread()
+	if (l.Model != "" && t.Model == "") || (l.Effort != "" && t.Effort == "") {
+		s.stale = true
+	}
+}
 
 func (s *codexSession) ConfigChanged() { s.stale = true }
 
@@ -876,10 +888,19 @@ func (s *codexSession) turnFailed(run *codexRun, err error) {
 		return
 	}
 	run.turnEnded()
-	run.planned = nil
 	if s.ctx.TurnID() != "" {
-		s.ctx.EndTurn(TurnEnd{Error: err.Error()})
+		s.ctx.EndTurn(withPlanned(TurnEnd{Error: err.Error()}, run.planned))
 	}
+	run.planned = nil
+}
+
+// withPlanned is a turn's end with what its Codex turns that completed (its plans') used, for a turn
+// that ends otherwise.
+func withPlanned(end TurnEnd, planned *codexPlanned) TurnEnd {
+	if planned != nil {
+		end.Usage, end.DurationMs = planned.Usage, planned.DurationMs
+	}
+	return end
 }
 
 // ---------- the process ----------
@@ -1316,8 +1337,9 @@ func (s *codexSession) exited(run *codexRun, status ExitStatus) {
 	// A run that ends while its turn is running ends the turn (as interrupted, if it was).
 	if !run.retired && ctx.TurnID() != "" {
 		s.clearStop()
-		ctx.EndTurn(TurnEnd{Error: codexExitError(status, run.stderr, true)})
+		ctx.EndTurn(withPlanned(TurnEnd{Error: codexExitError(status, run.stderr, true)}, run.planned))
 	}
+	run.planned = nil
 	run.finish()
 }
 
