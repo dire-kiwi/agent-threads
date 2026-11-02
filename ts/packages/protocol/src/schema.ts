@@ -556,6 +556,9 @@ export const schema: { readonly $defs: { readonly [name: string]: unknown } } = 
             "$ref": "#/$defs/Todo"
           }
         },
+        "subagent": {
+          "$ref": "#/$defs/SubagentState"
+        },
         "parent_id": {
           "type": "string"
         },
@@ -613,6 +616,46 @@ export const schema: { readonly $defs: { readonly [name: string]: unknown } } = 
           "type": "integer"
         }
       }
+    },
+    "SubagentState": {
+      "type": "object",
+      "required": [
+        "status"
+      ],
+      "properties": {
+        "status": {
+          "$ref": "#/$defs/SubagentStatus"
+        },
+        "background": {
+          "type": "boolean",
+          "default": false
+        },
+        "agent_type": {
+          "type": "string"
+        },
+        "model": {
+          "type": "string"
+        },
+        "activity": {
+          "type": "string"
+        },
+        "tool_uses": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "summary": {
+          "type": "string"
+        }
+      }
+    },
+    "SubagentStatus": {
+      "type": "string",
+      "enum": [
+        "running",
+        "completed",
+        "failed",
+        "stopped"
+      ]
     },
     "FileChange": {
       "type": "object",

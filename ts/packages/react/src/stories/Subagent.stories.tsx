@@ -49,3 +49,28 @@ export const NeedsYou: Story = () => {
     </FixtureThread>
   );
 };
+
+/** A background subagent: its call returned at once, and it carries on after its turn has ended. */
+export const Background: Story<{ done: boolean }> = ({ done }) => {
+  const snapshot = snapshotOf("claude/background-subagent", done ? undefined : (e) => e.type === "turn.completed");
+  return (
+    <FixtureThread snapshot={snapshot}>
+      <div className="at-root" style={{ maxWidth: "48rem" }}>
+        <Subagent call={subagentOf(snapshot)} />
+      </div>
+    </FixtureThread>
+  );
+};
+Background.argTypes = { done: { control: { type: "boolean" }, defaultValue: false } };
+
+/** A skill run in a forked subagent (a skill with context: fork). */
+export const SkillFork: Story = () => {
+  const snapshot = snapshotOf("claude/skill-fork");
+  return (
+    <FixtureThread snapshot={snapshot}>
+      <div className="at-root" style={{ maxWidth: "48rem" }}>
+        <Subagent call={subagentOf(snapshot)} />
+      </div>
+    </FixtureThread>
+  );
+};

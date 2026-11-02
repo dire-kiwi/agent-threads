@@ -212,6 +212,12 @@ type ThreadContext interface {
 	CancelRequest(id string)
 	// EndTurn says the running turn ended.
 	EndTurn(end TurnEnd)
+	// BeginTurn says the harness started a turn by itself, with no message (Claude does, to tell
+	// the agent that a background subagent has ended). It does nothing if a turn is running.
+	BeginTurn()
+	// StopSubagents says the subagents of these calls that are still running were stopped (their
+	// harness process ended): their calls still running are cancelled, and their open requests too.
+	StopSubagents(ids []string)
 	// Error reports something that went wrong that isn't the turn's, to the app's OnError.
 	Error(err error)
 	// Post runs fn on the thread's goroutine, after what's running there now.

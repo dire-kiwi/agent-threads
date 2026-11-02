@@ -4,7 +4,7 @@
 use serde_json::{Map, Value, json};
 
 use crate::ids::unix_time;
-use crate::protocol::{RateLimit, RateLimitStatus};
+use crate::protocol::{RateLimit, RateLimitStatus, SubagentState, SubagentStatus, ToolCall, ToolKind};
 use crate::thread::round_cost;
 
 /// The in-process MCP server that serves a thread's app tools.
@@ -288,6 +288,126 @@ pub(crate) fn claude_permission_mode(mode: Option<crate::protocol::PermissionMod
         Bypass => Some("bypassPermissions"),
         Default => None,
     }
+}
+
+/// How Claude says a subagent ended (in its task_* messages and the Agent call's result), as a
+/// SubagentStatus; none if what it says isn't an end.
+fn subagent_end(status: &Value) -> Option<SubagentStatus> {
+    match status.as_str()? {
+        "completed" | "success" => Some(SubagentStatus::Completed),
+        "failed" | "error" => Some(SubagentStatus::Failed),
+        "killed" | "stopped" | "cancelled" | "interrupted" => Some(SubagentStatus::Stopped),
+        _ => None,
+    }
+}
+
+fn running() -> SubagentState {
+    SubagentState {
+        status: SubagentStatus::Running,
+        background: false,
+        agent_type: None,
+        model: None,
+        activity: None,
+        tool_uses: None,
+        summary: None,
+    }
+}
+
+/// A subagent call's subagent, as a task_started (of a local_agent) says it has started.
+pub(crate) fn subagent_started(call: &ToolCall, m: &Value) -> SubagentState {
+    let mut s = call.subagent.clone().unwrap_or_else(running);
+    s.status = SubagentStatus::Running;
+    if m["is_backgrounded"] == true {
+        s.background = true;
+    }
+    if let Some(t) = str_arg(m, "subagent_type") {
+        s.agent_type = Some(t.into());
+    }
+    if let Some(model) = str_arg(m, "model").or_else(|| str_arg(&call.input, "model")) {
+        s.model = Some(model.into());
+    }
+    s
+}
+
+/// A subagent after a task_progress, task_updated or task_notification about it.
+pub(crate) fn subagent_task(s: &SubagentState, m: &Value) -> SubagentState {
+    let mut next = s.clone();
+    let running = s.status == SubagentStatus::Running;
+    match m["subtype"].as_str() {
+        Some("task_progress") => {
+            if let Some(d) = str_arg(m, "description") {
+                next.activity = Some(d.into());
+            }
+            if let Some(n) = m["usage"]["tool_uses"].as_u64() {
+                next.tool_uses = Some(n);
+            }
+        }
+        Some("task_updated") => {
+            // Continued (with SendMessage) after it ended, it runs again.
+            if m["patch"]["status"] == "running" {
+                next.status = SubagentStatus::Running;
+                next.summary = None;
+            } else if let Some(end) = subagent_end(&m["patch"]["status"]).filter(|_| running) {
+                next.status = end;
+            }
+        }
+        Some("task_notification") => {
+            if let Some(end) = subagent_end(&m["status"]).filter(|_| running) {
+                next.status = end;
+            }
+            if let Some(n) = m["usage"]["tool_uses"].as_u64() {
+                next.tool_uses = Some(n);
+            }
+            // A foreground subagent's report is its call's result.
+            if s.background
+                && let Some(summary) = str_arg(m, "summary")
+            {
+                next.summary = slim(summary)["content"].as_str().map(String::from);
+            }
+        }
+        _ => {}
+    }
+    next
+}
+
+/// A subagent call's subagent, as its result says (`meta` is the result's tool_use_result, `text`
+/// its content); none for a call whose subagent never started (it failed, or was denied).
+pub(crate) fn subagent_result(
+    call: &ToolCall,
+    is_error: bool,
+    interrupted: bool,
+    meta: &Value,
+    text: &str,
+) -> Option<SubagentState> {
+    if call.kind != ToolKind::Subagent || (call.subagent.is_none() && is_error) {
+        return None;
+    }
+    let mut s = call.subagent.clone().unwrap_or_else(running);
+    if let Some(m) = str_arg(meta, "resolvedModel") {
+        s.model = Some(m.into());
+    }
+    if let Some(t) = str_arg(meta, "agentType") {
+        s.agent_type = Some(t.into());
+    }
+    if let Some(n) = meta["totalToolUseCount"].as_u64() {
+        s.tool_uses = Some(n);
+    }
+    // A background subagent's call returns as soon as it has started it.
+    if meta["isAsync"] == true
+        || meta["status"] == "async_launched"
+        || text.trim_start().starts_with("Async agent launched")
+    {
+        s.background = true;
+    } else if s.status == SubagentStatus::Running {
+        s.status = if is_error && interrupted {
+            SubagentStatus::Stopped
+        } else if is_error {
+            SubagentStatus::Failed
+        } else {
+            subagent_end(&meta["status"]).unwrap_or(SubagentStatus::Completed)
+        };
+    }
+    Some(s)
 }
 
 /// The limit a `rate_limit_info` reports (from a rate_limit_event, or a message refused for the

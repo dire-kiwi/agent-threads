@@ -16,6 +16,11 @@ export interface SubagentInfo {
   /** What it did: the items whose parent_id is its id. */
   items: readonly Item[];
   status: SubagentStatus;
+  /**
+   * It runs in the background: its call returned as soon as it started, and it carries on after
+   * (so it can be running while its call has completed, and after its turn).
+   */
+  background: boolean;
   /** How many tools it has called. */
   toolUses: number;
   /** One of its requests (a permission or question) is open. */
@@ -83,7 +88,8 @@ export function buildView(items: readonly Item[], requests: readonly ThreadReque
       call: item,
       items: own,
       status: subagentStatus(item),
-      toolUses: own.reduce((n, i) => (i.type === "tool_call" ? n + 1 : n), 0),
+      background: !!item.subagent?.background,
+      toolUses: item.subagent?.tool_uses ?? own.reduce((n, i) => (i.type === "tool_call" ? n + 1 : n), 0),
       waiting: waiting.has(item.id),
       parent: item.parent_id,
     };
@@ -99,7 +105,9 @@ export function buildView(items: readonly Item[], requests: readonly ThreadReque
   };
 }
 
+/** The subagent's own status where the harness gives it (a background one's call has completed), or its call's. */
 function subagentStatus(call: ToolCall): SubagentStatus {
+  if (call.subagent) return call.subagent.status;
   switch (call.status) {
     case "pending":
     case "running":

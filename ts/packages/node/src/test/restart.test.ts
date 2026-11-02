@@ -291,6 +291,69 @@ describe.skipIf(process.platform === "win32")("a backend restart", () => {
     expect(said.join("\n")).toMatch(/may or may not have finished/);
   });
 
+  it.each(["running", "waiting on its request"])(
+    "stops a background subagent (%s) whose run was lost with the backend, and ends no turn that had ended",
+    { timeout: 60_000 },
+    async (how) => {
+      // The direct spawner's runs go with the backend: the next can't pick them up.
+      const s = mini({ SPAWNER: "direct", ...(how === "running" ? {} : { POLICY: "ask" }) });
+      const a = s.start();
+      const thread = await a.call<{ id: string }>("create", { harness: "claude", cwd: s.dirs.cwd });
+      await a.call("handle", { type: "send", thread_id: thread.id, text: "background 60000 apple" } satisfies Command);
+      await a.waitFor({ type: "turn.completed" });
+      await a.waitFor({ type: "thread.updated", thread: { status: how === "running" ? "idle" : "waiting" } });
+      await a.call("saved", thread.id);
+      await a.crash();
+
+      // Direct runs aren't saved as runs: the thread finds its run lost when it's loaded.
+      const b = s.start();
+      expect(await b.call("recover")).toEqual({ reattached: [], lost: [] });
+      const snap = await b.call<Snapshot>("snapshot", thread.id);
+      await b.call("close");
+      await b.exited;
+      const [agent, bash] = snap.items.filter((i) => i.type === "tool_call");
+      expect(agent).toMatchObject({ status: "completed", subagent: { status: "stopped", background: true } });
+      expect(bash).toMatchObject({ status: "cancelled", parent_id: agent!.id });
+      // None is still open (the subagent's was cancelled with it).
+      expect(openRequests(snap)).toEqual([]);
+      expect(snap.thread).toMatchObject({ status: "idle" });
+      expect(snap.thread.run).toBeUndefined();
+      // Its one turn had ended: it isn't ended again.
+      expect(snap.items.filter((i) => i.type === "turn_result")).toHaveLength(1);
+    },
+  );
+
+  it("takes up a background subagent's request after a restart with no turn running, and runs the turn Claude starts after", { timeout: 60_000 }, async () => {
+    const s = mini({ POLICY: "ask" });
+    const a = s.start();
+    const thread = await a.call<{ id: string }>("create", { harness: "claude", cwd: s.dirs.cwd });
+    await a.call("handle", { type: "send", thread_id: thread.id, text: "background 200 apple" } satisfies Command);
+    await a.waitFor({ type: "turn.completed" });
+    await a.waitFor({ type: "thread.updated", thread: { status: "waiting" } });
+    await a.call("saved", thread.id);
+    await a.call("close");
+    await a.exited;
+
+    const b = s.start();
+    expect(await b.call("recover")).toEqual({ reattached: [thread.id], lost: [] });
+    let snap = await b.call<Snapshot>("snapshot", thread.id);
+    expect(snap.thread.status).toBe("waiting");
+    const from = b.events.length;
+    await b.call("handle", { type: "respond", thread_id: thread.id, request_id: openRequests(snap)[0]!.id, resolution: { outcome: "allow" } } satisfies Command);
+    // Answered with no turn running, the thread is idle; then Claude's report is a turn of its own.
+    await until(() => b.events.slice(from).filter((e) => e.type === "turn.completed").length === 1);
+    snap = await b.call<Snapshot>("snapshot", thread.id);
+    await b.call("close", { stop: true });
+    await b.exited;
+    const after = b.events.slice(from).filter((e) => e.type === "thread.updated").map((e) => (e.type === "thread.updated" ? e.thread.status : ""));
+    expect(after[0]).toBe("idle");
+    const [first, second] = snap.items.filter((i) => i.type === "turn_result");
+    expect(second?.turn_id).toBeDefined();
+    expect(second!.turn_id).not.toBe(first!.turn_id);
+    const saved = await savedEvents(s.dirs.store, thread.id);
+    expect(saved.filter((e) => e.type === "turn.started")).toHaveLength(2);
+  });
+
   it("keeps the text streamed before it died, also when the run ends while it's down before finishing its message", { timeout: 60_000 }, async () => {
     const s = mini();
     const a = s.start();

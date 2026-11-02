@@ -1,0 +1,30 @@
+{
+  "description": "A skill with context: fork, which Claude runs as a subagent of the Skill call (task_started with task_type local_agent).",
+  "recorded": {
+    "cli": "2.1.312 (Claude Code)",
+    "model": "haiku",
+    "date": "2026-11-02"
+  },
+  "thread": {
+    "harness": "claude",
+    "model": "haiku"
+  },
+  "permissions": "allow",
+  "steps": [
+    {
+      "command": {
+        "type": "send",
+        "text": "Use the Skill tool to run the app:first-line skill. Then reply with just what it reported.",
+        "client_id": "c1"
+      }
+    },
+    {
+      "wait": {
+        "type": "thread.updated",
+        "thread": {
+          "status": "idle"
+        }
+      }
+    }
+  ]
+}

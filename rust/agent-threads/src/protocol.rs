@@ -816,6 +816,75 @@ pub struct Snapshot {
     pub start: ::std::option::Option<u64>,
     pub thread: Thread,
 }
+///A subagent, as its call (a tool_call of kind subagent) shows it: how it's getting on, and how it ended.
+#[derive(::serde::Deserialize, ::serde::Serialize, Clone, Debug)]
+pub struct SubagentState {
+    ///What it's doing, as of its latest progress report (e.g. Reading notes.txt).
+    #[serde(skip_serializing_if = "::std::option::Option::is_none")]
+    pub activity: ::std::option::Option<::std::string::String>,
+    ///What kind of agent it is (Claude's subagent_type, e.g. general-purpose).
+    #[serde(skip_serializing_if = "::std::option::Option::is_none")]
+    pub agent_type: ::std::option::Option<::std::string::String>,
+    ///It runs in the background: its call returned as soon as it started, and it carries on (its items keep arriving, after its turn has ended too) until it ends.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub background: bool,
+    ///The model it runs on.
+    #[serde(skip_serializing_if = "::std::option::Option::is_none")]
+    pub model: ::std::option::Option<::std::string::String>,
+    pub status: SubagentStatus,
+    ///A background subagent's final report, once it has ended. (A foreground one's is its call's result.)
+    #[serde(skip_serializing_if = "::std::option::Option::is_none")]
+    pub summary: ::std::option::Option<::std::string::String>,
+    ///How many tool calls it has made.
+    #[serde(skip_serializing_if = "::std::option::Option::is_none")]
+    pub tool_uses: ::std::option::Option<u64>,
+}
+///running: it's working. completed: it finished. failed: it ended with an error. stopped: it was stopped (killed, interrupted, or its harness process ended) before it finished.
+#[derive(::serde::Deserialize, ::serde::Serialize, Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub enum SubagentStatus {
+    #[serde(rename = "running")]
+    Running,
+    #[serde(rename = "completed")]
+    Completed,
+    #[serde(rename = "failed")]
+    Failed,
+    #[serde(rename = "stopped")]
+    Stopped,
+}
+impl ::std::fmt::Display for SubagentStatus {
+    fn fmt(&self, f: &mut ::std::fmt::Formatter<'_>) -> ::std::fmt::Result {
+        match *self {
+            Self::Running => f.write_str("running"),
+            Self::Completed => f.write_str("completed"),
+            Self::Failed => f.write_str("failed"),
+            Self::Stopped => f.write_str("stopped"),
+        }
+    }
+}
+impl ::std::str::FromStr for SubagentStatus {
+    type Err = self::error::ConversionError;
+    fn from_str(value: &str) -> ::std::result::Result<Self, self::error::ConversionError> {
+        match value {
+            "running" => Ok(Self::Running),
+            "completed" => Ok(Self::Completed),
+            "failed" => Ok(Self::Failed),
+            "stopped" => Ok(Self::Stopped),
+            _ => Err("invalid value".into()),
+        }
+    }
+}
+impl ::std::convert::TryFrom<&str> for SubagentStatus {
+    type Error = self::error::ConversionError;
+    fn try_from(value: &str) -> ::std::result::Result<Self, self::error::ConversionError> {
+        value.parse()
+    }
+}
+impl ::std::convert::TryFrom<::std::string::String> for SubagentStatus {
+    type Error = self::error::ConversionError;
+    fn try_from(value: ::std::string::String) -> ::std::result::Result<Self, self::error::ConversionError> {
+        value.parse()
+    }
+}
 ///A thread's own state. Sent whole in thread.updated and in snapshots.
 #[derive(::serde::Deserialize, ::serde::Serialize, Clone, Debug)]
 pub struct Thread {
@@ -1079,6 +1148,9 @@ pub struct ToolCall {
     #[serde(skip_serializing_if = "::std::option::Option::is_none")]
     pub server: ::std::option::Option<::std::string::String>,
     pub status: ToolStatus,
+    ///subagent: the subagent itself, once the harness says it has started. Its status is the subagent's, which a background subagent's call (completed as soon as it has started it) doesn't show.
+    #[serde(skip_serializing_if = "::std::option::Option::is_none")]
+    pub subagent: ::std::option::Option<SubagentState>,
     ///A short summary of the call, e.g. a subagent's description.
     #[serde(skip_serializing_if = "::std::option::Option::is_none")]
     pub title: ::std::option::Option<::std::string::String>,

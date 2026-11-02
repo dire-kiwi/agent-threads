@@ -87,6 +87,11 @@ describe("snapshotWindow", () => {
     // Pending counts as running; one that's ended doesn't.
     expect(snapshotWindow({ ...quiet, items: quiet.items.map((i) => (i.id === "sb" ? { ...i, status: "pending" as const } : i)) }, 2).context).toEqual([1, 3]);
     expect(snapshotWindow({ ...quiet, items: quiet.items.map((i) => (i.id === "sb" ? { ...i, status: "cancelled" as const } : i)) }, 2)).not.toHaveProperty("context");
+    // Where the call has its subagent's own status, that says: a background subagent runs on after
+    // its call has completed, and one that ended with its call still running doesn't.
+    const sub = (status: "running" | "completed") => (i: Item) => (i.id === "sb" ? { ...i, status: "completed" as const, subagent: { status, background: true } } : i);
+    expect(snapshotWindow({ ...quiet, items: quiet.items.map(sub("running")) }, 2).context).toEqual([1, 3]);
+    expect(snapshotWindow({ ...quiet, items: quiet.items.map(sub("completed")) }, 2)).not.toHaveProperty("context");
   });
 
   it("leaves context out when it needs nothing from before it", () => {

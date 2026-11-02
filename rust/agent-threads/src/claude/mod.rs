@@ -23,17 +23,17 @@ use crate::harness::{
 };
 use crate::ids::{new_id, now_iso, now_ms, private_temp_dir};
 use crate::permissions::{Decided, PermissionDecision, PermissionQuery, permission_key};
-use crate::protocol::{DeltaEventKind, Item, Resolution, ResolutionOutcome, ToolKind, ToolStatus};
+use crate::protocol::{DeltaEventKind, Item, Resolution, ResolutionOutcome, ToolKind, ToolStatus, Usage};
 use crate::skills::write_skills;
 use crate::spawner::{ExitStatus, HarnessProcess, ProcessEvent, Signal, SpawnOptions};
 use crate::store::RunRecord;
-use crate::thread::{ThreadContext, Timer};
+use crate::thread::{ThreadContext, Timer, add_usage, running_in_background};
 use crate::tools::{Cancellation, ToolContext, run_tool};
 
 pub(crate) use translate::{APP_SERVER, result_text, slim, title};
 use translate::{
     claude_permission_mode, claude_rate_limits, claude_tool, claude_usage, edit_change, hook_notice, questions,
-    retry_text,
+    retry_text, subagent_result, subagent_started, subagent_task,
 };
 
 /// How the Claude Code harness runs.
@@ -152,6 +152,17 @@ struct RunState {
     asked: Vec<(String, String)>,
     open: Vec<(String, OpenRequest)>,
     sent: Vec<Sent>,
+    /// Its subagents' task ids, and their calls' ids.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    tasks: Vec<(String, String)>,
+    /// The calls whose subagents it ran.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    agents: Vec<String>,
+    /// The turn Claude started by itself, and the usage of its turns held for the user's.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    auto_turn: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    held_usage: Option<Usage>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     plugin_dir: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -196,6 +207,14 @@ struct Run {
     open: Vec<(String, OpenRequest)>,
     /// The messages sent, oldest first, by what Claude echoes when it takes one in.
     sent: Vec<Sent>,
+    /// Its subagents' task ids (which some task_* messages name them by) -> their calls' ids.
+    tasks: HashMap<String, String>,
+    /// The calls whose subagents it ran, which are stopped when it ends.
+    agents: Vec<String>,
+    /// The turn it started by itself (begin_turn), if it has.
+    auto_turn: Option<String>,
+    /// The usage of turns Claude made by itself while one of the user's waited, for that turn's.
+    held_usage: Option<Usage>,
     /// The generated plugin with the thread's skills, for this run only.
     plugin_dir: Option<PathBuf>,
     launched: Option<Launched>,
@@ -226,6 +245,10 @@ impl Run {
             asked: HashMap::new(),
             open: Vec::new(),
             sent: Vec::new(),
+            tasks: HashMap::new(),
+            agents: Vec::new(),
+            auto_turn: None,
+            held_usage: None,
             plugin_dir: None,
             launched: None,
             detached: false,
@@ -324,6 +347,14 @@ impl Run {
             asked: self.asked.iter().map(|(k, v)| (k.clone(), v.clone())).collect(),
             open: self.open.clone(),
             sent: self.sent.clone(),
+            tasks: {
+                let mut t: Vec<(String, String)> = self.tasks.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
+                t.sort();
+                t
+            },
+            agents: self.agents.clone(),
+            auto_turn: self.auto_turn.clone(),
+            held_usage: self.held_usage.clone(),
             plugin_dir: self.plugin_dir.as_ref().map(|p| p.to_string_lossy().into()),
             launched: self.launched.clone(),
             stale: false,
@@ -344,12 +375,23 @@ impl Run {
         self.asked = st.asked.iter().cloned().collect();
         self.open = st.open.clone();
         self.sent = st.sent.clone();
+        self.tasks = st.tasks.iter().cloned().collect();
+        self.agents = st.agents.clone();
+        self.auto_turn = st.auto_turn.clone();
+        self.held_usage = st.held_usage.clone();
         self.plugin_dir = st.plugin_dir.as_ref().map(PathBuf::from);
         self.launched = st.launched.clone();
     }
 
     fn finish(&self) {
         self.done.send_replace(true);
+    }
+
+    /// Notes a call whose subagent it runs.
+    fn add_agent(&mut self, call: &str) {
+        if !self.agents.iter().any(|a| a == call) {
+            self.agents.push(call.to_string());
+        }
     }
 }
 
@@ -766,6 +808,7 @@ impl ClaudeSession {
         run.pending.clear();
         run.fail_controls("Claude Code exited before it answered.");
         let retired = run.retired;
+        let agents = run.agents.clone();
         let error = exit_error(&status, &run.stderr);
         if self.current.as_deref() == Some(id) {
             self.current = None;
@@ -778,6 +821,8 @@ impl ClaudeSession {
         if ctx.thread().run.as_ref().is_some_and(|r| r.id == id) {
             ctx.set_thread(|t| t.run = None);
         }
+        // Its subagents end with it.
+        ctx.stop_subagents(&agents);
         // A run that ends while its turn is running ends the turn (as interrupted, if it was).
         if !retired && ctx.turn_id().is_some() {
             self.clear_stop();
@@ -925,6 +970,13 @@ impl ClaudeSession {
                 }
             }
             "system" => {
+                // Claude starts a turn by itself to tell the agent that a background subagent has
+                // ended.
+                if m["subtype"] == "init" && ctx.turn_id().is_none() {
+                    ctx.begin_turn();
+                    let turn = ctx.turn_id().map(String::from);
+                    self.run(id).unwrap().auto_turn = turn;
+                }
                 if m["subtype"] == "api_retry" {
                     let n = json!({"id": new_id("n"), "type": "notice", "level": "warning", "code": "retry", "text": retry_text(m)});
                     ctx.add_item(under(n));
@@ -936,6 +988,9 @@ impl ClaudeSession {
                     n["type"] = json!("notice");
                     n["code"] = json!("hook");
                     ctx.add_item(under(n));
+                }
+                if m["subtype"].as_str().is_some_and(|s| s.starts_with("task_")) {
+                    self.task(ctx, id, m);
                 }
                 if m["subtype"] == "init"
                     && let Some(sid) = m["session_id"].as_str().filter(|s| !s.is_empty())
@@ -1057,16 +1112,35 @@ impl ClaudeSession {
                 }
             }
             "result" => {
-                let run = self.run(id).unwrap();
-                // The turn's requests are moot now; its open questions are cancelled with it.
-                run.open.clear();
-                // Its messages are done with: what was kept to translate them needn't be any more.
-                run.msg_of_parent.clear();
-                run.block_count.clear();
-                run.streamed.clear();
+                let run = self.runs.get_mut(id).unwrap();
+                // The turn's requests are moot now; its open questions are cancelled with it. A
+                // background subagent's carry on.
+                run.open
+                    .retain(|(_, o)| tool_use_of(&o.request).is_some_and(|c| ctx.in_background(c)));
+                // Its messages are done with: what was kept to translate them needn't be any more,
+                // unless a background subagent is still sending its own.
+                if !run
+                    .agents
+                    .iter()
+                    .any(|a| ctx.item(a).is_some_and(running_in_background))
+                {
+                    run.msg_of_parent.clear();
+                    run.block_count.clear();
+                    run.streamed.clear();
+                }
                 if ctx.turn_id().is_none() {
                     return;
                 }
+                // The end of a turn Claude made by itself (to tell the agent a background subagent
+                // ended) while a turn of the user's waited for it: the user's goes on to its own
+                // result, which gets this one's usage too.
+                let usage: Option<Usage> = serde_json::from_value(claude_usage(m)).ok();
+                let run = self.run(id).unwrap();
+                if m["origin"]["kind"] == "task-notification" && ctx.turn_id() != run.auto_turn.as_deref() {
+                    run.held_usage = add_usage(run.held_usage.as_ref(), usage.as_ref());
+                    return;
+                }
+                let usage = add_usage(run.held_usage.take().as_ref(), usage.as_ref());
                 self.clear_stop();
                 let failed = m["is_error"].as_bool().unwrap_or(false);
                 let error = failed.then(|| {
@@ -1088,7 +1162,7 @@ impl ClaudeSession {
                 let end = TurnEnd {
                     ok: !failed,
                     error,
-                    usage: serde_json::from_value(claude_usage(m)).ok(),
+                    usage,
                     duration_ms: m["duration_ms"].as_f64().map(|d| d as u64),
                 };
                 let live = self.live_id().is_some();
@@ -1133,13 +1207,22 @@ impl ClaudeSession {
             let Some(Item::ToolCall(it)) = ctx.item(b["tool_use_id"].as_str().unwrap_or("")) else {
                 continue;
             };
+            let is_error = b["is_error"].as_bool().unwrap_or(false);
+            let result = slim(&result_text(&b["content"]));
+            let tur = &m["tool_use_result"];
+            let subagent = subagent_result(
+                it,
+                is_error,
+                ctx.interrupted(),
+                tur,
+                result["content"].as_str().unwrap_or(""),
+            );
             let (call, kind, status, path) = (
                 it.id.clone(),
                 it.kind,
                 it.status,
                 it.changes.first().map(|c| c.path.clone()),
             );
-            let is_error = b["is_error"].as_bool().unwrap_or(false);
             let mut patch = Map::new();
             // A denied call stays denied; its result is what the agent was told.
             if status != ToolStatus::Denied {
@@ -1152,8 +1235,7 @@ impl ClaudeSession {
                 };
                 patch.insert("status".into(), json!(s));
             }
-            patch.insert("result".into(), Value::Object(slim(&result_text(&b["content"]))));
-            let tur = &m["tool_use_result"];
+            patch.insert("result".into(), Value::Object(result));
             if kind == ToolKind::Edit
                 && tur.is_object()
                 && !is_error
@@ -1161,8 +1243,57 @@ impl ClaudeSession {
             {
                 patch.insert("changes".into(), json!([change]));
             }
+            if let Some(s) = subagent {
+                patch.insert("subagent".into(), json!(s));
+                if let Some(run) = self.run(id) {
+                    run.add_agent(&call);
+                }
+            }
             ctx.update_item(&call, Value::Object(patch));
         }
+    }
+
+    /// Claude's task_* messages about a subagent: an Agent call's, or a skill's forked one (whose
+    /// Skill call becomes a subagent call). Other tasks (a command run in the background) aren't.
+    fn task(&mut self, ctx: &mut ThreadContext, id: &str, m: &Value) {
+        if m["subtype"] == "task_started"
+            && m["task_type"] == "local_agent"
+            && let Some(call) = m["tool_use_id"].as_str()
+        {
+            let Some(Item::ToolCall(c)) = ctx.item(call) else {
+                return;
+            };
+            let mut patch = json!({"subagent": subagent_started(c, m)});
+            if c.kind != ToolKind::Subagent {
+                patch["kind"] = json!("subagent");
+                if c.title.is_none()
+                    && let Some(d) = m["description"].as_str().filter(|d| !d.is_empty())
+                {
+                    patch["title"] = json!(d);
+                }
+            }
+            let call = c.id.clone();
+            let Some(run) = self.run(id) else { return };
+            if let Some(t) = m["task_id"].as_str() {
+                run.tasks.insert(t.to_string(), call.clone());
+            }
+            run.add_agent(&call);
+            ctx.update_item(&call, patch);
+            return;
+        }
+        let call = match m["tool_use_id"].as_str() {
+            Some(c) => c.to_string(),
+            None => match m["task_id"].as_str().and_then(|t| self.run(id)?.tasks.get(t).cloned()) {
+                Some(c) => c,
+                None => return,
+            },
+        };
+        let Some(Item::ToolCall(c)) = ctx.item(&call) else {
+            return;
+        };
+        let Some(s) = &c.subagent else { return };
+        let next = subagent_task(s, m);
+        ctx.update_item(&call, json!({"subagent": next}));
     }
 
     fn control_request(&mut self, ctx: &mut ThreadContext, id: &str, request_id: &str, req: Value) {
@@ -1176,14 +1307,14 @@ impl ClaudeSession {
         }
     }
 
-    /// Whether Claude still wants this answered: not cancelled, its turn not over, its run not
-    /// gone.
+    /// Whether Claude still wants this answered: not cancelled, its turn not over (unless it's a
+    /// background subagent's, which carries on after it), its run not gone.
     fn wanted(&self, ctx: &ThreadContext, c: &CanUse) -> bool {
         self.runs
             .get(&c.run)
             .is_some_and(|r| r.is_open(&c.request) && !r.exited && !r.retired && !r.detached)
             && self.current.as_deref() == Some(c.run.as_str())
-            && ctx.turn_id() == c.turn.as_deref()
+            && (ctx.turn_id() == c.turn.as_deref() || c.tool_use_id.as_deref().is_some_and(|t| ctx.in_background(t)))
     }
 
     fn allow(&mut self, ctx: &ThreadContext, c: &CanUse, input: Value) {
@@ -1784,6 +1915,13 @@ fn mcp_reply(s: &mut ClaudeSession, run: &str, request_id: &str, msg_id: &Value,
 
 /// What identifies a user message in Claude's echo of it: its text blocks and how many images it
 /// has (Claude echoes the content as it was sent).
+/// The tool call a request of Claude's is about: a can_use_tool's, or an app tool's mcp_message.
+fn tool_use_of(req: &Value) -> Option<&str> {
+    req["tool_use_id"]
+        .as_str()
+        .or_else(|| req["message"]["params"]["_meta"]["claudecode/toolUseId"].as_str())
+}
+
 fn echo_key(content: &Value) -> String {
     if let Some(s) = content.as_str() {
         return json!([s, 0]).to_string();

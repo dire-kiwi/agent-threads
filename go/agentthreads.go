@@ -1079,16 +1079,21 @@ func (a *AgentThreads) reattach(rt *threadRuntime, record *RunRecord) (bool, *Ru
 	}
 	run := rt.state.Thread.Run
 	var data struct {
-		Turn *turnState `json:"turn"`
+		Turn json.RawMessage `json:"turn"`
 	}
 	json.Unmarshal(record.Data, &data)
 	s := rt.state.Thread.Status
 	if s == protocol.ThreadStatusRunning || s == protocol.ThreadStatusWaiting {
-		if data.Turn != nil {
-			t := *data.Turn
-			rt.turn = &t
-		} else {
+		var t turnState
+		switch {
+		case len(data.Turn) == 0:
+			// A run saved before runs had their turn has the last one.
 			rt.turn = &turnState{ID: lastTurn(rt.state.Items)}
+		case string(data.Turn) == "null" || json.Unmarshal(data.Turn, &t) != nil:
+			// Saved with no turn running: it may be waiting only on a background subagent's request.
+			rt.turn = nil
+		default:
+			rt.turn = &t
 		}
 	}
 	rt.adoptRun(*record)
@@ -1105,9 +1110,14 @@ func (a *AgentThreads) reattach(rt *threadRuntime, record *RunRecord) (bool, *Ru
 			rt.emit(&protocol.RequestResolvedEvent{RequestID: r.ID(), Resolution: protocol.Resolution{Outcome: protocol.ResolutionOutcomeCancel}})
 		}
 	}
-	// With none left (one answered before the restart is closed, say), the turn runs on.
-	if rt.turn != nil && len(open) == 0 && rt.state.Thread.Status == protocol.ThreadStatusWaiting {
-		rt.SetThread(func(t *protocol.Thread) { t.Status = protocol.ThreadStatusRunning })
+	// With none left (one answered before the restart is closed, say), the turn runs on, or the
+	// thread is idle if none was running.
+	if len(open) == 0 && rt.state.Thread.Status == protocol.ThreadStatusWaiting {
+		status := protocol.ThreadStatusIdle
+		if rt.turn != nil {
+			status = protocol.ThreadStatusRunning
+		}
+		rt.SetThread(func(t *protocol.Thread) { t.Status = status })
 	}
 	rt.reattachedRun = record.ID
 	reattached := *run
@@ -1131,20 +1141,53 @@ func lastTurn(items []protocol.Item) string {
 	return NewID("turn")
 }
 
-// recoverLost ends a turn whose process was lost when the backend stopped.
+// openTurn is the turn a thread's items say is still running: its last, if it has no turn_result
+// ("" if none is; a thread waiting with none running is waiting on a background subagent's request).
+func openTurn(items []protocol.Item) string {
+	last := ""
+	for i := len(items) - 1; i >= 0 && last == ""; i-- {
+		last = items[i].TurnID()
+	}
+	for _, it := range items {
+		if r, ok := it.Value.(*protocol.TurnResult); ok && r.TurnID == last {
+			return ""
+		}
+	}
+	return last
+}
+
+// recoverLost ends a turn whose process was lost when the backend stopped, and stops the subagents
+// that went with it (a background one may be running with no turn).
 func recoverLost(rt *threadRuntime) {
 	s := rt.state.Thread.Status
-	if s == protocol.ThreadStatusRunning || s == protocol.ThreadStatusWaiting {
-		rt.turn = &turnState{ID: lastTurn(rt.state.Items)}
-		for _, r := range protocol.OpenRequests(rt.state) {
-			rt.emit(&protocol.RequestResolvedEvent{RequestID: r.ID(), Resolution: protocol.Resolution{Outcome: protocol.ResolutionOutcomeCancel}})
+	open := openTurn(rt.state.Items)
+	turn := s == protocol.ThreadStatusRunning || (s == protocol.ThreadStatusWaiting && open != "")
+	if turn {
+		if open == "" {
+			open = NewID("turn")
 		}
+		rt.turn = &turnState{ID: open}
+	}
+	var running []string
+	for _, it := range rt.state.Items {
+		if c, ok := it.Value.(*protocol.ToolCall); ok && c.Subagent != nil && c.Subagent.Status == protocol.SubagentStatusRunning {
+			running = append(running, c.ID)
+		}
+	}
+	rt.StopSubagents(running)
+	// Its open requests can't be answered now.
+	for _, r := range protocol.OpenRequests(rt.state) {
+		rt.emit(&protocol.RequestResolvedEvent{RequestID: r.ID(), Resolution: protocol.Resolution{Outcome: protocol.ResolutionOutcomeCancel}})
+	}
+	if turn {
 		rt.AddItem(&protocol.Notice{
 			ID: NewID("n"), Level: protocol.NoticeLevelWarning, Code: "run.lost",
 			Text: "The backend stopped while this turn was running, and couldn't pick its run up again.",
 		})
 		// Not carried over: loading a thread starts no process. Its queued messages go with the next.
 		rt.endTurn(TurnEnd{Error: "The backend stopped while this turn was running."}, false)
+	} else if rt.state.Thread.Status == protocol.ThreadStatusWaiting {
+		rt.SetThread(func(t *protocol.Thread) { t.Status = protocol.ThreadStatusIdle })
 	}
 	rt.SetThread(func(t *protocol.Thread) { t.Run = nil })
 }

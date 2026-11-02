@@ -71,6 +71,11 @@ describe("buildView", () => {
     ]);
   });
 
+  it("takes a subagent's status, background and tool uses from its subagent, where the harness gives them", () => {
+    const sub = call("s", { kind: "subagent", status: "completed", subagent: { status: "running", background: true, tool_uses: 3 } });
+    expect(buildView([sub], []).subagents.get("s")).toMatchObject({ status: "running", background: true, toolUses: 3 });
+  });
+
   it("follows nested subagents out", () => {
     const v = buildView([call("a", { kind: "subagent" }), call("b", { kind: "subagent", parent_id: "a" }), call("c", { kind: "subagent", parent_id: "b" })], []);
     expect(lineage(v.subagents, "c")).toEqual(["c", "b", "a"]);

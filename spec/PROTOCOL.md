@@ -97,7 +97,7 @@ A `tool_call` has the harness's `name` for the tool and its `input` as the harne
 | `web` | Fetching or searching the web | `url`, `query` |
 | `mcp` | A tool on an external MCP server | `server`; `name` is the tool's own name |
 | `app` | A tool the app defined | |
-| `subagent` | Starting a subagent (Claude's Agent/Task, Codex's child threads) | `title` (its description) |
+| `subagent` | Starting a subagent (Claude's Agent/Task, Codex's child threads) | `title` (its description), `subagent` |
 | `todo` | Updating the agent's plan or todo list (TodoWrite, Codex's plan updates) | `todos`: the whole list |
 | `other` | Anything else | |
 
@@ -114,6 +114,26 @@ A subagent is a `tool_call` of kind `subagent`. Everything the subagent does (it
 reasoning and tool calls) is an item whose `parent_id` is that call's id, in the same thread and
 the same item list. Requests from a subagent have its `parent_id` too. The call's `result` is what
 the subagent returned.
+
+Where the harness says how the subagent itself is getting on, the call has a `subagent` with its
+`status` (`running`, `completed`, `failed` or `stopped`), `agent_type`, `model`, `tool_uses`, its
+latest `activity`, and whether it runs in the `background`. A call that starts a subagent some
+other way (a skill Claude runs in a forked subagent) becomes a `subagent` call once the subagent
+starts.
+
+A **background** subagent's call completes as soon as it has started the subagent, which carries
+on: its `subagent.status` stays `running`, and its items keep coming, after its turn has ended
+too. Its calls and requests aren't cancelled when its turn ends, so the thread can be `waiting`
+(on one of its requests) with no turn running; answering it leaves the thread `idle`. When it ends,
+its `subagent.summary` is its report (its call's `result` only says it started). A subagent still
+running when its harness process ends is `stopped`, and its calls still running are `cancelled`.
+
+The harness can start a **turn by itself**, with no `user_message`: Claude Code does when a
+background subagent ends, to tell the agent. It goes as any turn does (`turn.started`, the thread
+`running`, a `turn_result`, `turn.completed`). If the user sent a message just before (so a turn of
+theirs is running), what the harness does by itself goes in the user's turn, which ends when the
+harness is done with the user's message. A backend that restarts and can't pick up a thread's run
+stops its subagents that were running.
 
 ## Requests
 

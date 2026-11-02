@@ -121,8 +121,14 @@ function anchor(items: readonly Item[], at: Map<string, number>, r: ThreadReques
   return -1;
 }
 
+/**
+ * A subagent's call whose subagent hasn't finished: by its subagent's status where it has one (a
+ * background subagent's call completes as soon as it has started it), or else by the call's.
+ */
 const isRunningSubagent = (item: Item): boolean =>
-  item.type === "tool_call" && item.kind === "subagent" && (item.status === "pending" || item.status === "running");
+  item.type === "tool_call" &&
+  item.kind === "subagent" &&
+  (item.subagent ? item.subagent.status === "running" : item.status === "pending" || item.status === "running");
 
 function indices(items: readonly Item[]): Map<string, number> {
   const at = new Map<string, number>();

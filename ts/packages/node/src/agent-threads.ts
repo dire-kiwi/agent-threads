@@ -11,6 +11,7 @@ import {
   validate,
   type Attachment,
   type Command,
+  type Item,
   type ItemPage,
   type PermissionMode,
   type Resolution,
@@ -531,7 +532,9 @@ export class AgentThreads {
     const s = rt.thread.status;
     if (s === "running" || s === "waiting") {
       const last = [...rt.snapshot.items].reverse().find((i) => i.turn_id)?.turn_id;
-      rt.turn = data.turn ? { ...data.turn } : { id: last ?? newId("turn"), interrupted: false };
+      // A run saved with no turn running (null) had none: it may be waiting only on a background
+      // subagent's request. A run saved before runs had their turn has the last one.
+      rt.turn = data.turn ? { ...data.turn } : "turn" in data ? null : { id: last ?? newId("turn"), interrupted: false };
     }
     rt.adoptRun(record);
     const session = rt.session;
@@ -543,8 +546,9 @@ export class AgentThreads {
     // Requests the session didn't take up again can't be answered.
     const open = new Set(rt.openRequests.map((r) => r.id));
     for (const r of openRequests(rt.snapshot)) if (!open.has(r.id)) rt.emit({ type: "request.resolved", request_id: r.id, resolution: { outcome: "cancel" } });
-    // With none left (one answered before the restart is closed, say), the turn runs on.
-    if (rt.turn && !open.size && rt.thread.status === "waiting") rt.setThread({ status: "running" });
+    // With none left (one answered before the restart is closed, say), the turn runs on, or the
+    // thread is idle if none was running.
+    if (!open.size && rt.thread.status === "waiting") rt.setThread({ status: rt.turn ? "running" : "idle" });
     rt.setThread({ run: { ...run, reattached_at: new Date().toISOString() } });
     if (rt.turn) {
       rt.addItem({
@@ -574,16 +578,31 @@ export class AgentThreads {
   }
 }
 
-/** Ends a turn whose process was lost when the backend stopped. */
+/**
+ * The turn a thread's items say is still running: its last, if it has no turn_result. (A thread
+ * waiting with none running is waiting on a background subagent's request.)
+ */
+function openTurn(items: readonly Item[]): string | undefined {
+  const last = [...items].reverse().find((i) => i.turn_id)?.turn_id;
+  return last && !items.some((i) => i.type === "turn_result" && i.turn_id === last) ? last : undefined;
+}
+
+/**
+ * Ends a turn whose process was lost when the backend stopped, and stops the subagents that went
+ * with it (a background one may be running with no turn).
+ */
 function recoverLost(rt: ThreadRuntime): void {
   const s = rt.thread.status;
-  if (s === "running" || s === "waiting") {
-    const items = rt.snapshot.items;
-    const turnId = [...items].reverse().find((i) => i.turn_id)?.turn_id ?? newId("turn");
-    rt.turn = { id: turnId, interrupted: false };
-    for (const r of openRequests(rt.snapshot)) {
-      rt.emit({ type: "request.resolved", request_id: r.id, resolution: { outcome: "cancel" } });
-    }
+  const items = rt.snapshot.items;
+  const open = openTurn(items);
+  const turn = s === "running" || (s === "waiting" && open !== undefined);
+  if (turn) rt.turn = { id: open ?? newId("turn"), interrupted: false };
+  rt.stopSubagents(items.filter((i) => i.type === "tool_call" && i.subagent?.status === "running").map((i) => i.id));
+  // Its open requests can't be answered now.
+  for (const r of openRequests(rt.snapshot)) {
+    rt.emit({ type: "request.resolved", request_id: r.id, resolution: { outcome: "cancel" } });
+  }
+  if (turn) {
     rt.addItem({
       id: newId("n"),
       type: "notice",
@@ -593,6 +612,6 @@ function recoverLost(rt: ThreadRuntime): void {
     });
     // Not carried over: loading a thread starts no process. Its queued messages go with the next.
     rt.endTurn({ ok: false, error: "The backend stopped while this turn was running." }, { carry: false });
-  }
+  } else if (rt.thread.status === "waiting") rt.setThread({ status: "idle" });
   rt.setThread({ run: undefined });
 }

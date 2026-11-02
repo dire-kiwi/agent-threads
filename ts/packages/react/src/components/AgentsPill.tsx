@@ -67,7 +67,7 @@ export function AgentsPill({ className, onSelect }: {
               <BotIcon size={13} />
               <span className="at-agents-text">
                 <span className="at-agents-title">{subagentTitle(s.call)}</span>
-                <span className="at-agents-meta">{[subagentKind(s.call), s.toolUses > 0 && `${s.toolUses} tool uses`].filter(Boolean).join(" · ")}</span>
+                <span className="at-agents-meta">{[subagentKind(s.call), s.background && "background", s.toolUses > 0 && `${s.toolUses} tool uses`].filter(Boolean).join(" · ")}</span>
               </span>
               <SubagentStatusBadge status={s.status} waiting={s.waiting} />
             </button>

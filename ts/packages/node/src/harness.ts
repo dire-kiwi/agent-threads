@@ -176,8 +176,42 @@ export interface ThreadContext {
   cancelRequest(id: string): void;
   /** The running turn ended. */
   endTurn(end: TurnEnd): void;
+  /**
+   * The harness started a turn by itself, with no message (Claude does, to tell the agent that a
+   * background subagent has ended). Does nothing if a turn is running.
+   */
+  beginTurn(): void;
+  /**
+   * The subagents of these calls that are still running were stopped (their harness process
+   * ended): their calls still running are cancelled, and their open requests too.
+   */
+  stopSubagents(ids: Iterable<string>): void;
   /** Something went wrong that isn't the turn's: for the app's onError. */
   error(error: unknown): void;
+}
+
+/** The calls of the subagents an item is inside, innermost first. */
+export function* ancestors(item: (id: string) => Item | undefined, id: string): Generator<Item> {
+  const seen = new Set<string>();
+  for (let p = item(id)?.parent_id; p && !seen.has(p); p = item(p)?.parent_id) {
+    seen.add(p);
+    const it = item(p);
+    if (it) yield it;
+  }
+}
+
+/** Whether a tool_call is a background subagent's that's still running. */
+export function runningInBackground(it: Item | undefined): boolean {
+  return it?.type === "tool_call" && !!it.subagent?.background && it.subagent.status === "running";
+}
+
+/**
+ * Whether an item is inside a background subagent that's still running: what it does carries on
+ * after the turn it was started in has ended.
+ */
+export function inBackground(item: (id: string) => Item | undefined, id: string): boolean {
+  for (const a of ancestors(item, id)) if (runningInBackground(a)) return true;
+  return false;
 }
 
 /** What a driver needs saved to carry on with its run after the backend restarts. */

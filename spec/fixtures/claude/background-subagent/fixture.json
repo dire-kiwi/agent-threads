@@ -1,0 +1,43 @@
+{
+  "description": "A background subagent (run_in_background): its call returns at once, it carries on after the turn ends, and when it's done Claude starts a turn by itself to say so.",
+  "recorded": {
+    "cli": "2.1.312 (Claude Code)",
+    "model": "haiku",
+    "date": "2026-11-02"
+  },
+  "thread": {
+    "harness": "claude",
+    "model": "haiku"
+  },
+  "permissions": "allow",
+  "steps": [
+    {
+      "command": {
+        "type": "send",
+        "text": "Use the Agent tool with run_in_background set to true to start a general-purpose subagent with this prompt: 'Run `sleep 3` with the Bash tool, then read notes.txt with the Read tool and reply with its first line only.' Don't wait for it: reply with just: started",
+        "client_id": "c1"
+      }
+    },
+    {
+      "wait": {
+        "type": "thread.updated",
+        "thread": {
+          "status": "idle"
+        }
+      }
+    },
+    {
+      "wait": {
+        "type": "turn.started"
+      }
+    },
+    {
+      "wait": {
+        "type": "thread.updated",
+        "thread": {
+          "status": "idle"
+        }
+      }
+    }
+  ]
+}

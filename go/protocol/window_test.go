@@ -166,6 +166,19 @@ func TestSnapshotWindowBringsRunningSubagents(t *testing.T) {
 	if c := protocol.SnapshotWindow(quiet(protocol.ToolStatusCancelled), 2).Context; c != nil {
 		t.Fatalf("an ended subagent in context: %v", c)
 	}
+	// Where the call has its subagent's own status, that says: a background subagent runs on after
+	// its call has completed, and one that ended with its call still running doesn't.
+	withSubagent := func(status protocol.SubagentStatus) protocol.Snapshot {
+		s := quiet(protocol.ToolStatusCompleted)
+		c := *s.Items[3].Value.(*protocol.ToolCall)
+		c.Subagent = &protocol.SubagentState{Status: status, Background: true}
+		s.Items[3] = protocol.Item{Value: &c}
+		return s
+	}
+	same(t, protocol.SnapshotWindow(withSubagent(protocol.SubagentStatusRunning), 2).Context, []int64{1, 3})
+	if c := protocol.SnapshotWindow(withSubagent(protocol.SubagentStatusCompleted), 2).Context; c != nil {
+		t.Fatalf("an ended background subagent in context: %v", c)
+	}
 }
 
 func TestWithPageTakesThePagesVersion(t *testing.T) {

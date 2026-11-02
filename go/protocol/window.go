@@ -194,10 +194,18 @@ func indices(items []Item) map[string]int {
 	return at
 }
 
-// isRunningSubagent is whether item is a subagent's call that hasn't finished.
+// isRunningSubagent is whether item is a subagent's call whose subagent hasn't finished: by its
+// subagent's status where it has one (a background subagent's call completes as soon as it has
+// started it), or else by the call's.
 func isRunningSubagent(item Item) bool {
 	c, ok := item.Value.(*ToolCall)
-	return ok && c.Kind == ToolKindSubagent && (c.Status == ToolStatusPending || c.Status == ToolStatusRunning)
+	if !ok || c.Kind != ToolKindSubagent {
+		return false
+	}
+	if c.Subagent != nil {
+		return c.Subagent.Status == SubagentStatusRunning
+	}
+	return c.Status == ToolStatusPending || c.Status == ToolStatusRunning
 }
 
 // contextOf is the indices before start of the items with an id in need, and of their parents,
