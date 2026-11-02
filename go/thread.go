@@ -952,7 +952,8 @@ func (rt *threadRuntime) Reopen(requestID string, answered func(protocol.Resolut
 		return false
 	}
 	for _, r := range rt.state.Requests {
-		if r.ID() == requestID {
+		// One that's been resolved stays in the state, with its resolution, but can't be reopened.
+		if r.ID() == requestID && r.Resolution() == nil {
 			rt.addRequest(requestID, &openRequest{request: r, answered: answered, standing: standing})
 			return true
 		}
