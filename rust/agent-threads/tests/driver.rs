@@ -12,9 +12,9 @@ use std::time::Duration;
 
 use agent_threads::protocol::ToolKind;
 use agent_threads::{
-    AgentThreads, Capabilities, ClaudeCodeOptions, CreateOptions, Error, FileStore, McpServer, MemoryState,
-    MemoryStore, Options, PermissionDecision, PermissionPolicy, RunRecord, SendOptions, Skill, SqliteStore, Store,
-    StoreError, StoreResult, ThreadEvent, ThreadOptions, ToolContext, tool,
+    AgentThreads, Capabilities, ClaudeCodeOptions, CreateOptions, Error, FileStore, HarnessMessage, McpServer,
+    MemoryState, MemoryStore, Options, PermissionDecision, PermissionPolicy, RunRecord, SendOptions, Skill,
+    SqliteStore, Store, StoreError, StoreResult, ThreadEvent, ThreadOptions, ToolContext, tool,
 };
 use async_trait::async_trait;
 use common::{items, mini_runs, settle, texts, until};
@@ -28,6 +28,8 @@ struct Setup {
     store: Option<Arc<dyn Store>>,
     capabilities: Capabilities,
     errors: Arc<Mutex<Vec<String>>>,
+    /// What the app's on_harness_message has been given.
+    messages: Arc<Mutex<Vec<HarnessMessage>>>,
 }
 
 impl Default for Setup {
@@ -42,6 +44,7 @@ impl Default for Setup {
                 ..Default::default()
             },
             errors: Arc::default(),
+            messages: Arc::default(),
         }
     }
 }
@@ -68,12 +71,14 @@ impl Env {
         }
         claude.env.extend(env);
         let errors = self.setup.errors.clone();
+        let messages = self.setup.messages.clone();
         AgentThreads::new(Options {
             store: Some(store),
             harnesses: vec![agent_threads::claude_code(claude)],
             capabilities: self.setup.capabilities.clone(),
             on_error: Some(Arc::new(move |e| errors.lock().unwrap().push(e.to_string()))),
             event_capacity: 1 << 16,
+            on_harness_message: Some(Arc::new(move |m| messages.lock().unwrap().push(m.clone()))),
             ..Default::default()
         })
     }
@@ -157,6 +162,67 @@ async fn runs_turns_in_one_process_and_sets_the_session_id() {
     assert_eq!(runs.len(), 1);
     assert!(has(&runs[0].argv, "--model", "mini") && has(&runs[0].argv, "--setting-sources", ""));
     assert!(runs[0].argv.contains(&"--strict-mcp-config".to_string()));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn leaves_raw_out_unless_its_turned_on_and_passes_the_app_every_line() {
+    let mut env = setup(Setup::default());
+    let t = env.sdk.create(create()).await.unwrap();
+    env.sdk.send(&t.id, "reply hi", SendOptions::default()).await.unwrap();
+    let s = settle(&env.sdk, &t.id).await;
+    assert!(
+        env.events_json()
+            .iter()
+            .all(|e| e.get("raw").is_none() && e["item"].get("raw").is_none())
+    );
+    assert!(s["items"].as_array().unwrap().iter().all(|i| i.get("raw").is_none()));
+    let messages = env.setup.messages.lock().unwrap();
+    let types: Vec<&str> = messages
+        .iter()
+        .filter_map(|m| m.message.as_ref()?["type"].as_str())
+        .collect();
+    for want in ["control_response", "system", "assistant", "result"] {
+        assert!(types.contains(&want), "no {want} message in {types:?}");
+    }
+    let run = s["thread"]["run"]["id"].as_str().unwrap();
+    assert!(messages.iter().all(|m| m.thread_id == t.id
+        && m.harness == "claude"
+        && m.run_id == run
+        && m.message == serde_json::from_str::<Value>(&m.line).ok()));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn sends_control_requests_to_the_running_process_and_fails_them_when_it_cant() {
+    let env = setup(Setup::default());
+    let t = env.sdk.create(create()).await.unwrap();
+    let usage = json!({"subtype": "get_context_usage"});
+    assert!(matches!(
+        env.sdk.control(&t.id, usage.clone()).await,
+        Err(Error::Command(_))
+    ));
+    env.sdk.send(&t.id, "reply hi", SendOptions::default()).await.unwrap();
+    settle(&env.sdk, &t.id).await;
+    assert_eq!(env.sdk.control(&t.id, usage.clone()).await.unwrap(), json!({}));
+    assert!(matches!(
+        env.sdk.control(&t.id, json!("get_context_usage")).await,
+        Err(Error::Command(_))
+    ));
+    // One the process exits before answering.
+    let sdk = env.sdk.clone();
+    let id = t.id.clone();
+    let pending = tokio::spawn(async move { sdk.control(&id, json!({"subtype": "never_answered"})).await });
+    until(5, || async {
+        env.runs()
+            .first()?
+            .sent
+            .iter()
+            .any(|m| m["request"]["subtype"] == "never_answered")
+            .then_some(())
+    })
+    .await;
+    env.sdk.close(true).await.unwrap();
+    assert!(matches!(pending.await.unwrap(), Err(Error::Control { .. })));
+    assert!(matches!(env.sdk.control(&t.id, usage).await, Err(Error::Command(_))));
 }
 
 #[tokio::test(flavor = "multi_thread")]

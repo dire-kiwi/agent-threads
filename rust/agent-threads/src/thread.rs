@@ -19,12 +19,14 @@ use serde_json::{Map, Value, json};
 use tokio::sync::{broadcast, mpsc, oneshot};
 
 use crate::agent_threads::Error;
-use crate::harness::{HarnessSession, Message, RunCheckpoint, ThreadConfig, TurnEnd};
+use crate::harness::{
+    HarnessMessage, HarnessMessageHandler, HarnessSession, Message, RunCheckpoint, ThreadConfig, TurnEnd,
+};
 use crate::ids::{new_id, now_iso};
 use crate::permissions::{Decided, PermissionContext, PermissionDecision, PermissionPolicy, PermissionQuery, decide};
 use crate::protocol::{
-    Attachment, DeltaEventKind, Item, Resolution, ResolutionOutcome, Snapshot, Thread, ThreadEvent, ThreadRequest,
-    Usage, UserMessage,
+    Attachment, DeltaEventKind, Item, RateLimit, Resolution, ResolutionOutcome, Snapshot, Thread, ThreadEvent,
+    ThreadRequest, Usage, UserMessage,
 };
 use crate::reducer::{apply_event, utf16_len};
 use crate::spawner::Spawner;
@@ -105,6 +107,9 @@ pub(crate) struct Host {
     pub spawner: Arc<dyn Spawner>,
     pub events: broadcast::Sender<ThreadEvent>,
     pub on_error: Arc<dyn Fn(Error) + Send + Sync>,
+    /// Fill in events' `raw` (the raw option).
+    pub raw: bool,
+    pub on_harness_message: Option<HarnessMessageHandler>,
 }
 
 /// A thread on its task: the core and the driver's session.
@@ -149,6 +154,9 @@ pub struct ThreadContext {
     structured: HashMap<String, Value>,
     effects: VecDeque<Effect>,
     waiters: Vec<Waiter>,
+    /// The harness message being handled, which events made now have as their `raw` (with the raw
+    /// option).
+    raw: Option<Value>,
     tx: mpsc::UnboundedSender<Job>,
     /// Stops retrying writes: the backend is closing.
     pub(crate) disposed: bool,
@@ -279,6 +287,14 @@ impl ThreadContext {
 
     /// Numbers an event (`type` and its fields), applies it, sends it, and queues it to be saved.
     fn emit(&mut self, mut event: Value) {
+        // An item or request has the harness message it came from, and its event doesn't as well.
+        if let Some(raw) = &self.raw {
+            match event["type"].as_str() {
+                Some("item.added") => event["item"]["raw"] = raw.clone(),
+                Some("request.opened") => event["request"]["raw"] = raw.clone(),
+                _ => event["raw"] = raw.clone(),
+            }
+        }
         let saved = event["type"] != "delta";
         event["thread_id"] = json!(self.thread_id);
         event["seq"] = json!(self.state.seq + saved as u64);
@@ -394,6 +410,54 @@ impl ThreadContext {
         next.updated_at = Some(now_iso());
         self.thread_changed = true;
         self.emit(json!({"type": "thread.updated", "thread": next}));
+    }
+
+    /// The harness reported usage limits: they replace the thread's `rate_limits` with the same
+    /// ids, which are kept sorted by id (with a thread.updated if that changes them).
+    pub fn rate_limits(&mut self, limits: Vec<RateLimit>) {
+        if limits.is_empty() {
+            return;
+        }
+        self.set_thread(|t| {
+            for l in limits {
+                match t.rate_limits.iter_mut().find(|x| x.id == l.id) {
+                    Some(x) => *x = l,
+                    None => t.rate_limits.push(l),
+                }
+            }
+            t.rate_limits.sort_by(|a, b| a.id.cmp(&b.id));
+        });
+    }
+
+    /// Handles a line the harness process `run_id` wrote (`message` is it parsed, if it's JSON):
+    /// runs `handle`, which translates it, with the events it makes taking it as their `raw` (with
+    /// the raw option on), and then passes it to the app's `on_harness_message`.
+    pub fn from_harness(
+        &mut self,
+        run_id: &str,
+        line: &str,
+        message: Option<Value>,
+        handle: impl FnOnce(&mut ThreadContext, Option<&Value>),
+    ) {
+        let before = if self.host.raw && message.is_some() {
+            std::mem::replace(&mut self.raw, message.clone())
+        } else {
+            self.raw.take()
+        };
+        handle(self, message.as_ref());
+        self.raw = before;
+        if let Some(f) = self.host.on_harness_message.clone() {
+            let m = HarnessMessage {
+                thread_id: self.thread_id.clone(),
+                run_id: run_id.to_string(),
+                harness: self.state.thread.harness.clone(),
+                line: line.to_string(),
+                message,
+            };
+            if std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| f(&m))).is_err() {
+                self.error(Error::Other("the app's on_harness_message panicked".into()));
+            }
+        }
     }
 
     /// The harness took in the queued message with this id. Whether it was queued.
@@ -955,6 +1019,7 @@ impl Actor {
             structured: HashMap::new(),
             effects: VecDeque::new(),
             waiters: Vec::new(),
+            raw: None,
             tx: tx.clone(),
             disposed: false,
             exit: false,

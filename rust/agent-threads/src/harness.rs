@@ -11,6 +11,7 @@ use std::sync::Arc;
 
 use serde_json::Value;
 
+use crate::agent_threads::Error;
 use crate::protocol::{Attachment, Usage};
 use crate::store::RunRecord;
 use crate::thread::ThreadContext;
@@ -149,6 +150,29 @@ pub struct RunCheckpoint {
 
 pub type BoxFuture<T> = Pin<Box<dyn Future<Output = T> + Send>>;
 
+/// Where a control request's answer goes ([`HarnessSession::control`]): the harness's answer, an
+/// [`Error::Control`] if it refused it or didn't answer, or an [`Error::Command`] if there was
+/// nothing to send it to. Dropping it unanswered fails the request too.
+pub type ControlReply = Box<dyn FnOnce(Result<Value, Error>) + Send>;
+
+/// The app's handler for the lines harness processes write
+/// ([`on_harness_message`](crate::Options::on_harness_message)).
+pub type HarnessMessageHandler = Arc<dyn Fn(&HarnessMessage) + Send + Sync>;
+
+/// A line a thread's harness process wrote, for the app's
+/// [`on_harness_message`](crate::Options::on_harness_message).
+#[derive(Clone, Debug)]
+pub struct HarnessMessage {
+    pub thread_id: String,
+    /// The process that wrote it (the thread's `run.id` while it runs).
+    pub run_id: String,
+    pub harness: String,
+    /// The line, without its newline.
+    pub line: String,
+    /// The line parsed as JSON; none if it isn't JSON.
+    pub message: Option<Value>,
+}
+
 /// A driver's side, for one thread. Its methods are called on the thread's own task, one at a
 /// time, with the thread's [`ThreadContext`].
 pub trait HarnessSession: Send + Any {
@@ -170,6 +194,16 @@ pub trait HarnessSession: Send + Any {
     fn options_changed(&mut self, ctx: &mut ThreadContext);
     /// Stop the harness process, if it's running; the future resolves once it has gone.
     fn close(&mut self, ctx: &mut ThreadContext) -> BoxFuture<()>;
+
+    /// Sends the running process a request of the app's own ([`AgentThreads::control`]) and gives
+    /// `reply` its answer. A driver without it takes no requests.
+    ///
+    /// [`AgentThreads::control`]: crate::AgentThreads::control
+    fn control(&mut self, _ctx: &mut ThreadContext, _request: Value, reply: ControlReply) {
+        reply(Err(Error::Command(
+            "this thread's harness doesn't take control requests".into(),
+        )));
+    }
 
     // With a spawner whose processes outlive the backend (Spawner::durable). A driver that has none
     // of these has its runs stopped when the backend restarts, and their turns end.
