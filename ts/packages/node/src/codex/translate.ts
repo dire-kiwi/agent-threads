@@ -163,16 +163,19 @@ export function mcpServerConfig(s: McpServer): { [k: string]: unknown } | { unsu
 
 /**
  * The limits an `account/rateLimits/updated` notification's snapshot reports: its primary and
- * secondary windows, named by its limitId when that isn't Codex's own.
+ * secondary windows, named by its limitId when that isn't Codex's own. A used-up one is rejected,
+ * unless credits carry on past it.
  */
 export function codexRateLimits(rl: { [k: string]: any }): RateLimit[] {
   const prefix = typeof rl.limitId === "string" && rl.limitId && rl.limitId !== "codex" ? `${rl.limitId}:` : "";
+  // Credits carry on past a used-up window.
+  const credits = rl.credits?.hasCredits === true || rl.credits?.unlimited === true;
   const out: RateLimit[] = [];
   for (const key of ["primary", "secondary"]) {
     const w = rl[key];
     if (!w || typeof w !== "object") continue;
     const used = typeof w.usedPercent === "number" && Number.isFinite(w.usedPercent) ? w.usedPercent : undefined;
-    const limit: RateLimit = { id: prefix + key, status: used !== undefined && used >= 100 ? "rejected" : "allowed" };
+    const limit: RateLimit = { id: prefix + key, status: used !== undefined && used >= 100 ? (credits ? "warning" : "rejected") : "allowed" };
     if (used !== undefined) limit.used_percent = used;
     if (typeof w.resetsAt === "number" && Number.isFinite(w.resetsAt)) limit.resets_at = unixTime(w.resetsAt);
     if (typeof w.windowDurationMins === "number" && Number.isInteger(w.windowDurationMins) && w.windowDurationMins >= 0) limit.window_minutes = w.windowDurationMins;

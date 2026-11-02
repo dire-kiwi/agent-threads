@@ -587,7 +587,8 @@ export function codexLimits(rl) {
   for (const key of ["primary", "secondary"]) {
     const w = rl[key];
     if (!w || typeof w !== "object") continue;
-    const l = { id: prefix + key, status: typeof w.usedPercent === "number" && w.usedPercent >= 100 ? "rejected" : "allowed" };
+    const credits = rl.credits?.hasCredits === true || rl.credits?.unlimited === true;
+    const l = { id: prefix + key, status: typeof w.usedPercent === "number" && w.usedPercent >= 100 ? (credits ? "warning" : "rejected") : "allowed" };
     if (typeof w.usedPercent === "number") l.used_percent = w.usedPercent;
     if (typeof w.resetsAt === "number") l.resets_at = unixTime(w.resetsAt);
     if (typeof w.windowDurationMins === "number") l.window_minutes = w.windowDurationMins;

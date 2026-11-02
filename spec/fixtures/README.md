@@ -255,8 +255,9 @@ backend drives each CLI:
 - **Rate limits**: an `account/rateLimits/updated` notification's `rateLimits` reports a limit for
   each of its `primary` and `secondary` windows that isn't null or missing, named `primary` and
   `secondary` (with its `limitId` and `:` in front, when it has a `limitId` other than `codex`):
-  `usedPercent` is `used_percent`, and makes the `status` `rejected` when it's 100 or more and
-  `allowed` otherwise; `resetsAt` (Unix seconds) is `resets_at`, as `YYYY-MM-DDTHH:MM:SSZ`;
+  `usedPercent` is `used_percent`, and makes the `status` `rejected` when it's 100 or more (but
+  `warning` if the notification's `credits` has `hasCredits` or `unlimited` true, since credits carry
+  on past it) and `allowed` otherwise; `resetsAt` (Unix seconds) is `resets_at`, as `YYYY-MM-DDTHH:MM:SSZ`;
   `windowDurationMins` is `window_minutes`. The thread's `rate_limits` take them in as
   [PROTOCOL.md](../PROTOCOL.md#threads) says, with a `thread.updated` if that changes them.
 - **Usage**: Codex reports the thread's running totals, so a turn's usage is how far the last
