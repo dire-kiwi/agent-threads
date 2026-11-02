@@ -10,11 +10,11 @@
 import { mkdtempSync, realpathSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { isAbsolute, join, resolve, sep } from "node:path";
-import type { PermissionMode, Resolution, ToolCall, Usage } from "@dire-kiwi/agent-threads-protocol";
+import type { PermissionMode, Resolution, SubagentState, ToolCall, Usage } from "@dire-kiwi/agent-threads-protocol";
 import { messageParts } from "../attachments.js";
 import { title } from "../claude/translate.js";
 import { CommandError, ControlError } from "../errors.js";
-import { parseLine, type Harness, type HarnessSession, type Message, type RunCheckpoint, type ThreadContext } from "../harness.js";
+import { ancestors, inBackground, parseLine, runningInBackground, type Harness, type HarnessSession, type Message, type RunCheckpoint, type ThreadContext } from "../harness.js";
 import { newId } from "../ids.js";
 import { applyLaunchEnv, launchedOf, launchFromStored, sameLaunch, withEnv, type Launched } from "../launch.js";
 import { serveTools, type LoopbackMcp } from "../mcp-http.js";
@@ -48,7 +48,23 @@ import type {
   UserInput,
 } from "./protocol.js";
 import { Rpc, RpcError, type Incoming, type PendingRequest, type RequestId } from "./rpc.js";
-import { APP_SERVER, codexDone, codexPolicy, codexRateLimits, codexTool, codexUsage, isToolItem, mcpServerConfig, questions, sandboxPolicy, todos, unwrapCommand } from "./translate.js";
+import {
+  APP_SERVER,
+  childTurnSubagent,
+  codexDone,
+  codexPolicy,
+  codexRateLimits,
+  codexTool,
+  codexUsage,
+  collabSubagent,
+  isToolItem,
+  mcpServerConfig,
+  questions,
+  sandboxPolicy,
+  spawnDone,
+  todos,
+  unwrapCommand,
+} from "./translate.js";
 
 export interface CodexOptions {
   /** The `codex` binary. */
@@ -995,6 +1011,8 @@ class CodexSession implements HarnessSession {
       this.#last = run;
     }
     if (ctx.thread.run?.id === run.id) ctx.setThread({ run: undefined });
+    // Its subagents (child threads) end with it.
+    ctx.stopSubagents(run.children.values());
     // A run that ends while its turn is running ends the turn (as interrupted, if it was).
     if (!run.retired && ctx.turnId) {
       this.#clearStop();
@@ -1069,6 +1087,11 @@ class CodexSession implements HarnessSession {
           run.error = null;
           run.setTurn(p.turn.id);
         }
+        // A child taking up work again (a follow-up sent to it): its report is to come.
+        if (!own) {
+          run.lastChild.delete(p.threadId);
+          this.#subagent(run, parent_id!, (s) => collabSubagent(s, { status: "running" }));
+        }
         return;
       case "turn/completed":
         if (own) return this.#turnCompleted(run, p.turn as Turn);
@@ -1141,16 +1164,24 @@ class CodexSession implements HarnessSession {
         return;
       }
       case "collabAgentToolCall": {
-        if (item.tool !== "spawnAgent") return; // wait, sendInput... aren't items of their own.
-        if (!done) {
+        // wait, sendInput... aren't items of their own.
+        if (item.tool === "spawnAgent" && !done) {
           if (!ctx.item(item.id)) {
             const prompt = item.prompt ?? "";
             ctx.addItem({ id: item.id, type: "tool_call", name: "spawnAgent", kind: "subagent", input: { prompt }, status: "running", ...(prompt ? { title: prompt } : {}), ...under });
           }
           return;
         }
-        for (const t of item.receiverThreadIds ?? []) run.children.set(t, item.id);
-        if (item.status === "failed") ctx.updateItem(item.id, { status: "failed" });
+        if (!done) return;
+        if (item.tool === "spawnAgent") {
+          for (const t of item.receiverThreadIds ?? []) run.children.set(t, item.id);
+          ctx.updateItem(item.id, spawnDone(item));
+        }
+        // Any collab call's completion says how the child threads it's about are getting on.
+        for (const [t, state] of Object.entries(item.agentsStates ?? {})) {
+          const call = run.children.get(t);
+          if (call) this.#subagent(run, call, (s) => collabSubagent(s, state));
+        }
         return;
       }
       case "contextCompaction":
@@ -1200,8 +1231,11 @@ class CodexSession implements HarnessSession {
     run.proposed = undefined;
     run.turnEnded();
     run.error = null;
-    // The turn's requests are moot now; its open ones are cancelled with it.
-    run.open.clear();
+    // The turn's requests are moot now; its open ones are cancelled with it. A background
+    // subagent's carry on.
+    for (const [id, open] of run.open) {
+      if (!this.#inBackground(this.#parent(run, open.msg.params?.threadId) ?? undefined)) run.open.delete(id);
+    }
     // Codex reports the session's totals: the turn used how far they grew. (Where the session's
     // totals before it aren't known, the thread's usage stands in for them.)
     const usage = run.total ? codexUsage(run.total, run.baseline ? totalsAsUsage(run.baseline) : ctx.thread.usage) : undefined;
@@ -1264,11 +1298,42 @@ class CodexSession implements HarnessSession {
     });
   }
 
-  /** A subagent's turn ended: so did its call, with the subagent's last message. */
+  /** A subagent's turn ended: so did the subagent, with its last message. */
   #childDone(run: Run, child: string, turn: Turn, callId: string): void {
-    const status = turn?.status === "completed" ? "completed" : turn?.status === "interrupted" ? "cancelled" : "failed";
-    const content = status === "failed" ? (turn?.error?.message ?? run.lastChild.get(child) ?? "") : (run.lastChild.get(child) ?? "");
-    this.#ctx.updateItem(callId, { status, result: { content } });
+    this.#subagent(run, callId, (s) => childTurnSubagent(s, turn, run.lastChild.get(child)));
+  }
+
+  /**
+   * Changes a spawnAgent call's subagent, if it has one (`change` returns undefined to leave it).
+   * One that ends leaves nothing running: what it was doing is cancelled, and its requests with it.
+   */
+  #subagent(run: Run, callId: string, change: (s: SubagentState) => SubagentState | undefined): void {
+    const ctx = this.#ctx;
+    const it = ctx.item(callId);
+    if (it?.type !== "tool_call" || !it.subagent) return;
+    const next = change(it.subagent);
+    if (!next) return;
+    // Its requests Codex no longer wants answered: the user's too, those that aren't about one of
+    // its calls (which ending it doesn't reach) included.
+    const asked: string[] = [];
+    if (it.subagent.status === "running" && next.status !== "running") {
+      const lookup = (id: string) => ctx.item(id);
+      const within = (call: string | null | undefined) => !!call && (call === callId || [...ancestors(lookup, call)].some((a) => a.id === callId));
+      for (const id of [...run.open.keys()]) {
+        if (!within(this.#parent(run, run.open.get(id)!.msg.params?.threadId))) continue;
+        run.open.delete(id);
+        const rid = run.asked.get(id);
+        if (rid) asked.push(rid);
+      }
+    }
+    ctx.endSubagent(callId, next);
+    for (const rid of asked) ctx.cancelRequest(rid);
+  }
+
+  /** Whether what comes from the child thread of this subagent call is a background subagent's, which carries on after its turn. */
+  #inBackground(parentId: string | undefined): boolean {
+    const lookup = (id: string) => this.#ctx.item(id);
+    return parentId !== undefined && (runningInBackground(lookup(parentId)) || inBackground(lookup, parentId));
   }
 
   // ---------- the server's requests ----------
@@ -1285,9 +1350,16 @@ class CodexSession implements HarnessSession {
     const turn = resume ? resume.turn : ctx.turnId;
     const existing = resume?.existing;
     run.open.set(id, { turn, msg: m });
-    // Whether Codex still wants this answered: not resolved, its turn not over, its run not gone.
-    // (Not once it's left running as the backend shuts down: what's open stays as it was saved.)
-    const wanted = () => run.open.has(id) && !run.exited && !run.retired && !run.detached && this.#run === run && ctx.turnId === turn;
+    // Whether Codex still wants this answered: not resolved, its turn not over (unless it's a
+    // background subagent's, which carries on after it), its run not gone. (Not once it's left
+    // running as the backend shuts down: what's open stays as it was saved.)
+    const wanted = () =>
+      run.open.has(id) &&
+      !run.exited &&
+      !run.retired &&
+      !run.detached &&
+      this.#run === run &&
+      (ctx.turnId === turn || this.#inBackground(parent ?? undefined));
     const answer = (result: unknown) => {
       if (!wanted()) return;
       run.open.delete(id);
@@ -1364,7 +1436,15 @@ class CodexSession implements HarnessSession {
       if (d === "allow") return done(true, "");
       if (d === "ask") {
         const id = ask(
-          { type: "permission", name: q.name, kind: q.kind, input: q.input, ...(q.title ? { title: q.title } : {}), ...(q.reason ? { reason: q.reason } : {}) },
+          {
+            type: "permission",
+            name: q.name,
+            kind: q.kind,
+            input: q.input,
+            ...(q.title ? { title: q.title } : {}),
+            ...(q.reason ? { reason: q.reason } : {}),
+            ...(q.parentId ? { parent_id: q.parentId } : {}),
+          },
           call,
           (res: Resolution) => {
             if (!wanted()) return;
@@ -1504,7 +1584,7 @@ class CodexSession implements HarnessSession {
     const matching = run.mcpCalls.filter((c) => c.server === APP_SERVER && c.name === name && sameJson(c.args, args ?? {}));
     const it = matching.length === 1 ? ctx.item(matching[0]!.id) : undefined;
     const turn = ctx.turnId;
-    const wanted = () => !run.exited && !run.retired && !run.detached && this.#run === run && ctx.turnId === turn;
+    const wanted = () => !run.exited && !run.retired && !run.detached && this.#run === run && (ctx.turnId === turn || this.#inBackground(it?.parent_id));
     const t = { name, kind: "app" as const, input: args ?? {}, title: name };
     return new Promise((resolve) => {
       this.#permit(run, undefined, this.#query(t, it?.id, undefined, it?.parent_id), wanted, (ok, message) => {

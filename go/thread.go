@@ -922,7 +922,7 @@ func (rt *threadRuntime) endTurn(end TurnEnd, carry bool) {
 		if t := r.request.TurnID(); t != "" && t != turn.ID {
 			continue
 		}
-		if call := r.request.ToolCallID(); call != "" && inBackground(rt.Item, call) {
+		if requestInBackground(rt.Item, r.request) {
 			continue
 		}
 		rt.dropRequest(id)
@@ -1021,28 +1021,55 @@ func (rt *threadRuntime) BeginTurn() {
 }
 
 func (rt *threadRuntime) StopSubagents(ids []string) {
-	stopped := map[string]bool{}
+	ends := map[string]protocol.SubagentState{}
+	var order []string
 	for _, id := range ids {
 		it, ok := rt.Item(id)
 		c, isCall := it.Value.(*protocol.ToolCall)
-		if !ok || !isCall || c.Subagent == nil || c.Subagent.Status != protocol.SubagentStatusRunning || stopped[id] {
+		if _, seen := ends[id]; !ok || !isCall || c.Subagent == nil || c.Subagent.Status != protocol.SubagentStatusRunning || seen {
 			continue
 		}
-		stopped[id] = true
 		s := *c.Subagent
 		s.Status = protocol.SubagentStatusStopped
-		rt.UpdateItem(id, Patch{"subagent": s})
+		ends[id] = s
+		order = append(order, id)
 	}
-	if len(stopped) == 0 {
+	rt.endSubagents(ends, order)
+}
+
+func (rt *threadRuntime) EndSubagent(id string, end protocol.SubagentState) {
+	it, ok := rt.Item(id)
+	c, isCall := it.Value.(*protocol.ToolCall)
+	if !ok || !isCall {
 		return
+	}
+	if c.Subagent != nil && c.Subagent.Status == protocol.SubagentStatusRunning && end.Status != protocol.SubagentStatusRunning {
+		rt.endSubagents(map[string]protocol.SubagentState{id: end}, []string{id})
+		return
+	}
+	rt.UpdateItem(id, Patch{"subagent": end})
+}
+
+// endSubagents says these subagents ended, as each says (in order): what they left unfinished is
+// cancelled.
+func (rt *threadRuntime) endSubagents(ends map[string]protocol.SubagentState, order []string) {
+	if len(ends) == 0 {
+		return
+	}
+	for _, id := range order {
+		rt.UpdateItem(id, Patch{"subagent": ends[id]})
 	}
 	within := func(id string) bool {
 		for _, a := range ancestors(rt.Item, id) {
-			if stopped[a.ID()] {
+			if _, ok := ends[a.ID()]; ok {
 				return true
 			}
 		}
 		return false
+	}
+	from := func(call string) bool {
+		_, ended := ends[call]
+		return call != "" && (ended || within(call))
 	}
 	rt.finishText(within)
 	for id := range rt.structured {
@@ -1057,15 +1084,21 @@ func (rt *threadRuntime) StopSubagents(ids []string) {
 	}
 	for _, id := range append([]string(nil), rt.requestOrder...) {
 		r := rt.requests[id]
-		if r == nil || r.request.ToolCallID() == "" || !within(r.request.ToolCallID()) {
+		if r == nil {
+			continue
+		}
+		// Its requests: about its calls, or (about none) from it.
+		if call := r.request.ToolCallID(); call != "" {
+			if !within(call) {
+				continue
+			}
+		} else if !from(r.request.ParentID()) {
 			continue
 		}
 		rt.dropRequest(id)
 		rt.emit(&protocol.RequestResolvedEvent{RequestID: id, Resolution: protocol.Resolution{Outcome: protocol.ResolutionOutcomeCancel}})
 	}
-	if !rt.waiting() && rt.turn == nil && rt.state.Thread.Status == protocol.ThreadStatusWaiting {
-		rt.SetThread(func(t *protocol.Thread) { t.Status = protocol.ThreadStatusIdle })
-	}
+	rt.requestsDone()
 }
 
 // ancestors is the calls of the subagents an item is inside, innermost first.
@@ -1090,6 +1123,20 @@ func ancestors(item func(string) (protocol.Item, bool), id string) []protocol.It
 func runningInBackground(it protocol.Item) bool {
 	c, ok := it.Value.(*protocol.ToolCall)
 	return ok && c.Subagent != nil && c.Subagent.Background && c.Subagent.Status == protocol.SubagentStatusRunning
+}
+
+// requestInBackground says whether a request is a background subagent's that's still running (about
+// one of its calls, or from it): it carries on after the turn it was asked in has ended.
+func requestInBackground(item func(string) (protocol.Item, bool), r protocol.ThreadRequest) bool {
+	if call := r.ToolCallID(); call != "" {
+		return inBackground(item, call)
+	}
+	p := r.ParentID()
+	if p == "" {
+		return false
+	}
+	it, ok := item(p)
+	return (ok && runningInBackground(it)) || inBackground(item, p)
 }
 
 // inBackground says whether an item is inside a background subagent that's still running: what it
@@ -1188,7 +1235,9 @@ func (rt *threadRuntime) Ask(request protocol.ThreadRequestValue, toolCallID str
 	}
 	turnID := rt.TurnID()
 	var id string
-	var parent string
+	// A request about a call is from the subagent the call is (or the thread itself); one about
+	// none says which it's from.
+	parent := protocol.ThreadRequest{Value: request}.ParentID()
 	if call, ok := rt.Item(toolCallID); ok && toolCallID != "" {
 		parent = call.ParentID()
 		rt.UpdateItem(call.ID(), Patch{"status": protocol.ToolStatusPending})

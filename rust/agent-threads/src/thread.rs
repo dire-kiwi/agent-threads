@@ -269,6 +269,16 @@ impl ThreadContext {
         self.ancestors(id).into_iter().any(running_in_background)
     }
 
+    /// Whether a request is a background subagent's that's still running (about one of its calls,
+    /// or from it): it carries on after the turn it was asked in has ended.
+    pub fn request_in_background(&self, r: &ThreadRequest) -> bool {
+        match (r.tool_call_id(), r.parent_id()) {
+            (Some(c), _) => self.in_background(c),
+            (None, Some(p)) => self.item(p).is_some_and(running_in_background) || self.in_background(p),
+            (None, None) => false,
+        }
+    }
+
     // ---------- jobs ----------
 
     /// Runs `f` with the session (a `S`) as a job of its own, after the one running now.
@@ -645,8 +655,7 @@ impl ThreadContext {
             let keep = if open.late {
                 self.queue.is_empty()
             } else {
-                open.request.turn_id().is_some_and(|t| t != turn.id)
-                    || open.request.tool_call_id().is_some_and(|c| self.in_background(c))
+                open.request.turn_id().is_some_and(|t| t != turn.id) || self.request_in_background(&open.request)
             };
             if keep {
                 self.requests.push((id, open));
@@ -784,7 +793,7 @@ impl ThreadContext {
     /// The subagents of these calls that are still running were stopped (their harness process
     /// ended): their calls still running are cancelled, and their open requests too.
     pub fn stop_subagents(&mut self, ids: &[String]) {
-        let mut stopped: Vec<String> = Vec::new();
+        let mut ends: Vec<(String, SubagentState)> = Vec::new();
         for id in ids {
             let Some(Item::ToolCall(c)) = self.item(id) else {
                 continue;
@@ -792,16 +801,36 @@ impl ThreadContext {
             let Some(mut s) = c.subagent.clone().filter(|s| s.status == SubagentStatus::Running) else {
                 continue;
             };
-            if stopped.contains(id) {
+            if ends.iter().any(|(e, _)| e == id) {
                 continue;
             }
-            stopped.push(id.clone());
             s.status = SubagentStatus::Stopped;
-            self.update_item(id, json!({"subagent": s}));
+            ends.push((id.clone(), s));
         }
-        if stopped.is_empty() {
+        self.end_subagents(ends);
+    }
+
+    /// Sets a subagent call's subagent. If it was running and has ended, what it left unfinished
+    /// is cancelled: its calls still running, its streaming text and its open requests.
+    pub fn end_subagent(&mut self, id: &str, end: SubagentState) {
+        let Some(Item::ToolCall(c)) = self.item(id) else { return };
+        let running = c.subagent.as_ref().is_some_and(|s| s.status == SubagentStatus::Running);
+        if running && end.status != SubagentStatus::Running {
+            self.end_subagents(vec![(id.to_string(), end)]);
+        } else {
+            self.update_item(id, json!({ "subagent": end }));
+        }
+    }
+
+    /// These subagents ended, as each says: what they left unfinished is cancelled.
+    fn end_subagents(&mut self, ends: Vec<(String, SubagentState)>) {
+        if ends.is_empty() {
             return;
         }
+        for (id, s) in &ends {
+            self.update_item(id, json!({ "subagent": s }));
+        }
+        let stopped: Vec<String> = ends.into_iter().map(|(id, _)| id).collect();
         let within =
             |ctx: &ThreadContext, id: &str| ctx.ancestors(id).iter().any(|a| stopped.iter().any(|s| s == a.id()));
         self.finish_text(within);
@@ -828,24 +857,23 @@ impl ThreadContext {
         for id in cut {
             self.update_item(&id, json!({"status": "cancelled"}));
         }
+        // Its requests: about its calls, or (about none) from it.
+        let from = |ctx: &ThreadContext, r: &ThreadRequest| match r.tool_call_id() {
+            Some(c) => within(ctx, c),
+            None => r
+                .parent_id()
+                .is_some_and(|p| stopped.iter().any(|s| s == p) || within(ctx, p)),
+        };
         let mut i = 0;
         while i < self.requests.len() {
-            if !self.requests[i]
-                .1
-                .request
-                .tool_call_id()
-                .is_some_and(|c| within(self, c))
-            {
+            if !from(self, &self.requests[i].1.request) {
                 i += 1;
                 continue;
             }
             let (id, _) = self.requests.remove(i);
             self.emit_resolved(&id, &cancel());
         }
-        if !self.waiting() && self.turn.is_none() && self.state.thread.status == crate::protocol::ThreadStatus::Waiting
-        {
-            self.set_thread(|t| t.status = crate::protocol::ThreadStatus::Idle);
-        }
+        self.requests_done();
     }
 
     /// Sets the thread running again once it has no open requests, or idle if no turn is running
@@ -968,8 +996,13 @@ impl ThreadContext {
         let call = tool_call_id
             .and_then(|c| self.item(c))
             .map(|i| (i.id().to_string(), i.parent_id().map(String::from)));
+        // A request about a call is from the subagent the call is (or the thread itself); one about
+        // none says which it's from.
         if let Some((call, parent)) = &call {
             request["tool_call_id"] = json!(call);
+            if let Some(o) = request.as_object_mut() {
+                o.remove("parent_id");
+            }
             if let Some(p) = parent {
                 request["parent_id"] = json!(p);
             }
