@@ -6,7 +6,8 @@ import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { afterEach, describe, expect, it } from "vitest";
 import { applyEvents, initialState, openRequests, type Item, type ThreadEvent, type ToolCall, type TurnResult, type UserMessage } from "@dire-kiwi/agent-threads-protocol";
-import { AgentThreads, CommandError, type AgentThreadsOptions } from "../agent-threads.js";
+import { AgentThreads, CommandError, ControlError, type AgentThreadsOptions } from "../agent-threads.js";
+import type { HarnessMessage } from "../harness.js";
 import { claudeCode, type ClaudeCodeOptions } from "../claude/driver.js";
 import type { LaunchOptions } from "../harness.js";
 import { shim } from "../shim.js";
@@ -20,9 +21,18 @@ import { shimPath, tempDir } from "./spec.js";
 const mini = fileURLToPath(new URL("./mini-claude.mjs", import.meta.url));
 
 let open: AgentThreads[] = [];
+/** File stores, which are the app's to close (left open, their files are closed when they're collected, which fails). */
+const fileStores: FileStore[] = [];
 afterEach(async () => {
   await Promise.all(open.splice(0).map((s) => s.close()));
+  await Promise.all(fileStores.splice(0).map((s) => s.close()));
 });
+
+function fileStore(): FileStore {
+  const store = new FileStore(tempDir());
+  fileStores.push(store);
+  return store;
+}
 
 interface Setup extends AgentThreadsOptions {
   claude?: ClaudeCodeOptions;
@@ -470,6 +480,35 @@ describe("the Claude driver", () => {
     expect(init).toMatchObject({ request: { subtype: "initialize", sdkMcpServers: ["app"] } });
   });
 
+  it("leaves raw out unless it's turned on, and passes the app every line", async () => {
+    const messages: HarnessMessage[] = [];
+    const { sdk, events } = setup({ onHarnessMessage: (m) => messages.push(m) });
+    const t = await sdk.create();
+    await sdk.send(t.id, "reply hi");
+    const s = await settle(sdk, t.id);
+    expect(events.some((e) => "raw" in e || (e.type === "item.added" && "raw" in e.item))).toBe(false);
+    expect(s.items.some((i) => "raw" in i)).toBe(false);
+    const types = messages.map((m) => (m.message as { type?: string }).type);
+    expect(types).toEqual(expect.arrayContaining(["control_response", "system", "assistant", "result"]));
+    expect(messages.every((m) => m.threadId === t.id && m.harness === "claude" && m.runId === s.thread.run?.id && JSON.parse(m.line).type)).toBe(true);
+  });
+
+  it("sends control requests to the running process, and fails them when it can't", async () => {
+    const { sdk, runs } = setup();
+    const t = await sdk.create();
+    await expect(sdk.control(t.id, { subtype: "get_context_usage" })).rejects.toThrow(CommandError);
+    await sdk.send(t.id, "reply hi");
+    await settle(sdk, t.id);
+    await expect(sdk.control(t.id, { subtype: "get_context_usage" })).resolves.toEqual({});
+    await expect(sdk.control(t.id, "get_context_usage")).rejects.toThrow(CommandError);
+    // One the process exits before answering.
+    const pending = sdk.control(t.id, { subtype: "never_answered" }).catch((e: unknown) => e);
+    await until(() => runs()[0]?.sent.some((m) => (m.request as { subtype?: string } | undefined)?.subtype === "never_answered"));
+    await sdk.close();
+    expect(await pending).toBeInstanceOf(ControlError);
+    await expect(sdk.control(t.id, { subtype: "get_context_usage" })).rejects.toThrow(CommandError);
+  });
+
   it("fails the turn when Claude can't be started, and tries again on the next send", async () => {
     const { sdk } = setup({ claude: { bin: "/nonexistent/claude" } });
     const t = await sdk.create();
@@ -725,7 +764,7 @@ describe("the Claude driver", () => {
 });
 
 describe.each([
-  ["FileStore", () => new FileStore(tempDir())],
+  ["FileStore", () => fileStore()],
   ["SqliteStore", () => new SqliteStore(join(tempDir(), "t.db"))],
 ])("AgentThreads on a %s", (_, makeStore) => {
   it("saves events, and picks a thread up again after a restart", async () => {
@@ -925,7 +964,7 @@ describe("a thread's launch options", () => {
   };
 
   it("start Claude with them, stored with the thread but not sent to clients, after setOptions changes them and after a restart", async () => {
-    const store = new FileStore(tempDir());
+    const store = fileStore();
     const { sdk, make, events, runs } = setup({
       store,
       claude: { args: ["--own"], configDir: "/instance-config" },

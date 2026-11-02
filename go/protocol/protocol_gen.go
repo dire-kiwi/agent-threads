@@ -2043,6 +2043,10 @@ type Thread struct {
 	// The harness process running the thread, if one is. Absent when it's idle with no process.
 	Run *Run `json:"run,omitempty"`
 
+	// The usage limits of the account the harness runs on, as it last reported them in this thread,
+	// sorted by id. Absent until it reports one.
+	RateLimits []RateLimit `json:"rate_limits,omitempty"`
+
 	// The app's own data, given when the thread was created. Backends store it and pass it to tools;
 	// they don't read it.
 	Metadata  map[string]json.RawMessage `json:"metadata,omitempty"`
@@ -2054,7 +2058,7 @@ type Thread struct {
 	Extra map[string]json.RawMessage `json:"-"`
 }
 
-var knownThread = fieldSet("id", "harness", "status", "title", "model", "effort", "permission_mode", "cwd", "session_id", "usage", "error", "run", "metadata", "created_at", "updated_at")
+var knownThread = fieldSet("id", "harness", "status", "title", "model", "effort", "permission_mode", "cwd", "session_id", "usage", "error", "run", "rate_limits", "metadata", "created_at", "updated_at")
 
 func (v Thread) MarshalJSON() ([]byte, error) {
 	type plain Thread
@@ -2165,6 +2169,72 @@ type RunSpawner string
 const (
 	RunSpawnerDirect RunSpawner = "direct"
 	RunSpawnerShim   RunSpawner = "shim"
+)
+
+// RateLimit: A usage limit of the account the harness runs on (a subscription's session or weekly
+// limit, say), as the harness last reported it.
+type RateLimit struct {
+
+	// Which limit, by the harness's name for it: Claude Code's rateLimitType (five_hour, seven_day,
+	// seven_day_opus...), Codex's primary and secondary windows.
+	ID string `json:"id"`
+
+	// allowed: there's room. warning: it's nearly used up, or used up with extra usage carrying on.
+	// rejected: the harness refuses turns until it resets.
+	Status RateLimitStatus `json:"status"`
+
+	// How much of it is used, from 0 to 100, when the harness says.
+	UsedPercent *float64 `json:"used_percent,omitempty"`
+
+	// When it resets, when the harness says.
+	ResetsAt string `json:"resets_at,omitempty"`
+
+	// How long its window is, when the harness says.
+	WindowMinutes *int64 `json:"window_minutes,omitempty"`
+
+	// Extra has the fields the spec doesn't name, as they came, so that they're written again
+	// unchanged (receivers ignore fields they don't know, and stores keep them).
+	Extra map[string]json.RawMessage `json:"-"`
+}
+
+var knownRateLimit = fieldSet("id", "status", "used_percent", "resets_at", "window_minutes")
+
+func (v RateLimit) MarshalJSON() ([]byte, error) {
+	type plain RateLimit
+	p := plain(v)
+	data, err := json.Marshal(p)
+	if err != nil {
+		return nil, err
+	}
+	return withExtra(data, v.Extra, knownRateLimit)
+}
+
+func (v *RateLimit) UnmarshalJSON(data []byte) error {
+	if isNull(data) {
+		return nil
+	}
+	type plain RateLimit
+	var p plain
+	if err := json.Unmarshal(data, &p); err != nil {
+		return err
+	}
+	extra, err := extraFields(data, knownRateLimit)
+	if err != nil {
+		return err
+	}
+	p.Extra = extra
+	*v = RateLimit(p)
+	return nil
+}
+
+// RateLimitStatus: allowed: there's room. warning: it's nearly used up, or used up with extra usage
+// carrying on. rejected: the harness refuses turns until it resets.
+type RateLimitStatus string
+
+const (
+	RateLimitStatusAllowed  RateLimitStatus = "allowed"
+	RateLimitStatusWarning  RateLimitStatus = "warning"
+	RateLimitStatusRejected RateLimitStatus = "rejected"
 )
 
 // Usage: Token counts.

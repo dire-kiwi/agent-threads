@@ -17,6 +17,8 @@
 //   streamcrash <text>    streams <text> (deltas, no final message), then crashes
 //   streamhang <text>     streams <text>, then waits for its input to close
 //
+// It answers every control request with success and an empty response, but a `never_answered` one.
+//
 // MINI_CLAUDE_LOG names a file each run appends its argv (with CLAUDE_CONFIG_DIR, and the
 // variables MINI_LOG_ENV names, comma-separated), every line it's sent and each result it sends
 // ({"result": ...}) to. With
@@ -70,6 +72,7 @@ createInterface({ input: process.stdin })
     const m = JSON.parse(line);
     note(m);
     if (m.type === "control_request") {
+      if (m.request.subtype === "never_answered") return;
       if (m.request.subtype === "initialize") initialized = true;
       out({ type: "control_response", response: { subtype: "success", request_id: m.request_id, response: {} } });
       if (m.request.subtype === "interrupt" && busy && !stubborn) {

@@ -20,7 +20,8 @@ import {
 } from "@dire-kiwi/agent-threads-protocol";
 import { claudeCode } from "./claude/driver.js";
 import { codex } from "./codex/driver.js";
-import type { Harness, LaunchOptions, McpServer, Skill, ThreadConfig } from "./harness.js";
+import { CommandError } from "./errors.js";
+import type { Harness, HarnessMessage, LaunchOptions, McpServer, Skill, ThreadConfig } from "./harness.js";
 import { newId } from "./ids.js";
 import { splitStored, storedThread } from "./launch.js";
 import type { PermissionPolicy } from "./permissions.js";
@@ -53,6 +54,17 @@ export interface AgentThreadsOptions extends Capabilities {
   spawner?: Spawner;
   /** Called with errors that aren't any command's: a store that fails, a subscriber that throws. */
   onError?: (error: unknown) => void;
+  /**
+   * Fill in `raw` on events, items and requests: the harness message each came from. Off by
+   * default; it's saved with the events, so they take more room.
+   */
+  raw?: boolean;
+  /**
+   * Called with every line a thread's harness process writes, once its driver has dealt with it:
+   * for what the protocol leaves out (Claude Code's system messages and rate limit events, Codex's
+   * token usage...). It runs as the output is read, so it should be quick.
+   */
+  onHarnessMessage?: (message: HarnessMessage) => void;
 }
 
 export interface CreateOptions extends Capabilities {
@@ -97,16 +109,11 @@ export interface Recovered {
   lost: string[];
 }
 
+export { CommandError, ControlError } from "./errors.js";
+
 /** How often the shim spawner's finished runs are pruned. */
 const PRUNE_EVERY_MS = 3600_000;
 
-/** A command that can't be carried out: an unknown thread, or a malformed command. */
-export class CommandError extends Error {
-  constructor(message: string) {
-    super(message);
-    this.name = "CommandError";
-  }
-}
 
 export class AgentThreads {
   readonly store: Store;
@@ -285,6 +292,24 @@ export class AgentThreads {
     }
   }
 
+  /**
+   * Sends the thread's running harness process a request of the app's own, and resolves with its
+   * answer: for Claude Code a control request's `request` (e.g. `{subtype: "get_context_usage"}`),
+   * answered with the control response's `response`; for Codex `{method, params?}`, answered with the
+   * JSON-RPC result. Rejects with a CommandError if the thread has no running process or its harness
+   * takes no requests, and with a ControlError if the harness refuses it, or its process exits (or
+   * the backend closes) before it answers. It mustn't be used for what the driver does itself
+   * (starting turns, answering the harness's requests...).
+   */
+  async control(threadId: string, request: unknown): Promise<unknown> {
+    this.#open();
+    const rt = await this.#load(threadId);
+    this.#open();
+    const session = rt.session;
+    if (!session?.control) throw new CommandError(`thread ${threadId} runs on ${rt.thread.harness}, which doesn't take control requests`);
+    return session.control(request);
+  }
+
   // ---------- commands ----------
 
   /** Carries out a command from a client. Throws a CommandError for one it can't. */
@@ -437,10 +462,20 @@ export class AgentThreads {
 
   #runtime(state: Snapshot, launch: LaunchOptions): ThreadRuntime {
     const id = state.thread.id;
+    const onMessage = this.#options.onHarnessMessage;
     const host = {
       store: this.store,
       spawner: this.spawner,
+      raw: !!this.#options.raw,
       publish: (e: ThreadEvent) => this.#publish(e),
+      harnessMessage: (m: HarnessMessage) => {
+        if (!onMessage) return;
+        try {
+          onMessage(m);
+        } catch (e) {
+          this.#error(e);
+        }
+      },
       error: (e: unknown) => this.#error(e),
     };
     const rt = new ThreadRuntime(host, state, this.#config(id), launch, this.#policy(id));

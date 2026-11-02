@@ -1127,6 +1127,12 @@ export const schema: { readonly $defs: { readonly [name: string]: unknown } } = 
         "run": {
           "$ref": "#/$defs/Run"
         },
+        "rate_limits": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/RateLimit"
+          }
+        },
         "metadata": {
           "type": "object",
           "additionalProperties": true
@@ -1183,6 +1189,38 @@ export const schema: { readonly $defs: { readonly [name: string]: unknown } } = 
         "reattached_at": {
           "type": "string",
           "format": "date-time"
+        }
+      }
+    },
+    "RateLimit": {
+      "type": "object",
+      "required": [
+        "id",
+        "status"
+      ],
+      "properties": {
+        "id": {
+          "type": "string"
+        },
+        "status": {
+          "type": "string",
+          "enum": [
+            "allowed",
+            "warning",
+            "rejected"
+          ]
+        },
+        "used_percent": {
+          "type": "number",
+          "minimum": 0
+        },
+        "resets_at": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "window_minutes": {
+          "type": "integer",
+          "minimum": 0
         }
       }
     },
