@@ -2,10 +2,22 @@
 // steering queue and open requests. Every change is an event, numbered, applied, sent to the
 // subscribers, and saved to the store in order (deltas aren't saved).
 
-import { applyEvent, type Attachment, type Item, type Resolution, type Snapshot, type Thread, type ThreadEvent, type ThreadRequest, type Usage, type UserMessage } from "@dire-kiwi/agent-threads-protocol";
+import {
+  applyEvent,
+  type Attachment,
+  type Item,
+  type QuestionRequest,
+  type Resolution,
+  type Snapshot,
+  type Thread,
+  type ThreadEvent,
+  type ThreadRequest,
+  type Usage,
+  type UserMessage,
+} from "@dire-kiwi/agent-threads-protocol";
 import type { HarnessSession, Message, NewItem, NewRequest, ThreadConfig, ThreadContext, TurnEnd } from "./harness.js";
 import { newId } from "./ids.js";
-import { decide, permissionKey, type PermissionDecision, type PermissionPolicy, type PermissionQuery } from "./permissions.js";
+import { DONT_ASK_DENIAL, decide, modeDecision, permissionKey, standsFor, type PermissionDecision, type PermissionPolicy, type PermissionQuery, type StandingKey } from "./permissions.js";
 import type { Spawner } from "./spawner.js";
 import { StoreError, type RunRecord, type Store } from "./store.js";
 
@@ -40,7 +52,12 @@ interface OpenRequest {
   request: ThreadRequest;
   answered: (resolution: Resolution) => void;
   /** The tool it's about (permissionKey), for an answer given `always`. */
-  standing?: string;
+  standing?: StandingKey;
+  /**
+   * A question kept open after its turn ended (lateAnswers): its answer is sent as the next
+   * message, unless a turn starts first.
+   */
+  late?: boolean;
 }
 
 /** A message as sent: its text and attachments, and the client's id for it. */
@@ -56,6 +73,8 @@ export interface RuntimeHost {
   spawner: Spawner;
   publish(event: ThreadEvent): void;
   error(error: unknown): void;
+  /** AgentThreadsOptions.lateAnswers. */
+  lateAnswers?: boolean;
 }
 
 export class ThreadRuntime implements ThreadContext {
@@ -76,7 +95,6 @@ export class ThreadRuntime implements ThreadContext {
   #saved: Snapshot;
   #queue: string[] = []; // ids of queued user messages, oldest first
   #requests = new Map<string, OpenRequest>();
-  #always = new Map<string, "allow" | "deny">(); // permissionKey -> the user's standing answer
   #unsaved: ThreadEvent[] = []; // saved events not yet in the store, in order
   #threadChanged = false;
   #writes: Promise<void> = Promise.resolve();
@@ -398,6 +416,8 @@ export class ThreadRuntime implements ThreadContext {
   send(message: Outgoing): void {
     const id = newId("um");
     if (!this.turn) {
+      // The conversation moves on: questions kept open after their turns can't be answered.
+      this.#cancelLate();
       // Messages still queued from before weren't delivered: they go first, in this turn, and stay
       // queued until the harness takes them in. Such a turn is a retry for them.
       const left = this.queued();
@@ -456,9 +476,9 @@ export class ThreadRuntime implements ThreadContext {
       }
     }
     for (const [id, r] of this.#requests) {
-      if (r.request.turn_id !== undefined && r.request.turn_id !== turn.id) continue;
+      if (r.late || (r.request.turn_id !== undefined && r.request.turn_id !== turn.id)) continue;
       this.#requests.delete(id);
-      this.emit({ type: "request.resolved", request_id: id, resolution: { outcome: "cancel" } });
+      if (!this.#keepLate(r.request)) this.emit({ type: "request.resolved", request_id: id, resolution: { outcome: "cancel" } });
     }
     const ok = end.ok && !turn.interrupted;
     const error = !ok && !turn.interrupted ? end.error || "The turn failed." : undefined;
@@ -521,14 +541,52 @@ export class ThreadRuntime implements ThreadContext {
 
   // ---------- requests ----------
 
+  /**
+   * The thread's standing answers come first, then the policy; what the policy would ask the user
+   * about, the thread's permission mode may decide instead (bypass allows it, dont_ask denies it).
+   */
   decide(query: PermissionQuery): PermissionDecision | Promise<PermissionDecision> {
-    const standing = this.#always.get(permissionKey(query));
-    if (standing) return standing;
-    return decide(this.policy, query, { threadId: this.threadId, thread: this.thread, metadata: this.thread.metadata ?? {} });
+    const standing = this.#standing(permissionKey(query));
+    if (standing) return standing.outcome === "allow" ? "allow" : { deny: standing.message! };
+    const mode = this.thread.permission_mode;
+    const d = decide(this.policy, query, { threadId: this.threadId, thread: this.thread, metadata: this.thread.metadata ?? {} });
+    // (An async policy's ask is decided by the mode as it is when the request would be opened: see
+    // ask().)
+    return d instanceof Promise ? d : modeDecision(mode, d);
   }
 
-  ask(request: NewRequest, toolCallId: string | undefined, answered: (resolution: Resolution) => void, standing?: string): string {
-    const r = { ...request, id: newId(request.type === "question" ? "q" : "perm") } as ThreadRequest;
+  /** The thread's standing answer for a tool, if it has one. */
+  #standing(key: StandingKey): Resolution | undefined {
+    const a = (this.thread.standing_answers ?? []).findLast((a) => standsFor(a, key));
+    if (!a) return undefined;
+    return a.outcome === "allow" ? { outcome: "allow" } : { outcome: "deny", message: STANDING_DENIAL };
+  }
+
+  /**
+   * How a request is answered without asking the user, if it is: a permission request by the
+   * thread's standing answer for its tool, or else by its permission mode (bypass allows it,
+   * dont_ask denies it); a question by dont_ask, which dismisses it.
+   */
+  #settled(question: boolean, standing: StandingKey | undefined): Resolution | undefined {
+    if (!question && standing) {
+      const r = this.#standing(standing);
+      if (r) return r;
+    }
+    const mode = this.thread.permission_mode;
+    if (mode === "bypass" && !question) return { outcome: "allow" };
+    if (mode === "dont_ask") return { outcome: question ? "cancel" : "deny", message: DONT_ASK_DENIAL };
+    return undefined;
+  }
+
+  ask(request: NewRequest, toolCallId: string | undefined, answered: (resolution: Resolution) => void, standing?: StandingKey): string {
+    const question = request.type === "question";
+    const settled = this.#settled(question, standing);
+    if (settled) {
+      queueMicrotask(() => answered(settled));
+      return newId(question ? "q" : "perm");
+    }
+    const r = { ...request, id: newId(question ? "q" : "perm") } as ThreadRequest;
+    if (!question && standing?.server) (r as { server?: string }).server = standing.server;
     if (this.turn) r.turn_id = this.turn.id;
     const call = toolCallId ? this.item(toolCallId) : undefined;
     if (call) {
@@ -542,7 +600,7 @@ export class ThreadRuntime implements ThreadContext {
     return r.id;
   }
 
-  reopen(requestId: string, answered: (resolution: Resolution) => void, standing?: string): boolean {
+  reopen(requestId: string, answered: (resolution: Resolution) => void, standing?: StandingKey): boolean {
     if (this.#requests.has(requestId)) return false;
     const request = this.#state.requests.find((r) => r.id === requestId);
     if (!request) return false;
@@ -556,27 +614,114 @@ export class ThreadRuntime implements ThreadContext {
     this.#requests.delete(requestId);
     // The answers to secret questions go only to the harness: what's sent and saved hides them.
     this.emit({ type: "request.resolved", request_id: requestId, resolution: redact(open.request, resolution) });
-    if (!this.#requests.size && this.turn) this.setThread({ status: "running" });
-    if (resolution.always && open.standing && (resolution.outcome === "allow" || resolution.outcome === "deny")) {
-      this.#always.set(open.standing, resolution.outcome);
+    if (!this.#waiting() && this.turn) this.setThread({ status: "running" });
+    const key = open.standing;
+    const always = resolution.always && key && (resolution.outcome === "allow" || resolution.outcome === "deny");
+    if (always) {
+      const answers = (this.thread.standing_answers ?? []).filter((a) => !standsFor(a, key));
+      this.setThread({ standing_answers: [...answers, { ...key, outcome: resolution.outcome as "allow" | "deny" }] });
     }
     open.answered(resolution);
+    // It stands for the requests open for the same tool too.
+    if (always) this.settle();
+  }
+
+  /**
+   * Answers the open requests the thread's standing answers or permission mode now answer (see
+   * #settled), after either changed.
+   */
+  settle(): void {
+    for (const [id, open] of [...this.#requests]) {
+      if (open.late || !this.#requests.has(id)) continue;
+      const r = this.#settled(open.request.type === "question", open.standing);
+      if (r) this.respond(id, r);
+    }
   }
 
   cancelRequest(id: string): void {
-    if (!this.#requests.has(id)) return;
+    const open = this.#requests.get(id);
+    if (!open || open.late) return;
     this.#requests.delete(id);
-    this.emit({ type: "request.resolved", request_id: id, resolution: { outcome: "cancel" } });
-    if (!this.#requests.size && this.turn) this.setThread({ status: "running" });
+    if (!(this.interrupted && this.#keepLate(open.request))) {
+      this.emit({ type: "request.resolved", request_id: id, resolution: { outcome: "cancel" } });
+    }
+    if (!this.#waiting() && this.turn) this.setThread({ status: "running" });
   }
 
+  /** Whether the turn waits on a request (one that isn't kept open after its turn). */
+  #waiting(): boolean {
+    for (const r of this.#requests.values()) if (!r.late) return true;
+    return false;
+  }
+
+  /** Whether a request is open (taken up), a question kept open after its turn included. */
+  isOpen(id: string): boolean {
+    return this.#requests.has(id);
+  }
+
+  /** The open requests, but for questions kept open after their turns. */
   get openRequests(): ThreadRequest[] {
-    return [...this.#requests.values()].map((r) => r.request);
+    return [...this.#requests.values()].filter((r) => !r.late).map((r) => r.request);
+  }
+
+  /**
+   * Keeps a question open after its turn ended, with lateAnswers, if it can be: not a secret one
+   * (its answer would be shown, as a message), and not when messages are queued (the conversation
+   * has moved on). Whether it did.
+   */
+  #keepLate(request: ThreadRequest): boolean {
+    if (request.type !== "question" || !this.#host.lateAnswers || this.#queue.length || request.questions.some((q) => q.secret)) return false;
+    this.#requests.set(request.id, {
+      request,
+      late: true,
+      answered: (r) => {
+        // A dismissal sends nothing.
+        if (r.outcome === "answer") this.send({ text: lateAnswerText(request, r) });
+      },
+    });
+    return true;
+  }
+
+  /** Cancels the questions kept open after their turns. */
+  #cancelLate(): void {
+    for (const [id, r] of this.#requests) {
+      if (!r.late) continue;
+      this.#requests.delete(id);
+      this.emit({ type: "request.resolved", request_id: id, resolution: { outcome: "cancel" } });
+    }
+  }
+
+  /**
+   * Takes up, as a thread is loaded, the requests open in its state that nothing will answer: those
+   * of turns that ended (or all of them), which aren't taken up already. A question is kept open
+   * after its turn as endTurn() keeps it; the others are cancelled.
+   */
+  takeUpRequests(all: boolean): void {
+    const ended = new Set(this.#state.items.flatMap((i) => (i.type === "turn_result" && i.turn_id !== undefined ? [i.turn_id] : [])));
+    for (const r of this.#state.requests) {
+      if (this.#requests.has(r.id) || !(all || (r.turn_id !== undefined && ended.has(r.turn_id)))) continue;
+      if (!this.#keepLate(r)) this.emit({ type: "request.resolved", request_id: r.id, resolution: { outcome: "cancel" } });
+    }
   }
 
   error(error: unknown): void {
     this.#host.error(error);
   }
+}
+
+/** What the agent is told when a standing answer denies a call. */
+const STANDING_DENIAL = "The user has denied this tool for the rest of the thread.";
+
+/** The message a late answer is sent as: each question, with its answers (and the note with them). */
+export function lateAnswerText(q: QuestionRequest, r: Resolution): string {
+  const lines = q.questions.map((question) => {
+    const answers = r.answers?.[question.id] ?? [];
+    return `- ${question.question}\n  ${answers.length ? answers.join(", ") : "(no answer)"}`;
+  });
+  const what = lines.length === 1 ? "answer to the question" : "answers to the questions";
+  let text = `My ${what} you asked:\n\n${lines.join("\n")}`;
+  if (r.message) text += `\n\n${r.message}`;
+  return text;
 }
 
 /** What a secret answer is shown as. */

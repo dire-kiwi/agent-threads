@@ -1185,7 +1185,7 @@ impl AgentThreads {
             .requests
             .iter()
             .map(|r| r.id().to_string())
-            .filter(|id| !open.contains(id))
+            .filter(|id| !c.is_taken_up(id))
             .collect();
         for id in stale {
             c.emit_resolved(&id, &cancel_resolution());

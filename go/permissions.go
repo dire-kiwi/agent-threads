@@ -85,18 +85,49 @@ func (f PolicyFunc) Decide(ctx context.Context, q PermissionQuery, t PermissionC
 	return f(ctx, q, t)
 }
 
-// PermissionKey says which tool a query is about, for an answer given "always" (ThreadContext.Ask's
-// standing): its kind, its MCP server and its name, since two servers (or an app tool and a
-// built-in) can have tools of the same name.
-func PermissionKey(q PermissionQuery) string { return permissionKey(q.Kind, q.Server, q.Name) }
+// StandingKey is which tool a query is about, for a standing answer (ThreadContext.Ask's standing):
+// its kind, its MCP server and its name, since two servers (or an app tool and a built-in) can have
+// tools of the same name.
+type StandingKey struct {
+	Kind   protocol.ToolKind
+	Server string
+	Name   string
+}
 
-func permissionKey(kind protocol.ToolKind, server, name string) string {
-	var s any
-	if server != "" {
-		s = server
+// Matches says whether a standing answer is for this tool.
+func (k StandingKey) Matches(a protocol.StandingAnswer) bool {
+	return a.Kind == k.Kind && a.Name == k.Name && a.Server == k.Server
+}
+
+// Answer is the standing answer for this tool with outcome.
+func (k StandingKey) Answer(outcome protocol.StandingAnswerOutcome) protocol.StandingAnswer {
+	return protocol.StandingAnswer{Kind: k.Kind, Server: k.Server, Name: k.Name, Outcome: outcome}
+}
+
+// PermissionKey is the tool a query is about, for a standing answer.
+func PermissionKey(q PermissionQuery) *StandingKey { return permissionKey(q.Kind, q.Server, q.Name) }
+
+func permissionKey(kind protocol.ToolKind, server, name string) *StandingKey {
+	return &StandingKey{Kind: kind, Server: server, Name: name}
+}
+
+// DontAskDenial is what the agent is told when the thread's mode (dont_ask) denies what it would
+// have asked.
+const DontAskDenial = "Denied automatically: this thread's permission mode is dont_ask, so the user isn't asked."
+
+// modeDecision is what the thread's permission mode makes of a call the policy would ask the user
+// about: bypass allows it, dont_ask denies it.
+func modeDecision(mode protocol.PermissionMode, d Decision) Decision {
+	if !d.IsAsk() {
+		return d
 	}
-	data, _ := json.Marshal([]any{kind, s, name})
-	return string(data)
+	switch mode {
+	case protocol.PermissionModeBypass:
+		return Allow
+	case protocol.PermissionModeDontAsk:
+		return DenyWith(DontAskDenial)
+	}
+	return d
 }
 
 // decide runs a policy; one that panics denies.

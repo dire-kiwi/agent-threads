@@ -12,7 +12,7 @@ import type {
   Usage,
   UserMessage,
 } from "@dire-kiwi/agent-threads-protocol";
-import type { PermissionDecision, PermissionQuery } from "./permissions.js";
+import type { PermissionDecision, PermissionQuery, StandingKey } from "./permissions.js";
 import type { Spawner } from "./spawner.js";
 import type { RunRecord } from "./store.js";
 import type { Tool } from "./tools.js";
@@ -89,21 +89,27 @@ export interface ThreadContext {
   /**
    * Opens a request (for the tool call `toolCallId`, which is set `pending`) and calls `answered`
    * when the user responds. It isn't called when the request is cancelled because its turn ended.
-   * `standing` (permissionKey of the tool) lets an answer given `always` stand for the thread.
+   * `standing` (permissionKey of the tool) lets an answer given `always` stand for the thread. A
+   * request the thread's standing answers or permission mode answer isn't opened: `answered` is
+   * called with their answer, in a microtask.
    */
-  ask(request: NewRequest, toolCallId: string | undefined, answered: (resolution: Resolution) => void, standing?: string): string;
+  ask(request: NewRequest, toolCallId: string | undefined, answered: (resolution: Resolution) => void, standing?: StandingKey): string;
   /**
    * Takes up a request opened before the backend restarted, which is still open: `answered` is
    * called when the user responds, as for ask(). Whether it's open.
    */
-  reopen(requestId: string, answered: (resolution: Resolution) => void, standing?: string): boolean;
+  reopen(requestId: string, answered: (resolution: Resolution) => void, standing?: StandingKey): boolean;
   /**
    * Saves the thread's run as it is now (with a spawner whose runs outlive the backend), before
    * the driver does something that mustn't be done twice: after a restart, it's re-attached as of
    * this. Resolves once it's saved; rejects if the store can't save it.
    */
   persist(): Promise<void>;
-  /** Closes a request the harness no longer wants answered. */
+  /**
+   * Closes a request the harness no longer wants answered. (A question kept open after its turn
+   * isn't the harness's any more, and stays open; so does one the harness gives up on because the
+   * user interrupted its turn, with lateAnswers.)
+   */
   cancelRequest(id: string): void;
   /** The running turn ended. */
   endTurn(end: TurnEnd): void;

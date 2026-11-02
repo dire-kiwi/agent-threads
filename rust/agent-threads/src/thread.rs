@@ -821,6 +821,11 @@ impl ThreadContext {
             .collect()
     }
 
+    /// Whether a request is open here (taken up, by its session or as kept open after its turn).
+    pub(crate) fn is_taken_up(&self, id: &str) -> bool {
+        self.requests.iter().any(|(r, _)| r == id)
+    }
+
     /// Keeps a question open after its turn ended, with late_answers, if it can be: not a secret one
     /// (its answer would be shown, as a message), and not when messages are queued (the
     /// conversation has moved on). Whether it did.

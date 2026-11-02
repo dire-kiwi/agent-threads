@@ -46,6 +46,11 @@ type Options struct {
 	// OnError is called with errors that aren't any command's: a store that fails, a subscriber that
 	// panics. They're logged by default.
 	OnError func(error)
+	// LateAnswers keeps questions still open when their turn ends (it was interrupted, say) open,
+	// rather than cancelling them: an answer is sent to the agent as the user's next message, unless
+	// the conversation has moved on first (a turn started, or a message was queued). Secret ones are
+	// cancelled still.
+	LateAnswers bool
 }
 
 // CreateOptions are a new thread's.
@@ -64,6 +69,9 @@ type CreateOptions struct {
 	Metadata map[string]any
 	// ID is the thread's id; a new one by default.
 	ID string
+	// StandingAnswers stand from the start (from the app's own rules, say), as answers given with
+	// "always" do.
+	StandingAnswers []protocol.StandingAnswer
 }
 
 // SendOptions are a message's attachments and the client's id for it.
@@ -77,6 +85,9 @@ type ThreadOptions struct {
 	Model          *string
 	Effort         *string
 	PermissionMode *protocol.PermissionMode
+	// StandingAnswers replaces the thread's standing answers when it isn't nil; an empty one clears
+	// them.
+	StandingAnswers []protocol.StandingAnswer
 }
 
 // Recovered is what Recover did.
@@ -185,7 +196,7 @@ func (a *AgentThreads) Create(ctx context.Context, o CreateOptions) (protocol.Th
 	}
 	thread := protocol.Thread{
 		ID: id, Harness: harness, Status: protocol.ThreadStatusIdle, Title: o.Title, Model: o.Model,
-		Effort: o.Effort, PermissionMode: mode, Cwd: cwd, CreatedAt: now(),
+		Effort: o.Effort, PermissionMode: mode, Cwd: cwd, CreatedAt: now(), StandingAnswers: o.StandingAnswers,
 	}
 	if len(o.Metadata) > 0 {
 		thread.Metadata = map[string]json.RawMessage{}
@@ -527,6 +538,7 @@ func (a *AgentThreads) Handle(ctx context.Context, command protocol.Command) err
 		if c.PermissionMode != "" {
 			o.PermissionMode = &c.PermissionMode
 		}
+		o.StandingAnswers = c.StandingAnswers
 		return a.SetOptions(ctx, c.ThreadID, o)
 	}
 	return commandErr("that isn't a command")
@@ -555,6 +567,10 @@ func (a *AgentThreads) HandleJSON(ctx context.Context, data []byte) error {
 		}
 		if sc.PermissionMode != "" {
 			o.PermissionMode = &sc.PermissionMode
+		}
+		// [] clears them.
+		if _, ok := raw["standing_answers"]; ok {
+			o.StandingAnswers = append([]protocol.StandingAnswer{}, sc.StandingAnswers...)
 		}
 		return a.SetOptions(ctx, sc.ThreadID, o)
 	}
@@ -588,10 +604,17 @@ func (a *AgentThreads) Respond(ctx context.Context, threadID, requestID string, 
 	return a.do(ctx, threadID, func(rt *threadRuntime) { rt.respond(requestID, res) })
 }
 
-// SetOptions changes the thread's model, effort or permission mode, from its next turn.
+// SetOptions changes the thread's model, effort or permission mode, from its next turn, or its
+// standing answers. Open permission requests the new mode or standing answers answer (bypass allows
+// them, dont_ask denies them) are answered at once.
 func (a *AgentThreads) SetOptions(ctx context.Context, threadID string, o ThreadOptions) error {
 	if o.PermissionMode != nil {
 		if problems := protocol.ValidateValue(*o.PermissionMode, "PermissionMode"); len(problems) > 0 {
+			return invalid(problems)
+		}
+	}
+	for _, s := range o.StandingAnswers {
+		if problems := protocol.ValidateValue(s, "StandingAnswer"); len(problems) > 0 {
 			return invalid(problems)
 		}
 	}
@@ -607,11 +630,15 @@ func (a *AgentThreads) SetOptions(ctx context.Context, threadID string, o Thread
 			if o.PermissionMode != nil {
 				t.PermissionMode = *o.PermissionMode
 			}
+			if o.StandingAnswers != nil {
+				t.StandingAnswers = append([]protocol.StandingAnswer(nil), o.StandingAnswers...)
+			}
 		})
 		after := rt.state.Thread
 		if before.Model != after.Model || before.Effort != after.Effort || before.PermissionMode != after.PermissionMode {
 			rt.session.OptionsChanged()
 		}
+		rt.settle()
 	})
 }
 
@@ -941,6 +968,9 @@ func (a *AgentThreads) fromStore(ctx context.Context, threadID string) (*threadR
 	}
 	var abandon *RunRecord
 	rt.loop.call(func() {
+		// Questions kept open after their turns ended are taken up again (or cancelled, if they can't
+		// be any more).
+		rt.takeUpRequests(false)
 		ok, stop := a.reattach(rt, record)
 		if ok {
 			return
@@ -993,7 +1023,7 @@ func (a *AgentThreads) reattach(rt *threadRuntime, record *RunRecord) (bool, *Ru
 	// Requests the session didn't take up again can't be answered.
 	open := rt.openRequestIDs()
 	for _, r := range rt.state.Requests {
-		if !open[r.ID()] {
+		if rt.requests[r.ID()] == nil {
 			rt.emit(&protocol.RequestResolvedEvent{RequestID: r.ID(), Resolution: protocol.Resolution{Outcome: protocol.ResolutionOutcomeCancel}})
 		}
 	}
@@ -1028,9 +1058,8 @@ func recoverLost(rt *threadRuntime) {
 	s := rt.state.Thread.Status
 	if s == protocol.ThreadStatusRunning || s == protocol.ThreadStatusWaiting {
 		rt.turn = &turnState{ID: lastTurn(rt.state.Items)}
-		for _, r := range rt.state.Requests {
-			rt.emit(&protocol.RequestResolvedEvent{RequestID: r.ID(), Resolution: protocol.Resolution{Outcome: protocol.ResolutionOutcomeCancel}})
-		}
+		// Its requests can't be answered (but for questions that can be answered late).
+		rt.takeUpRequests(true)
 		rt.AddItem(&protocol.Notice{
 			ID: NewID("n"), Level: protocol.NoticeLevelWarning, Code: "run.lost",
 			Text: "The backend stopped while this turn was running, and couldn't pick its run up again.",

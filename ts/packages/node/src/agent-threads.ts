@@ -9,6 +9,7 @@ import {
   type Attachment,
   type Command,
   type PermissionMode,
+  type StandingAnswer,
   type Resolution,
   type Snapshot,
   type Thread,
@@ -48,6 +49,13 @@ export interface AgentThreadsOptions extends Capabilities {
   spawner?: Spawner;
   /** Called with errors that aren't any command's: a store that fails, a subscriber that throws. */
   onError?: (error: unknown) => void;
+  /**
+   * Questions still open when their turn ends (it was interrupted, say) stay open, rather than
+   * being cancelled: an answer is sent to the agent as the user's next message, unless the
+   * conversation has moved on first (a turn started, or a message was queued). Secret ones are
+   * cancelled still.
+   */
+  lateAnswers?: boolean;
 }
 
 export interface CreateOptions extends Capabilities {
@@ -61,6 +69,11 @@ export interface CreateOptions extends Capabilities {
   title?: string;
   /** The app's own data about the thread (e.g. the user it's for); tools and the policy get it. */
   metadata?: { [k: string]: unknown };
+  /**
+   * Answers that stand from the start (from the app's own rules, say), as answers given with
+   * `always` do.
+   */
+  standing_answers?: StandingAnswer[];
   /** The thread's id; a new one by default. */
   id?: string;
 }
@@ -120,6 +133,7 @@ export class AgentThreads {
       permission_mode: options.permission_mode ?? "default",
       cwd: options.cwd ?? process.cwd(),
       ...(options.metadata ? { metadata: options.metadata } : {}),
+      ...(options.standing_answers?.length ? { standing_answers: options.standing_answers } : {}),
       created_at: new Date().toISOString(),
     };
     const { tools, mcpServers, skills, permissions, systemPrompt } = options;
@@ -283,16 +297,26 @@ export class AgentThreads {
     (await this.#ready({ type: "respond", thread_id: threadId, request_id: requestId, resolution })).respond(requestId, resolution);
   }
 
-  /** Changes the thread's model, effort or permission mode, from its next turn. */
-  async setOptions(threadId: string, options: { model?: string; effort?: string; permission_mode?: PermissionMode }): Promise<void> {
+  /**
+   * Changes the thread's model, effort or permission mode, from its next turn, or its standing
+   * answers (`[]` clears them). Open permission requests the new mode or standing answers answer
+   * (bypass allows them, dont_ask denies them) are answered at once.
+   */
+  async setOptions(
+    threadId: string,
+    options: { model?: string; effort?: string; permission_mode?: PermissionMode; standing_answers?: StandingAnswer[] },
+  ): Promise<void> {
     const rt = await this.#ready({ type: "set_options", thread_id: threadId, ...options });
     const patch: Partial<Thread> = {};
     if (options.model !== undefined) patch.model = options.model || undefined;
     if (options.effort !== undefined) patch.effort = options.effort || undefined;
     if (options.permission_mode !== undefined) patch.permission_mode = options.permission_mode;
-    const before = JSON.stringify(rt.thread);
+    if (options.standing_answers !== undefined) patch.standing_answers = options.standing_answers.length ? options.standing_answers : undefined;
+    const optionsOf = (t: Thread) => JSON.stringify([t.model, t.effort, t.permission_mode]);
+    const before = optionsOf(rt.thread);
     rt.setThread(patch);
-    if (JSON.stringify(rt.thread) !== before) rt.session?.optionsChanged();
+    if (optionsOf(rt.thread) !== before) rt.session?.optionsChanged();
+    rt.settle();
   }
 
   /**
@@ -393,6 +417,7 @@ export class AgentThreads {
       spawner: this.spawner,
       publish: (e: ThreadEvent) => this.#publish(e),
       error: (e: unknown) => this.#error(e),
+      lateAnswers: !!this.#options.lateAnswers,
     };
     const rt = new ThreadRuntime(host, state, this.#config(id), this.#policy(id));
     const harness = this.harnesses[state.thread.harness];
@@ -422,6 +447,9 @@ export class AgentThreads {
     let state = applyEvents(snap ?? initialState(thread), events);
     if (state.seq === 0) state = initialState(thread);
     const rt = this.#runtime(state);
+    // Questions kept open after their turns ended are taken up again (or cancelled, if they can't
+    // be any more).
+    rt.takeUpRequests(false);
     if (await this.#reattach(rt)) return rt;
     // The process that ran its turn went with the backend before this one, or can't be followed.
     const s = rt.thread.status;
@@ -455,11 +483,11 @@ export class AgentThreads {
       await this.#abandon(record);
       return false;
     }
-    // Requests the session didn't take up again can't be answered.
-    const open = new Set(rt.openRequests.map((r) => r.id));
-    for (const r of rt.snapshot.requests) if (!open.has(r.id)) rt.emit({ type: "request.resolved", request_id: r.id, resolution: { outcome: "cancel" } });
+    // Requests the session didn't take up again can't be answered (questions kept open after their
+    // turns were taken up before).
+    for (const r of rt.snapshot.requests) if (!rt.isOpen(r.id)) rt.emit({ type: "request.resolved", request_id: r.id, resolution: { outcome: "cancel" } });
     // With none left (one answered before the restart is closed, say), the turn runs on.
-    if (rt.turn && !open.size && rt.thread.status === "waiting") rt.setThread({ status: "running" });
+    if (rt.turn && !rt.openRequests.length && rt.thread.status === "waiting") rt.setThread({ status: "running" });
     rt.setThread({ run: { ...run, reattached_at: new Date().toISOString() } });
     if (rt.turn) {
       rt.addItem({
@@ -496,9 +524,8 @@ function recoverLost(rt: ThreadRuntime): void {
     const items = rt.snapshot.items;
     const turnId = [...items].reverse().find((i) => i.turn_id)?.turn_id ?? newId("turn");
     rt.turn = { id: turnId, interrupted: false };
-    for (const r of rt.snapshot.requests) {
-      rt.emit({ type: "request.resolved", request_id: r.id, resolution: { outcome: "cancel" } });
-    }
+    // Its requests can't be answered (but for questions that can be answered late).
+    rt.takeUpRequests(true);
     rt.addItem({
       id: newId("n"),
       type: "notice",

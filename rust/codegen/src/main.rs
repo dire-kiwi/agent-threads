@@ -189,7 +189,8 @@ fn optional_lists(file: &mut syn::File) {
             field.ty = syn::parse_quote!(::std::option::Option<#ty>);
             for attr in &mut field.attrs {
                 if attr.path().is_ident("serde") {
-                    *attr = syn::parse_quote!(#[serde(default, skip_serializing_if = "::std::option::Option::is_none")]);
+                    *attr =
+                        syn::parse_quote!(#[serde(default, skip_serializing_if = "::std::option::Option::is_none")]);
                 }
             }
         }

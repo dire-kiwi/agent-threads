@@ -162,6 +162,8 @@ export function claudePermissionMode(mode: string | undefined): string | undefin
       return "plan";
     case "bypass":
       return "bypassPermissions";
+    // dont_ask: Claude asks, and agent-threads denies what it asks about (so the policy still allows
+    // what it allows).
     default:
       return undefined;
   }

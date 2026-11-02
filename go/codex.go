@@ -1871,8 +1871,8 @@ func (s *codexSession) userInput(run *codexRun, key string, p jmap, answer func(
 		ctx.UpdateItem(itemID, Patch{"status": protocol.ToolStatusCompleted, "result": protocol.ToolResult{Content: strings.Join(lines, "\n")}})
 	}
 	rid := existing
-	if existing == "" || !ctx.Reopen(existing, answered, "") {
-		rid = ctx.Ask(&protocol.QuestionRequest{Questions: qs}, itemID, answered, "")
+	if existing == "" || !ctx.Reopen(existing, answered, nil) {
+		rid = ctx.Ask(&protocol.QuestionRequest{Questions: qs}, itemID, answered, nil)
 	}
 	run.asked[key] = rid
 }
