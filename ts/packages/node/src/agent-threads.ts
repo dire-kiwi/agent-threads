@@ -320,11 +320,12 @@ export class AgentThreads {
         return this.respond(command.thread_id, command.request_id, command.resolution);
       case "set_options": {
         // Only the thread's options a client may change: not its launch options.
-        const { thread_id, model, effort, permission_mode } = command;
+        const { thread_id, model, effort, permission_mode, standing_answers } = command;
         return this.setOptions(thread_id, {
           ...(model !== undefined ? { model } : {}),
           ...(effort !== undefined ? { effort } : {}),
           ...(permission_mode !== undefined ? { permission_mode } : {}),
+          ...(standing_answers !== undefined ? { standing_answers } : {}),
         });
       }
     }

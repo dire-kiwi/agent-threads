@@ -20,11 +20,21 @@ const question = `{"questions":[{"question":"Colour?","options":[{"label":"Blue"
 // every call.
 func newMini(t *testing.T, store agentthreads.Store, late bool) *agentthreads.AgentThreads {
 	t.Helper()
+	return newMiniWith(t, store, late, nil)
+}
+
+// newMiniWith is newMini with more of mini-claude's environment.
+func newMiniWith(t *testing.T, store agentthreads.Store, late bool, env map[string]string) *agentthreads.AgentThreads {
+	t.Helper()
 	bin := filepath.Join(specDir, "..", "ts", "packages", "node", "src", "test", "mini-claude.mjs")
+	e := map[string]string{"MINI_CLAUDE_LOG": filepath.Join(t.TempDir(), "log.jsonl")}
+	for k, v := range env {
+		e[k] = v
+	}
 	sdk := agentthreads.New(agentthreads.Options{
 		Store: store,
 		Harnesses: map[string]agentthreads.Harness{"claude": agentthreads.ClaudeCode(agentthreads.ClaudeOptions{
-			Bin: bin, Env: map[string]string{"MINI_CLAUDE_LOG": filepath.Join(t.TempDir(), "log.jsonl")},
+			Bin: bin, Env: e,
 		})},
 		Capabilities: agentthreads.Capabilities{Permissions: agentthreads.Ask},
 		OnError:      func(err error) { t.Logf("backend error: %v", err) },
@@ -74,7 +84,7 @@ func openRequest(t *testing.T, sdk *agentthreads.AgentThreads, id, ty, not strin
 	var found protocol.ThreadRequest
 	until(t, func() bool {
 		s, _ := sdk.Snapshot(context.Background(), id)
-		for _, r := range s.Requests {
+		for _, r := range protocol.OpenRequests(s) {
 			_, q := r.Value.(*protocol.QuestionRequest)
 			if (ty == "question") == q && r.ID() != not {
 				found = r
@@ -172,7 +182,7 @@ func TestStandingAnswersAreKeptWithTheThreadAndTheAppSeedsAndClearsThem(t *testi
 		t.Fatalf("stored %s", jsonOf(stored))
 	}
 	send(t, sdk, th.ID, `tool Bash {"command":"pwd"}`)
-	if s := settled(t, sdk, th.ID); lastText(s) != `ran with {"command":"pwd"}` || len(s.Requests) != 0 {
+	if s := settled(t, sdk, th.ID); lastText(s) != `ran with {"command":"pwd"}` || len(protocol.OpenRequests(s)) != 0 {
 		t.Fatalf("got %s", jsonOf(s))
 	}
 
@@ -234,7 +244,7 @@ func TestAModeChangeAnswersOpenPermissionRequestsAndDecidesLaterOnes(t *testing.
 	send(t, sdk, th.ID, "tool AskUserQuestion "+question)
 	q := openRequest(t, sdk, th.ID, "question", "")
 	mode(protocol.PermissionModeBypass)
-	if s, _ := sdk.Snapshot(ctx, th.ID); len(s.Requests) != 1 {
+	if s, _ := sdk.Snapshot(ctx, th.ID); len(protocol.OpenRequests(s)) != 1 {
 		t.Fatalf("got %s", jsonOf(s))
 	}
 	sdk.Respond(ctx, th.ID, q.ID(), protocol.Resolution{Outcome: protocol.ResolutionOutcomeAnswer, Answers: map[string][]string{"Colour?": {"Blue"}}})
@@ -287,7 +297,7 @@ func TestAQuestionLeftOpenWhenItsTurnEndsIsAnsweredWithAMessage(t *testing.T) {
 	q := openRequest(t, sdk, th.ID, "question", "")
 	sdk.Interrupt(ctx, th.ID)
 	s := settled(t, sdk, th.ID)
-	if s.Thread.Status != protocol.ThreadStatusIdle || len(s.Requests) != 1 || s.Requests[0].ID() != q.ID() {
+	if s.Thread.Status != protocol.ThreadStatusIdle || len(protocol.OpenRequests(s)) != 1 || protocol.OpenRequests(s)[0].ID() != q.ID() {
 		t.Fatalf("got %s", jsonOf(s))
 	}
 	if err := sdk.Close(ctx); err != nil {
@@ -296,7 +306,7 @@ func TestAQuestionLeftOpenWhenItsTurnEndsIsAnsweredWithAMessage(t *testing.T) {
 
 	// Still open after a restart; the answer goes to the agent as the next message.
 	sdk = newMini(t, agentthreads.NewMemoryStoreOn(state), true)
-	if s, _ := sdk.Snapshot(ctx, th.ID); len(s.Requests) != 1 || s.Requests[0].ID() != q.ID() {
+	if s, _ := sdk.Snapshot(ctx, th.ID); len(protocol.OpenRequests(s)) != 1 || protocol.OpenRequests(s)[0].ID() != q.ID() {
 		t.Fatalf("got %s", jsonOf(s))
 	}
 	before := len(resolutions(t, sdk, th.ID))
@@ -306,7 +316,7 @@ func TestAQuestionLeftOpenWhenItsTurnEndsIsAnsweredWithAMessage(t *testing.T) {
 	if got := texts[len(texts)-1]; got != "My answer to the question you asked:\n\n- Colour?\n  Blue\n\nThanks." {
 		t.Fatalf("got %q", got)
 	}
-	if len(s.Requests) != 0 || len(resolutions(t, sdk, th.ID)) != before+1 {
+	if len(protocol.OpenRequests(s)) != 0 || len(resolutions(t, sdk, th.ID)) != before+1 {
 		t.Fatalf("got %s", jsonOf(s))
 	}
 	results := 0
@@ -323,13 +333,13 @@ func TestAQuestionLeftOpenWhenItsTurnEndsIsAnsweredWithAMessage(t *testing.T) {
 	send(t, sdk, th.ID, "asking AskUserQuestion "+question)
 	q2 := openRequest(t, sdk, th.ID, "question", "")
 	sdk.Interrupt(ctx, th.ID)
-	if s := settled(t, sdk, th.ID); len(s.Requests) != 1 || s.Requests[0].ID() != q2.ID() {
+	if s := settled(t, sdk, th.ID); len(protocol.OpenRequests(s)) != 1 || protocol.OpenRequests(s)[0].ID() != q2.ID() {
 		t.Fatalf("got %s", jsonOf(s))
 	}
 	send(t, sdk, th.ID, "reply hi")
 	s = settled(t, sdk, th.ID)
 	rs := resolutions(t, sdk, th.ID)
-	if last := rs[len(rs)-1]; len(s.Requests) != 0 || last.RequestID != q2.ID() || last.Resolution.Outcome != protocol.ResolutionOutcomeCancel {
+	if last := rs[len(rs)-1]; len(protocol.OpenRequests(s)) != 0 || last.RequestID != q2.ID() || last.Resolution.Outcome != protocol.ResolutionOutcomeCancel {
 		t.Fatalf("got %s", jsonOf(rs))
 	}
 	// Answering it now does nothing.
@@ -340,6 +350,151 @@ func TestAQuestionLeftOpenWhenItsTurnEndsIsAnsweredWithAMessage(t *testing.T) {
 	}
 }
 
+// interruptedQuestion asks a question and interrupts its turn: the harness cancels the question,
+// which is kept open. It doesn't wait for the turn to end.
+func interruptedQuestion(t *testing.T, sdk *agentthreads.AgentThreads, id string) protocol.ThreadRequest {
+	t.Helper()
+	send(t, sdk, id, "asking AskUserQuestion "+question)
+	q := openRequest(t, sdk, id, "question", "")
+	sdk.Interrupt(context.Background(), id)
+	// No longer waiting on it, though it's open.
+	until(t, func() bool {
+		s, _ := sdk.Snapshot(context.Background(), id)
+		return s.Thread.Status != protocol.ThreadStatusWaiting
+	})
+	return q
+}
+
+// resolutionOf is the resolution the thread's request got, if it has one.
+func resolutionOf(t *testing.T, sdk *agentthreads.AgentThreads, id string, q protocol.ThreadRequest) *protocol.Resolution {
+	t.Helper()
+	s, _ := sdk.Snapshot(context.Background(), id)
+	for _, r := range s.Requests {
+		if r.ID() == q.ID() {
+			return r.Resolution()
+		}
+	}
+	return nil
+}
+
+func TestAQuestionIsntKeptOpenOnceTheUserSendsAMessageDuringItsTurn(t *testing.T) {
+	ctx := context.Background()
+	sdk := newMiniWith(t, nil, true, map[string]string{"MINI_CLAUDE_INTERRUPT_DELAY": "300"})
+	th, _ := sdk.Create(ctx, agentthreads.CreateOptions{Cwd: t.TempDir()})
+	cancelled := protocol.Resolution{Outcome: protocol.ResolutionOutcomeCancel}
+
+	// The message comes after the harness gave the question up, before the turn ends.
+	q := interruptedQuestion(t, sdk, th.ID)
+	if r := resolutionOf(t, sdk, th.ID, q); r != nil {
+		t.Fatalf("got %s", jsonOf(r))
+	}
+	send(t, sdk, th.ID, "reply hi")
+	s := settled(t, sdk, th.ID)
+	if r := resolutionOf(t, sdk, th.ID, q); len(protocol.OpenRequests(s)) != 0 || r == nil || jsonOf(r) != jsonOf(cancelled) {
+		t.Fatalf("got %s", jsonOf(s))
+	}
+	n := len(userTexts(s))
+	sdk.Respond(ctx, th.ID, q.ID(), protocol.Resolution{Outcome: protocol.ResolutionOutcomeAnswer, Answers: map[string][]string{"Colour?": {"Red"}}})
+	if s := settled(t, sdk, th.ID); len(userTexts(s)) != n {
+		t.Fatalf("got %s", jsonOf(s))
+	}
+
+	// And before it.
+	send(t, sdk, th.ID, "asking AskUserQuestion "+question)
+	q = openRequest(t, sdk, th.ID, "question", "")
+	send(t, sdk, th.ID, "reply later")
+	sdk.Interrupt(ctx, th.ID)
+	s = settled(t, sdk, th.ID)
+	if r := resolutionOf(t, sdk, th.ID, q); len(protocol.OpenRequests(s)) != 0 || r == nil || jsonOf(r) != jsonOf(cancelled) {
+		t.Fatalf("got %s", jsonOf(s))
+	}
+}
+
+func TestDontAskDismissesQuestionsKeptOpenAfterTheirTurnsBeforeAndAfterARestart(t *testing.T) {
+	ctx := context.Background()
+	state := agentthreads.NewMemoryState()
+	sdk := newMini(t, agentthreads.NewMemoryStoreOn(state), true)
+	th, _ := sdk.Create(ctx, agentthreads.CreateOptions{Cwd: t.TempDir()})
+	sdk.Close(ctx)
+	mode := func(sdk *agentthreads.AgentThreads, m protocol.PermissionMode) {
+		t.Helper()
+		if err := sdk.SetOptions(ctx, th.ID, agentthreads.ThreadOptions{PermissionMode: &m}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for _, restart := range []bool{false, true} {
+		sdk := newMini(t, agentthreads.NewMemoryStoreOn(state), true)
+		mode(sdk, protocol.PermissionModeDefault)
+		q := interruptedQuestion(t, sdk, th.ID)
+		if s := settled(t, sdk, th.ID); len(protocol.OpenRequests(s)) != 1 || protocol.OpenRequests(s)[0].ID() != q.ID() {
+			t.Fatalf("got %s", jsonOf(s))
+		}
+		if restart {
+			if err := sdk.Close(ctx); err != nil {
+				t.Fatal(err)
+			}
+			sdk = newMini(t, agentthreads.NewMemoryStoreOn(state), true)
+		}
+		results := len(func() []string {
+			s, _ := sdk.Snapshot(ctx, th.ID)
+			var out []string
+			for _, it := range s.Items {
+				if it.Type() == "turn_result" {
+					out = append(out, it.ID())
+				}
+			}
+			return out
+		}())
+		mode(sdk, protocol.PermissionModeDontAsk)
+		s := settled(t, sdk, th.ID)
+		want := protocol.Resolution{Outcome: protocol.ResolutionOutcomeCancel, Message: agentthreads.DontAskDenial}
+		if r := resolutionOf(t, sdk, th.ID, q); len(protocol.OpenRequests(s)) != 0 || r == nil || jsonOf(r) != jsonOf(want) {
+			t.Fatalf("restart %v: got %s", restart, jsonOf(s))
+		}
+		// Dismissed, it sent nothing.
+		after := 0
+		for _, it := range s.Items {
+			if it.Type() == "turn_result" {
+				after++
+			}
+		}
+		if after != results {
+			t.Fatalf("restart %v: %d turns, then %d", restart, results, after)
+		}
+		if err := sdk.Close(ctx); err != nil {
+			t.Fatal(err)
+		}
+	}
+}
+
+func TestATypedSetOptionsCommandCanClearStandingAnswers(t *testing.T) {
+	ctx := context.Background()
+	empty := []protocol.StandingAnswer{}
+	if got := jsonOf(protocol.SetOptionsCommand{ThreadID: "t", StandingAnswers: &empty}); !strings.Contains(got, `"standing_answers":[]`) {
+		t.Fatalf("got %s", got)
+	}
+	if got := jsonOf(protocol.SetOptionsCommand{ThreadID: "t"}); strings.Contains(got, "standing_answers") {
+		t.Fatalf("got %s", got)
+	}
+	sdk := newMini(t, nil, false)
+	seeded := []protocol.StandingAnswer{{Kind: protocol.ToolKindShell, Name: "Bash", Outcome: protocol.StandingAnswerOutcomeAllow}}
+	th, _ := sdk.Create(ctx, agentthreads.CreateOptions{Cwd: t.TempDir(), StandingAnswers: seeded})
+	roundTrip := func(c protocol.SetOptionsCommand) []protocol.StandingAnswer {
+		t.Helper()
+		c.ThreadID = th.ID
+		handle(t, sdk, jsonOf(protocol.Command{Value: &c}))
+		s, _ := sdk.Snapshot(ctx, th.ID)
+		return s.Thread.StandingAnswers
+	}
+	// Left out, they stay; given empty, they're cleared.
+	if got := roundTrip(protocol.SetOptionsCommand{Model: "m"}); jsonOf(got) != jsonOf(seeded) {
+		t.Fatalf("got %s", jsonOf(got))
+	}
+	if got := roundTrip(protocol.SetOptionsCommand{StandingAnswers: &empty}); len(got) != 0 {
+		t.Fatalf("got %s", jsonOf(got))
+	}
+}
+
 func TestWithoutLateAnswersATurnThatEndsCancelsItsQuestions(t *testing.T) {
 	ctx := context.Background()
 	sdk := newMini(t, nil, false)
@@ -347,7 +502,7 @@ func TestWithoutLateAnswersATurnThatEndsCancelsItsQuestions(t *testing.T) {
 	send(t, sdk, th.ID, "asking AskUserQuestion "+question)
 	openRequest(t, sdk, th.ID, "question", "")
 	sdk.Interrupt(ctx, th.ID)
-	if s := settled(t, sdk, th.ID); len(s.Requests) != 0 {
+	if s := settled(t, sdk, th.ID); len(protocol.OpenRequests(s)) != 0 {
 		t.Fatalf("got %s", jsonOf(s))
 	}
 }

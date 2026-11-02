@@ -574,7 +574,10 @@ func (a *AgentThreads) Handle(ctx context.Context, command protocol.Command) err
 		if c.PermissionMode != "" {
 			o.PermissionMode = &c.PermissionMode
 		}
-		o.StandingAnswers = c.StandingAnswers
+		// Given (even empty, which clears them), they replace the thread's.
+		if c.StandingAnswers != nil {
+			o.StandingAnswers = append([]protocol.StandingAnswer{}, *c.StandingAnswers...)
+		}
 		return a.SetOptions(ctx, c.ThreadID, o)
 	}
 	return commandErr("that isn't a command")
@@ -604,9 +607,8 @@ func (a *AgentThreads) HandleJSON(ctx context.Context, data []byte) error {
 		if sc.PermissionMode != "" {
 			o.PermissionMode = &sc.PermissionMode
 		}
-		// [] clears them.
-		if _, ok := raw["standing_answers"]; ok {
-			o.StandingAnswers = append([]protocol.StandingAnswer{}, sc.StandingAnswers...)
+		if sc.StandingAnswers != nil {
+			o.StandingAnswers = append([]protocol.StandingAnswer{}, *sc.StandingAnswers...)
 		}
 		return a.SetOptions(ctx, sc.ThreadID, o)
 	}

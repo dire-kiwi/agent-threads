@@ -56,9 +56,14 @@ interface OpenRequest {
   standing?: StandingKey;
   /**
    * A question kept open after its turn ended (lateAnswers): its answer is sent as the next
-   * message, unless a turn starts first.
+   * message, unless the user sends one first.
    */
   late?: boolean;
+  /**
+   * How many messages the user had sent when it was opened: one sent since means the conversation
+   * has moved on, and it isn't kept open after its turn.
+   */
+  users: number;
 }
 
 /** A message as sent: its text and attachments, and the client's id for it. */
@@ -436,9 +441,9 @@ export class ThreadRuntime implements ThreadContext {
   /** Sends a message: starts a turn, or steers the running one. */
   send(message: Outgoing): void {
     const id = newId("um");
+    // The conversation moves on: questions kept open after their turns can't be answered.
+    this.#cancelLate();
     if (!this.turn) {
-      // The conversation moves on: questions kept open after their turns can't be answered.
-      this.#cancelLate();
       // Messages still queued from before weren't delivered: they go first, in this turn, and stay
       // queued until the harness takes them in. Such a turn is a retry for them.
       const left = this.queued();
@@ -496,10 +501,14 @@ export class ThreadRuntime implements ThreadContext {
         this.updateItem(it.id, { status: "cancelled" });
       }
     }
+    // Questions are kept open after the turn (some may be already: see cancelRequest()), unless
+    // messages are left queued, which a turn carries over or the next message sends: the
+    // conversation has moved on.
     for (const [id, r] of this.#requests) {
-      if (r.late || (r.request.turn_id !== undefined && r.request.turn_id !== turn.id)) continue;
+      const keep = r.late ? !this.#queue.length : r.request.turn_id !== undefined && r.request.turn_id !== turn.id;
+      if (keep) continue;
       this.#requests.delete(id);
-      if (!this.#keepLate(r.request)) this.emit({ type: "request.resolved", request_id: id, resolution: { outcome: "cancel" } });
+      if (r.late || !this.#keepLate(r.request, r.users)) this.emit({ type: "request.resolved", request_id: id, resolution: { outcome: "cancel" } });
     }
     const ok = end.ok && !turn.interrupted;
     const error = !ok && !turn.interrupted ? end.error || "The turn failed." : undefined;
@@ -615,7 +624,7 @@ export class ThreadRuntime implements ThreadContext {
       if (call.parent_id) r.parent_id = call.parent_id;
       this.updateItem(call.id, { status: "pending" });
     }
-    this.#requests.set(r.id, { request: r, answered, ...(standing ? { standing } : {}) });
+    this.#requests.set(r.id, { request: r, answered, users: this.#userMessages(), ...(standing ? { standing } : {}) });
     this.emit({ type: "request.opened", request: r });
     this.setThread({ status: "waiting" });
     return r.id;
@@ -625,7 +634,7 @@ export class ThreadRuntime implements ThreadContext {
     if (this.#requests.has(requestId)) return false;
     const request = this.#state.requests.find((r) => r.id === requestId);
     if (!request || request.resolution) return false;
-    this.#requests.set(requestId, { request, answered, ...(standing ? { standing } : {}) });
+    this.#requests.set(requestId, { request, answered, users: this.#userMessages(), ...(standing ? { standing } : {}) });
     return true;
   }
 
@@ -649,11 +658,12 @@ export class ThreadRuntime implements ThreadContext {
 
   /**
    * Answers the open requests the thread's standing answers or permission mode now answer (see
-   * #settled), after either changed.
+   * #settled), after either changed: questions kept open after their turns included, which
+   * dont_ask dismisses (and which then send nothing).
    */
   settle(): void {
     for (const [id, open] of [...this.#requests]) {
-      if (open.late || !this.#requests.has(id)) continue;
+      if (!this.#requests.has(id)) continue;
       const r = this.#settled(open.request.type === "question", open.standing);
       if (r) this.respond(id, r);
     }
@@ -663,7 +673,7 @@ export class ThreadRuntime implements ThreadContext {
     const open = this.#requests.get(id);
     if (!open || open.late) return;
     this.#requests.delete(id);
-    if (!(this.interrupted && this.#keepLate(open.request))) {
+    if (!(this.interrupted && this.#keepLate(open.request, open.users))) {
       this.emit({ type: "request.resolved", request_id: id, resolution: { outcome: "cancel" } });
     }
     if (!this.#waiting() && this.turn) this.setThread({ status: "running" });
@@ -687,20 +697,29 @@ export class ThreadRuntime implements ThreadContext {
 
   /**
    * Keeps a question open after its turn ended, with lateAnswers, if it can be: not a secret one
-   * (its answer would be shown, as a message), and not when messages are queued (the conversation
-   * has moved on). Whether it did.
+   * (its answer would be shown, as a message), not under dont_ask (which dismisses questions), and
+   * not when the conversation has moved on: messages are queued, or the user sent one since it was
+   * opened (when there were `users`). Whether it did.
    */
-  #keepLate(request: ThreadRequest): boolean {
-    if (request.type !== "question" || !this.#host.lateAnswers || this.#queue.length || request.questions.some((q) => q.secret)) return false;
+  #keepLate(request: ThreadRequest, users?: number): boolean {
+    if (request.type !== "question" || !this.#host.lateAnswers || request.questions.some((q) => q.secret)) return false;
+    const movedOn = this.#queue.length > 0 || (users !== undefined && this.#userMessages() > users);
+    if (movedOn || this.thread.permission_mode === "dont_ask") return false;
     this.#requests.set(request.id, {
       request,
       late: true,
+      users: this.#userMessages(),
       answered: (r) => {
         // A dismissal sends nothing.
         if (r.outcome === "answer") this.send({ text: lateAnswerText(request, r) });
       },
     });
     return true;
+  }
+
+  /** How many messages the user has sent. */
+  #userMessages(): number {
+    return this.#state.items.filter((i) => i.type === "user_message").length;
   }
 
   /** Cancels the questions kept open after their turns. */

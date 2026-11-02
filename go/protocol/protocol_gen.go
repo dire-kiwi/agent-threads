@@ -216,7 +216,7 @@ type SetOptionsCommand struct {
 	PermissionMode PermissionMode `json:"permission_mode,omitempty"`
 
 	// Replaces the thread's standing answers ([] clears them).
-	StandingAnswers []StandingAnswer `json:"standing_answers,omitempty"`
+	StandingAnswers *[]StandingAnswer `json:"standing_answers,omitempty"`
 
 	// Extra has the fields the spec doesn't name, as they came, so that they're written again
 	// unchanged (receivers ignore fields they don't know, and stores keep them).
