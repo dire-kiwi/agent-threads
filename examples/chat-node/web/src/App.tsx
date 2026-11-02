@@ -7,6 +7,7 @@ import {
   useSetOptions,
   useThreadState,
   type Command,
+  type PermissionMode,
   type Snapshot,
   type ThreadEvent,
   type ThreadInfo,
@@ -149,7 +150,18 @@ function ThreadPane({ id, status, generation }: { id: string; status: string; ge
   );
 }
 
-/** The thread's title, harness and model, which can be changed for its next turn. */
+/** The permission modes, as the header's picker names them. */
+const MODES: { mode: PermissionMode; label: string }[] = [
+  { mode: "default", label: "ask" },
+  { mode: "accept_edits", label: "accept edits" },
+  { mode: "plan", label: "plan" },
+  { mode: "bypass", label: "bypass" },
+];
+
+/**
+ * The thread's title, harness, model and permission mode. A new model or mode goes to the running
+ * agent straight away where the harness allows, and otherwise from the next turn.
+ */
 function ThreadHeader() {
   const thread = useThreadState((s) => s.snapshot.thread);
   const setOptions = useSetOptions();
@@ -170,6 +182,16 @@ function ThreadHeader() {
           model <input value={model} onChange={(e) => setModel(e.target.value)} size={14} aria-label="Model" />
         </label>
       </form>
+      <label className="model-form">
+        mode{" "}
+        <select value={thread.permission_mode ?? "default"} aria-label="Permission mode" onChange={(e) => void setOptions({ permission_mode: e.target.value as PermissionMode })}>
+          {MODES.map((m) => (
+            <option key={m.mode} value={m.mode}>
+              {m.label}
+            </option>
+          ))}
+        </select>
+      </label>
     </header>
   );
 }
