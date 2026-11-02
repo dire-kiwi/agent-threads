@@ -171,7 +171,9 @@ stays open while the thread is idle. Answering it sends the answers to the agent
 message, as a `send` would, which starts a turn. It isn't kept, or stays open, once the
 conversation has moved on: when the user sends a message (after it was asked, before or after its
 turn ended), or a message was left queued when its turn ended. Nor is one with a `secret` question,
-or under `dont_ask`.
+or under `dont_ask`. Such a question stays open across a backend restart, as does one the harness gave up
+because its turn was interrupted, while that turn hasn't ended yet; a request the harness still has
+(a background subagent's, say) is taken up again as it was.
 
 ## Events
 
