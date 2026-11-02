@@ -1,6 +1,6 @@
 import type { Story, StoryDefault } from "@ladle/react";
-import type { PermissionRequest, QuestionRequest } from "@dire-kiwi/agent-threads-protocol";
-import { PermissionCard, QuestionCard } from "../components/Requests.js";
+import type { PermissionRequest, PlanRequest, QuestionRequest } from "@dire-kiwi/agent-threads-protocol";
+import { PermissionCard, PlanCard, QuestionCard } from "../components/Requests.js";
 import { FixtureThread, snapshotOf } from "./fixtures.js";
 
 export default { title: "Requests" } satisfies StoryDefault;
@@ -35,6 +35,19 @@ export const PermissionForAnEdit: Story = () => {
     </FixtureThread>
   );
 };
+
+/** A plan from a fixture: approve it in a mode, or keep planning with feedback. */
+export const Plan: Story<{ fixture: string }> = ({ fixture }) => {
+  const snapshot = snapshotOf(fixture, (e) => e.type === "request.opened" && e.request.type === "plan");
+  return (
+    <FixtureThread snapshot={snapshot}>
+      <div className="at-root" style={{ maxWidth: "48rem" }}>
+        <PlanCard request={snapshot.requests[0] as PlanRequest} />
+      </div>
+    </FixtureThread>
+  );
+};
+Plan.argTypes = { fixture: { options: ["claude/plan", "codex/plan"], control: { type: "radio" }, defaultValue: "claude/plan" } };
 
 /** A question from a fixture: pick an option (or press 1–9), or write your own. */
 export const Question: Story<{ fixture: string }> = ({ fixture }) => {

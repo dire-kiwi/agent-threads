@@ -54,22 +54,30 @@ for (const dir of fixtureDirs()) {
 
     test(`codex/${meta.scenario}: each turn used what its model calls did`, () => {
       // Each run: the `last` of every report from the turn's start to its end, if Codex reported
-      // any tokens in the run.
+      // any tokens in the run. A Codex turn that proposed a plan goes on in the next (the answer to
+      // it): they're one turn of the thread's.
       const used = [];
       for (const entries of runs.values()) {
         const msgs = entries.filter((e) => e.dir === "out" && e.msg?.method).map((e) => e.msg);
         let reported = false;
         let turn = null;
+        let planned = false;
         for (const m of msgs) {
           if (!own.has(m.params?.threadId)) continue;
-          if (m.method === "turn/started") turn = { ...zero };
+          if (m.method === "turn/started") turn ??= { ...zero };
+          if (m.method === "item/completed" && m.params.item?.type === "plan") planned = true;
           if (m.method === "thread/tokenUsage/updated") {
             reported = true;
             if (turn) turn = add(turn, asUsage(m.params.tokenUsage.last));
           }
           if (m.method === "turn/completed") {
+            if (planned && m.params.turn?.status === "completed") {
+              planned = false;
+              continue;
+            }
             used.push(reported ? (turn ?? { ...zero }) : undefined);
             turn = null;
+            planned = false;
           }
         }
       }

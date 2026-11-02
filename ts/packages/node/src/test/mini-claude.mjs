@@ -84,6 +84,11 @@ createInterface({ input: process.stdin })
     if (m.type === "control_request") {
       if (m.request.subtype === "never_answered") return;
       if (m.request.subtype === "initialize") initialized = true;
+      // As Claude Code, which can be switched to bypass mode only if it was started in it.
+      if (m.request.subtype === "set_permission_mode" && m.request.mode === "bypassPermissions" && !process.argv.includes("bypassPermissions")) {
+        out({ type: "control_response", response: { subtype: "error", request_id: m.request_id, error: "not launched with --dangerously-skip-permissions" } });
+        return;
+      }
       out({ type: "control_response", response: { subtype: "success", request_id: m.request_id, response: {} } });
       if (m.request.subtype === "interrupt" && busy && !stubborn) {
         wasInterrupted = true;

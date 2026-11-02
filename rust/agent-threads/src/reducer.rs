@@ -210,6 +210,7 @@ impl ThreadRequest {
         match self {
             ThreadRequest::Permission(r) => &r.id,
             ThreadRequest::Question(r) => &r.id,
+            ThreadRequest::Plan(r) => &r.id,
         }
     }
 
@@ -217,6 +218,7 @@ impl ThreadRequest {
         match self {
             ThreadRequest::Permission(r) => r.turn_id.as_deref(),
             ThreadRequest::Question(r) => r.turn_id.as_deref(),
+            ThreadRequest::Plan(r) => r.turn_id.as_deref(),
         }
     }
 
@@ -224,6 +226,7 @@ impl ThreadRequest {
         match self {
             ThreadRequest::Permission(r) => r.parent_id.as_deref(),
             ThreadRequest::Question(r) => r.parent_id.as_deref(),
+            ThreadRequest::Plan(r) => r.parent_id.as_deref(),
         }
     }
 
@@ -231,6 +234,7 @@ impl ThreadRequest {
         match self {
             ThreadRequest::Permission(r) => r.tool_call_id.as_deref(),
             ThreadRequest::Question(r) => r.tool_call_id.as_deref(),
+            ThreadRequest::Plan(r) => r.tool_call_id.as_deref(),
         }
     }
 
@@ -239,6 +243,7 @@ impl ThreadRequest {
         match self {
             ThreadRequest::Permission(r) => r.resolution.as_ref(),
             ThreadRequest::Question(r) => r.resolution.as_ref(),
+            ThreadRequest::Plan(r) => r.resolution.as_ref(),
         }
     }
 
@@ -251,6 +256,7 @@ impl ThreadRequest {
         let at = match self {
             ThreadRequest::Permission(r) => &mut r.resolution,
             ThreadRequest::Question(r) => &mut r.resolution,
+            ThreadRequest::Plan(r) => &mut r.resolution,
         };
         *at = Some(resolution);
     }

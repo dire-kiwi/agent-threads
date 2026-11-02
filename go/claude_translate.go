@@ -362,6 +362,14 @@ func askQuestions(input json.RawMessage) []protocol.Question {
 	return out
 }
 
+// claudeMode is a permission mode as Claude Code names it, for set_permission_mode and setMode.
+func claudeMode(mode protocol.PermissionMode) string {
+	if m := claudePermissionMode(mode); m != "" {
+		return m
+	}
+	return "default"
+}
+
 // claudePermissionMode is the permission mode as Claude Code names it, or "" for the default.
 func claudePermissionMode(mode protocol.PermissionMode) string {
 	switch mode {

@@ -39,7 +39,7 @@ export {
   type ThreadProviderProps,
 } from "./hooks.js";
 export type { ThreadConfig, ToolBodyProps, ToolMeta, ToolRenderer, ToolRowProps } from "./config.js";
-export { brief, relative, toolMeta } from "./toolMeta.js";
+export { brief, planTitle, relative, toolMeta } from "./toolMeta.js";
 
 // Components
 export { Thread, ThreadStatusLine, type ThreadProps } from "./components/Thread.js";
@@ -47,7 +47,7 @@ export { AssistantMessage, ItemView, MessageList, MessageRow, Reasoning, UserMes
 export { StreamingText } from "./components/StreamingText.js";
 export { builtinToolRenderers, EditDiff, PatchDiff, ToolCall, ToolGroup, ToolResultView, ToolStatus, toolRenderer } from "./components/ToolCall.js";
 export { reportText, Subagent, SubagentStatusBadge, subagentKind, subagentTitle } from "./components/Subagent.js";
-export { OpenRequests, PermissionCard, QuestionCard, RequestCard } from "./components/Requests.js";
+export { OpenRequests, PermissionCard, PlanCard, QuestionCard, RequestCard } from "./components/Requests.js";
 export { LoadEarlier } from "./components/LoadEarlier.js";
 export { CompactionLine, Notice, TurnResult, usageText } from "./components/Lines.js";
 export { afterSent, Composer, type ComposerProps } from "./components/Composer.js";

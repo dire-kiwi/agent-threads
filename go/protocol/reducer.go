@@ -231,6 +231,10 @@ func withResolution(request ThreadRequest, res Resolution) ThreadRequest {
 		c := *r
 		c.Resolution = &res
 		return ThreadRequest{Value: &c}
+	case *PlanRequest:
+		c := *r
+		c.Resolution = &res
+		return ThreadRequest{Value: &c}
 	}
 	return request
 }

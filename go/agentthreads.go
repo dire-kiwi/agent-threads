@@ -320,7 +320,7 @@ func (a *AgentThreads) Configure(ctx context.Context, threadID string, c Capabil
 		config, policy := a.config(threadID), a.policy(threadID)
 		rt.loop.call(func() {
 			rt.config, rt.policy = config, policy
-			rt.session.OptionsChanged()
+			rt.session.ConfigChanged()
 			// A run that outlives the backend is saved knowing it, without an event to save it with.
 			rt.scheduleFlush()
 		})
@@ -652,8 +652,9 @@ func (a *AgentThreads) Respond(ctx context.Context, threadID, requestID string, 
 	return a.do(ctx, threadID, func(rt *threadRuntime) { rt.respond(requestID, res) })
 }
 
-// SetOptions changes the thread's model, effort, permission mode or launch options, from its next
-// turn.
+// SetOptions changes the thread's model, effort, permission mode or launch options: the model and
+// permission mode straight away where the harness takes them in its running process, and otherwise
+// from the next turn.
 func (a *AgentThreads) SetOptions(ctx context.Context, threadID string, o ThreadOptions) error {
 	if o.PermissionMode != nil {
 		if problems := protocol.ValidateValue(*o.PermissionMode, "PermissionMode"); len(problems) > 0 {

@@ -6,6 +6,7 @@ import type {
   Attachment,
   Item,
   PermissionRequest,
+  PlanRequest,
   QuestionRequest,
   RateLimit,
   Resolution,
@@ -109,7 +110,10 @@ export function unixTime(seconds: number): string {
 }
 
 /** A request to open, without the fields the core fills in. */
-export type NewRequest = Omit<PermissionRequest, "id" | "turn_id" | "tool_call_id" | "parent_id"> | Omit<QuestionRequest, "id" | "turn_id" | "tool_call_id" | "parent_id">;
+export type NewRequest =
+  | Omit<PermissionRequest, "id" | "turn_id" | "tool_call_id" | "parent_id">
+  | Omit<QuestionRequest, "id" | "turn_id" | "tool_call_id" | "parent_id">
+  | Omit<PlanRequest, "id" | "turn_id" | "tool_call_id" | "parent_id">;
 
 /** An item to add, without its turn (the core sets the running turn's). */
 export type NewItem = Item extends infer I ? (I extends Item ? Omit<I, "turn_id"> : never) : never;
@@ -255,7 +259,7 @@ export interface HarnessSession {
   /**
    * Where a rewind to before turn `index` of `sessions` (each turn's session, in order) takes the
    * session (see sessions.ts). Throws a RewindError if it can't be rewound there. The core then
-   * sets the thread's session_id and resume_at, and calls optionsChanged().
+   * sets the thread's session_id and resume_at, and retires the run (see retire).
    */
   rewindPoint?(sessions: (TurnSession | undefined)[], index: number): RewindPoint;
   /** Whether a harness process is running that has the queued messages (it was sent them). */
@@ -265,12 +269,17 @@ export interface HarnessSession {
    * process that has them). They're sent again with the next turn's start().
    */
   release(): void;
-  /** The thread's options (model, effort, permission mode, launch options) or config changed. */
+  /**
+   * The thread's options (model, effort, permission mode) changed: they go to the running process
+   * where the harness takes them, and otherwise apply from the next turn.
+   */
   optionsChanged(): void;
+  /** The thread's config (tools, MCP servers, skills, system prompt) or launch options changed: the next turn needs a new process. */
+  configChanged(): void;
   /**
    * The thread's session changed (new_session, rewind) with no turn running: stop the running
    * process now (its background work too), and let nothing it says after reach the thread. The
-   * next turn starts a new one. Without it, the core calls optionsChanged().
+   * next turn starts a new one. Without it, the core calls configChanged().
    */
   retire?(): void;
   /** Stop the harness process, if it's running. */

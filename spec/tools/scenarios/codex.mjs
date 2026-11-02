@@ -36,6 +36,8 @@ export function threadParams(ctx, { model = MODEL, dynamicTools, mcpServers } = 
     cwd: ctx.work,
     model,
     approvalPolicy: "untrusted",
+    // Whatever the permission mode: Codex says what this sandbox is, with all its config, and the
+    // first turn puts the thread in its mode's (plan: read-only).
     sandbox: "workspace-write",
     config: {
       "features.default_mode_request_user_input": true,
@@ -91,10 +93,13 @@ async function start(ctx, handlers = answers(), { setup } = {}) {
 
 const turnCompleted = (threadId) => (m) => m.method === "turn/completed" && m.params?.threadId === threadId;
 
-async function turn(rpc, threadId, prompt) {
-  const r = await rpc.request("turn/start", { threadId, input: text(prompt), effort: EFFORT });
+async function turn(rpc, threadId, prompt, more = {}) {
+  const r = await rpc.request("turn/start", { threadId, input: text(prompt), effort: EFFORT, ...more });
   return r.turn.id;
 }
+
+/** turn/start's collaborationMode for Codex's plan mode (or its default one). */
+const collaboration = (mode, model = MODEL) => ({ mode, settings: { model, reasoning_effort: EFFORT, developer_instructions: null } });
 
 /** One thread, one turn, then the process is closed. */
 async function oneTurn(ctx, prompt, { thread, handlers, setup } = {}) {
@@ -297,6 +302,49 @@ export const scenarios = {
       p.note({ type: "compact" });
       await rpc.request("thread/compact/start", { threadId: thread.id });
       await p.next(turnCompleted(thread.id), "the compaction to complete");
+      p.close();
+      await p.exited;
+    },
+  },
+
+  plan: {
+    description:
+      "Plan mode (collaboration mode plan): the agent proposes a plan and its turn ends; the user's feedback is another plan-mode turn; they approve the second plan, which is a default-mode turn with Codex's own \"Implement the plan.\" and the accept_edits policy, in which the edit isn't asked about.",
+    async run(ctx) {
+      const { p, rpc } = await start(ctx);
+      const { thread } = await rpc.request("thread/start", threadParams(ctx));
+      await turn(rpc, thread.id, "Plan this change: in notes.txt, change the line apple to apricot. Don't ask me any questions, and keep the plan short.", {
+        sandboxPolicy: { type: "readOnly" },
+        collaborationMode: collaboration("plan"),
+      });
+      await p.next(turnCompleted(thread.id), "the first plan");
+      await turn(rpc, thread.id, "Also change the line banana to blueberry.", { collaborationMode: collaboration("plan") });
+      await p.next(turnCompleted(thread.id), "the second plan");
+      await turn(rpc, thread.id, "Implement the plan.", {
+        collaborationMode: collaboration("default"),
+        approvalPolicy: "on-request",
+        sandboxPolicy: { type: "workspaceWrite" },
+      });
+      await p.next(turnCompleted(thread.id), "the implementation");
+      p.close();
+      await p.exited;
+    },
+  },
+
+  "set-options": {
+    description:
+      "Options changed between turns while the process runs: the next turn/start overrides the model and the approval policy (accept_edits), so its edit isn't asked about.",
+    async run(ctx) {
+      const { p, rpc } = await start(ctx);
+      const { thread } = await rpc.request("thread/start", threadParams(ctx));
+      await turn(rpc, thread.id, "Reply with just: one");
+      await p.next(turnCompleted(thread.id), "the first turn to complete");
+      await turn(rpc, thread.id, "Edit notes.txt with apply_patch to change the line apple to apricot. Then reply with just: done", {
+        model: "gpt-6-luna",
+        // The sandbox stays as it is (workspace-write): only the approval policy changes.
+        approvalPolicy: "on-request",
+      });
+      await p.next(turnCompleted(thread.id), "the second turn to complete");
       p.close();
       await p.exited;
     },

@@ -369,7 +369,8 @@ export class ThreadRuntime implements ThreadContext {
     this.#launch = normalLaunch(launch);
     this.#threadChanged = true;
     this.#scheduleFlush();
-    this.session?.optionsChanged();
+    // Its process is started with them: the next turn needs another.
+    this.session?.configChanged();
   }
 
   item(id: string): Item | undefined {
@@ -502,7 +503,7 @@ export class ThreadRuntime implements ThreadContext {
     for (const id of [...this.#requests.keys()]) this.cancelRequest(id);
     if (!this.turn && this.#state.thread.status === "waiting") this.setThread({ status: "idle" });
     if (this.session?.retire) this.session.retire();
-    else this.session?.optionsChanged();
+    else this.session?.configChanged();
   }
 
   /**
@@ -699,7 +700,7 @@ export class ThreadRuntime implements ThreadContext {
   }
 
   ask(request: NewRequest, toolCallId: string | undefined, answered: (resolution: Resolution) => void, standing?: string): string {
-    const r = { ...request, id: newId(request.type === "question" ? "q" : "perm") } as ThreadRequest;
+    const r = { ...request, id: newId(request.type === "question" ? "q" : request.type === "plan" ? "plan" : "perm") } as ThreadRequest;
     if (this.turn) r.turn_id = this.turn.id;
     const call = toolCallId ? this.item(toolCallId) : undefined;
     if (call) {

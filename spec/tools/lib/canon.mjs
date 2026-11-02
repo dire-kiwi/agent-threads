@@ -121,6 +121,8 @@ export class Context {
           // What the tool will run with: the input it asked about, unless the backend changed it
           // (AskUserQuestion's answers go in it too). A denial's message is what the agent is told.
           if (body.behavior === "allow") k.input = body.updatedInput ?? asked.input;
+          // An approved plan's mode (setMode), and any other permission updates.
+          if (body.behavior === "allow" && body.updatedPermissions?.length) k.permissions = body.updatedPermissions;
           if (body.behavior === "deny") k.message = body.message;
         } else if (asked.subtype === "mcp_message") {
           k.mcp = mcpReply(asked.message, body.mcp_response);
@@ -202,7 +204,17 @@ function codexParams(method, p) {
       return k;
     }
     case "turn/start":
-      return { threadId: p.threadId, text: text(p.input), ...(p.effort ? { effort: p.effort } : {}) };
+      // With the options it changes: the model, the policy, and the collaboration mode (plan, or
+      // back to default).
+      return {
+        threadId: p.threadId,
+        text: text(p.input),
+        ...(p.effort ? { effort: p.effort } : {}),
+        ...(p.model ? { model: p.model } : {}),
+        ...(p.approvalPolicy ? { approvalPolicy: p.approvalPolicy } : {}),
+        ...(p.sandboxPolicy ? { sandboxPolicy: p.sandboxPolicy.type } : {}),
+        ...(p.collaborationMode ? { collaborationMode: p.collaborationMode.mode } : {}),
+      };
     case "turn/steer":
       return { threadId: p.threadId, expectedTurnId: p.expectedTurnId, text: text(p.input) };
     case "turn/interrupt":

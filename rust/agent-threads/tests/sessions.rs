@@ -43,7 +43,8 @@ impl HarnessSession for Fake {
         false
     }
     fn release(&mut self, _: &mut ThreadContext) {}
-    fn options_changed(&mut self, _: &mut ThreadContext) {
+    fn options_changed(&mut self, _: &mut ThreadContext) {}
+    fn config_changed(&mut self, _: &mut ThreadContext) {
         self.counts.lock().unwrap().changes += 1;
     }
     fn close(&mut self, _: &mut ThreadContext) -> BoxFuture<()> {

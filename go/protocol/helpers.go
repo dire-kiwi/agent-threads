@@ -201,6 +201,8 @@ func (u ThreadRequest) ID() string {
 		return r.ID
 	case *QuestionRequest:
 		return r.ID
+	case *PlanRequest:
+		return r.ID
 	}
 	return ""
 }
@@ -211,6 +213,8 @@ func (u ThreadRequest) TurnID() string {
 	case *PermissionRequest:
 		return r.TurnID
 	case *QuestionRequest:
+		return r.TurnID
+	case *PlanRequest:
 		return r.TurnID
 	}
 	return ""
@@ -223,6 +227,8 @@ func (u ThreadRequest) ParentID() string {
 		return r.ParentID
 	case *QuestionRequest:
 		return r.ParentID
+	case *PlanRequest:
+		return r.ParentID
 	}
 	return ""
 }
@@ -234,6 +240,8 @@ func (u ThreadRequest) ToolCallID() string {
 		return r.ToolCallID
 	case *QuestionRequest:
 		return r.ToolCallID
+	case *PlanRequest:
+		return r.ToolCallID
 	}
 	return ""
 }
@@ -244,6 +252,8 @@ func (u ThreadRequest) Resolution() *Resolution {
 	case *PermissionRequest:
 		return r.Resolution
 	case *QuestionRequest:
+		return r.Resolution
+	case *PlanRequest:
 		return r.Resolution
 	}
 	return nil
@@ -390,6 +400,8 @@ func (u ThreadRequest) SetRaw(raw json.RawMessage) {
 		r.Raw = raw
 	case *QuestionRequest:
 		r.Raw = raw
+	case *PlanRequest:
+		r.Raw = raw
 	}
 }
 
@@ -399,6 +411,8 @@ func (u ThreadRequest) Raw() json.RawMessage {
 	case *PermissionRequest:
 		return r.Raw
 	case *QuestionRequest:
+		return r.Raw
+	case *PlanRequest:
 		return r.Raw
 	}
 	return nil

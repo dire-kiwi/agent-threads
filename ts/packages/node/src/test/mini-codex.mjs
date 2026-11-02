@@ -20,6 +20,7 @@
 //   concurrent <server> <json>  starts MCP calls ({"calls": [[tool, args]...]}) on one server, then
 //                       elicits approval for the one at "ask"
 //   plan                two turn/plan/updated notifications
+//   propose <text>      a proposed plan (a plan item), as in plan mode
 //   search <query>      a web search
 //   sub <prompt>        spawns a subagent (a child thread), which replies, and waits for it
 //   sleep <ms>          waits (or until it's interrupted)
@@ -281,6 +282,12 @@ async function step(line) {
       notify("turn/plan/updated", { ...ids, explanation: "The steps", plan: [{ step: "one", status: "inProgress" }, { step: "two", status: "pending" }] });
       notify("turn/plan/updated", { ...ids, explanation: "The steps", plan: [{ step: "one", status: "completed" }, { step: "two", status: "inProgress" }] });
       return;
+    case "propose": {
+      const id = `${turn.id}-plan`;
+      item("item/started", { type: "plan", id, text: "" });
+      notify("item/plan/delta", { ...ids, itemId: id, delta: arg });
+      return item("item/completed", { type: "plan", id, text: arg });
+    }
     case "search": {
       const id = uid("ws");
       item("item/started", { type: "webSearch", id, query: "", action: null });
@@ -319,6 +326,35 @@ async function step(line) {
       process.stderr.write("mini-codex crashed\n");
       process.exit(3);
   }
+}
+
+/**
+ * The sandbox policy thread/start's sandbox and config make, as Codex reports it: the thread's
+ * config over $CODEX_HOME/config.toml's [sandbox_workspace_write] (`key = value` lines of JSON).
+ */
+function sandboxOf(p) {
+  if (p.sandbox === "read-only") return { type: "readOnly", networkAccess: false };
+  if (p.sandbox === "danger-full-access") return { type: "dangerFullAccess" };
+  const toml = {};
+  const file = home && join(home, "config.toml");
+  if (file && existsSync(file)) {
+    let section = "";
+    for (const line of readFileSync(file, "utf8").split("\n")) {
+      const head = /^\[(.+)\]$/.exec(line.trim());
+      if (head) section = head[1];
+      const kv = /^(\w+)\s*=\s*(.+)$/.exec(line.trim());
+      if (kv && section === "sandbox_workspace_write") toml[kv[1]] = JSON.parse(kv[2]);
+    }
+  }
+  const c = p.config ?? {};
+  const set = (k, none) => (c.sandbox_workspace_write ?? {})[k] ?? c[`sandbox_workspace_write.${k}`] ?? toml[k] ?? none;
+  return {
+    type: "workspaceWrite",
+    writableRoots: set("writable_roots", []),
+    networkAccess: set("network_access", false),
+    excludeTmpdirEnvVar: set("exclude_tmpdir_env_var", false),
+    excludeSlashTmp: set("exclude_slash_tmp", false),
+  };
 }
 
 async function runTurn(input, id0 = uid("turn")) {
@@ -382,14 +418,14 @@ createInterface({ input: process.stdin })
         if (p.dynamicTools?.length && process.env.MINI_CODEX_NO_DYNAMIC) return fail("dynamicTools isn't supported by this version");
         thread = { id: uid("thread"), totals: { totalTokens: 0, inputTokens: 0, cachedInputTokens: 0, cacheWriteInputTokens: 0, outputTokens: 0 }, params: p, dynamicTools: p.dynamicTools ?? [] };
         save();
-        return reply({ thread: { id: thread.id } });
+        return reply({ thread: { id: thread.id }, sandbox: sandboxOf(p) });
       case "thread/resume": {
         const file = sessions && join(sessions, `${p.threadId}.json`);
         if (!file || !existsSync(file)) return fail(`no rollout found for thread id ${p.threadId}`);
         // As Codex does, it keeps the dynamic tools the session started with (resuming can't change them).
         const saved = JSON.parse(readFileSync(file, "utf8"));
         thread = { id: p.threadId, totals: saved.totals, params: p, dynamicTools: saved.dynamicTools ?? [] };
-        return reply({ thread: { id: thread.id } });
+        return reply({ thread: { id: thread.id }, sandbox: sandboxOf(p) });
       }
       case "turn/start":
         if (turn) return fail("a turn is already running");

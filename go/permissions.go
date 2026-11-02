@@ -115,3 +115,15 @@ func decide(ctx context.Context, policy PermissionPolicy, q PermissionQuery, t P
 	}
 	return d
 }
+
+// modeAfterPlan is the permission mode a thread carries on in once its plan is approved: the one
+// the user picked, or else its own, or default if that's plan.
+func modeAfterPlan(current, picked protocol.PermissionMode) protocol.PermissionMode {
+	if picked != "" && picked != protocol.PermissionModePlan {
+		return picked
+	}
+	if current != "" && current != protocol.PermissionModePlan {
+		return current
+	}
+	return protocol.PermissionModeDefault
+}

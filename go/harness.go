@@ -259,9 +259,12 @@ type Session interface {
 	// Release says the core gave up carrying the queued messages over: make sure nothing acts on
 	// them (stop a process that has them). They're sent again with the next turn's Start.
 	Release()
-	// OptionsChanged says the thread's options (model, effort, permission mode), launch options or
-	// config changed.
+	// OptionsChanged says the thread's options (model, effort, permission mode) changed: they go to
+	// the running process where the harness takes them, and otherwise apply from the next turn.
 	OptionsChanged()
+	// ConfigChanged says the thread's config (tools, MCP servers, skills, system prompt) changed: the
+	// next turn needs a new process.
+	ConfigChanged()
 	// Close stops the harness process, if it's running, and calls done once it has.
 	Close(done func())
 }
@@ -275,7 +278,7 @@ type CompactingSession interface {
 }
 
 // RetiringSession is a Session that can retire its process as the thread's session changes
-// (new_session, rewind) with no turn running. Without it, the core calls OptionsChanged.
+// (new_session, rewind) with no turn running. Without it, the core calls ConfigChanged.
 type RetiringSession interface {
 	Session
 	// Retire stops the running process now (its background work too), and lets nothing it says
@@ -290,7 +293,7 @@ type RewindingSession interface {
 	// RewindPoint is where a rewind to before turn index of sessions (each turn's session, in order;
 	// nil for a turn that ended with none) takes the session: ResumeAtPoint or RevertPoint, say. It
 	// returns a *RewindError if it can't be rewound there. The core then retires the old session
-	// (Retire, or OptionsChanged), and sets the thread's session_id and resume_at.
+	// (Retire, or ConfigChanged), and sets the thread's session_id and resume_at.
 	RewindPoint(sessions []*protocol.TurnSession, index int) (RewindPoint, error)
 }
 

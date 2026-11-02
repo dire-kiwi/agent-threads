@@ -51,7 +51,8 @@ func (s *sessionFake) CarryOver([]agentthreads.Message) {}
 func (s *sessionFake) Interrupt()                       {}
 func (s *sessionFake) Live() bool                       { return false }
 func (s *sessionFake) Release()                         {}
-func (s *sessionFake) OptionsChanged()                  { s.h.changes.Add(1) }
+func (s *sessionFake) OptionsChanged()                  {}
+func (s *sessionFake) ConfigChanged()                   { s.h.changes.Add(1) }
 func (s *sessionFake) Close(done func())                { done() }
 func (s *sessionFake) Compact()                         { s.h.compacts.Add(1) }
 func (s *sessionFake) RewindPoint(sessions []*protocol.TurnSession, i int) (agentthreads.RewindPoint, error) {
@@ -157,7 +158,7 @@ func kinds(items []protocol.Item) []string {
 	return out
 }
 
-func sameAs(t *testing.T, what string, got, want any) {
+func expectSame(t *testing.T, what string, got, want any) {
 	t.Helper()
 	if !reflect.DeepEqual(mustMarshal(got), mustMarshal(want)) {
 		t.Fatalf("%s: got %s, want %s", what, mustMarshal(got), mustMarshal(want))
@@ -183,14 +184,14 @@ func TestTurnResultSession(t *testing.T) {
 			t.Fatal(err)
 		}
 		s.turn("four", "S2", "m4")
-		sameAs(t, "sessions", turnSessions(s.snap().Items), []*protocol.TurnSession{
+		expectSame(t, "sessions", turnSessions(s.snap().Items), []*protocol.TurnSession{
 			{ID: "S1", At: "m1", Started: true}, {ID: "S1", At: "m2"}, {ID: "S1"}, {ID: "S2", At: "m4", Started: true},
 		})
 	})
 	t.Run("is left out when the turn ended with no session", func(t *testing.T) {
 		s := newSessionsScene(t, agentthreads.ResumeAtPoint, "")
 		s.turn("one", "", "")
-		sameAs(t, "sessions", turnSessions(s.snap().Items), []*protocol.TurnSession{nil})
+		expectSame(t, "sessions", turnSessions(s.snap().Items), []*protocol.TurnSession{nil})
 	})
 }
 
@@ -208,7 +209,7 @@ func TestRewind(t *testing.T) {
 			t.Fatal(err)
 		}
 		snap := s.snap()
-		sameAs(t, "items", kinds(snap.Items), []string{"user_message", "assistant_message", "turn_result", "rewind"})
+		expectSame(t, "items", kinds(snap.Items), []string{"user_message", "assistant_message", "turn_result", "rewind"})
 		if n, ok := snap.Items[3].Value.(*protocol.Notice); !ok || n.Level != protocol.NoticeLevelInfo {
 			t.Fatalf("got %s", mustMarshal(snap.Items[3]))
 		}
@@ -216,7 +217,7 @@ func TestRewind(t *testing.T) {
 			t.Fatalf("got %s", mustMarshal(snap.Thread))
 		}
 		if got := s.h.changes.Load(); got != changes+1 {
-			t.Fatalf("OptionsChanged %d times, not once", got-changes)
+			t.Fatalf("ConfigChanged %d times, not once", got-changes)
 		}
 		events := s.events()
 		var removed []string
@@ -229,9 +230,9 @@ func TestRewind(t *testing.T) {
 		for _, it := range before.Items[3:] {
 			want = append(want, it.ID())
 		}
-		sameAs(t, "removed", removed, want)
+		expectSame(t, "removed", removed, want)
 		first := events[0].Value.(*protocol.ThreadUpdatedEvent).Thread
-		sameAs(t, "the snapshot", snap, protocol.ApplyEvents(protocol.InitialState(first), events))
+		expectSame(t, "the snapshot", snap, protocol.ApplyEvents(protocol.InitialState(first), events))
 	})
 
 	t.Run("to before a session's first turn starts a new one", func(t *testing.T) {
@@ -245,7 +246,7 @@ func TestRewind(t *testing.T) {
 		if snap.Thread.SessionID != "" || snap.Thread.ResumeAt != "" {
 			t.Fatalf("got %s", mustMarshal(snap.Thread))
 		}
-		sameAs(t, "items", kinds(snap.Items), []string{"rewind"})
+		expectSame(t, "items", kinds(snap.Items), []string{"rewind"})
 	})
 
 	t.Run("to before the first turn after a new_session keeps the new session's notice, and starts a new one", func(t *testing.T) {
@@ -262,7 +263,7 @@ func TestRewind(t *testing.T) {
 		if snap.Thread.SessionID != "" {
 			t.Fatalf("got %s", mustMarshal(snap.Thread))
 		}
-		sameAs(t, "items", kinds(snap.Items), []string{"user_message", "assistant_message", "turn_result", "session.new", "rewind"})
+		expectSame(t, "items", kinds(snap.Items), []string{"user_message", "assistant_message", "turn_result", "session.new", "rewind"})
 	})
 
 	t.Run("goes back into the session before a new_session, taking the new session's notice with it", func(t *testing.T) {
@@ -298,7 +299,7 @@ func TestRewind(t *testing.T) {
 		s.turn("one", "", "m1")
 		before := s.snap()
 		refused(t, s.rewind(turnIDs(before.Items)[0]), "can't be rewound to before that turn")
-		sameAs(t, "the snapshot", s.snap(), before)
+		expectSame(t, "the snapshot", s.snap(), before)
 	})
 
 	t.Run("reverts a Codex session to before the first turn from there that has a mark", func(t *testing.T) {
@@ -392,18 +393,18 @@ func TestRewind(t *testing.T) {
 			t.Fatal(err)
 		}
 		snap := s.snap()
-		sameAs(t, "turns", turnIDs(snap.Items), turnIDs(before.Items)[:1])
+		expectSame(t, "turns", turnIDs(snap.Items), turnIDs(before.Items)[:1])
 		if has(snap.Items, steered) {
 			t.Fatal("the steered message is still there")
 		}
-		sameAs(t, "items", kinds(snap.Items), []string{"user_message", "turn_result", "rewind"})
+		expectSame(t, "items", kinds(snap.Items), []string{"user_message", "turn_result", "rewind"})
 		// To before turn three: turn two stays.
 		s, before, steered = carried(t)
 		if err := s.rewind(turnIDs(before.Items)[2]); err != nil {
 			t.Fatal(err)
 		}
 		snap = s.snap()
-		sameAs(t, "turns", turnIDs(snap.Items), turnIDs(before.Items)[:2])
+		expectSame(t, "turns", turnIDs(snap.Items), turnIDs(before.Items)[:2])
 		if has(snap.Items, steered) {
 			t.Fatal("the steered message is still there")
 		}
@@ -434,14 +435,14 @@ func TestRewind(t *testing.T) {
 		if w.Start == nil || *w.Start != 3 {
 			t.Fatalf("got %s", mustMarshal(w))
 		}
-		sameAs(t, "items", kinds(w.Items), []string{"rewind"})
+		expectSame(t, "items", kinds(w.Items), []string{"rewind"})
 		// The page before it is turn one, and fits.
 		page, err := s.sdk.ItemsBefore(ctx, s.id, *w.Start, 10)
 		if err != nil {
 			t.Fatal(err)
 		}
 		whole := protocol.WithPage(w, page)
-		sameAs(t, "the whole", whole.Items, s.snap().Items)
+		expectSame(t, "the whole", whole.Items, s.snap().Items)
 	})
 
 	t.Run("is refused while a turn runs, and for a turn the thread hasn't", func(t *testing.T) {
@@ -513,7 +514,7 @@ func TestNewSession(t *testing.T) {
 		t.Fatalf("got %s", mustMarshal(snap.Items[len(snap.Items)-1]))
 	}
 	if s.h.changes.Load() == 0 {
-		t.Fatal("OptionsChanged wasn't called")
+		t.Fatal("ConfigChanged wasn't called")
 	}
 }
 
@@ -537,9 +538,9 @@ func TestCompact(t *testing.T) {
 		c.EndTurn(agentthreads.TurnEnd{OK: true, SessionAt: "m2"})
 	})
 	snap := s.snap()
-	sameAs(t, "items", kinds(snap.Items[n:]), []string{"compaction", "turn_result"})
+	expectSame(t, "items", kinds(snap.Items[n:]), []string{"compaction", "turn_result"})
 	sessions := turnSessions(snap.Items)
-	sameAs(t, "session", sessions[len(sessions)-1], &protocol.TurnSession{ID: "S1", At: "m2"})
+	expectSame(t, "session", sessions[len(sessions)-1], &protocol.TurnSession{ID: "S1", At: "m2"})
 }
 
 func TestSessionsNeedTheHarness(t *testing.T) {
@@ -575,9 +576,9 @@ func TestRewindPoints(t *testing.T) {
 	type P = agentthreads.RewindPoint
 	t.Run("resume at the latest mark before the turn, in its session", func(t *testing.T) {
 		f := agentthreads.ResumeAtPoint
-		sameAs(t, "1", point(f, []*protocol.TurnSession{s("A", "a1", true), s("A", "", false), s("A", "a3", false)}, 2), P{SessionID: "A", ResumeAt: "a1"})
-		sameAs(t, "2", point(f, []*protocol.TurnSession{s("A", "a1", true), s("B", "b1", true)}, 1), P{})
-		sameAs(t, "3", point(f, []*protocol.TurnSession{nil, s("A", "a1", true)}, 0), P{})
+		expectSame(t, "1", point(f, []*protocol.TurnSession{s("A", "a1", true), s("A", "", false), s("A", "a3", false)}, 2), P{SessionID: "A", ResumeAt: "a1"})
+		expectSame(t, "2", point(f, []*protocol.TurnSession{s("A", "a1", true), s("B", "b1", true)}, 1), P{})
+		expectSame(t, "3", point(f, []*protocol.TurnSession{nil, s("A", "a1", true)}, 0), P{})
 		var re *agentthreads.RewindError
 		if _, err := f([]*protocol.TurnSession{s("A", "", true), s("A", "a2", false)}, 1); !errors.As(err, &re) {
 			t.Fatalf("got %v", err)
@@ -588,9 +589,9 @@ func TestRewindPoints(t *testing.T) {
 	})
 	t.Run("revert to before the first mark from the turn on, in its session", func(t *testing.T) {
 		f := agentthreads.RevertPoint
-		sameAs(t, "1", point(f, []*protocol.TurnSession{s("A", "a1", true), s("A", "", false), s("A", "a3", false)}, 1), P{SessionID: "A", ResumeAt: "a3"})
-		sameAs(t, "2", point(f, []*protocol.TurnSession{s("A", "a1", true), s("A", "", false), s("B", "b1", true)}, 1), P{SessionID: "A"})
-		sameAs(t, "3", point(f, []*protocol.TurnSession{s("A", "a1", true)}, 0), P{})
+		expectSame(t, "1", point(f, []*protocol.TurnSession{s("A", "a1", true), s("A", "", false), s("A", "a3", false)}, 1), P{SessionID: "A", ResumeAt: "a3"})
+		expectSame(t, "2", point(f, []*protocol.TurnSession{s("A", "a1", true), s("A", "", false), s("B", "b1", true)}, 1), P{SessionID: "A"})
+		expectSame(t, "3", point(f, []*protocol.TurnSession{s("A", "a1", true)}, 0), P{})
 	})
 }
 
@@ -647,7 +648,7 @@ func TestLostTurnSession(t *testing.T) {
 	ctx := context.Background()
 	t.Run("records that it started the session it got", func(t *testing.T) {
 		next, id, snap := lostTurn(t, "", nil)
-		sameAs(t, "sessions", turnSessions(snap.Items), []*protocol.TurnSession{{ID: "S-new", Started: true}})
+		expectSame(t, "sessions", turnSessions(snap.Items), []*protocol.TurnSession{{ID: "S-new", Started: true}})
 		if err := next.Rewind(ctx, id, turnIDs(snap.Items)[0]); err != nil {
 			t.Fatal(err)
 		}
@@ -662,7 +663,7 @@ func TestLostTurnSession(t *testing.T) {
 				t.Fatal(err)
 			}
 		})
-		sameAs(t, "sessions", turnSessions(snap.Items), []*protocol.TurnSession{{ID: "S-old", At: "m1", Started: true}, {ID: "S-new", Started: true}})
+		expectSame(t, "sessions", turnSessions(snap.Items), []*protocol.TurnSession{{ID: "S-old", At: "m1", Started: true}, {ID: "S-new", Started: true}})
 	})
 	t.Run("is a compaction that had no items yet, not the turn before it", func(t *testing.T) {
 		store := agentthreads.NewMemoryStore()
@@ -715,9 +716,9 @@ func TestLostTurnSession(t *testing.T) {
 				completed = append(completed, ev.TurnID)
 			}
 		}
-		sameAs(t, "turns completed", completed, started)
-		sameAs(t, "turns", turnIDs(snap.Items), started)
-		sameAs(t, "sessions", turnSessions(snap.Items), []*protocol.TurnSession{{ID: "S", At: "m1", Started: true}, {ID: "S"}})
+		expectSame(t, "turns completed", completed, started)
+		expectSame(t, "turns", turnIDs(snap.Items), started)
+		expectSame(t, "sessions", turnSessions(snap.Items), []*protocol.TurnSession{{ID: "S", At: "m1", Started: true}, {ID: "S"}})
 		if err := next.Rewind(ctx, th.ID, started[1]); err != nil {
 			t.Fatal(err)
 		}
@@ -727,7 +728,7 @@ func TestLostTurnSession(t *testing.T) {
 	})
 	t.Run("records that it continued a session the thread adopted", func(t *testing.T) {
 		next, id, snap := lostTurn(t, "S0", nil)
-		sameAs(t, "sessions", turnSessions(snap.Items), []*protocol.TurnSession{{ID: "S0"}})
+		expectSame(t, "sessions", turnSessions(snap.Items), []*protocol.TurnSession{{ID: "S0"}})
 		refused(t, next.Rewind(ctx, id, turnIDs(snap.Items)[0]), "can't be rewound to before that turn")
 	})
 }

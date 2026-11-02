@@ -29,8 +29,10 @@ use crate::harness::{
 };
 use crate::ids::{new_id, now_iso, now_ms, private_temp_dir};
 use crate::mcp_http::{LoopbackMcp, ToolServer, serve_tools};
-use crate::permissions::{Decided, PermissionDecision, PermissionQuery, permission_key};
-use crate::protocol::{DeltaEventKind, Item, Resolution, ResolutionOutcome, ToolKind, ToolStatus, TurnSession, Usage};
+use crate::permissions::{Decided, PermissionDecision, PermissionQuery, mode_after_plan, permission_key};
+use crate::protocol::{
+    DeltaEventKind, Item, PermissionMode, Resolution, ResolutionOutcome, ToolKind, ToolStatus, TurnSession, Usage,
+};
 use crate::sessions::{RewindError, RewindPoint, revert_point};
 use crate::skills::write_skills;
 use crate::spawner::{ExitStatus, HarnessProcess, ProcessEvent, Signal, SpawnOptions};
@@ -42,7 +44,7 @@ use home::{
 };
 use translate::{
     APP_SERVER, call_usage, codex_done, codex_policy, codex_rate_limits, codex_tool, is_tool_item, mcp_server_config,
-    no_usage, questions, todos,
+    no_usage, questions, sandbox_policy, todos,
 };
 
 /// How the app's tools reach Codex.
@@ -182,14 +184,16 @@ struct Sent {
     key: String,
 }
 
-#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+/// The thread's options a process has: those it was started with, and those it was given with a
+/// turn since (turn/start overrides them).
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
 struct Launched {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     model: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     effort: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    permission_mode: Option<String>,
+    permission_mode: Option<PermissionMode>,
     #[serde(default, skip_serializing_if = "LaunchOptions::is_empty")]
     launch: LaunchOptions,
 }
@@ -200,9 +204,41 @@ impl Launched {
         Launched {
             model: t.model.clone(),
             effort: t.effort.clone(),
-            permission_mode: t.permission_mode.map(|m| m.to_string()),
+            permission_mode: t.permission_mode,
             launch: ctx.launch().clone(),
         }
+    }
+}
+
+/// What Codex is told when the user approves its plan, as its own client says it.
+const IMPLEMENT: &str = "Implement the plan.";
+
+/// A thread's turn that has had a plan from Codex: what its Codex turns so far used, and the plan
+/// request while the user hasn't answered it (the turn goes on meanwhile).
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+struct Planned {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    usage: Option<Usage>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    duration_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    request: Option<String>,
+    /// The turn's mark (its session's `at`): its first Codex turn.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    session_at: Option<String>,
+}
+
+/// A turn's end with what its Codex turns that completed (its plans') used, for a turn that ends
+/// otherwise, and its mark: its first Codex turn (`at`, the one running, if it's that).
+fn with_planned(end: TurnEnd, planned: Option<Planned>, at: Option<String>) -> TurnEnd {
+    match planned {
+        Some(p) => TurnEnd {
+            usage: p.usage,
+            duration_ms: p.duration_ms,
+            session_at: p.session_at.or(at),
+            ..end
+        },
+        None => TurnEnd { session_at: at, ..end },
     }
 }
 
@@ -261,6 +297,18 @@ struct RunState {
     rpc: RpcState,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     launched: Option<Launched>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    model: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    workspace: Option<Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    sandbox: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    collab: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    proposed: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    planned: Option<Planned>,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     stale: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -330,6 +378,21 @@ struct Run {
     sent: Vec<Sent>,
     held: HashSet<String>,
     launched: Option<Launched>,
+    /// The model Codex says the thread runs, for a collaboration mode's settings when the thread
+    /// has none of its own.
+    model: Option<String>,
+    /// The workspace-write sandbox Codex last said the thread had, with its settings.
+    workspace: Option<Value>,
+    /// The sandbox mode it has (none: its permission mode's, from a checkpoint from before this was
+    /// kept).
+    sandbox: Option<String>,
+    /// The collaboration mode it was last given, `plan` or `default` (none: it's in its default
+    /// one).
+    collab: Option<String>,
+    /// The plan the running Codex turn proposed, in plan mode.
+    proposed: Option<String>,
+    /// The thread's turn has had a plan.
+    planned: Option<Planned>,
     detached: bool,
 }
 
@@ -374,6 +437,12 @@ impl Run {
             sent: Vec::new(),
             held: HashSet::new(),
             launched: None,
+            model: None,
+            workspace: None,
+            sandbox: None,
+            collab: None,
+            proposed: None,
+            planned: None,
             detached: false,
         }
     }
@@ -466,6 +535,12 @@ impl Run {
                     .collect(),
             },
             launched: self.launched.clone(),
+            model: self.model.clone(),
+            workspace: self.workspace.clone(),
+            sandbox: self.sandbox.clone(),
+            collab: self.collab.clone(),
+            proposed: self.proposed.clone(),
+            planned: self.planned.clone(),
             stale: false,
             stop_at: None,
         })
@@ -498,6 +573,12 @@ impl Run {
         self.sent = st.sent.clone();
         self.held = st.held.iter().cloned().collect();
         self.launched = st.launched.clone();
+        self.model = st.model.clone();
+        self.workspace = st.workspace.clone();
+        self.sandbox = st.sandbox.clone();
+        self.collab = st.collab.clone();
+        self.proposed = st.proposed.clone();
+        self.planned = st.planned.clone();
         self.next = st.rpc.next;
         self.ready = Ready::Started(st.thread_id.clone());
     }
@@ -542,6 +623,8 @@ pub(crate) struct CodexSession {
     runs: HashMap<String, Run>,
     current: Option<String>,
     last: Option<String>,
+    /// The config changed since the run started (or its options aren't known): the next turn
+    /// starts a new one.
     stale: bool,
     stop_timer: Option<Timer>,
     stop_at: Option<u64>,
@@ -808,33 +891,106 @@ impl CodexSession {
     fn turn_start(&mut self, ctx: &mut ThreadContext, run: &str, messages: &[Message]) {
         let input = self.input(ctx, messages);
         let sent = self.sent(run, messages.iter().map(|m| m.id.clone()).collect(), &input);
+        self.start_turn(ctx, run, input, Some(sent));
+    }
+
+    /// Starts a Codex turn with the input: the messages `sent`, or the driver's own.
+    fn start_turn(&mut self, ctx: &mut ThreadContext, run: &str, input: Vec<Value>, sent: Option<Sent>) {
         if let Some(r) = self.run(run) {
             r.starting = true;
         }
-        let effort = ctx.thread().effort.clone();
+        let ours = run.to_string();
         self.when_ready(
             ctx,
             run,
             Box::new(move |s, ctx, ready| {
-                let run = match s.runs.iter().find(|(_, r)| r.sent.contains(&sent)) {
+                let run = match sent
+                    .as_ref()
+                    .and_then(|sent| s.runs.iter().find(|(_, r)| r.sent.contains(sent)))
+                {
                     Some((id, _)) => id.clone(),
+                    None if sent.is_none() => ours,
                     None => s.current.clone().unwrap_or_default(),
                 };
                 let thread_id = match ready {
                     Ok(t) => t,
                     Err(e) => {
-                        s.refused(&run, &sent);
+                        if let Some(sent) = &sent {
+                            s.refused(&run, sent);
+                        }
                         return s.turn_failed(ctx, &run, &e);
                     }
                 };
+                let before = s
+                    .runs
+                    .get(&run)
+                    .map(|r| (r.launched.clone(), r.collab.clone(), r.sandbox.clone()));
                 let mut params = json!({"threadId": thread_id, "input": input});
-                if let Some(e) = effort {
-                    params["effort"] = json!(e);
+                for (k, v) in s.turn_options(ctx, &run) {
+                    params[k] = v;
                 }
-                let meta = json!({"sent": sent});
-                s.request(ctx, &run, "turn/start", params, Some(meta), turn_started(sent));
+                let meta = sent.as_ref().map(|sent| json!({"sent": sent}));
+                s.request(ctx, &run, "turn/start", params, meta, turn_started(sent, before));
             }),
         );
+    }
+
+    /// turn/start's options: the thread's effort, and what the process doesn't have yet (Codex
+    /// keeps them for later turns): the model, the policy for the permission mode, and in plan mode
+    /// the collaboration mode `plan` (and `default` after it).
+    fn turn_options(&mut self, ctx: &ThreadContext, run: &str) -> Map<String, Value> {
+        let t = ctx.thread();
+        let mut o = Map::new();
+        let Some(r) = self.runs.get_mut(run) else { return o };
+        let l = r.launched.clone().unwrap_or_default();
+        if let Some(e) = &t.effort {
+            o.insert("effort".into(), json!(e));
+        }
+        if let Some(m) = &t.model
+            && l.model.as_ref() != Some(m)
+        {
+            o.insert("model".into(), json!(m));
+        }
+        let (approval, sandbox) = codex_policy(t.permission_mode);
+        let (approval_before, sandbox_before) = codex_policy(l.permission_mode);
+        if approval != approval_before {
+            o.insert("approvalPolicy".into(), json!(approval));
+        }
+        // Only a new sandbox, since what's sent replaces all of it.
+        if r.sandbox.as_deref().unwrap_or(sandbox_before) != sandbox {
+            o.insert(
+                "sandboxPolicy".into(),
+                sandbox_policy(sandbox, r.workspace.as_ref(), &self.o.config),
+            );
+        }
+        r.sandbox = Some(sandbox.to_string());
+        let collab = if t.permission_mode == Some(PermissionMode::Plan) {
+            Some("plan")
+        } else if r.collab.as_deref() == Some("plan") {
+            Some("default")
+        } else {
+            None
+        };
+        if let Some(mode) = collab {
+            let model = t
+                .model
+                .clone()
+                .or(l.model.clone())
+                .or(r.model.clone())
+                .unwrap_or_default();
+            o.insert(
+                "collaborationMode".into(),
+                json!({"mode": mode, "settings": {"model": model, "reasoning_effort": t.effort, "developer_instructions": null}}),
+            );
+            r.collab = Some(mode.into());
+        }
+        r.launched = Some(Launched {
+            model: t.model.clone().or(l.model),
+            effort: t.effort.clone(),
+            permission_mode: t.permission_mode,
+            launch: l.launch,
+        });
+        o
     }
 
     /// Messages are being sent to the process, as this input.
@@ -870,15 +1026,19 @@ impl CodexSession {
         }
         let at = self.runs.get(run).and_then(|r| r.turn_id.clone());
         self.turn_ended(ctx, run);
+        let planned = self.run(run).unwrap().planned.take();
         if ctx.turn_id().is_some() {
             let live = self.live_id().is_some();
             ctx.end_turn(
-                TurnEnd {
-                    ok: false,
-                    error: Some(error.to_string()),
-                    session_at: at,
-                    ..Default::default()
-                },
+                with_planned(
+                    TurnEnd {
+                        ok: false,
+                        error: Some(error.to_string()),
+                        ..Default::default()
+                    },
+                    planned,
+                    at,
+                ),
                 live,
             );
         }
@@ -1025,10 +1185,8 @@ impl CodexSession {
             Ok(p) => p,
             Err(e) => return self.spawn_failed(ctx, id, e.to_string()),
         };
-        let launched = Launched::of(ctx);
         let run = self.run(id).unwrap();
         run.proc = Some(proc);
-        run.launched = Some(launched);
         forward_events::<CodexSession>(ctx, id, rx, |s, ctx, id, e| s.event(ctx, id, e));
         let spawner = ctx.spawner().name().to_string();
         let run_id = id.to_string();
@@ -1276,7 +1434,14 @@ impl CodexSession {
         let Some(thread_id) = r["thread"]["id"].as_str().map(String::from) else {
             return self.start_failed(ctx, run, "Codex didn't say which thread it started".into());
         };
-        self.run(run).unwrap().thread_id = Some(thread_id.clone());
+        let rs = self.run(run).unwrap();
+        rs.thread_id = Some(thread_id.clone());
+        if let Some(m) = r["model"].as_str() {
+            rs.model = Some(m.to_string());
+        }
+        if r["sandbox"]["type"] == "workspaceWrite" {
+            rs.workspace = Some(r["sandbox"].clone());
+        }
         // A rewind's resume_at was for the session it had, which this isn't if it couldn't be resumed.
         if ctx.thread().session_id.as_deref() != Some(thread_id.as_str()) {
             let sid = thread_id.clone();
@@ -1398,8 +1563,11 @@ impl CodexSession {
                 .collect();
             cfg.insert("skills".into(), json!({"config": skills}));
         }
-        let (approval, sandbox) = codex_policy(t.permission_mode);
-        let mut params = json!({"approvalPolicy": approval, "sandbox": sandbox, "config": cfg});
+        // The thread starts in the workspace-write sandbox whatever its mode, so that Codex says what
+        // that sandbox is with all of its config (CODEX_HOME's, the thread's writable roots...): the
+        // first turn puts it in its mode's, and switching back to workspace-write later has it all.
+        let (approval, _) = codex_policy(t.permission_mode);
+        let mut params = json!({"approvalPolicy": approval, "sandbox": "workspace-write", "config": cfg});
         if let Some(cwd) = &t.cwd {
             params["cwd"] = json!(cwd);
         }
@@ -1411,6 +1579,8 @@ impl CodexSession {
         } else {
             Vec::new()
         };
+        r.launched = Some(Launched::of(ctx));
+        r.sandbox = Some("workspace-write".into());
         if !dynamic.is_empty() {
             let tools: Vec<Value> = dynamic
                 .into_iter()
@@ -1463,17 +1633,21 @@ impl CodexSession {
         if ctx.thread().run.as_ref().is_some_and(|r| r.id == id) {
             ctx.set_thread(|t| t.run = None);
         }
+        let planned = self.run(id).and_then(|r| r.planned.take());
         // A run that ends while its turn is running ends the turn (as interrupted, if it was).
         if !retired && ctx.turn_id().is_some() {
             self.clear_stop();
             let live = self.live_id().is_some();
             ctx.end_turn(
-                TurnEnd {
-                    ok: false,
-                    error: Some(error),
-                    session_at: at,
-                    ..Default::default()
-                },
+                with_planned(
+                    TurnEnd {
+                        ok: false,
+                        error: Some(error),
+                        ..Default::default()
+                    },
+                    planned,
+                    at,
+                ),
                 live,
             );
         }
@@ -1657,6 +1831,13 @@ impl CodexSession {
                     ctx.rate_limits(codex_rate_limits(&p["rateLimits"]));
                 }
             }
+            "thread/settings/updated" => {
+                // Its workspace-write sandbox, kept for when it's switched back to it.
+                let sandbox = &p["threadSettings"]["sandboxPolicy"];
+                if own && sandbox["type"] == "workspaceWrite" {
+                    self.run(run).unwrap().workspace = Some(sandbox.clone());
+                }
+            }
             "thread/tokenUsage/updated" => {
                 if own && p["tokenUsage"].is_object() {
                     let r = self.run(run).unwrap();
@@ -1797,6 +1978,9 @@ impl CodexSession {
                 {
                     r.last_child.insert(c.clone(), text.clone());
                 }
+                if child.is_none() && ty == "plan" {
+                    r.proposed = Some(text.clone());
+                }
                 if r.streamed.contains(&item_id) {
                     ctx.update_item(&item_id, json!({"text": text}));
                 } else if !text.is_empty() {
@@ -1935,11 +2119,10 @@ impl CodexSession {
     }
 
     fn turn_completed(&mut self, ctx: &mut ThreadContext, run: &str, turn: &Value) {
-        let error = self.run(run).unwrap().error.clone();
-        let at = turn["id"]
-            .as_str()
-            .map(String::from)
-            .or_else(|| self.runs.get(run).and_then(|r| r.turn_id.clone()));
+        let r = self.run(run).unwrap();
+        let error = r.error.clone();
+        let plan = r.proposed.take();
+        let at = turn["id"].as_str().map(String::from).or_else(|| r.turn_id.clone());
         self.turn_ended(ctx, run);
         let r = self.run(run).unwrap();
         r.error = None;
@@ -1951,9 +2134,38 @@ impl CodexSession {
             return;
         }
         self.clear_stop();
+        let ok = turn["status"] == "completed";
+        // The thread's turn is all of its Codex turns, the plans' included.
+        let r = self.run(run).unwrap();
+        let mut sum = r.planned.take().unwrap_or_default();
+        sum.usage = add_usage(sum.usage.as_ref(), usage.as_ref());
+        if let Some(d) = turn["durationMs"].as_f64() {
+            sum.duration_ms = Some(sum.duration_ms.unwrap_or(0) + d as u64);
+        }
+        sum.request = None;
+        // Its mark is its first Codex turn: reverting to before that takes back all of them.
+        if sum.session_at.is_none() {
+            sum.session_at = at;
+        }
+        if let Some(plan) = plan
+            && ok
+            && ctx.thread().permission_mode == Some(PermissionMode::Plan)
+            && !ctx.interrupted()
+        {
+            // A plan: the turn goes on while the user decides whether to start on it.
+            r.planned = Some(sum);
+            let id = run.to_string();
+            let answered =
+                ThreadContext::answered::<CodexSession>(move |s, ctx, res: Resolution| s.plan_answered(ctx, &id, res));
+            let request = ctx.ask(json!({"type": "plan", "plan": plan}), None, answered, None);
+            if let Some(p) = self.run(run).and_then(|r| r.planned.as_mut()) {
+                p.request = Some(request);
+            }
+            return;
+        }
         let failed = turn["status"] == "failed";
         let end = TurnEnd {
-            ok: turn["status"] == "completed",
+            ok,
             error: failed.then(|| {
                 turn["error"]["message"]
                     .as_str()
@@ -1961,12 +2173,66 @@ impl CodexSession {
                     .or(error)
                     .unwrap_or_else(|| "The turn failed.".into())
             }),
-            usage,
-            duration_ms: turn["durationMs"].as_f64().map(|d| d as u64),
-            session_at: at,
+            usage: sum.usage,
+            duration_ms: sum.duration_ms,
+            session_at: sum.session_at,
         };
         let live = self.live_id().is_some();
         ctx.end_turn(end, live);
+    }
+
+    /// The user answered a plan: approved, Codex implements it in the mode the thread carries on
+    /// in; sent back with feedback, it plans again. Either way in another Codex turn of the same
+    /// turn. Otherwise the turn ends.
+    fn plan_answered(&mut self, ctx: &mut ThreadContext, run: &str, res: Resolution) {
+        if self.live_id().as_deref() != Some(run) {
+            return;
+        }
+        let Some(r) = self.run(run) else { return };
+        let Some(planned) = r.planned.as_mut().filter(|p| p.request.is_some() && !r.detached) else {
+            return;
+        };
+        planned.request = None;
+        let text = |t: &str| vec![json!({"type": "text", "text": t, "text_elements": []})];
+        let feedback = res.message.as_deref().filter(|m| !m.is_empty());
+        match (res.outcome, feedback) {
+            (ResolutionOutcome::Allow, _) => {
+                let mode = mode_after_plan(ctx.thread().permission_mode, res.permission_mode);
+                ctx.set_thread(|t| t.permission_mode = Some(mode));
+                self.start_turn(ctx, run, text(IMPLEMENT), None);
+            }
+            (ResolutionOutcome::Deny, Some(m)) => self.start_turn(ctx, run, text(m), None),
+            _ => self.end_planned(ctx, run),
+        }
+    }
+
+    /// Ends a turn that's waiting on its plan (or whose plan wasn't answered), as its Codex turns
+    /// went.
+    fn end_planned(&mut self, ctx: &mut ThreadContext, run: &str) {
+        if self.current.as_deref() != Some(run) {
+            return;
+        }
+        let Some(planned) = self.run(run).and_then(|r| r.planned.take()) else {
+            return;
+        };
+        if let Some(request) = &planned.request {
+            ctx.cancel_request(request);
+        }
+        self.clear_stop();
+        if ctx.turn_id().is_none() {
+            return;
+        }
+        let live = self.live_id().is_some();
+        ctx.end_turn(
+            TurnEnd {
+                ok: true,
+                error: None,
+                usage: planned.usage,
+                duration_ms: planned.duration_ms,
+                session_at: planned.session_at,
+            },
+            live,
+        );
     }
 
     /// A subagent's turn ended: so did its call, with the subagent's last message.
@@ -2621,8 +2887,13 @@ impl CodexSession {
     }
 }
 
-/// What's done with turn/start's answer.
-fn turn_started(sent: Sent) -> Then {
+/// The options a process had before a turn/start gave it more: its launched options and its
+/// collaboration mode.
+type Before = (Option<Launched>, Option<String>, Option<String>);
+
+/// What's done with turn/start's answer: for the messages `sent` (none: the driver's own input),
+/// sent to a process that had the options `before` (none: they aren't known).
+fn turn_started(sent: Option<Sent>, before: Option<Before>) -> Then {
     Box::new(move |s, ctx, run, r| match r {
         Ok(r) => {
             if let Some(t) = r["turn"]["id"].as_str()
@@ -2632,7 +2903,17 @@ fn turn_started(sent: Sent) -> Then {
             }
         }
         Err(e) => {
-            s.refused(run, &sent);
+            // Refused, the process hasn't the options it was sent with it.
+            if let Some((launched, collab, sandbox)) = before
+                && let Some(r) = s.run(run)
+            {
+                r.launched = launched;
+                r.collab = collab;
+                r.sandbox = sandbox;
+            }
+            if let Some(sent) = &sent {
+                s.refused(run, sent);
+            }
             s.turn_failed(ctx, run, &e.message);
         }
     })
@@ -2685,6 +2966,13 @@ impl HarnessSession for CodexSession {
         // With no process, there's no turn to steer: the message stays queued, and the turn's end
         // carries it over.
         let Some(run) = self.live_id() else { return };
+        if let Some(planned) = self.run(&run).unwrap().planned.as_mut()
+            && let Some(request) = planned.request.take()
+        {
+            // A message instead of an answer to the plan: it goes to Codex, which keeps planning.
+            ctx.cancel_request(&request);
+            return self.turn_start(ctx, &run, &[message]);
+        }
         let input = self.input(ctx, std::slice::from_ref(&message));
         let sent = self.sent(&run, vec![message.id], &input);
         self.with_turn(
@@ -2718,7 +3006,7 @@ impl HarnessSession for CodexSession {
         match self.live_id() {
             Some(run) if !self.stale => self.turn_start(ctx, &run, &messages),
             live => {
-                // The next turn runs with the options as they are now, so in a new process if they
+                // The next turn runs with the config as it is now, so in a new process if it
                 // changed.
                 if let Some(run) = live {
                     self.stop(ctx, &run, true, true);
@@ -2730,6 +3018,10 @@ impl HarnessSession for CodexSession {
 
     fn interrupt(&mut self, ctx: &mut ThreadContext) {
         let Some(run) = self.live_id() else { return };
+        // Waiting on the user's answer to a plan, with no Codex turn to interrupt.
+        if self.runs[&run].planned.as_ref().is_some_and(|p| p.request.is_some()) {
+            return self.end_planned(ctx, &run);
+        }
         let grace = self.o.stop_grace;
         self.stop_after(ctx, &run, grace);
         let turn = ctx.turn_id().map(String::from);
@@ -2777,7 +3069,20 @@ impl HarnessSession for CodexSession {
         }
     }
 
-    fn options_changed(&mut self, _ctx: &mut ThreadContext) {
+    fn options_changed(&mut self, ctx: &mut ThreadContext) {
+        // Codex takes them with the next turn (turn_options), and keeps them: a model or effort
+        // that's cleared, which turn/start can't say, needs a new process, which starts with
+        // Codex's own.
+        let Some(l) = self.live_id().and_then(|id| self.runs.get(&id)?.launched.clone()) else {
+            return;
+        };
+        let t = ctx.thread();
+        if (l.model.is_some() && t.model.is_none()) || (l.effort.is_some() && t.effort.is_none()) {
+            self.stale = true;
+        }
+    }
+
+    fn config_changed(&mut self, _ctx: &mut ThreadContext) {
         self.stale = true;
     }
 
@@ -2871,19 +3176,7 @@ impl HarnessSession for CodexSession {
                 .and_then(|s| serde_json::from_value(s.clone()).ok());
             let mine = sent.filter(|s| run.sent.contains(s));
             let then: Then = match p.method.as_str() {
-                "turn/start" => match mine {
-                    Some(sent) => turn_started(sent),
-                    None => Box::new(|s, ctx, run, r| match r {
-                        Ok(r) => {
-                            if let Some(t) = r["turn"]["id"].as_str()
-                                && s.runs.get(run).is_some_and(|r| r.starting && r.turn_id.is_none())
-                            {
-                                s.set_turn(ctx, run, t.to_string());
-                            }
-                        }
-                        Err(e) => s.turn_failed(ctx, run, &e.message),
-                    }),
-                },
+                "turn/start" => turn_started(mine, None),
                 "turn/steer" => Box::new(move |s, _, run, r| {
                     if r.is_err()
                         && let Some(sent) = &mine
@@ -2935,9 +3228,9 @@ impl HarnessSession for CodexSession {
                 ),
             }
         }
-        // A process started with other options than the thread's now is replaced at the next turn.
-        let now = Launched::of(ctx);
-        self.stale = st.stale || st.launched.as_ref() != Some(&now);
+        // The options it doesn't have go with its next turn; one whose options aren't known, or that
+        // was started with other launch options than the thread's now, is replaced.
+        self.stale = st.stale || st.launched.as_ref().is_none_or(|l| l.launch != *ctx.launch());
         // Codex's requests that were open: the user's questions are taken up again, an app tool
         // that was running is answered (not run again), and the rest are dealt with again.
         // One answered before the restart, though that wasn't saved, is closed: Codex has its
@@ -2952,6 +3245,15 @@ impl HarnessSession for CodexSession {
         }
         if let Some(at) = st.stop_at {
             self.stop_after(ctx, &id, Duration::from_millis(at.saturating_sub(now_ms())));
+        }
+        // A plan the user was asked about is still asked; if it's no longer open, its turn ends.
+        if let Some(plan) = st.planned.and_then(|p| p.request) {
+            let run = id.clone();
+            let answered =
+                ThreadContext::answered::<CodexSession>(move |s, ctx, res: Resolution| s.plan_answered(ctx, &run, res));
+            if ctx.reopen(&plan, answered, None).is_err() {
+                ctx.post::<CodexSession>(move |s, ctx| s.end_planned(ctx, &id));
+            }
         }
         true
     }

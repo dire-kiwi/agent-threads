@@ -248,8 +248,8 @@ pub trait HarnessSession: Send + Any {
     /// Where a rewind to before turn `index` of `sessions` (each turn's session, in order) takes the
     /// session (see [`resume_at_point`](crate::resume_at_point) and
     /// [`revert_point`](crate::revert_point)), or an error if it can't be rewound there; none if it
-    /// can't be rewound at all. The core then sets the thread's session_id and resume_at, and calls
-    /// options_changed().
+    /// can't be rewound at all. The core then sets the thread's session_id and resume_at, and retires
+    /// the run (see retire).
     fn rewind_point(
         &self,
         _sessions: &[Option<TurnSession>],
@@ -262,13 +262,17 @@ pub trait HarnessSession: Send + Any {
     /// The core gave up carrying the queued messages over: make sure nothing acts on them (stop a
     /// process that has them). They're sent again with the next turn's start.
     fn release(&mut self, ctx: &mut ThreadContext);
-    /// The thread's options (model, effort, permission mode) or config changed.
+    /// The thread's options (model, effort, permission mode) changed: they go to the running process
+    /// where the harness takes them, and otherwise apply from the next turn.
     fn options_changed(&mut self, ctx: &mut ThreadContext);
+    /// The thread's config (tools, MCP servers, skills, system prompt) changed: the next turn needs a
+    /// new process.
+    fn config_changed(&mut self, ctx: &mut ThreadContext);
     /// The thread's session changed (new_session, rewind) with no turn running: stop the running
     /// process now (its background work too), and let nothing it says after reach the thread. The
-    /// next turn starts a new one. By default, options_changed.
+    /// next turn starts a new one. By default, config_changed.
     fn retire(&mut self, ctx: &mut ThreadContext) {
-        self.options_changed(ctx);
+        self.config_changed(ctx);
     }
     /// Stop the harness process, if it's running; the future resolves once it has gone.
     fn close(&mut self, ctx: &mut ThreadContext) -> BoxFuture<()>;
