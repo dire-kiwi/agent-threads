@@ -510,6 +510,29 @@ pub struct PermissionRequest {
     #[serde(skip_serializing_if = "::std::option::Option::is_none")]
     pub turn_id: ::std::option::Option<::std::string::String>,
 }
+///The agent has made a plan and asks to start on it (Claude's ExitPlanMode; a proposed plan from Codex in plan mode). Answered with outcome allow, to start on it in the resolution's permission_mode, or deny, to keep planning, with the message as the user's feedback.
+#[derive(::serde::Deserialize, ::serde::Serialize, Clone, Debug)]
+pub struct PlanRequest {
+    #[serde(skip_serializing_if = "::std::option::Option::is_none")]
+    pub created_at: ::std::option::Option<::std::string::String>,
+    pub id: ::std::string::String,
+    ///The subagent tool_call that's asking, if one is.
+    #[serde(skip_serializing_if = "::std::option::Option::is_none")]
+    pub parent_id: ::std::option::Option<::std::string::String>,
+    ///The plan, as Markdown.
+    pub plan: ::std::string::String,
+    ///The harness's own payload, for debugging.
+    #[serde(skip_serializing_if = "::std::option::Option::is_none")]
+    pub raw: ::std::option::Option<::serde_json::Value>,
+    ///How it was resolved, once it is (request.resolved): the state keeps resolved requests with this set. Absent while it's open.
+    #[serde(skip_serializing_if = "::std::option::Option::is_none")]
+    pub resolution: ::std::option::Option<Resolution>,
+    ///The tool_call item it's for, when there is one.
+    #[serde(skip_serializing_if = "::std::option::Option::is_none")]
+    pub tool_call_id: ::std::option::Option<::std::string::String>,
+    #[serde(skip_serializing_if = "::std::option::Option::is_none")]
+    pub turn_id: ::std::option::Option<::std::string::String>,
+}
 ///`Question`
 #[derive(::serde::Deserialize, ::serde::Serialize, Clone, Debug)]
 pub struct Question {
@@ -662,19 +685,22 @@ pub struct RequestResolvedEvent {
 ///How a request was answered: sent in respond, and repeated in request.resolved.
 #[derive(::serde::Deserialize, ::serde::Serialize, Clone, Debug)]
 pub struct Resolution {
-    ///allow, deny: apply the same answer to matching calls for the rest of the thread, without asking.
+    ///allow, deny, for a permission: apply the same answer to matching calls for the rest of the thread, without asking.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub always: bool,
     ///answer: for each question id, the chosen option labels or the free text.
     #[serde(default, skip_serializing_if = ":: std :: collections :: HashMap::is_empty")]
     pub answers: ::std::collections::HashMap<::std::string::String, ::std::vec::Vec<::std::string::String>>,
-    ///deny: why, which the agent is told. answer: a note with the answers.
+    ///deny: why, which the agent is told (for a plan, the user's feedback on it). answer: a note with the answers.
     #[serde(skip_serializing_if = "::std::option::Option::is_none")]
     pub message: ::std::option::Option<::std::string::String>,
-    ///allow, deny: for a permission. answer: for a question. cancel: for either, when the user dismisses it or the turn ends first.
+    ///allow, deny: for a permission or a plan. answer: for a question. cancel: for any, when the user dismisses it or the turn ends first.
     pub outcome: ResolutionOutcome,
+    ///allow, for a plan: the permission mode the thread carries on in, which it's set to. Left out (or plan), it's the thread's mode, or default if that's plan.
+    #[serde(skip_serializing_if = "::std::option::Option::is_none")]
+    pub permission_mode: ::std::option::Option<PermissionMode>,
 }
-///allow, deny: for a permission. answer: for a question. cancel: for either, when the user dismisses it or the turn ends first.
+///allow, deny: for a permission or a plan. answer: for a question. cancel: for any, when the user dismisses it or the turn ends first.
 #[derive(::serde::Deserialize, ::serde::Serialize, Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub enum ResolutionOutcome {
     #[serde(rename = "allow")]
@@ -997,6 +1023,8 @@ pub enum ThreadRequest {
     Permission(PermissionRequest),
     #[serde(rename = "question")]
     Question(QuestionRequest),
+    #[serde(rename = "plan")]
+    Plan(PlanRequest),
 }
 impl ::std::convert::From<PermissionRequest> for ThreadRequest {
     fn from(value: PermissionRequest) -> Self {
@@ -1006,6 +1034,11 @@ impl ::std::convert::From<PermissionRequest> for ThreadRequest {
 impl ::std::convert::From<QuestionRequest> for ThreadRequest {
     fn from(value: QuestionRequest) -> Self {
         Self::Question(value)
+    }
+}
+impl ::std::convert::From<PlanRequest> for ThreadRequest {
+    fn from(value: PlanRequest) -> Self {
+        Self::Plan(value)
     }
 }
 ///idle: no turn is running. running: a turn is running. waiting: a turn is waiting on a request (permission or question). error: the last turn failed, or the harness couldn't start; the next send tries again.

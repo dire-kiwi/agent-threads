@@ -90,7 +90,8 @@ was for, and a question in place of its call. `openRequests(snapshot)` is the on
 ## Components
 
 `<Thread>`, `<MessageList>` (a `parentId` draws a subagent's own thread), `<StreamingText>`,
-`<ToolCall>`, `<Subagent>`, `<PermissionCard>`, `<QuestionCard>`, `<RequestCard>`, `<OpenRequests>`,
+`<ToolCall>`, `<Subagent>`, `<PermissionCard>`, `<QuestionCard>`, `<PlanCard>` (approve a plan
+in a permission mode, or keep planning with feedback), `<RequestCard>`, `<OpenRequests>`,
 `<LoadEarlier>`,
 `<CompactionLine>`, `<TurnResult>`, `<Notice>`, `<Composer>` and `<AgentsPill>`. Each takes a
 `className`.

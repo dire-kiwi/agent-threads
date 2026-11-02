@@ -16,6 +16,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -111,9 +112,10 @@ func runBackend() {
 		case "create":
 			var o struct {
 				Harness, Model, Effort, Cwd string
+				PermissionMode              protocol.PermissionMode `json:"permission_mode"`
 			}
 			json.Unmarshal(arg(0), &o)
-			result, err = sdk.Create(ctx, agentthreads.CreateOptions{Harness: o.Harness, Model: o.Model, Effort: o.Effort, Cwd: o.Cwd})
+			result, err = sdk.Create(ctx, agentthreads.CreateOptions{Harness: o.Harness, Model: o.Model, Effort: o.Effort, PermissionMode: o.PermissionMode, Cwd: o.Cwd})
 		case "handle":
 			err = sdk.HandleJSON(ctx, arg(0))
 		case "snapshot":
@@ -786,4 +788,83 @@ func TestCloseKeepsTheDeadlinesOfTimersThatWentOff(t *testing.T) {
 	b.waitFor(`{"type":"turn.completed"}`)
 	b.call("stop")
 	<-b.exited
+}
+
+// After a restart, the next turn starts a new process if the options changed, as it would have. (A
+// new effort needs a new process; a model or permission mode doesn't.)
+func TestRestartStartsANewProcessIfTheOptionsChanged(t *testing.T) {
+	needNode(t)
+	log := filepath.Join(t.TempDir(), "log.jsonl")
+	s := miniScene(t, "MINI_CLAUDE_LOG="+log)
+	a := s.start()
+	var th protocol.Thread
+	json.Unmarshal(a.call("create", map[string]any{"harness": "claude", "effort": "old", "cwd": s.cwd}), &th)
+	a.call("handle", map[string]any{"type": "send", "thread_id": th.ID, "text": "reply one"})
+	a.waitFor(`{"type":"turn.completed"}`)
+	a.call("handle", map[string]any{"type": "set_options", "thread_id": th.ID, "effort": "new"})
+	a.waitFor(`{"type":"thread.updated","thread":{"effort":"new"}}`)
+	a.call("saved", th.ID)
+	a.crash()
+
+	b := s.start()
+	expectRecovered(t, b, th.ID)
+	b.call("handle", map[string]any{"type": "send", "thread_id": th.ID, "text": "reply two"})
+	b.waitFor(`{"type":"turn.completed"}`)
+	b.call("stop")
+	<-b.exited
+	data, _ := os.ReadFile(log)
+	var efforts []string
+	for _, line := range strings.Split(strings.TrimSpace(string(data)), "\n") {
+		var v struct{ Argv []string }
+		json.Unmarshal([]byte(line), &v)
+		if i := slices.Index(v.Argv, "--effort"); i >= 0 && i+1 < len(v.Argv) {
+			efforts = append(efforts, v.Argv[i+1])
+		}
+	}
+	if !slices.Equal(efforts, []string{"old", "new"}) {
+		t.Fatalf("efforts %v", efforts)
+	}
+}
+
+// A plan Codex proposed is still asked about after a restart, and approving it carries on with the
+// turn.
+func TestRestartStillAsksAboutCodexsPlan(t *testing.T) {
+	needNode(t)
+	log := filepath.Join(t.TempDir(), "log.jsonl")
+	s := miniScene(t, "MINI_CODEX_LOG="+log)
+	a := s.start()
+	var th protocol.Thread
+	json.Unmarshal(a.call("create", map[string]any{"harness": "codex", "permission_mode": "plan", "cwd": s.cwd}), &th)
+	a.call("handle", map[string]any{"type": "send", "thread_id": th.ID, "text": "propose One."})
+	a.waitFor(`{"type":"request.opened","request":{"type":"plan","plan":"One."}}`)
+	a.call("saved", th.ID)
+	a.crash()
+
+	b := s.start()
+	expectRecovered(t, b, th.ID)
+	snap := snapshotOf(t, b, th.ID)
+	if snap.Thread.Status != protocol.ThreadStatusWaiting || len(snap.Requests) != 1 {
+		t.Fatalf("got %s", mustMarshal(snap))
+	}
+	if _, ok := snap.Requests[0].Value.(*protocol.PlanRequest); !ok {
+		t.Fatalf("request %s", mustMarshal(snap.Requests[0]))
+	}
+	b.call("handle", map[string]any{"type": "respond", "thread_id": th.ID, "request_id": snap.Requests[0].ID(), "resolution": map[string]any{"outcome": "allow", "permission_mode": "accept_edits"}})
+	b.waitFor(`{"type":"thread.updated","thread":{"status":"idle"}}`)
+	snap = snapshotOf(t, b, th.ID)
+	b.call("stop")
+	<-b.exited
+	var results []*protocol.TurnResult
+	for _, it := range snap.Items {
+		if r, ok := it.Value.(*protocol.TurnResult); ok {
+			results = append(results, r)
+		}
+	}
+	if snap.Thread.PermissionMode != protocol.PermissionModeAcceptEdits || len(results) != 1 || !results[0].OK || results[0].DurationMs == nil || *results[0].DurationMs != 14 {
+		t.Fatalf("got %s", mustMarshal(snap))
+	}
+	data, _ := os.ReadFile(log)
+	if !strings.Contains(string(data), `"text":"Implement the plan."`) {
+		t.Fatalf("no turn to implement the plan:\n%s", data)
+	}
 }

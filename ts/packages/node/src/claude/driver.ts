@@ -13,13 +13,14 @@ import { CommandError, ControlError } from "../errors.js";
 import { inBackground, parseLine, runningInBackground, type Harness, type HarnessSession, type Message, type RunCheckpoint, type Skill, type ThreadContext } from "../harness.js";
 import { newId } from "../ids.js";
 import { applyLaunchEnv, launchedNow, launchedOf, withEnv, type Launched } from "../launch.js";
-import { permissionKey, type PermissionDecision } from "../permissions.js";
+import { modeAfterPlan, permissionKey, type PermissionDecision } from "../permissions.js";
 import { writeSkills } from "../skills.js";
 import type { ExitStatus, HarnessProcess, ProcessHandlers } from "../spawner.js";
 import type { RunRecord } from "../store.js";
 import { runTool } from "../tools.js";
 import {
   APP_SERVER,
+  claudeMode,
   claudePermissionMode,
   claudeRateLimits,
   claudeTool,
@@ -106,7 +107,7 @@ interface RunState {
   autoTurn?: string;
   heldUsage?: Usage;
   pluginDir?: string;
-  /** The thread's options it was started with. */
+  /** The thread's options it has: those it was started with, and the model and permission mode since. */
   launched?: Launched;
   /** The thread's options or config have changed since, so the next turn starts a new process. */
   stale?: boolean;
@@ -173,16 +174,24 @@ class Run {
     else this.waiting.push(JSON.stringify(msg));
   }
 
-  /** Sends a control request of ours: its answer's body, or null if Claude refused it (or exited). */
-  control(request: Json): Promise<Json | null> {
-    return this.request(request).then(body);
+  /**
+   * Sends a control request of ours (`queue`: once Claude is ready): its answer's body, or null if
+   * Claude refused it (or exited).
+   */
+  control(request: Json, queue = false): Promise<Json | null> {
+    return this.request(request, queue).then(body);
   }
 
   /** Sends a control request: its control response (`subtype`, `response`, `error`), or null if it exited first. */
-  request(request: Json): Promise<Json | null> {
+  request(request: Json, queue = false): Promise<Json | null> {
     const request_id = `req_${this.#nextRequest++}`;
     const p = new Promise<Json | null>((resolve) => this.pending.set(request_id, { subtype: String(request.subtype), resolve }));
-    this.write({ type: "control_request", request_id, request });
+    const msg = { type: "control_request", request_id, request };
+    if (queue && !this.ready) {
+      // Ahead of the messages waiting (after the requests already queued), so they run with it.
+      const at = this.waiting.findIndex((l) => JSON.parse(l).type !== "control_request");
+      this.waiting.splice(at < 0 ? this.waiting.length : at, 0, JSON.stringify(msg));
+    } else this.write(msg);
     return p;
   }
 
@@ -342,7 +351,44 @@ class ClaudeSession implements HarnessSession {
   }
 
   optionsChanged(): void {
+    const run = this.#live();
+    const l = run?.launched;
+    // A process yet to start is started with them.
+    if (!run || !l) return;
+    const t = this.#ctx.thread;
+    // Claude takes a new model and permission mode as it runs, even during a turn; a new effort
+    // needs a new process, at the next turn.
+    if (l.effort !== t.effort) this.#stale = true;
+    // Set as they're asked for, so a restart before the answer doesn't ask again; one Claude
+    // refuses is the next process's.
+    const refused = (r: Json | null) => {
+      if (!r && this.#run === run) this.#stale = true;
+    };
+    if (l.model !== t.model) {
+      l.model = t.model;
+      void run.control({ subtype: "set_model", model: t.model ?? "default" }, true).then(refused);
+    }
+    if (l.permission_mode !== t.permission_mode) {
+      l.permission_mode = t.permission_mode;
+      void run.control({ subtype: "set_permission_mode", mode: this.#liveMode(run, t.permission_mode) }, true).then(refused);
+    }
+  }
+
+  configChanged(): void {
     this.#stale = true;
+  }
+
+  /**
+   * Claude's name for a permission mode the running process is switched to. One not started in
+   * bypass mode can't be switched to it: it goes to acceptEdits, the driver allows what it asks
+   * about (see #canUseTool), and the next turn has a new process, in bypass mode.
+   */
+  #liveMode(run: Run, mode: string | undefined): string {
+    if (mode === "bypass" && !run.launched?.bypass) {
+      this.#stale = true;
+      return "acceptEdits";
+    }
+    return claudeMode(mode);
   }
 
   live(): boolean {
@@ -388,7 +434,17 @@ class ClaudeSession implements HarnessSession {
     const spawner = this.#ctx.spawner;
     if (!st || st.v !== 1 || !spawner.attach || this.#run) return false;
     const run = new Run(record.id);
-    run.restore(st, (subtype) => (subtype === "initialize" ? (r) => this.#initialized(run, body(r)) : () => {}));
+    // A new model or mode Claude refuses after the restart is the next process's, as before it.
+    const refused = (r: Json | null) => {
+      if (!r && this.#run === run) this.#stale = true;
+    };
+    run.restore(st, (subtype) =>
+      subtype === "initialize"
+        ? (r) => this.#initialized(run, body(r))
+        : subtype === "set_model" || subtype === "set_permission_mode"
+          ? (r) => refused(body(r))
+          : () => {},
+    );
     this.#run = run;
     try {
       run.proc = spawner.attach(record, this.#handlers(run));
@@ -582,7 +638,7 @@ class ClaudeSession implements HarnessSession {
       return;
     }
     run.proc = proc;
-    run.launched = launchedOf(ctx);
+    run.launched = { ...launchedOf(ctx), ...(thread.permission_mode === "bypass" ? { bypass: true } : {}) };
     ctx.setThread({ run: { id: run.id, spawner: ctx.spawner.name, started_at: new Date().toISOString() } });
     void run.control({ subtype: "initialize", ...(tools.length ? { sdkMcpServers: [APP_SERVER] } : {}) }).then((r) => this.#initialized(run, r));
   }
@@ -922,7 +978,7 @@ class ClaudeSession implements HarnessSession {
       !run.detached &&
       this.#run === run &&
       (ctx.turnId === turn || (toolUseId !== undefined && inBackground((id) => ctx.item(id), toolUseId)));
-    const allow = (updatedInput: unknown) => wanted() && run.respond(requestId, { behavior: "allow", updatedInput });
+    const allow = (updatedInput: unknown, more?: Json) => wanted() && run.respond(requestId, { behavior: "allow", updatedInput, ...more });
     const deny = (message: string) => wanted() && run.respond(requestId, { behavior: "deny", message });
     const denied = () => toolUseId && ctx.updateItem(toolUseId, { status: "denied" });
 
@@ -943,6 +999,30 @@ class ClaudeSession implements HarnessSession {
       run.asked.set(requestId, id);
       return;
     }
+
+    if (req.tool_name === "ExitPlanMode") {
+      // A plan, which only the user approves. Approved, Claude leaves plan mode for the mode the
+      // thread carries on in (setMode), as does the thread; sent back, it plans again.
+      const plan = typeof input.plan === "string" ? input.plan : "";
+      const id = ask({ type: "plan", plan }, toolUseId, (res: Resolution) => {
+        if (!wanted()) return;
+        if (res.outcome === "allow") {
+          const mode = modeAfterPlan(ctx.thread.permission_mode, res.permission_mode);
+          allow(input, { updatedPermissions: [{ type: "setMode", mode: this.#liveMode(run, mode), destination: "session" }] });
+          if (run.launched) run.launched.permission_mode = mode;
+          ctx.setThread({ permission_mode: mode });
+          if (toolUseId) ctx.updateItem(toolUseId, { status: "running" });
+        } else {
+          deny(res.message || "The user wants you to keep planning rather than start on this plan.");
+          denied();
+        }
+      });
+      run.asked.set(requestId, id);
+      return;
+    }
+
+    // The thread is in bypass mode, which its process couldn't be switched to: nothing is asked.
+    if (ctx.thread.permission_mode === "bypass" && existing === undefined) return void allow(input);
 
     const t = claudeTool(req.tool_name, input);
     const call = toolUseId ? ctx.item(toolUseId) : undefined;

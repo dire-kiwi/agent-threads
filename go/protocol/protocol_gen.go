@@ -1611,7 +1611,7 @@ const (
 
 // ThreadRequest: A request, told apart by type: open, or resolved (with its resolution).
 //
-// Value is one of *PermissionRequest, *QuestionRequest.
+// Value is one of *PermissionRequest, *QuestionRequest, *PlanRequest.
 type ThreadRequest struct {
 	Value ThreadRequestValue
 }
@@ -1627,6 +1627,8 @@ func (*PermissionRequest) Type() string     { return "permission" }
 func (*PermissionRequest) isThreadRequest() {}
 func (*QuestionRequest) Type() string       { return "question" }
 func (*QuestionRequest) isThreadRequest()   {}
+func (*PlanRequest) Type() string           { return "plan" }
+func (*PlanRequest) isThreadRequest()       {}
 
 func (u ThreadRequest) MarshalJSON() ([]byte, error) {
 	if u.Value == nil {
@@ -1648,6 +1650,8 @@ func (u *ThreadRequest) UnmarshalJSON(data []byte) error {
 		v = new(PermissionRequest)
 	case "question":
 		v = new(QuestionRequest)
+	case "plan":
+		v = new(PlanRequest)
 	default:
 		return fmt.Errorf("protocol: unknown ThreadRequest type %q", t.Type)
 	}
@@ -1795,6 +1799,70 @@ func (v *QuestionRequest) UnmarshalJSON(data []byte) error {
 	return nil
 }
 
+// PlanRequest: The agent has made a plan and asks to start on it (Claude's ExitPlanMode; a proposed
+// plan from Codex in plan mode). Answered with outcome allow, to start on it in the resolution's
+// permission_mode, or deny, to keep planning, with the message as the user's feedback.
+//
+// It's the "plan" variant of ThreadRequest.
+type PlanRequest struct {
+	ID string `json:"id"`
+
+	// The plan, as Markdown.
+	Plan string `json:"plan"`
+
+	// The tool_call item it's for, when there is one.
+	ToolCallID string `json:"tool_call_id,omitempty"`
+
+	// The subagent tool_call that's asking, if one is.
+	ParentID string `json:"parent_id,omitempty"`
+
+	// How it was resolved, once it is (request.resolved): the state keeps resolved requests with this
+	// set. Absent while it's open.
+	Resolution *Resolution `json:"resolution,omitempty"`
+	TurnID     string      `json:"turn_id,omitempty"`
+	CreatedAt  string      `json:"created_at,omitempty"`
+
+	// The harness's own payload, for debugging.
+	Raw json.RawMessage `json:"raw,omitempty"`
+
+	// Extra has the fields the spec doesn't name, as they came, so that they're written again
+	// unchanged (receivers ignore fields they don't know, and stores keep them).
+	Extra map[string]json.RawMessage `json:"-"`
+}
+
+var knownPlanRequest = fieldSet("type", "id", "plan", "tool_call_id", "parent_id", "resolution", "turn_id", "created_at", "raw")
+
+func (v PlanRequest) MarshalJSON() ([]byte, error) {
+	type plain PlanRequest
+	p := plain(v)
+	data, err := json.Marshal(struct {
+		Type string `json:"type"`
+		plain
+	}{"plan", p})
+	if err != nil {
+		return nil, err
+	}
+	return withExtra(data, v.Extra, knownPlanRequest)
+}
+
+func (v *PlanRequest) UnmarshalJSON(data []byte) error {
+	if isNull(data) {
+		return nil
+	}
+	type plain PlanRequest
+	var p plain
+	if err := json.Unmarshal(data, &p); err != nil {
+		return err
+	}
+	extra, err := extraFields(data, knownPlanRequest)
+	if err != nil {
+		return err
+	}
+	p.Extra = extra
+	*v = PlanRequest(p)
+	return nil
+}
+
 type Question struct {
 
 	// Unique within the request; the key for its answer.
@@ -1895,15 +1963,21 @@ func (v *QuestionOption) UnmarshalJSON(data []byte) error {
 // Resolution: How a request was answered: sent in respond, and repeated in request.resolved.
 type Resolution struct {
 
-	// allow, deny: for a permission. answer: for a question. cancel: for either, when the user
+	// allow, deny: for a permission or a plan. answer: for a question. cancel: for any, when the user
 	// dismisses it or the turn ends first.
 	Outcome ResolutionOutcome `json:"outcome"`
 
-	// allow, deny: apply the same answer to matching calls for the rest of the thread, without asking.
+	// allow, deny, for a permission: apply the same answer to matching calls for the rest of the
+	// thread, without asking.
 	Always bool `json:"always,omitempty"`
 
-	// deny: why, which the agent is told. answer: a note with the answers.
+	// deny: why, which the agent is told (for a plan, the user's feedback on it). answer: a note with
+	// the answers.
 	Message string `json:"message,omitempty"`
+
+	// allow, for a plan: the permission mode the thread carries on in, which it's set to. Left out (or
+	// plan), it's the thread's mode, or default if that's plan.
+	PermissionMode PermissionMode `json:"permission_mode,omitempty"`
 
 	// answer: for each question id, the chosen option labels or the free text.
 	Answers map[string][]string `json:"answers,omitempty"`
@@ -1913,7 +1987,7 @@ type Resolution struct {
 	Extra map[string]json.RawMessage `json:"-"`
 }
 
-var knownResolution = fieldSet("outcome", "always", "message", "answers")
+var knownResolution = fieldSet("outcome", "always", "message", "permission_mode", "answers")
 
 func (v Resolution) MarshalJSON() ([]byte, error) {
 	type plain Resolution
@@ -1943,8 +2017,8 @@ func (v *Resolution) UnmarshalJSON(data []byte) error {
 	return nil
 }
 
-// ResolutionOutcome: allow, deny: for a permission. answer: for a question. cancel: for either,
-// when the user dismisses it or the turn ends first.
+// ResolutionOutcome: allow, deny: for a permission or a plan. answer: for a question. cancel: for
+// any, when the user dismisses it or the turn ends first.
 type ResolutionOutcome string
 
 const (

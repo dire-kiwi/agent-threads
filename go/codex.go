@@ -93,6 +93,17 @@ type mcpCall struct {
 	Thread string          `json:"thread,omitempty"`
 }
 
+// implementPlan is what Codex is told when the user approves its plan, as its own client says it.
+const implementPlan = "Implement the plan."
+
+// codexPlanned is a thread's turn that has had a plan from Codex: what its Codex turns so far used,
+// and the plan request while the user hasn't answered it (the turn goes on meanwhile).
+type codexPlanned struct {
+	Usage      *protocol.Usage `json:"usage,omitempty"`
+	DurationMs *int64          `json:"duration_ms,omitempty"`
+	Request    string          `json:"request,omitempty"`
+}
+
 type mcpEndpoint struct {
 	Port  int    `json:"port"`
 	Token string `json:"token"`
@@ -127,6 +138,12 @@ type codexRunState struct {
 	Held           []string        `json:"held"`
 	RPC            rpcState        `json:"rpc"`
 	Launched       *launched       `json:"launched,omitempty"`
+	Model          string          `json:"model,omitempty"`
+	Workspace      json.RawMessage `json:"workspace,omitempty"`
+	Sandbox        string          `json:"sandbox,omitempty"`
+	Collab         string          `json:"collab,omitempty"`
+	Proposed       *string         `json:"proposed,omitempty"`
+	Planned        *codexPlanned   `json:"planned,omitempty"`
 	Stale          bool            `json:"stale,omitempty"`
 	StopAt         *int64          `json:"stopAt,omitempty"`
 	raw            json.RawMessage `json:"-"`
@@ -194,8 +211,25 @@ type codexRun struct {
 	// sent is the messages sent, oldest first, by the text inputs Codex echoes in its userMessage item.
 	sent []*codexSent
 	// held is the queued messages this process has (it was sent them, and didn't refuse them).
-	held     map[string]bool
+	held map[string]bool
+	// launched is the thread's options it has: those it was started with, and those it was given
+	// with a turn since (turn/start overrides them).
 	launched *launched
+	// model is the model Codex says the thread runs, for a collaboration mode's settings when the
+	// thread has none of its own.
+	model string
+	// workspace is the workspace-write sandbox Codex last said the thread had, with its settings.
+	workspace json.RawMessage
+	// sandbox is the sandbox mode it has ("": its permission mode's, from a checkpoint from before
+	// this was kept).
+	sandbox string
+	// collab is the collaboration mode it was last given ("plan" or "default"; "": it's in its
+	// default one).
+	collab string
+	// proposed is the plan the running Codex turn proposed, in plan mode.
+	proposed *string
+	// planned says the thread's turn has had a plan.
+	planned *codexPlanned
 }
 
 func newCodexRun(id string) *codexRun {
@@ -290,6 +324,7 @@ func (r *codexRun) state() *codexRunState {
 		Error: r.errText, Home: r.home, Dynamic: r.dynamic, MCPApp: r.mcpApp, Baseline: r.baseline,
 		HiddenSkills: orEmptyList(r.hiddenSkills), NoticedServers: r.noticedServers, SkillsDir: r.skillsDir, MCP: r.mcpEndpoint,
 		Streamed: sortedKeys(r.streamed), MCPCalls: append([]mcpCall{}, r.mcpCalls...), RPC: r.rpc.state(), Launched: r.launched,
+		Model: r.model, Workspace: r.workspace, Sandbox: r.sandbox, Collab: r.collab, Proposed: r.proposed,
 		SummaryPart: [][2]any{}, Children: [][2]string{}, LastChild: [][2]string{}, Open: [][2]any{}, Asked: [][2]any{}, Sent: []codexSent{}, Held: sortedKeys(r.held),
 	}
 	for _, k := range sortedKeys(r.summaryPart) {
@@ -309,6 +344,10 @@ func (r *codexRun) state() *codexRunState {
 	}
 	for _, s := range r.sent {
 		st.Sent = append(st.Sent, *s)
+	}
+	if r.planned != nil {
+		p := *r.planned
+		st.Planned = &p
 	}
 	return st
 }
@@ -349,7 +388,7 @@ func (r *codexRun) restore(st codexRunState) {
 	for _, id := range st.Held {
 		r.held[id] = true
 	}
-	r.launched = st.Launched
+	r.launched, r.model, r.workspace, r.sandbox, r.collab, r.proposed, r.planned = st.Launched, st.Model, st.Workspace, st.Sandbox, st.Collab, st.Proposed, st.Planned
 	r.readyDone, r.readyID = true, st.ThreadID
 }
 
@@ -424,6 +463,13 @@ func (s *codexSession) Steer(m Message) {
 	if run == nil {
 		return
 	}
+	if run.planned != nil && run.planned.Request != "" {
+		// A message instead of an answer to the plan: it goes to Codex, which keeps planning.
+		s.ctx.CancelRequest(run.planned.Request)
+		run.planned.Request = ""
+		s.turnStart(run, []Message{m})
+		return
+	}
 	input := s.input([]Message{m})
 	sent := s.sentAs(run, []string{m.ID}, input)
 	run.withTurn(func(turnID string) {
@@ -440,7 +486,7 @@ func (s *codexSession) Steer(m Message) {
 func (s *codexSession) CarryOver(messages []Message) {
 	run := s.live()
 	if run == nil || s.stale {
-		// The next turn runs with the options as they are now, so in a new process if they changed.
+		// The next turn runs with the config as it is now, so in a new process if it changed.
 		if run != nil {
 			s.stop(run, true, true, nil)
 		}
@@ -453,6 +499,11 @@ func (s *codexSession) CarryOver(messages []Message) {
 func (s *codexSession) Interrupt() {
 	run := s.live()
 	if run == nil {
+		return
+	}
+	// Waiting on the user's answer to a plan, with no Codex turn to interrupt.
+	if run.planned != nil && run.planned.Request != "" {
+		s.endPlanned(run)
 		return
 	}
 	s.stopAfter(run, orDuration(s.o.StopGrace, 10*time.Second))
@@ -493,7 +544,22 @@ func (s *codexSession) clearStop() {
 	s.stopTimer = nil
 }
 
-func (s *codexSession) OptionsChanged() { s.stale = true }
+// OptionsChanged: Codex takes them with the next turn (see turnOptions).
+// OptionsChanged: Codex takes them with the next turn (turnOptions), and keeps them. A model or
+// effort that's cleared, which turn/start can't say, needs a new process, which starts with Codex's
+// own.
+func (s *codexSession) OptionsChanged() {
+	run := s.live()
+	if run == nil || run.launched == nil {
+		return
+	}
+	l, t := run.launched, s.ctx.Thread()
+	if (l.Model != "" && t.Model == "") || (l.Effort != "" && t.Effort == "") {
+		s.stale = true
+	}
+}
+
+func (s *codexSession) ConfigChanged() { s.stale = true }
 
 func (s *codexSession) Live() bool { return s.live() != nil }
 
@@ -619,8 +685,9 @@ func (s *codexSession) Reattach(record RunRecord) bool {
 			run.mcp = mcp
 		}
 	}
-	// A process started with other options than the thread's now is replaced at the next turn.
-	s.stale = st.Stale || st.Launched.stale(ctx)
+	// The options it doesn't have go with its next turn; one whose options aren't known, or that was
+	// started with other launch options than the thread's now, is replaced.
+	s.stale = st.Stale || st.Launched.launchStale(ctx)
 	// Codex's requests that were open: the user's questions are taken up again, an app tool that was
 	// running is answered (not run again), and the rest are dealt with again. One answered before the
 	// restart, though that wasn't saved, is closed: Codex has its answer.
@@ -633,6 +700,10 @@ func (s *codexSession) Reattach(record RunRecord) bool {
 	}
 	if st.StopAt != nil {
 		s.stopAfter(run, time.Duration(max(0, *st.StopAt-time.Now().UnixMilli()))*time.Millisecond)
+	}
+	// A plan the user was asked about is still asked; if it's no longer open, its turn ends.
+	if plan := run.planned; plan != nil && plan.Request != "" && !ctx.Reopen(plan.Request, func(res protocol.Resolution) { s.planAnswered(run, res) }, "") {
+		ctx.Post(func() { s.endPlanned(run) })
 	}
 	return true
 }
@@ -732,12 +803,17 @@ func (s *codexSession) input(messages []Message) []map[string]any {
 // turnStart starts a Codex turn with the messages.
 func (s *codexSession) turnStart(run *codexRun, messages []Message) {
 	input := s.input(messages)
-	sent := s.sentAs(run, messageIDs(messages), input)
+	s.startTurn(run, input, s.sentAs(run, messageIDs(messages), input))
+}
+
+// startTurn starts a Codex turn with the input: the messages sent, or (sent nil) the driver's own.
+func (s *codexSession) startTurn(run *codexRun, input []map[string]any, sent *codexSent) {
 	run.starting = true
-	effort := s.ctx.Thread().Effort
 	run.whenReady(func(threadID string, err error) {
 		fail := func(e error) {
-			s.refused(run, sent)
+			if sent != nil {
+				s.refused(run, sent)
+			}
 			s.turnFailed(run, e)
 		}
 		if err != nil {
@@ -745,15 +821,74 @@ func (s *codexSession) turnStart(run *codexRun, messages []Message) {
 			return
 		}
 		params := map[string]any{"threadId": threadID, "input": input}
-		if effort != "" {
-			params["effort"] = effort
+		launched, collab, sandbox := run.launched, run.collab, run.sandbox
+		s.turnOptions(run, params)
+		var meta any
+		if sent != nil {
+			meta = map[string]any{"sent": sent}
 		}
-		run.rpc.request("turn/start", params, map[string]any{"sent": sent}, func(r jmap) {
+		run.rpc.request("turn/start", params, meta, func(r jmap) {
 			if id := r.obj("turn").str("id"); id != "" && run.starting && run.turnID == "" {
 				run.setTurn(id)
 			}
-		}, fail)
+		}, func(e error) {
+			// Refused, the process hasn't the options it was sent with it.
+			run.launched, run.collab, run.sandbox = launched, collab, sandbox
+			fail(e)
+		})
 	})
+}
+
+// turnOptions adds turn/start's options to params: the thread's effort, and what the process
+// doesn't have yet (Codex keeps them for later turns): the model, the policy for the permission
+// mode, and in plan mode the collaboration mode plan (and default after it).
+func (s *codexSession) turnOptions(run *codexRun, params map[string]any) {
+	t := s.ctx.Thread()
+	var l launched
+	if run.launched != nil {
+		l = *run.launched
+	}
+	if t.Effort != "" {
+		params["effort"] = t.Effort
+	}
+	if t.Model != "" && t.Model != l.Model {
+		params["model"] = t.Model
+	}
+	approvalBefore, sandboxBefore := codexPolicy(protocol.PermissionMode(l.PermissionMode))
+	approval, sandbox := codexPolicy(t.PermissionMode)
+	if approval != approvalBefore {
+		params["approvalPolicy"] = approval
+	}
+	// Only a new sandbox, since what's sent replaces all of it.
+	if run.sandbox != "" {
+		sandboxBefore = run.sandbox
+	}
+	if sandbox != sandboxBefore {
+		params["sandboxPolicy"] = sandboxPolicy(sandbox, run.workspace, s.o.Config)
+	}
+	run.sandbox = sandbox
+	collab := ""
+	if t.PermissionMode == protocol.PermissionModePlan {
+		collab = "plan"
+	} else if run.collab == "plan" {
+		collab = "default"
+	}
+	model := t.Model
+	if model == "" {
+		model = l.Model
+	}
+	if collab != "" {
+		settings := map[string]any{"model": model, "reasoning_effort": nil, "developer_instructions": nil}
+		if model == "" {
+			settings["model"] = run.model
+		}
+		if t.Effort != "" {
+			settings["reasoning_effort"] = t.Effort
+		}
+		params["collaborationMode"] = map[string]any{"mode": collab, "settings": settings}
+		run.collab = collab
+	}
+	run.launched = &launched{Model: model, Effort: t.Effort, PermissionMode: string(t.PermissionMode), Launch: l.Launch}
 }
 
 // sentAs records that messages are being sent to the process, as this input.
@@ -795,8 +930,18 @@ func (s *codexSession) turnFailed(run *codexRun, err error) {
 	}
 	run.turnEnded()
 	if s.ctx.TurnID() != "" {
-		s.ctx.EndTurn(TurnEnd{Error: err.Error()})
+		s.ctx.EndTurn(withPlanned(TurnEnd{Error: err.Error()}, run.planned))
 	}
+	run.planned = nil
+}
+
+// withPlanned is a turn's end with what its Codex turns that completed (its plans') used, for a turn
+// that ends otherwise.
+func withPlanned(end TurnEnd, planned *codexPlanned) TurnEnd {
+	if planned != nil {
+		end.Usage, end.DurationMs = planned.Usage, planned.DurationMs
+	}
+	return end
 }
 
 // ---------- the process ----------
@@ -808,7 +953,7 @@ func (s *codexSession) live() *codexRun {
 	return nil
 }
 
-// ensure is the running process, or a new one. A new turn (fresh) restarts it if the options changed.
+// ensure is the running process, or a new one. A new turn (fresh) restarts it if the config changed.
 func (s *codexSession) ensure(fresh bool) *codexRun {
 	live := s.live()
 	if live != nil && !(fresh && s.stale) {
@@ -895,7 +1040,6 @@ func (s *codexSession) spawn(run *codexRun) {
 		return
 	}
 	run.proc = proc
-	run.launched = launchedOf(ctx)
 	ctx.SetThread(func(t *protocol.Thread) {
 		t.Run = &protocol.Run{ID: run.id, Spawner: protocol.RunSpawner(ctx.Spawner().Name()), StartedAt: now()}
 	})
@@ -912,6 +1056,12 @@ func (s *codexSession) spawn(run *codexRun) {
 	}
 	started := func(r jmap) {
 		run.threadID = r.obj("thread").str("id")
+		if m := r.str("model"); m != "" {
+			run.model = m
+		}
+		if sb := r.raw("sandbox"); jmap(r.obj("sandbox")).str("type") == "workspaceWrite" {
+			run.workspace = sb
+		}
 		if ctx.Thread().SessionID != run.threadID {
 			ctx.SetThread(func(t *protocol.Thread) { t.SessionID = run.threadID })
 		}
@@ -1175,8 +1325,13 @@ func (s *codexSession) threadParams(run *codexRun, fresh bool) (map[string]any, 
 		}
 		config["skills"] = map[string]any{"config": list}
 	}
-	approval, sandbox := codexPolicy(t.PermissionMode)
-	params := map[string]any{"approvalPolicy": approval, "sandbox": sandbox, "config": config}
+	// The thread starts in the workspace-write sandbox whatever its mode, so that Codex says what that
+	// sandbox is with all of its config (CODEX_HOME's, the thread's writable roots...): the first turn
+	// puts it in its mode's, and switching back to workspace-write later has it all.
+	approval, _ := codexPolicy(t.PermissionMode)
+	params := map[string]any{"approvalPolicy": approval, "sandbox": "workspace-write", "config": config}
+	run.launched = launchedOf(s.ctx)
+	run.sandbox = "workspace-write"
 	if t.Cwd != "" {
 		params["cwd"] = t.Cwd
 	}
@@ -1257,8 +1412,9 @@ func (s *codexSession) exited(run *codexRun, status ExitStatus) {
 	// A run that ends while its turn is running ends the turn (as interrupted, if it was).
 	if !run.retired && ctx.TurnID() != "" {
 		s.clearStop()
-		ctx.EndTurn(TurnEnd{Error: codexExitError(status, run.stderr, true)})
+		ctx.EndTurn(withPlanned(TurnEnd{Error: codexExitError(status, run.stderr, true)}, run.planned))
 	}
+	run.planned = nil
 	run.finish()
 }
 
@@ -1346,6 +1502,11 @@ func (s *codexSession) notification(run *codexRun, m jmap) {
 			s.turnCompleted(run, p.obj("turn"))
 		} else {
 			s.childDone(run, p.str("threadId"), p.obj("turn"), parent)
+		}
+	case "thread/settings/updated":
+		// Its workspace-write sandbox, kept for when it's switched back to it.
+		if sb := p.obj("threadSettings").raw("sandboxPolicy"); own && p.obj("threadSettings").obj("sandboxPolicy").str("type") == "workspaceWrite" {
+			run.workspace = sb
 		}
 	case "thread/tokenUsage/updated":
 		if total := p.obj("tokenUsage").raw("total"); own && total != nil {
@@ -1445,6 +1606,9 @@ func (s *codexSession) item(run *codexRun, item jmap, done bool, parent, child s
 		}
 		if child != "" && typ == "agentMessage" {
 			run.lastChild[child] = text
+		}
+		if child == "" && typ == "plan" {
+			run.proposed = &text
 		}
 		if run.streamed[id] {
 			ctx.UpdateItem(id, Patch{"text": text})
@@ -1584,6 +1748,8 @@ func (s *codexSession) tookIn(run *codexRun, key string) {
 func (s *codexSession) turnCompleted(run *codexRun, turn jmap) {
 	ctx := s.ctx
 	errText := run.errText
+	plan := run.proposed
+	run.proposed = nil
 	run.turnEnded()
 	run.errText = nil
 	// The turn's requests are moot now; its open ones are cancelled with it.
@@ -1607,7 +1773,26 @@ func (s *codexSession) turnCompleted(run *codexRun, turn jmap) {
 		return
 	}
 	s.clearStop()
-	end := TurnEnd{OK: turn.str("status") == "completed", Usage: usage}
+	ok := turn.str("status") == "completed"
+	// The thread's turn is all of its Codex turns, the plans' included.
+	var sum codexPlanned
+	if run.planned != nil {
+		sum = *run.planned
+	}
+	sum.Usage = addUsage(sum.Usage, usage)
+	if d, has := turn.num("durationMs"); has {
+		n := deref(sum.DurationMs) + int64(d)
+		sum.DurationMs = &n
+	}
+	sum.Request = ""
+	if plan != nil && ok && ctx.Thread().PermissionMode == protocol.PermissionModePlan && !ctx.Interrupted() {
+		// A plan: the turn goes on while the user decides whether to start on it.
+		run.planned = &sum
+		run.planned.Request = ctx.Ask(&protocol.PlanRequest{Plan: *plan}, "", func(res protocol.Resolution) { s.planAnswered(run, res) }, "")
+		return
+	}
+	run.planned = nil
+	end := TurnEnd{OK: ok, Usage: sum.Usage, DurationMs: sum.DurationMs}
 	if turn.str("status") == "failed" {
 		end.Error = turn.obj("error").str("message")
 		if end.Error == "" && errText != nil {
@@ -1617,11 +1802,49 @@ func (s *codexSession) turnCompleted(run *codexRun, turn jmap) {
 			end.Error = "The turn failed."
 		}
 	}
-	if d, ok := turn.num("durationMs"); ok {
-		n := int64(d)
-		end.DurationMs = &n
-	}
 	ctx.EndTurn(end)
+}
+
+// planAnswered says the user answered a plan: approved, Codex implements it in the mode the thread
+// carries on in; sent back with feedback, it plans again. Either way in another Codex turn of the
+// same turn. Otherwise the turn ends.
+func (s *codexSession) planAnswered(run *codexRun, res protocol.Resolution) {
+	if run != s.live() || run.planned == nil || run.planned.Request == "" || run.detached {
+		return
+	}
+	run.planned.Request = ""
+	ctx := s.ctx
+	text := func(t string) []map[string]any {
+		return []map[string]any{{"type": "text", "text": t, "text_elements": []any{}}}
+	}
+	switch {
+	case res.Outcome == protocol.ResolutionOutcomeAllow:
+		mode := modeAfterPlan(ctx.Thread().PermissionMode, res.PermissionMode)
+		ctx.SetThread(func(t *protocol.Thread) { t.PermissionMode = mode })
+		s.startTurn(run, text(implementPlan), nil)
+	case res.Outcome == protocol.ResolutionOutcomeDeny && res.Message != "":
+		s.startTurn(run, text(res.Message), nil)
+	default:
+		s.endPlanned(run)
+	}
+}
+
+// endPlanned ends a turn that's waiting on its plan (or whose plan wasn't answered), as its Codex
+// turns went.
+func (s *codexSession) endPlanned(run *codexRun) {
+	planned := run.planned
+	if planned == nil || run != s.run {
+		return
+	}
+	run.planned = nil
+	if planned.Request != "" {
+		s.ctx.CancelRequest(planned.Request)
+	}
+	s.clearStop()
+	if s.ctx.TurnID() == "" {
+		return
+	}
+	s.ctx.EndTurn(TurnEnd{OK: true, Usage: planned.Usage, DurationMs: planned.DurationMs})
 }
 
 // childDone says a subagent's turn ended: so did its call, with the subagent's last message.

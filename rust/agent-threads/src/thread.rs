@@ -88,6 +88,7 @@ enum Effect {
     Interrupt,
     Release,
     OptionsChanged,
+    ConfigChanged,
 }
 
 /// Something waiting for the next save.
@@ -568,6 +569,10 @@ impl ThreadContext {
         self.effects.push_back(Effect::OptionsChanged);
     }
 
+    pub(crate) fn config_changed(&mut self) {
+        self.effects.push_back(Effect::ConfigChanged);
+    }
+
     /// The running turn ended. `live`: whether the session has a process running that has the
     /// queued messages (HarnessSession::live).
     pub fn end_turn(&mut self, end: TurnEnd, live: bool) {
@@ -885,7 +890,11 @@ impl ThreadContext {
         answered: Answered,
         standing: Option<String>,
     ) -> String {
-        let id = new_id(if request["type"] == "question" { "q" } else { "perm" });
+        let id = new_id(match request["type"].as_str() {
+            Some("question") => "q",
+            Some("plan") => "plan",
+            _ => "perm",
+        });
         request["id"] = json!(id);
         if let Some(turn) = &self.turn {
             request["turn_id"] = json!(turn.id);
@@ -1237,6 +1246,7 @@ impl Actor {
                 Effect::Interrupt => s.interrupt(c),
                 Effect::Release => s.release(c),
                 Effect::OptionsChanged => s.options_changed(c),
+                Effect::ConfigChanged => s.config_changed(c),
             }
         }
     }
@@ -1391,6 +1401,7 @@ fn cancel() -> Resolution {
         answers: Default::default(),
         message: None,
         outcome: ResolutionOutcome::Cancel,
+        permission_mode: None,
     }
 }
 
@@ -1478,7 +1489,8 @@ impl ThreadContext {
         self.launch = launch;
         self.thread_changed = true;
         self.flush_queued = true;
-        self.options_changed();
+        // Its process is started with them: the next turn needs another.
+        self.config_changed();
     }
 
     /// Saves the thread's run (with a durable spawner) though no event changed.

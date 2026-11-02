@@ -1,7 +1,7 @@
 // The app's permission policy: whether the agent may call a tool, decided in code or by asking the
 // user (which opens a `permission` request).
 
-import type { Thread, ToolKind } from "@dire-kiwi/agent-threads-protocol";
+import type { PermissionMode, Thread, ToolKind } from "@dire-kiwi/agent-threads-protocol";
 
 /** A tool call the agent wants to make. */
 export interface PermissionQuery {
@@ -55,4 +55,13 @@ export function decide(policy: PermissionPolicy, query: PermissionQuery, ctx: Pe
   } catch (e) {
     return { deny: `The permission policy failed: ${e instanceof Error ? e.message : e}` };
   }
+}
+
+/**
+ * The permission mode a thread carries on in once its plan is approved: the one the user picked,
+ * or else its own, or default if that's plan.
+ */
+export function modeAfterPlan(current: PermissionMode | undefined, picked: PermissionMode | undefined): PermissionMode {
+  if (picked && picked !== "plan") return picked;
+  return current && current !== "plan" ? current : "default";
 }

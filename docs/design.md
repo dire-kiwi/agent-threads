@@ -228,7 +228,7 @@ checkpoints are the same as Node's).
   `useRespond()` and `useInterrupt()` call an app-supplied `onCommand`.
 - **Components**, ported from Huntaway minus the board: `<Thread>`, `<MessageList>`, `<ToolCall>`
   with built-in renderers for shell, edit diff, read and search, `<Subagent>`, `<PermissionCard>`,
-  `<QuestionCard>`, `<Composer>` and `<StreamingText>`.
+  `<QuestionCard>`, `<PlanCard>`, `<Composer>` and `<StreamingText>`.
 - **Extension points**: a tool-renderer registry (so an app can draw `lookup_order` as an order
   card), slots for message and markdown rendering, and a `className` per component.
 - The reducer keeps Huntaway's item reuse: unchanged items keep their identity, so rows don't

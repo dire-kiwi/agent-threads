@@ -390,11 +390,12 @@ describe.skipIf(process.platform === "win32")("a backend restart", () => {
   it("starts a new process for the next turn after a restart if the options changed, as it would have", { timeout: 60_000 }, async () => {
     const s = mini();
     const a = s.start();
-    const thread = await a.call<{ id: string }>("create", { harness: "claude", model: "old", cwd: s.dirs.cwd });
+    // A new effort needs a new process (a model or permission mode doesn't).
+    const thread = await a.call<{ id: string }>("create", { harness: "claude", effort: "old", cwd: s.dirs.cwd });
     await a.call("handle", { type: "send", thread_id: thread.id, text: "reply one" } satisfies Command);
     await a.waitFor({ type: "turn.completed" });
-    await a.call("handle", { type: "set_options", thread_id: thread.id, model: "new" } satisfies Command);
-    await a.waitFor({ type: "thread.updated", thread: { model: "new" } });
+    await a.call("handle", { type: "set_options", thread_id: thread.id, effort: "new" } satisfies Command);
+    await a.waitFor({ type: "thread.updated", thread: { effort: "new" } });
     await a.call("saved", thread.id);
     await a.crash();
 
@@ -405,7 +406,7 @@ describe.skipIf(process.platform === "win32")("a backend restart", () => {
     await b.call("close", { stop: true });
     await b.exited;
     const argvs = readFileSync(s.log, "utf8").trim().split("\n").map((l) => JSON.parse(l)).filter((l) => l.argv).map((l) => l.argv as string[]);
-    expect(argvs.map((v) => v[v.indexOf("--model") + 1])).toEqual(["old", "new"]);
+    expect(argvs.map((v) => v[v.indexOf("--effort") + 1])).toEqual(["old", "new"]);
   });
 
   it("carries on stopping a run's process group after the backend that was stopping it exits, or is killed", { timeout: 60_000 }, async () => {
