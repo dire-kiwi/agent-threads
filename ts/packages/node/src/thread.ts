@@ -2,8 +2,8 @@
 // steering queue and open requests. Every change is an event, numbered, applied, sent to the
 // subscribers, and saved to the store in order (deltas aren't saved).
 
-import { applyEvent, type Attachment, type Item, type RateLimit, type Resolution, type Snapshot, type Thread, type ThreadEvent, type ThreadRequest, type Usage, type UserMessage } from "@dire-kiwi/agent-threads-protocol";
-import { ancestors, inBackground, type HarnessMessage, type HarnessSession, type LaunchOptions, type Message, type NewItem, type NewRequest, type ThreadConfig, type ThreadContext, type TurnEnd } from "./harness.js";
+import { applyEvent, type Attachment, type Item, type RateLimit, type Resolution, type Snapshot, type SubagentState, type Thread, type ThreadEvent, type ThreadRequest, type Usage, type UserMessage } from "@dire-kiwi/agent-threads-protocol";
+import { ancestors, inBackground, requestInBackground, type HarnessMessage, type HarnessSession, type LaunchOptions, type Message, type NewItem, type NewRequest, type ThreadConfig, type ThreadContext, type TurnEnd } from "./harness.js";
 import { newId } from "./ids.js";
 import { normalLaunch, sameLaunch, storedThread, type StoredThread } from "./launch.js";
 import { decide, permissionKey, type PermissionDecision, type PermissionPolicy, type PermissionQuery } from "./permissions.js";
@@ -510,7 +510,7 @@ export class ThreadRuntime implements ThreadContext {
     }
     for (const [id, r] of this.#requests) {
       if (r.request.turn_id !== undefined && r.request.turn_id !== turn.id) continue;
-      if (r.request.tool_call_id && inBackground(lookup, r.request.tool_call_id)) continue;
+      if (requestInBackground(lookup, r.request)) continue;
       this.#requests.delete(id);
       this.emit({ type: "request.resolved", request_id: id, resolution: { outcome: "cancel" } });
     }
@@ -581,27 +581,40 @@ export class ThreadRuntime implements ThreadContext {
   }
 
   stopSubagents(ids: Iterable<string>): void {
-    const stopped = new Set<string>();
+    const ends = new Map<string, SubagentState>();
     for (const id of ids) {
       const it = this.item(id);
-      if (it?.type !== "tool_call" || it.subagent?.status !== "running") continue;
-      stopped.add(id);
-      this.updateItem(id, { subagent: { ...it.subagent, status: "stopped" } });
+      if (it?.type === "tool_call" && it.subagent?.status === "running") ends.set(id, { ...it.subagent, status: "stopped" });
     }
-    if (!stopped.size) return;
+    this.#endSubagents(ends);
+  }
+
+  endSubagent(id: string, end: SubagentState): void {
+    const it = this.item(id);
+    if (it?.type !== "tool_call") return;
+    if (it.subagent?.status === "running" && end.status !== "running") this.#endSubagents(new Map([[id, end]]));
+    else this.updateItem(id, { subagent: end });
+  }
+
+  /** Subagents that ended, as each says: what they left unfinished is cancelled. */
+  #endSubagents(ends: Map<string, SubagentState>): void {
+    if (!ends.size) return;
+    for (const [id, end] of ends) this.updateItem(id, { subagent: end });
     const lookup = (id: string) => this.item(id);
-    const within = (id: string) => [...ancestors(lookup, id)].some((a) => stopped.has(a.id));
+    const within = (id: string) => [...ancestors(lookup, id)].some((a) => ends.has(a.id));
     this.#finishText(within);
     for (const id of [...this.#structured.keys()]) if (within(id)) this.#structured.delete(id);
     for (const it of this.#state.items) {
       if (it.type === "tool_call" && (it.status === "running" || it.status === "pending") && within(it.id)) this.updateItem(it.id, { status: "cancelled" });
     }
+    // Its requests: about its calls, or (about none) from it.
+    const from = (call: string | undefined) => !!call && (ends.has(call) || within(call));
     for (const [id, r] of this.#requests) {
-      if (!r.request.tool_call_id || !within(r.request.tool_call_id)) continue;
+      if (!(r.request.tool_call_id ? within(r.request.tool_call_id) : from(r.request.parent_id))) continue;
       this.#requests.delete(id);
       this.emit({ type: "request.resolved", request_id: id, resolution: { outcome: "cancel" } });
     }
-    if (!this.#requests.size && !this.turn && this.#state.thread.status === "waiting") this.setThread({ status: "idle" });
+    if (!this.#requests.size && (this.turn || this.#state.thread.status === "waiting")) this.setThread({ status: this.turn ? "running" : "idle" });
   }
 
   #undelivered(n: number): void {
@@ -625,9 +638,12 @@ export class ThreadRuntime implements ThreadContext {
   ask(request: NewRequest, toolCallId: string | undefined, answered: (resolution: Resolution) => void, standing?: string): string {
     const r = { ...request, id: newId(request.type === "question" ? "q" : request.type === "plan" ? "plan" : "perm") } as ThreadRequest;
     if (this.turn) r.turn_id = this.turn.id;
+    // A request about a call is from the subagent the call is (or the thread itself); one about
+    // none says which it's from.
     const call = toolCallId ? this.item(toolCallId) : undefined;
     if (call) {
       r.tool_call_id = call.id;
+      delete r.parent_id;
       if (call.parent_id) r.parent_id = call.parent_id;
       this.updateItem(call.id, { status: "pending" });
     }

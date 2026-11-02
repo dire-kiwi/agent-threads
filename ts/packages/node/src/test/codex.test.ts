@@ -374,10 +374,148 @@ describe("the Codex driver", () => {
     await sdk.send(t.id, "sub read the notes");
     const s = await settle(sdk, t.id);
     const call = calls(s.items)[0]!;
-    expect(call).toMatchObject({ name: "spawnAgent", kind: "subagent", title: "read the notes", status: "completed", result: { content: "child says read the notes" } });
+    // The spawn returns as soon as the child has started; the child's end is its subagent's.
+    expect(call).toMatchObject({ name: "spawnAgent", kind: "subagent", title: "read the notes", status: "completed" });
+    expect(call.result).toBeUndefined();
+    expect(call.subagent).toEqual({ status: "completed", background: true, summary: "child says read the notes" });
     const child = s.items.filter((i) => i.parent_id === call.id);
     expect(child.map((i) => [i.type, (i as { text?: string }).text])).toEqual([["assistant_message", "child says read the notes"]]);
     expect(texts(s.items.filter((i) => !i.parent_id))).toEqual(["the subagent is done"]);
+  });
+
+  it("keeps a child thread's calls and requests after its parent's turn, and ends its subagent with the child's turn", async () => {
+    const { sdk, events, runs } = setup({ permissions: (q) => (q.kind === "shell" ? "ask" : "allow") });
+    const t = await sdk.create({ harness: "codex", cwd: tempDir() });
+    await sdk.send(t.id, "bg touch a.txt");
+    // The turn ends with the child's command waiting for the user, who's still asked.
+    const r = await request(sdk, t.id);
+    await until(() => events.some((e) => e.type === "turn.completed"));
+    let s = await sdk.snapshot(t.id);
+    expect(s.thread.status).toBe("waiting");
+    let [spawn, cmd] = calls(s.items);
+    expect(spawn).toMatchObject({ name: "spawnAgent", status: "completed", subagent: { status: "running", background: true, model: "mini-child" } });
+    expect(cmd).toMatchObject({ status: "pending", parent_id: spawn!.id });
+    expect(r).toMatchObject({ tool_call_id: cmd!.id, parent_id: spawn!.id });
+
+    await sdk.respond(t.id, r.id, { outcome: "allow" });
+    s = await until(async () => {
+      const x = await sdk.snapshot(t.id);
+      return x.thread.status === "idle" && calls(x.items)[0]!.subagent?.status !== "running" && x;
+    });
+    [spawn, cmd] = calls(s.items);
+    expect(spawn!.subagent).toEqual({ status: "completed", background: true, model: "mini-child", summary: "child ran touch a.txt" });
+    expect(cmd).toMatchObject({ status: "completed", result: { content: "ran touch a.txt\n" } });
+    expect(answers(runs()[0]!.sent)).toContainEqual({ decision: "accept" });
+    expect(results(s.items)).toHaveLength(1);
+  });
+
+  it("fails a child thread's subagent when its turn fails, with the turn's error", async () => {
+    const { sdk } = setup({ permissions: (q) => (q.kind === "shell" ? "ask" : "allow") });
+    const t = await sdk.create({ harness: "codex", cwd: tempDir() });
+    await sdk.send(t.id, "bg rm -rf /");
+    const r = await request(sdk, t.id);
+    await sdk.respond(t.id, r.id, { outcome: "deny" });
+    const s = await until(async () => {
+      const x = await sdk.snapshot(t.id);
+      return x.thread.status === "idle" && calls(x.items)[0]!.subagent?.status !== "running" && x;
+    });
+    const [spawn, cmd] = calls(s.items);
+    expect(spawn!.subagent).toEqual({ status: "failed", background: true, model: "mini-child", summary: "the child wasn't allowed to" });
+    expect(cmd).toMatchObject({ status: "denied" });
+  });
+
+  for (const [how, end] of [
+    ["its turn is interrupted", "endchild interrupted"],
+    ["it's closed", "closechild"],
+  ]) {
+    it(`cancels what a child thread left unfinished when ${how} after its parent's turn`, async () => {
+      const { sdk, events } = setup({ permissions: (q) => (q.kind === "shell" ? "ask" : "allow") });
+      const t = await sdk.create({ harness: "codex", cwd: tempDir() });
+      await sdk.send(t.id, "bg sleep 60");
+      const r = await request(sdk, t.id);
+      await until(() => events.some((e) => e.type === "turn.completed"));
+      expect((await sdk.snapshot(t.id)).thread.status).toBe("waiting");
+      await sdk.send(t.id, end!);
+      const s = await settle(sdk, t.id);
+      const [spawn, cmd] = calls(s.items);
+      expect(spawn!.subagent).toEqual({ status: "stopped", background: true, model: "mini-child" });
+      expect(cmd).toMatchObject({ status: "cancelled", parent_id: spawn!.id });
+      expect(openRequests(s)).toEqual([]);
+      expect(events).toContainEqual(expect.objectContaining({ type: "request.resolved", request_id: r.id, resolution: { outcome: "cancel" } }));
+    });
+  }
+
+  for (const [how, end] of [
+    ["its turn is interrupted", "endchild interrupted"],
+    ["it's closed", "closechild"],
+  ]) {
+    it(`sets the thread running again when ${how} while its parent's turn goes on`, async () => {
+      const { sdk, events } = setup({ permissions: (q) => (q.kind === "shell" ? "ask" : "allow") });
+      const t = await sdk.create({ harness: "codex", cwd: tempDir() });
+      await sdk.send(t.id, `bg sleep 60\nsleep 200\n${end}\nsleep 1500`);
+      const r = await request(sdk, t.id);
+      expect((await sdk.snapshot(t.id)).thread.status).toBe("waiting");
+      await until(() => events.some((e) => e.type === "request.resolved" && e.request_id === r.id));
+      const s = await sdk.snapshot(t.id);
+      expect(events.some((e) => e.type === "turn.completed")).toBe(false);
+      expect(calls(s.items)[0]!.subagent).toMatchObject({ status: "stopped" });
+      expect(openRequests(s)).toEqual([]);
+      expect(s.thread.status).toBe("running");
+      await sdk.interrupt(t.id);
+      expect((await settle(sdk, t.id)).thread.status).toBe("idle");
+    });
+  }
+
+  for (const [how, end] of [
+    ["its turn is interrupted", "endchild interrupted"],
+    ["it's closed", "closechild"],
+  ]) {
+    for (const late of [false, true]) {
+      it(`cancels a child thread's approval that's about none of its calls, asked ${late ? "after" : "during"} its parent's turn, when ${how} after it`, async () => {
+        const { sdk, events } = setup({ permissions: "ask" });
+        const t = await sdk.create({ harness: "codex", cwd: tempDir() });
+        await sdk.send(t.id, `bgmcp srv echo${late ? " late" : ""}`);
+        await until(() => events.some((e) => e.type === "turn.completed"));
+        // Two calls alike: the approval can't be put down to either. It's the child's, and outlives the turn.
+        const r = await request(sdk, t.id);
+        const spawnId = calls((await sdk.snapshot(t.id)).items)[0]!.id;
+        expect(r).toMatchObject({ type: "permission", kind: "mcp", parent_id: spawnId });
+        expect(r.tool_call_id).toBeUndefined();
+        expect((await sdk.snapshot(t.id)).thread.status).toBe("waiting");
+        await sdk.send(t.id, end!);
+        const s = await settle(sdk, t.id);
+        const [spawn, ...mcp] = calls(s.items);
+        expect(spawn!.subagent).toEqual({ status: "stopped", background: true, model: "mini-child" });
+        expect(mcp.map((c) => c.status)).toEqual(["cancelled", "cancelled"]);
+        expect(openRequests(s)).toEqual([]);
+        expect(events).toContainEqual(expect.objectContaining({ type: "request.resolved", request_id: r.id, resolution: { outcome: "cancel" } }));
+      });
+    }
+  }
+
+  it("doesn't take a child thread's earlier report for a follow-up turn that ends without one", async () => {
+    const { sdk } = setup();
+    const t = await sdk.create({ harness: "codex", cwd: tempDir() });
+    await sdk.send(t.id, "sub old summary");
+    let s = await settle(sdk, t.id);
+    expect(calls(s.items)[0]!.subagent).toEqual({ status: "completed", background: true, summary: "child says old summary" });
+    await sdk.send(t.id, "followup interrupted");
+    s = await settle(sdk, t.id);
+    expect(calls(s.items)[0]!.subagent).toEqual({ status: "stopped", background: true });
+  });
+
+  it("stops a run's child threads when it ends, and cancels what they were doing", async () => {
+    const { sdk, events } = setup({ permissions: "ask" });
+    const t = await sdk.create({ harness: "codex", cwd: tempDir() });
+    await sdk.send(t.id, "bg sleep 60");
+    await request(sdk, t.id);
+    await until(() => events.some((e) => e.type === "turn.completed"));
+    await sdk.close();
+    const s = applyEvents(initialState(t), events);
+    const [spawn, cmd] = calls(s.items);
+    expect(spawn).toMatchObject({ status: "completed", subagent: { status: "stopped", background: true } });
+    expect(cmd).toMatchObject({ status: "cancelled", parent_id: spawn!.id });
+    expect(openRequests(s)).toEqual([]);
   });
 
   it("steers a running turn with turn/steer, and the message joins it when Codex takes it in", async () => {

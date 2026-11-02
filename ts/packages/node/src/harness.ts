@@ -10,6 +10,7 @@ import type {
   QuestionRequest,
   RateLimit,
   Resolution,
+  SubagentState,
   Thread,
   Usage,
   UserMessage,
@@ -102,11 +103,14 @@ export function unixTime(seconds: number): string {
   return new Date(Math.floor(seconds) * 1000).toISOString().replace(/\.\d{3}Z$/, "Z");
 }
 
-/** A request to open, without the fields the core fills in. */
+/**
+ * A request to open, without the fields the core fills in. Its `parent_id` says which subagent's
+ * call it's from when it's about none of the calls (otherwise the call's is taken).
+ */
 export type NewRequest =
-  | Omit<PermissionRequest, "id" | "turn_id" | "tool_call_id" | "parent_id">
-  | Omit<QuestionRequest, "id" | "turn_id" | "tool_call_id" | "parent_id">
-  | Omit<PlanRequest, "id" | "turn_id" | "tool_call_id" | "parent_id">;
+  | Omit<PermissionRequest, "id" | "turn_id" | "tool_call_id">
+  | Omit<QuestionRequest, "id" | "turn_id" | "tool_call_id">
+  | Omit<PlanRequest, "id" | "turn_id" | "tool_call_id">;
 
 /** An item to add, without its turn (the core sets the running turn's). */
 export type NewItem = Item extends infer I ? (I extends Item ? Omit<I, "turn_id"> : never) : never;
@@ -190,6 +194,11 @@ export interface ThreadContext {
    * ended): their calls still running are cancelled, and their open requests too.
    */
   stopSubagents(ids: Iterable<string>): void;
+  /**
+   * Sets a subagent call's subagent. If it was running and has ended, what it left unfinished is
+   * cancelled: its calls still running, its streaming text and its open requests.
+   */
+  endSubagent(id: string, subagent: SubagentState): void;
   /** Something went wrong that isn't the turn's: for the app's onError. */
   error(error: unknown): void;
 }
@@ -207,6 +216,15 @@ export function* ancestors(item: (id: string) => Item | undefined, id: string): 
 /** Whether a tool_call is a background subagent's that's still running. */
 export function runningInBackground(it: Item | undefined): boolean {
   return it?.type === "tool_call" && !!it.subagent?.background && it.subagent.status === "running";
+}
+
+/**
+ * Whether a request is a background subagent's that's still running (about one of its calls, or
+ * from it): it carries on after the turn it was asked in has ended.
+ */
+export function requestInBackground(item: (id: string) => Item | undefined, r: { tool_call_id?: string; parent_id?: string }): boolean {
+  if (r.tool_call_id) return inBackground(item, r.tool_call_id);
+  return !!r.parent_id && (runningInBackground(item(r.parent_id)) || inBackground(item, r.parent_id));
 }
 
 /**
