@@ -812,9 +812,20 @@ func (rt *threadRuntime) endTurn(end TurnEnd, carry bool) {
 	}
 	clear(rt.streaming)
 	clear(rt.structured)
+	// What a background subagent that's still running does carries on after the turn: its calls
+	// and requests too.
 	for _, it := range rt.state.Items {
-		if c, ok := it.Value.(*protocol.ToolCall); ok && c.TurnID == turn.ID && (c.Status == protocol.ToolStatusRunning || c.Status == protocol.ToolStatusPending) {
-			rt.UpdateItem(c.ID, Patch{"status": protocol.ToolStatusCancelled})
+		if c, ok := it.Value.(*protocol.ToolCall); ok && c.TurnID == turn.ID && (c.Status == protocol.ToolStatusRunning || c.Status == protocol.ToolStatusPending) && !inBackground(rt.Item, c.ID) {
+			patch := Patch{"status": protocol.ToolStatusCancelled}
+			// A subagent cut short (by an interrupt, or its process ending) is stopped with its call.
+			if saved, ok := rt.Item(c.ID); ok {
+				if s := saved.Value.(*protocol.ToolCall).Subagent; s != nil && s.Status == protocol.SubagentStatusRunning {
+					stopped := *s
+					stopped.Status = protocol.SubagentStatusStopped
+					patch["subagent"] = stopped
+				}
+			}
+			rt.UpdateItem(c.ID, patch)
 		}
 	}
 	for _, id := range append([]string(nil), rt.requestOrder...) {
@@ -823,6 +834,9 @@ func (rt *threadRuntime) endTurn(end TurnEnd, carry bool) {
 			continue
 		}
 		if t := r.request.TurnID(); t != "" && t != turn.ID {
+			continue
+		}
+		if call := r.request.ToolCallID(); call != "" && inBackground(rt.Item, call) {
 			continue
 		}
 		rt.dropRequest(id)
@@ -862,6 +876,8 @@ func (rt *threadRuntime) endTurn(end TurnEnd, carry bool) {
 		status := protocol.ThreadStatusIdle
 		if errText != "" {
 			status = protocol.ThreadStatusError
+		} else if len(rt.requests) > 0 {
+			status = protocol.ThreadStatusWaiting
 		}
 		rt.SetThread(func(t *protocol.Thread) { t.Status = status; t.Error = errText; t.Usage = usage })
 		if len(left) > 0 && carry && !rt.closing && rt.session != nil {
@@ -885,6 +901,92 @@ func (rt *threadRuntime) endTurn(end TurnEnd, carry bool) {
 		msgs = append(msgs, toMessage(q))
 	}
 	rt.session.CarryOver(msgs)
+}
+
+func (rt *threadRuntime) BeginTurn() {
+	if rt.turn != nil || rt.closing || rt.disposed {
+		return
+	}
+	rt.turn = &turnState{ID: NewID("turn")}
+	rt.emit(&protocol.TurnStartedEvent{TurnID: rt.turn.ID})
+	rt.SetThread(func(t *protocol.Thread) { t.Status = protocol.ThreadStatusRunning; t.Error = "" })
+}
+
+func (rt *threadRuntime) StopSubagents(ids []string) {
+	stopped := map[string]bool{}
+	for _, id := range ids {
+		it, ok := rt.Item(id)
+		c, isCall := it.Value.(*protocol.ToolCall)
+		if !ok || !isCall || c.Subagent == nil || c.Subagent.Status != protocol.SubagentStatusRunning || stopped[id] {
+			continue
+		}
+		stopped[id] = true
+		s := *c.Subagent
+		s.Status = protocol.SubagentStatusStopped
+		rt.UpdateItem(id, Patch{"subagent": s})
+	}
+	if len(stopped) == 0 {
+		return
+	}
+	within := func(id string) bool {
+		for _, a := range ancestors(rt.Item, id) {
+			if stopped[a.ID()] {
+				return true
+			}
+		}
+		return false
+	}
+	for _, it := range rt.state.Items {
+		if c, ok := it.Value.(*protocol.ToolCall); ok && (c.Status == protocol.ToolStatusRunning || c.Status == protocol.ToolStatusPending) && within(c.ID) {
+			rt.UpdateItem(c.ID, Patch{"status": protocol.ToolStatusCancelled})
+		}
+	}
+	for _, id := range append([]string(nil), rt.requestOrder...) {
+		r := rt.requests[id]
+		if r == nil || r.request.ToolCallID() == "" || !within(r.request.ToolCallID()) {
+			continue
+		}
+		rt.dropRequest(id)
+		rt.emit(&protocol.RequestResolvedEvent{RequestID: id, Resolution: protocol.Resolution{Outcome: protocol.ResolutionOutcomeCancel}})
+	}
+	if len(rt.requests) == 0 && rt.turn == nil && rt.state.Thread.Status == protocol.ThreadStatusWaiting {
+		rt.SetThread(func(t *protocol.Thread) { t.Status = protocol.ThreadStatusIdle })
+	}
+}
+
+// ancestors is the calls of the subagents an item is inside, innermost first.
+func ancestors(item func(string) (protocol.Item, bool), id string) []protocol.Item {
+	var out []protocol.Item
+	seen := map[string]bool{}
+	it, ok := item(id)
+	for ok {
+		p := it.ParentID()
+		if p == "" || seen[p] {
+			break
+		}
+		seen[p] = true
+		if it, ok = item(p); ok {
+			out = append(out, it)
+		}
+	}
+	return out
+}
+
+// runningInBackground says whether an item is a background subagent's call that's still running.
+func runningInBackground(it protocol.Item) bool {
+	c, ok := it.Value.(*protocol.ToolCall)
+	return ok && c.Subagent != nil && c.Subagent.Background && c.Subagent.Status == protocol.SubagentStatusRunning
+}
+
+// inBackground says whether an item is inside a background subagent that's still running: what it
+// does carries on after the turn it was started in has ended.
+func inBackground(item func(string) (protocol.Item, bool), id string) bool {
+	for _, a := range ancestors(item, id) {
+		if runningInBackground(a) {
+			return true
+		}
+	}
+	return false
 }
 
 func (rt *threadRuntime) undelivered(n int) {
@@ -968,9 +1070,7 @@ func (rt *threadRuntime) respond(requestID string, res protocol.Resolution) {
 	rt.dropRequest(requestID)
 	// The answers to secret questions go only to the harness: what's sent and saved hides them.
 	rt.emit(&protocol.RequestResolvedEvent{RequestID: requestID, Resolution: redact(open.request, res)})
-	if len(rt.requests) == 0 && rt.turn != nil {
-		rt.SetThread(func(t *protocol.Thread) { t.Status = protocol.ThreadStatusRunning })
-	}
+	rt.requestsDone()
 	if res.Always && open.standing != "" {
 		switch res.Outcome {
 		case protocol.ResolutionOutcomeAllow:
@@ -988,8 +1088,19 @@ func (rt *threadRuntime) CancelRequest(id string) {
 	}
 	rt.dropRequest(id)
 	rt.emit(&protocol.RequestResolvedEvent{RequestID: id, Resolution: protocol.Resolution{Outcome: protocol.ResolutionOutcomeCancel}})
-	if len(rt.requests) == 0 && rt.turn != nil {
+	rt.requestsDone()
+}
+
+// requestsDone sets the thread running again once it has no open requests, or idle if no turn is
+// running (a background subagent's request can be answered after its turn).
+func (rt *threadRuntime) requestsDone() {
+	if len(rt.requests) > 0 {
+		return
+	}
+	if rt.turn != nil {
 		rt.SetThread(func(t *protocol.Thread) { t.Status = protocol.ThreadStatusRunning })
+	} else if rt.state.Thread.Status == protocol.ThreadStatusWaiting {
+		rt.SetThread(func(t *protocol.Thread) { t.Status = protocol.ThreadStatusIdle })
 	}
 }
 

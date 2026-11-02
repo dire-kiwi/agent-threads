@@ -102,6 +102,8 @@ type claudeRunState struct {
 	Asked       [][2]string     `json:"asked"`
 	Open        [][2]any        `json:"open"`
 	Sent        []sentMessage   `json:"sent"`
+	Tasks       [][2]string     `json:"tasks,omitempty"`  // [a subagent's task id, its call's id]
+	Agents      []string        `json:"agents,omitempty"` // the calls whose subagents it ran
 	PluginDir   string          `json:"pluginDir,omitempty"`
 	Launched    *launched       `json:"launched,omitempty"`
 	Stale       bool            `json:"stale,omitempty"`
@@ -146,6 +148,10 @@ type claudeRun struct {
 	openOrder []string
 	// sent is the messages sent, oldest first, by what Claude echoes when it takes one in.
 	sent []sentMessage
+	// tasks is its subagents' task ids (which some task_* messages name them by) -> their calls'
+	// ids, and agents the calls whose subagents it ran, which are stopped when it ends.
+	tasks  map[string]string
+	agents []string
 	// pluginDir is the generated plugin with the thread's skills, for this run only.
 	pluginDir string
 	launched  *launched
@@ -159,8 +165,18 @@ func newClaudeRun(id string) *claudeRun {
 	return &claudeRun{
 		id: id, pending: map[string]*pendingControl{}, nextRequest: 1, toolCtx: ctx, abort: cancel,
 		msgOfParent: map[string]string{}, blockCount: map[string]int{}, streamed: map[string]bool{},
-		asked: map[string]string{}, open: map[string]*claudeOpen{},
+		asked: map[string]string{}, open: map[string]*claudeOpen{}, tasks: map[string]string{},
 	}
+}
+
+// addAgent notes a call whose subagent the run runs.
+func (r *claudeRun) addAgent(id string) {
+	for _, a := range r.agents {
+		if a == id {
+			return
+		}
+	}
+	r.agents = append(r.agents, id)
 }
 
 func (r *claudeRun) write(msg any) {
@@ -261,6 +277,10 @@ func (r *claudeRun) state() claudeRunState {
 	for _, id := range r.openOrder {
 		st.Open = append(st.Open, [2]any{id, r.open[id]})
 	}
+	for _, k := range sortedKeys(r.tasks) {
+		st.Tasks = append(st.Tasks, [2]string{k, r.tasks[k]})
+	}
+	st.Agents = append([]string(nil), r.agents...)
 	return st
 }
 
@@ -304,6 +324,10 @@ func (r *claudeRun) restore(st claudeRunState, answered func(subtype string) fun
 		r.setOpen(id, &o)
 	}
 	r.sent = append([]sentMessage{}, st.Sent...)
+	for _, kv := range st.Tasks {
+		r.tasks[kv[0]] = kv[1]
+	}
+	r.agents = append([]string(nil), st.Agents...)
 	r.pluginDir = st.PluginDir
 	r.launched = st.Launched
 }
@@ -1010,6 +1034,8 @@ func (s *claudeSession) exited(run *claudeRun, status ExitStatus) {
 	if r := ctx.Thread().Run; r != nil && r.ID == run.id {
 		ctx.SetThread(func(t *protocol.Thread) { t.Run = nil })
 	}
+	// Its subagents end with it.
+	ctx.StopSubagents(run.agents)
 	// A run that ends while its turn is running ends the turn (as interrupted, if it was).
 	if !run.retired && ctx.TurnID() != "" {
 		s.clearStop()
@@ -1051,9 +1077,16 @@ func (s *claudeSession) message(run *claudeRun, m jmap) {
 	parent := m.str("parent_tool_use_id")
 	switch m.str("type") {
 	case "system":
+		// Claude starts a turn by itself to tell the agent that a background subagent has ended.
+		if m.str("subtype") == "init" {
+			ctx.BeginTurn()
+		}
 		sid := m.str("session_id")
 		if m.str("subtype") == "init" && sid != "" && sid != ctx.Thread().SessionID {
 			ctx.SetThread(func(t *protocol.Thread) { t.SessionID = sid })
+		}
+		if strings.HasPrefix(m.str("subtype"), "task_") {
+			s.task(run, m)
 		}
 		if m.str("subtype") == "compact_boundary" {
 			meta := m.obj("compact_metadata")
@@ -1156,10 +1189,24 @@ func (s *claudeSession) message(run *claudeRun, m jmap) {
 			ctx.CancelRequest(ours)
 		}
 	case "result":
-		// The turn's requests are moot now; its open questions are cancelled with it.
-		run.open, run.openOrder = map[string]*claudeOpen{}, nil
-		// Its messages are done with: what was kept to translate them needn't be any more.
-		run.msgOfParent, run.blockCount, run.streamed = map[string]string{}, map[string]int{}, map[string]bool{}
+		// The turn's requests are moot now; its open questions are cancelled with it. A background
+		// subagent's carry on.
+		for _, id := range append([]string(nil), run.openOrder...) {
+			if call := toolUseOf(run.open[id].Request); call == "" || !inBackground(ctx.Item, call) {
+				run.dropOpen(id)
+			}
+		}
+		// Its messages are done with: what was kept to translate them needn't be any more, unless a
+		// background subagent is still sending its own.
+		background := false
+		for _, id := range run.agents {
+			if it, ok := ctx.Item(id); ok && runningInBackground(it) {
+				background = true
+			}
+		}
+		if !background {
+			run.msgOfParent, run.blockCount, run.streamed = map[string]string{}, map[string]int{}, map[string]bool{}
+		}
 		if ctx.TurnID() == "" {
 			return
 		}
@@ -1258,8 +1305,58 @@ func (s *claudeSession) user(run *claudeRun, m jmap) {
 				patch["changes"] = []protocol.FileChange{*change}
 			}
 		}
+		result := patch["result"].(protocol.ToolResult)
+		if sub := subagentResult(call, b.bool("is_error"), ctx.Interrupted(), m.obj("tool_use_result"), result.Content); sub != nil {
+			patch["subagent"] = sub
+			run.addAgent(call.ID)
+		}
 		ctx.UpdateItem(call.ID, patch)
 	}
+}
+
+// task takes Claude's task_* messages about a subagent: an Agent call's, or a skill's forked one
+// (whose Skill call becomes a subagent call). Other tasks (a command run in the background) aren't.
+func (s *claudeSession) task(run *claudeRun, m jmap) {
+	ctx := s.ctx
+	if m.str("subtype") == "task_started" && m.str("task_type") == "local_agent" && m.str("tool_use_id") != "" {
+		it, ok := ctx.Item(m.str("tool_use_id"))
+		call, isCall := it.Value.(*protocol.ToolCall)
+		if !ok || !isCall {
+			return
+		}
+		if t := m.str("task_id"); t != "" {
+			run.tasks[t] = call.ID
+		}
+		run.addAgent(call.ID)
+		patch := Patch{"subagent": subagentStarted(call, m)}
+		if call.Kind != protocol.ToolKindSubagent {
+			patch["kind"] = protocol.ToolKindSubagent
+			if d := m.str("description"); call.Title == "" && d != "" {
+				patch["title"] = d
+			}
+		}
+		ctx.UpdateItem(call.ID, patch)
+		return
+	}
+	id := m.str("tool_use_id")
+	if id == "" {
+		id = run.tasks[m.str("task_id")]
+	}
+	it, ok := ctx.Item(id)
+	call, isCall := it.Value.(*protocol.ToolCall)
+	if id == "" || !ok || !isCall || call.Subagent == nil {
+		return
+	}
+	ctx.UpdateItem(call.ID, Patch{"subagent": subagentTask(*call.Subagent, m)})
+}
+
+// toolUseOf is the tool call a request of Claude's is about: a can_use_tool's, or an app tool's
+// mcp_message.
+func toolUseOf(req jmap) string {
+	if id := req.str("tool_use_id"); id != "" {
+		return id
+	}
+	return req.obj("message").obj("params").obj("_meta").str("claudecode/toolUseId")
 }
 
 func (s *claudeSession) controlRequest(run *claudeRun, requestID string, req jmap) {
@@ -1295,10 +1392,12 @@ func (s *claudeSession) canUseTool(run *claudeRun, requestID string, req jmap, e
 		}
 		return ctx.Ask(request, toolCallID, answered, standing)
 	}
-	// Whether Claude still wants this answered: not cancelled, its turn not over, its run not gone.
+	// Whether Claude still wants this answered: not cancelled, its turn not over (unless it's a
+	// background subagent's, which carries on after it), its run not gone.
 	wanted := func() bool {
 		_, open := run.open[requestID]
-		return open && !run.exited && !run.retired && !run.detached && s.run == run && ctx.TurnID() == turn
+		return open && !run.exited && !run.retired && !run.detached && s.run == run &&
+			(ctx.TurnID() == turn || (toolUseID != "" && inBackground(ctx.Item, toolUseID)))
 	}
 	allow := func(updated json.RawMessage) {
 		if wanted() {

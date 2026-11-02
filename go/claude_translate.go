@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"math"
 	"strings"
+	"unicode"
 
 	"github.com/dire-kiwi/agent-threads/go/protocol"
 )
@@ -127,6 +128,126 @@ func resultText(content json.RawMessage) string {
 }
 
 // slim is a result's content, cut short if it's long (counting as JavaScript does).
+// subagentEnd is how Claude says a subagent ended (in its task_* messages and the Agent call's
+// result) as a SubagentStatus, or "" if what it says isn't an end.
+func subagentEnd(status string) protocol.SubagentStatus {
+	switch status {
+	case "completed", "success":
+		return protocol.SubagentStatusCompleted
+	case "failed", "error":
+		return protocol.SubagentStatusFailed
+	case "killed", "stopped", "cancelled", "interrupted":
+		return protocol.SubagentStatusStopped
+	}
+	return ""
+}
+
+// count is a field that's a count (a whole number, not negative), or nil.
+func count(m jmap, k string) *int64 {
+	f, ok := m.num(k)
+	if !ok || f < 0 || f != math.Trunc(f) {
+		return nil
+	}
+	n := int64(f)
+	return &n
+}
+
+// subagentStarted is a subagent call's subagent, as a task_started (of a local_agent) says it has
+// started.
+func subagentStarted(call *protocol.ToolCall, m jmap) protocol.SubagentState {
+	var s protocol.SubagentState
+	if call.Subagent != nil {
+		s = *call.Subagent
+	}
+	s.Status = protocol.SubagentStatusRunning
+	if m.bool("is_backgrounded") {
+		s.Background = true
+	}
+	if t := m.str("subagent_type"); t != "" {
+		s.AgentType = t
+	}
+	model := m.str("model")
+	if model == "" {
+		model = parseObj(call.Input).str("model")
+	}
+	if model != "" {
+		s.Model = model
+	}
+	return s
+}
+
+// subagentTask is a subagent after a task_progress, task_updated or task_notification about it.
+func subagentTask(s protocol.SubagentState, m jmap) protocol.SubagentState {
+	next := s
+	switch m.str("subtype") {
+	case "task_progress":
+		if d := m.str("description"); d != "" {
+			next.Activity = d
+		}
+		if n := count(m.obj("usage"), "tool_uses"); n != nil {
+			next.ToolUses = n
+		}
+	case "task_updated":
+		// Continued (with SendMessage) after it ended, it runs again.
+		status := m.obj("patch").str("status")
+		if status == "running" {
+			next.Status, next.Summary = protocol.SubagentStatusRunning, ""
+		} else if end := subagentEnd(status); end != "" && s.Status == protocol.SubagentStatusRunning {
+			next.Status = end
+		}
+	case "task_notification":
+		if end := subagentEnd(m.str("status")); end != "" && s.Status == protocol.SubagentStatusRunning {
+			next.Status = end
+		}
+		if n := count(m.obj("usage"), "tool_uses"); n != nil {
+			next.ToolUses = n
+		}
+		// A foreground subagent's report is its call's result.
+		if summary := m.str("summary"); s.Background && summary != "" {
+			next.Summary = slim(summary).Content
+		}
+	}
+	return next
+}
+
+// subagentResult is a subagent call's subagent, as its result says (meta is the result's
+// tool_use_result, text its content); nil for a call whose subagent never started (it failed, or
+// was denied).
+func subagentResult(call *protocol.ToolCall, isError, interrupted bool, meta jmap, text string) *protocol.SubagentState {
+	if call.Kind != protocol.ToolKindSubagent || (call.Subagent == nil && isError) {
+		return nil
+	}
+	s := protocol.SubagentState{Status: protocol.SubagentStatusRunning}
+	if call.Subagent != nil {
+		s = *call.Subagent
+	}
+	if m := meta.str("resolvedModel"); m != "" {
+		s.Model = m
+	}
+	if t := meta.str("agentType"); t != "" {
+		s.AgentType = t
+	}
+	if n := count(meta, "totalToolUseCount"); n != nil {
+		s.ToolUses = n
+	}
+	// A background subagent's call returns as soon as it has started it.
+	if meta.bool("isAsync") || meta.str("status") == "async_launched" || strings.HasPrefix(strings.TrimLeftFunc(text, unicode.IsSpace), "Async agent launched") {
+		s.Background = true
+	} else if s.Status == protocol.SubagentStatusRunning {
+		switch end := subagentEnd(meta.str("status")); {
+		case isError && interrupted:
+			s.Status = protocol.SubagentStatusStopped
+		case isError:
+			s.Status = protocol.SubagentStatusFailed
+		case end != "":
+			s.Status = end
+		default:
+			s.Status = protocol.SubagentStatusCompleted
+		}
+	}
+	return &s
+}
+
 func slim(text string) protocol.ToolResult {
 	if protocol.TextLen(text) <= maxResult {
 		return protocol.ToolResult{Content: text}

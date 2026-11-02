@@ -208,6 +208,17 @@ func (u ThreadRequest) TurnID() string {
 	return ""
 }
 
+// ToolCallID is the request's tool_call_id.
+func (u ThreadRequest) ToolCallID() string {
+	switch r := u.Value.(type) {
+	case *PermissionRequest:
+		return r.ToolCallID
+	case *QuestionRequest:
+		return r.ToolCallID
+	}
+	return ""
+}
+
 // ThreadID is the command's thread_id.
 func (u Command) ThreadID() string {
 	switch c := u.Value.(type) {
