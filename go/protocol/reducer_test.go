@@ -70,7 +70,7 @@ func TestApplyEventItems(t *testing.T) {
 		t.Fatal("an update to an unknown item")
 	}
 	// Removed, skipping ids it doesn't have; the state before stays as it was.
-	r := protocol.ApplyEvent(s, event(t, `{"type":"items.removed","thread_id":"th","seq":4,"item_ids":["tc1","nope"]}`))
+	r := protocol.ApplyEvent(s, event(t, `{"type":"items.removed","thread_id":"th","seq":4,"item_ids":["tc1","nope"],"indices":[1,3]}`))
 	if r.Seq != 4 || len(r.Items) != 2 || r.Items[0].ID() != "u1" || r.Items[1].ID() != "a1" || len(s.Items) != 3 || s.Items[1].ID() != "tc1" {
 		t.Fatalf("removed: got %s", asJSON(t, r.Items))
 	}
@@ -80,6 +80,46 @@ func TestApplyEventItems(t *testing.T) {
 	}
 	if n := protocol.ApplyEvent(s, event(t, `{"type":"item.added","thread_id":"other","seq":4,"item":{"id":"x","type":"notice","level":"info","text":"x"}}`)); len(n.Items) != 3 || n.Seq != 3 {
 		t.Fatal("another thread's event")
+	}
+}
+
+func TestApplyEventItemsRemovedFromAWindow(t *testing.T) {
+	// The thread is a0..a9, with a2 a subagent call a8 belongs to; the window is from 7, with a2 as
+	// context.
+	var w protocol.Snapshot
+	err := json.Unmarshal([]byte(`{"thread":{"id":"th","harness":"claude","status":"idle","created_at":"2026-11-01T00:00:00Z"},"items":[
+		{"id":"a2","type":"tool_call","name":"Agent","kind":"subagent","input":{},"status":"running"},
+		{"id":"a7","type":"assistant_message","text":"a7"},
+		{"id":"a8","type":"assistant_message","text":"a8","parent_id":"a2"},
+		{"id":"a9","type":"assistant_message","text":"a9"}],"requests":[],"seq":5,"start":7,"context":[2]}`), &w)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ids := func(s protocol.Snapshot) []string {
+		var out []string
+		for _, it := range s.Items {
+			out = append(out, it.ID())
+		}
+		return out
+	}
+	// The window's start and context go down by the removed items before them.
+	next := protocol.ApplyEvent(w, event(t, `{"type":"items.removed","thread_id":"th","seq":6,"item_ids":["a1","a5","a6","a9"],"indices":[1,5,6,9]}`))
+	if next.Start == nil || *next.Start != 4 || !reflect.DeepEqual(next.Context, []int64{1}) || next.Seq != 6 {
+		t.Fatalf("got %s", asJSON(t, next))
+	}
+	if got := ids(next); !reflect.DeepEqual(got, []string{"a2", "a7", "a8"}) {
+		t.Fatalf("items: %v", got)
+	}
+	if *w.Start != 7 || !reflect.DeepEqual(w.Context, []int64{2}) {
+		t.Fatal("the window before changed")
+	}
+	// Its context item removed too, and everything before it: it starts at 0, with no context.
+	all := protocol.ApplyEvent(w, event(t, `{"type":"items.removed","thread_id":"th","seq":6,"item_ids":["a0","a1","a2","a3","a4","a5","a6"],"indices":[0,1,2,3,4,5,6]}`))
+	if all.Start == nil || *all.Start != 0 || all.Context != nil || strings.Contains(asJSON(t, all), `"context"`) {
+		t.Fatalf("got %s", asJSON(t, all))
+	}
+	if got := ids(all); !reflect.DeepEqual(got, []string{"a7", "a8", "a9"}) {
+		t.Fatalf("items: %v", got)
 	}
 }
 

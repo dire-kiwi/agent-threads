@@ -335,7 +335,8 @@ export const schema: { readonly $defs: { readonly [name: string]: unknown } } = 
         "type",
         "thread_id",
         "seq",
-        "item_ids"
+        "item_ids",
+        "indices"
       ],
       "properties": {
         "type": {
@@ -352,6 +353,13 @@ export const schema: { readonly $defs: { readonly [name: string]: unknown } } = 
           "type": "array",
           "items": {
             "type": "string"
+          }
+        },
+        "indices": {
+          "type": "array",
+          "items": {
+            "type": "integer",
+            "minimum": 0
           }
         },
         "raw": {}

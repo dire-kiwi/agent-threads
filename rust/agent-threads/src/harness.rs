@@ -264,6 +264,12 @@ pub trait HarnessSession: Send + Any {
     fn release(&mut self, ctx: &mut ThreadContext);
     /// The thread's options (model, effort, permission mode) or config changed.
     fn options_changed(&mut self, ctx: &mut ThreadContext);
+    /// The thread's session changed (new_session, rewind) with no turn running: stop the running
+    /// process now (its background work too), and let nothing it says after reach the thread. The
+    /// next turn starts a new one. By default, options_changed.
+    fn retire(&mut self, ctx: &mut ThreadContext) {
+        self.options_changed(ctx);
+    }
     /// Stop the harness process, if it's running; the future resolves once it has gone.
     fn close(&mut self, ctx: &mut ThreadContext) -> BoxFuture<()>;
 

@@ -86,11 +86,50 @@ fn items_removed_removes_items_and_skips_ids_it_doesnt_have() {
             json!({"type": "item.added", "thread_id": "th", "seq": seq, "item": {"id": id, "type": "notice", "level": "info", "text": id}}),
         )
     };
-    let removed = event(json!({"type": "items.removed", "thread_id": "th", "seq": 4, "item_ids": ["b", "nope"]}));
+    let removed = event(
+        json!({"type": "items.removed", "thread_id": "th", "seq": 4, "item_ids": ["b", "nope"], "indices": [1, 3]}),
+    );
     apply_events(&mut state, &[added(1, "a"), added(2, "b"), added(3, "c"), removed]);
     let ids: Vec<&str> = state.items.iter().map(|i| i.id()).collect();
     assert_eq!(ids, ["a", "c"]);
     assert_eq!(state.seq, 4);
+}
+
+#[test]
+fn items_removed_moves_a_windows_start_and_context_down_by_the_removed_items_before_them() {
+    let item = |id: &str, parent: Option<&str>| {
+        let mut i = json!({"id": id, "type": "assistant_message", "text": id});
+        if let Some(p) = parent {
+            i["parent_id"] = json!(p);
+        }
+        i
+    };
+    // The thread is a0..a9, with a2 a subagent call a8 belongs to; the window is from 7, with a2 as
+    // context.
+    let call =
+        json!({"id": "a2", "type": "tool_call", "name": "Agent", "kind": "subagent", "input": {}, "status": "running"});
+    let w: Snapshot = from(json!({
+        "thread": {"id": "th", "harness": "claude", "status": "idle", "created_at": "2026-11-01T00:00:00Z"},
+        "items": [call, item("a7", None), item("a8", Some("a2")), item("a9", None)],
+        "requests": [], "seq": 5, "start": 7, "context": [2],
+    }));
+    let removed = |ids: &[&str], indices: &[u64]| -> ThreadEvent {
+        from(json!({"type": "items.removed", "thread_id": "th", "seq": 6, "item_ids": ids, "indices": indices}))
+    };
+    let ids = |s: &Snapshot| s.items.iter().map(|i| i.id().to_string()).collect::<Vec<_>>();
+    let mut next = w.clone();
+    apply_event(&mut next, &removed(&["a1", "a5", "a6", "a9"], &[1, 5, 6, 9]));
+    assert_eq!((next.start, next.context.clone(), next.seq), (Some(4), vec![1], 6));
+    assert_eq!(ids(&next), ["a2", "a7", "a8"]);
+    // Its context item removed too, and everything before it: it starts at 0, with no context.
+    let mut all = w.clone();
+    apply_event(
+        &mut all,
+        &removed(&["a0", "a1", "a2", "a3", "a4", "a5", "a6"], &[0, 1, 2, 3, 4, 5, 6]),
+    );
+    assert_eq!(all.start, Some(0));
+    assert!(value(&all).get("context").is_none());
+    assert_eq!(ids(&all), ["a7", "a8", "a9"]);
 }
 
 fn from<T: DeserializeOwned>(v: Value) -> T {

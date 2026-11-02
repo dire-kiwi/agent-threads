@@ -409,6 +409,41 @@ func TestRewind(t *testing.T) {
 		}
 	})
 
+	t.Run("moves a client's window down, so it can still load the turns kept before it", func(t *testing.T) {
+		s := newSessionsScene(t, agentthreads.ResumeAtPoint, "")
+		s.turn("one", "S", "m1")
+		s.turn("two", "", "m2")
+		s.turn("three", "", "m3")
+		// A client with a window of the last 3 items (turn three's), from 6.
+		w, err := s.sdk.SnapshotWindow(ctx, s.id, 3)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if w.Start == nil || *w.Start != 6 {
+			t.Fatalf("got %s", mustMarshal(w))
+		}
+		from := w.Seq
+		if err := s.rewind(turnIDs(s.snap().Items)[1]); err != nil {
+			t.Fatal(err)
+		}
+		for _, e := range s.events() {
+			if e.Seq() > from {
+				w = protocol.ApplyEvent(w, e)
+			}
+		}
+		if w.Start == nil || *w.Start != 3 {
+			t.Fatalf("got %s", mustMarshal(w))
+		}
+		sameAs(t, "items", kinds(w.Items), []string{"rewind"})
+		// The page before it is turn one, and fits.
+		page, err := s.sdk.ItemsBefore(ctx, s.id, *w.Start, 10)
+		if err != nil {
+			t.Fatal(err)
+		}
+		whole := protocol.WithPage(w, page)
+		sameAs(t, "the whole", whole.Items, s.snap().Items)
+	})
+
 	t.Run("is refused while a turn runs, and for a turn the thread hasn't", func(t *testing.T) {
 		s := newSessionsScene(t, agentthreads.ResumeAtPoint, "")
 		s.turn("one", "S1", "m1")

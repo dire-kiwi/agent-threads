@@ -739,13 +739,18 @@ func (v *ItemUpdatedEvent) UnmarshalJSON(data []byte) error {
 }
 
 // ItemsRemovedEvent: Items were removed from the thread (a rewind took the conversation back to
-// before them). Ids the thread doesn't have are skipped.
+// before them). Ids the thread doesn't have are skipped. A window's start and context move down by
+// the removed items before them (see indices).
 //
 // It's the "items.removed" variant of ThreadEvent.
 type ItemsRemovedEvent struct {
 	ThreadID string   `json:"thread_id"`
 	Seq      int64    `json:"seq"`
 	ItemIDs  []string `json:"item_ids"`
+
+	// The removed items' indices in the thread's whole list of items before they were removed,
+	// ascending, one for each of item_ids: what lets a window or a page placed by index move with them.
+	Indices []int64 `json:"indices"`
 
 	// The harness's own payload, for debugging.
 	Raw json.RawMessage `json:"raw,omitempty"`
@@ -755,13 +760,16 @@ type ItemsRemovedEvent struct {
 	Extra map[string]json.RawMessage `json:"-"`
 }
 
-var knownItemsRemovedEvent = fieldSet("type", "thread_id", "seq", "item_ids", "raw")
+var knownItemsRemovedEvent = fieldSet("type", "thread_id", "seq", "item_ids", "indices", "raw")
 
 func (v ItemsRemovedEvent) MarshalJSON() ([]byte, error) {
 	type plain ItemsRemovedEvent
 	p := plain(v)
 	if p.ItemIDs == nil {
 		p.ItemIDs = []string{}
+	}
+	if p.Indices == nil {
+		p.Indices = []int64{}
 	}
 	data, err := json.Marshal(struct {
 		Type string `json:"type"`

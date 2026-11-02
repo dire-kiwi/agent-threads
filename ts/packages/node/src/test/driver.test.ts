@@ -466,6 +466,35 @@ describe("the Claude driver", () => {
     expectTracked(events, runs());
   });
 
+  for (const change of ["new_session", "rewind"] as const) {
+    it(`stops the process when ${change} changes the session, so a background subagent's turn can't bring the old one back`, async () => {
+      const { sdk, events, runs } = setup();
+      const t = await sdk.create({ model: "mini" });
+      await sdk.send(t.id, "background 500 apple");
+      await until(() => events.some((e) => e.type === "turn.completed"));
+      let s = await sdk.snapshot(t.id);
+      expect(s.thread.session_id).toBeTruthy();
+      const agent = s.items.find((i): i is ToolCall => i.type === "tool_call" && i.name === "Agent")!;
+      expect(agent.subagent?.status).toBe("running");
+      if (change === "new_session") await sdk.newSession(t.id);
+      else await sdk.rewind(t.id, results(s.items)[0]!.turn_id!);
+      // Long enough for the subagent to have ended, and Claude's turn about it to have come.
+      await new Promise((r) => setTimeout(r, 1000));
+      s = await sdk.snapshot(t.id);
+      expect(s.thread.session_id).toBeUndefined();
+      expect(s.thread.status).toBe("idle");
+      expect(s.items.at(-1)).toMatchObject({ type: "notice", code: change === "new_session" ? "session.new" : "rewind" });
+      expect(texts(s.items)).not.toContain("the subagent said apple");
+      if (change === "new_session") expect(s.items.find((i) => i.id === agent.id)).toMatchObject({ subagent: { status: "stopped" } });
+      expect(runs()).toHaveLength(1);
+      // The next message starts a new process, in a new session.
+      await sdk.send(t.id, "reply fresh");
+      s = await settle(sdk, t.id);
+      expect(texts(s.items).at(-1)).toBe("fresh");
+      expect(runs()[1]!.argv).not.toContain("--resume");
+    });
+  }
+
   it("keeps a turn of the user's going past a turn Claude makes by itself before taking the user's message in", async () => {
     const { sdk, events } = setup({ env: { MINI_CLAUDE_NOTIFY_FIRST: "1" } });
     const t = await sdk.create({ model: "mini" });

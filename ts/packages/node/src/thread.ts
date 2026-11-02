@@ -486,9 +486,23 @@ export class ThreadRuntime implements ThreadContext {
   /** The next turn starts a new session. The caller checks no turn is running. */
   newSession(): void {
     if (!this.#state.thread.session_id) return;
+    this.#retire();
     this.setThread({ session_id: undefined, resume_at: undefined });
     this.addItem({ id: newId("n"), type: "notice", level: "info", code: "session.new", text: NEW_SESSION_TEXT });
-    this.session?.optionsChanged();
+  }
+
+  /**
+   * The harness's session changes (new_session, rewind): what's still going on in the old one
+   * stops. Its running subagents (a background one, with no turn) are stopped and its open requests
+   * cancelled, and its process is retired, so that nothing it says after reaches the thread (Claude
+   * would start a turn of its own when a background subagent ended, in the old session).
+   */
+  #retire(): void {
+    this.stopSubagents(this.#saved.items.filter((i) => i.type === "tool_call" && i.subagent?.status === "running").map((i) => i.id));
+    for (const id of [...this.#requests.keys()]) this.cancelRequest(id);
+    if (!this.turn && this.#state.thread.status === "waiting") this.setThread({ status: "idle" });
+    if (this.session?.retire) this.session.retire();
+    else this.session?.optionsChanged();
   }
 
   /**
@@ -512,7 +526,8 @@ export class ThreadRuntime implements ThreadContext {
     const dropped = new Set(results.slice(index).map((r) => r.turn_id));
     const kept = index > 0 ? items.indexOf(results[index - 1]!) : -1;
     const first = items.findIndex((it) => it.turn_id !== undefined && dropped.has(it.turn_id));
-    const gone = items.filter((it, i) => (it.turn_id !== undefined ? dropped.has(it.turn_id) : i > kept && i > first)).map((it) => it.id);
+    const indices = items.flatMap((it, i) => ((it.turn_id !== undefined ? dropped.has(it.turn_id) : i > kept && i > first) ? [i] : []));
+    const gone = indices.map((i) => items[i]!.id);
     const goneSet = new Set(gone);
     this.#queue = this.#queue.filter((id) => !goneSet.has(id));
     // A rewind not yet made (resume_at) went back to before a later turn of the same session: with
@@ -520,10 +535,10 @@ export class ThreadRuntime implements ThreadContext {
     // nothing to the session but the ones it took back are still in it.
     const t = this.#state.thread;
     const resumeAt = point.resume_at ?? (point.session_id !== undefined && point.session_id === t.session_id ? t.resume_at : undefined);
-    this.emit({ type: "items.removed", item_ids: gone });
+    this.emit({ type: "items.removed", item_ids: gone, indices });
+    this.#retire();
     this.setThread({ session_id: point.session_id, resume_at: resumeAt });
     this.addItem({ id: newId("n"), type: "notice", level: "info", code: "rewind", text: REWIND_TEXT });
-    this.session.optionsChanged();
   }
 
   queued(): UserMessage[] {

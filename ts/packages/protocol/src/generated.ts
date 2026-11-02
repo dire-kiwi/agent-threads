@@ -648,13 +648,17 @@ export interface ItemUpdatedEvent {
   raw?: unknown;
 }
 /**
- * Items were removed from the thread (a rewind took the conversation back to before them). Ids the thread doesn't have are skipped.
+ * Items were removed from the thread (a rewind took the conversation back to before them). Ids the thread doesn't have are skipped. A window's start and context move down by the removed items before them (see indices).
  */
 export interface ItemsRemovedEvent {
   type: "items.removed";
   thread_id: string;
   seq: number;
   item_ids: string[];
+  /**
+   * The removed items' indices in the thread's whole list of items before they were removed, ascending, one for each of item_ids: what lets a window or a page placed by index move with them.
+   */
+  indices: number[];
   /**
    * The harness's own payload, for debugging.
    */

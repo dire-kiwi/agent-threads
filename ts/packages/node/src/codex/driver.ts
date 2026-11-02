@@ -416,6 +416,17 @@ class CodexSession implements HarnessSession {
     this.#stale = true;
   }
 
+  retire(): void {
+    this.#stale = true;
+    this.#clearStop();
+    const run = this.#live();
+    if (!run) return;
+    // Stopped now, and retired: what it says on its way out is left out. It's the thread's run no
+    // more from now, so its end, whenever that comes, changes nothing.
+    void this.#stop(run, true, true);
+    if (this.#ctx.thread.run?.id === run.id) this.#ctx.setThread({ run: undefined });
+  }
+
   live(): boolean {
     return !!this.#live();
   }

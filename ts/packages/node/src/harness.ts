@@ -267,6 +267,12 @@ export interface HarnessSession {
   release(): void;
   /** The thread's options (model, effort, permission mode, launch options) or config changed. */
   optionsChanged(): void;
+  /**
+   * The thread's session changed (new_session, rewind) with no turn running: stop the running
+   * process now (its background work too), and let nothing it says after reach the thread. The
+   * next turn starts a new one. Without it, the core calls optionsChanged().
+   */
+  retire?(): void;
   /** Stop the harness process, if it's running. */
   close(): Promise<void>;
   /**

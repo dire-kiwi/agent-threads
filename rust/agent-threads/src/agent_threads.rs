@@ -845,7 +845,7 @@ impl AgentThreads {
             .await?
             .call(|a| {
                 idle(a, "given a new session")?;
-                a.core.new_session();
+                a.new_session();
                 Ok(())
             })
             .await?

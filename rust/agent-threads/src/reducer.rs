@@ -63,7 +63,21 @@ pub fn apply_event(state: &mut Snapshot, event: &ThreadEvent) {
                 patch_item(item, &e.patch);
             }
         }
-        ThreadEvent::ItemsRemoved(e) => state.items.retain(|i| !e.item_ids.iter().any(|id| id == i.id())),
+        ThreadEvent::ItemsRemoved(e) => {
+            state.items.retain(|i| !e.item_ids.iter().any(|id| id == i.id()));
+            // A window: its start, and the indices of its context items left, go down by the
+            // removed items before them.
+            if let Some(start) = state.start.filter(|s| *s > 0) {
+                let below = |at: u64| e.indices.iter().filter(|i| **i < at).count() as u64;
+                state.start = Some(start - below(start));
+                state.context = state
+                    .context
+                    .iter()
+                    .filter(|i| !e.indices.contains(i))
+                    .map(|i| i - below(*i))
+                    .collect();
+            }
+        }
         ThreadEvent::RequestOpened(e) => match state.requests.iter().rposition(|r| r.id() == e.request.id()) {
             Some(at) => state.requests[at] = e.request.clone(),
             None => state.requests.push(e.request.clone()),

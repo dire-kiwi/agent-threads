@@ -571,6 +571,77 @@ async fn keeps_a_background_subagents_calls_and_requests_after_its_turn_and_runs
     );
 }
 
+/// new_session or rewind changes the session while a background subagent runs: the process is
+/// stopped, so the turn Claude would start when it ends can't bring the old session back.
+async fn stops_the_process_when_the_session_changes(rewind: bool) {
+    let mut env = setup(Setup::default());
+    let t = env.sdk.create(create()).await.unwrap();
+    env.sdk
+        .send(&t.id, "background 500 apple", SendOptions::default())
+        .await
+        .unwrap();
+    until(5, || {
+        let done = env.events().iter().any(|e| matches!(e, ThreadEvent::TurnCompleted(_)));
+        async move { done.then_some(()) }
+    })
+    .await;
+    let s = serde_json::to_value(env.sdk.snapshot(&t.id).await.unwrap()).unwrap();
+    assert!(s["thread"]["session_id"].is_string());
+    let agent = items(&s, "tool_call")
+        .into_iter()
+        .find(|c| c["name"] == "Agent")
+        .unwrap()
+        .clone();
+    assert_eq!(agent["subagent"]["status"], "running");
+    if rewind {
+        let turn = results(&s)[0]["turn_id"].as_str().unwrap().to_string();
+        env.sdk.rewind(&t.id, &turn).await.unwrap();
+    } else {
+        env.sdk.new_session(&t.id).await.unwrap();
+    }
+    // Long enough for the subagent to have ended, and Claude's turn about it to have come.
+    tokio::time::sleep(Duration::from_millis(1000)).await;
+    let s = serde_json::to_value(env.sdk.snapshot(&t.id).await.unwrap()).unwrap();
+    assert!(s["thread"].get("session_id").is_none(), "{}", s["thread"]);
+    assert_eq!(s["thread"]["status"], "idle");
+    let last = s["items"].as_array().unwrap().last().unwrap();
+    assert_eq!(
+        (&last["type"], &last["code"]),
+        (&json!("notice"), &json!(if rewind { "rewind" } else { "session.new" }))
+    );
+    assert!(!texts(&s).contains(&"the subagent said apple".to_string()));
+    if !rewind {
+        let call = s["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|i| i["id"] == agent["id"])
+            .unwrap();
+        assert_eq!(call["subagent"]["status"], "stopped");
+    }
+    assert_eq!(env.runs().len(), 1);
+    // The next message starts a new process, in a new session.
+    env.sdk
+        .send(&t.id, "reply fresh", SendOptions::default())
+        .await
+        .unwrap();
+    let s = settle(&env.sdk, &t.id).await;
+    assert_eq!(texts(&s).last().unwrap(), "fresh");
+    assert!(!env.runs()[1].argv.iter().any(|a| a == "--resume"));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn stops_the_process_when_new_session_changes_the_session_so_a_background_subagents_turn_cant_bring_the_old_one_back()
+ {
+    stops_the_process_when_the_session_changes(false).await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn stops_the_process_when_rewind_changes_the_session_so_a_background_subagents_turn_cant_bring_the_old_one_back()
+{
+    stops_the_process_when_the_session_changes(true).await;
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn keeps_a_users_turn_going_past_a_turn_claude_makes_before_taking_its_message_in() {
     let mut env = setup(Setup {

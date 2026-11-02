@@ -2,7 +2,7 @@
 // against a fake harness whose turns the test ends (the recorded fixtures have the real CLIs').
 
 import { describe, expect, it } from "vitest";
-import { applyEvents, initialState, type Item, type ThreadEvent, type TurnResult, type TurnSession } from "@dire-kiwi/agent-threads-protocol";
+import { applyEvent, applyEvents, initialState, withPage, type Item, type ThreadEvent, type TurnResult, type TurnSession } from "@dire-kiwi/agent-threads-protocol";
 import { AgentThreads, CommandError } from "../agent-threads.js";
 import type { Harness, HarnessSession, ThreadContext } from "../harness.js";
 import { resumeAtPoint, revertPoint, RewindError } from "../sessions.js";
@@ -187,6 +187,26 @@ describe("rewind", () => {
     s = await b.snap();
     expect(turnIds(s.items)).toEqual(turnIds(b.s.items).slice(0, 2));
     expect(s.items.some((i) => i.id === b.steered.id)).toBe(false);
+  });
+
+  it("moves a client's window down, so it can still load the turns kept before it", async () => {
+    const { sdk, id, events, turn, snap } = await setup();
+    await turn("one", "S", "m1");
+    await turn("two", undefined, "m2");
+    await turn("three", undefined, "m3");
+    // A client with a window of the last 3 items (turn three's), from 6.
+    let w = await sdk.snapshot(id, { limit: 3 });
+    expect(w.start).toBe(6);
+    const from = events.length;
+    await sdk.rewind(id, turnIds((await snap()).items)[1]!);
+    for (const e of events.slice(from)) w = applyEvent(w, e);
+    expect(w.start).toBe(3);
+    expect(w.items.map((i) => i.type)).toEqual(["notice"]);
+    // The page before it is turn one, and fits.
+    const page = await sdk.itemsBefore(id, w.start!, 10);
+    const whole = withPage(w, page);
+    expect(whole).not.toBe(w);
+    expect(whole.items).toEqual((await snap()).items);
   });
 
   it("is refused while a turn runs, and for a turn the thread hasn't", async () => {

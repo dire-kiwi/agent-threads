@@ -274,14 +274,23 @@ type CompactingSession interface {
 	Compact()
 }
 
+// RetiringSession is a Session that can retire its process as the thread's session changes
+// (new_session, rewind) with no turn running. Without it, the core calls OptionsChanged.
+type RetiringSession interface {
+	Session
+	// Retire stops the running process now (its background work too), and lets nothing it says
+	// after reach the thread. The next turn starts a new one.
+	Retire()
+}
+
 // RewindingSession is a Session that can take its conversation back to before a turn. A harness
 // whose sessions aren't refuses the rewind command.
 type RewindingSession interface {
 	Session
 	// RewindPoint is where a rewind to before turn index of sessions (each turn's session, in order;
 	// nil for a turn that ended with none) takes the session: ResumeAtPoint or RevertPoint, say. It
-	// returns a *RewindError if it can't be rewound there. The core then sets the thread's session_id
-	// and resume_at, and calls OptionsChanged.
+	// returns a *RewindError if it can't be rewound there. The core then retires the old session
+	// (Retire, or OptionsChanged), and sets the thread's session_id and resume_at.
 	RewindPoint(sessions []*protocol.TurnSession, index int) (RewindPoint, error)
 }
 

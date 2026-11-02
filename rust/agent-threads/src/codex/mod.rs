@@ -2781,6 +2781,19 @@ impl HarnessSession for CodexSession {
         self.stale = true;
     }
 
+    fn retire(&mut self, ctx: &mut ThreadContext) {
+        self.stale = true;
+        self.clear_stop();
+        // Stopped now, and retired: what it says on its way out is left out. It's the thread's run
+        // no more from now, so its end, whenever that comes, changes nothing.
+        if let Some(id) = self.live_id() {
+            self.stop(ctx, &id, true, true);
+            if ctx.thread().run.as_ref().is_some_and(|r| r.id == id) {
+                ctx.set_thread(|t| t.run = None);
+            }
+        }
+    }
+
     fn close(&mut self, ctx: &mut ThreadContext) -> BoxFuture<()> {
         self.closed = true;
         self.clear_stop();

@@ -291,7 +291,7 @@ class Draft {
     const point = this.meta.harness === "claude" ? resumeAtPoint(sessions, at) : revertPoint(sessions, at);
     for (const it of gone) this.items.delete(it.id);
     this.queued = this.queued.filter((q) => this.items.has(q.id));
-    this.emit({ type: "items.removed", item_ids: gone.map((it) => it.id) });
+    this.emit({ type: "items.removed", item_ids: gone.map((it) => it.id), indices: gone.map((it) => items.indexOf(it)) });
     // A rewind not yet made in the same session still has to be, if this one has no mark to go to.
     const pending = point.session_id !== undefined && point.session_id === this.thread.session_id ? this.thread.resume_at : undefined;
     this.setThread({ session_id: point.session_id, resume_at: point.resume_at ?? pending });

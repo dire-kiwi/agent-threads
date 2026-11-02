@@ -999,9 +999,34 @@ func (rt *threadRuntime) newSession() {
 	if rt.state.Thread.SessionID == "" {
 		return
 	}
+	rt.retire()
 	rt.SetThread(func(t *protocol.Thread) { t.SessionID, t.ResumeAt = "", "" })
 	rt.AddItem(&protocol.Notice{ID: NewID("n"), Level: protocol.NoticeLevelInfo, Code: "session.new", Text: newSessionText})
-	rt.session.OptionsChanged()
+}
+
+// retire stops what's still going on in the harness's old session as it changes (new_session,
+// rewind): its running subagents (a background one, with no turn) are stopped and its open requests
+// cancelled, and its process is retired, so that nothing it says after reaches the thread (Claude
+// would start a turn of its own when a background subagent ended, in the old session).
+func (rt *threadRuntime) retire() {
+	var running []string
+	for _, it := range rt.saved.Items {
+		if c, ok := it.Value.(*protocol.ToolCall); ok && c.Subagent != nil && c.Subagent.Status == protocol.SubagentStatusRunning {
+			running = append(running, c.ID)
+		}
+	}
+	rt.StopSubagents(running)
+	for _, id := range append([]string(nil), rt.requestOrder...) {
+		rt.CancelRequest(id)
+	}
+	if rt.turn == nil && rt.state.Thread.Status == protocol.ThreadStatusWaiting {
+		rt.SetThread(func(t *protocol.Thread) { t.Status = protocol.ThreadStatusIdle })
+	}
+	if r, ok := rt.session.(RetiringSession); ok {
+		r.Retire()
+	} else {
+		rt.session.OptionsChanged()
+	}
 }
 
 // rewind takes the conversation back to before the turn turnID: its items and every later turn's
@@ -1053,11 +1078,11 @@ func (rt *threadRuntime) rewind(turnID string) error {
 			break
 		}
 	}
-	gone := []string{}
+	gone, indices := []string{}, []int64{}
 	goneSet := map[string]bool{}
 	for i, it := range items {
 		if t := it.TurnID(); (t != "" && dropped[t]) || (t == "" && i > kept && i > first) {
-			gone = append(gone, it.ID())
+			gone, indices = append(gone, it.ID()), append(indices, int64(i))
 			goneSet[it.ID()] = true
 		}
 	}
@@ -1075,10 +1100,10 @@ func (rt *threadRuntime) rewind(turnID string) error {
 	if th := rt.state.Thread; resumeAt == "" && point.SessionID != "" && point.SessionID == th.SessionID {
 		resumeAt = th.ResumeAt
 	}
-	rt.emit(&protocol.ItemsRemovedEvent{ItemIDs: gone})
+	rt.emit(&protocol.ItemsRemovedEvent{ItemIDs: gone, Indices: indices})
+	rt.retire()
 	rt.SetThread(func(t *protocol.Thread) { t.SessionID, t.ResumeAt = point.SessionID, resumeAt })
 	rt.AddItem(&protocol.Notice{ID: NewID("n"), Level: protocol.NoticeLevelInfo, Code: "rewind", Text: rewindText})
-	rt.session.OptionsChanged()
 	return nil
 }
 

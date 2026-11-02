@@ -171,6 +171,12 @@ The thread's `session_id` becomes S (or is cleared), and its `resume_at` the mes
 or the turn to revert to before. The harness goes back there at the start of the next turn, in a
 new process, and `resume_at` is cleared once it has.
 
+A rewind or `new_session` is the end of what was still going on in the old session: the thread's
+running subagents (a background one goes on after its turn) are `stopped`, its open requests are
+resolved with `cancel`, and its harness process is stopped at once, and nothing it says after
+reaches the thread (Claude Code would otherwise start a turn of its own, in the old session, when
+a background subagent ended).
+
 ## Requests
 
 A request is something the agent is waiting on the user for. It's open from `request.opened` until
@@ -257,9 +263,10 @@ already past, and are skipped rather than added twice.
 
 A thread can run to thousands of items, so a client needn't load them all: a backend's snapshot can
 be a **window** of the thread, taken with a limit, that has only its last items, and the client loads
-earlier ones a page at a time as the user scrolls back. Items are only ever added at the end of a
-thread's list (an `item.added` for an id it has replaces that item in place), so an item's index in
-the whole list never changes, and windows and pages are told where they are by index.
+earlier ones a page at a time as the user scrolls back. Items are added at the end of a thread's list
+(an `item.added` for an id it has replaces that item in place), and only `items.removed` (a rewind)
+takes any out, saying where they were: so windows and pages are told where they are by index, and an
+item's index only changes, by the number of removed items before it, with an `items.removed`.
 
 A window of a state with `n` items and a limit `limit` (less than `n`; with a limit of `n` or more it
 is the whole state) has:
@@ -285,7 +292,12 @@ the items from `start` up to `before`; `requests`, the requests whose anchor is 
 `seq`, that of the state it was taken from. `start` 0 means there's nothing before it.
 
 Events apply to a window as to any state (an event about an item or request it doesn't have only
-advances `seq`), and leave `start` and `context` as they are. A client puts a page into its window
+advances `seq`), and leave `start` and `context` as they are, but for `items.removed`: its items
+the window has go (context ones too), `start` goes down by the number of its `indices` below it,
+and each index left in `context` by the number below that one. A page asked for before an
+`items.removed` the client has applied since is left out (it's placed by indices that may have
+changed, either side of the removal) and the page before the window's new `start` asked for
+instead. A client puts a page into its window
 by putting the page's items in front of its own (`withPage` in `@dire-kiwi/agent-threads-protocol`):
 the context items of both, ordered by index (the page's version of one they share), those of them
 the page's own items include dropped, then the page's items from its `start`, then its own from its

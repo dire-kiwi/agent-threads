@@ -193,7 +193,8 @@ backend drives each CLI:
 - **`new_session`**, when the thread has a session: a `thread.updated` without `session_id` (or
   `resume_at`), then a `notice` (`level: info`, `code: session.new`, with the text "A new
   conversation starts here: the agent doesn't remember what came before.").
-- **`rewind`** to before turn T: an `items.removed` with, in the items' order, the items of T and of
+- **`rewind`** to before turn T: an `items.removed` with (as `item_ids`, and their places in the
+  list before as `indices`), in the items' order, the items of T and of
   every turn after it (by `turn_id`; the turns' order is their `turn_result`s', since a message
   carried over to a later turn keeps its place among the items), and the items with no `turn_id`
   after both the last kept turn's `turn_result` and the first item of a turn that goes; then a

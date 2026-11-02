@@ -581,21 +581,6 @@ impl ThreadContext {
         self.effects.push_back(Effect::Compact);
     }
 
-    /// The next turn starts a new session. The caller checks no turn is running.
-    pub(crate) fn new_session(&mut self) {
-        if self.state.thread.session_id.is_none() {
-            return;
-        }
-        self.set_thread(|t| {
-            t.session_id = None;
-            t.resume_at = None;
-        });
-        self.add_item(
-            json!({"id": new_id("n"), "type": "notice", "level": "info", "code": "session.new", "text": NEW_SESSION_TEXT}),
-        );
-        self.effects.push_back(Effect::OptionsChanged);
-    }
-
     pub(crate) fn interrupt(&mut self) {
         let Some(turn) = &mut self.turn else { return };
         if turn.interrupted {
@@ -1339,15 +1324,15 @@ impl Actor {
             .iter()
             .position(|i| i.turn_id().is_some_and(|t| dropped.contains(t)));
         let after = |i: usize, at: Option<usize>| at.is_none_or(|a| i > a);
-        let gone: Vec<String> = items
+        let (indices, gone): (Vec<usize>, Vec<String>) = items
             .iter()
             .enumerate()
             .filter(|(i, it)| match it.turn_id() {
                 Some(t) => dropped.contains(t),
                 None => after(*i, kept) && after(*i, first),
             })
-            .map(|(_, it)| it.id().to_string())
-            .collect();
+            .map(|(i, it)| (i, it.id().to_string()))
+            .unzip();
         c.queue.retain(|id| !gone.contains(id));
         // A rewind not yet made (resume_at) went back to before a later turn of the same session:
         // with no mark of its own to go to, this one still needs that one made, as the turns since
@@ -1358,7 +1343,9 @@ impl Actor {
                 .then(|| t.resume_at.clone())
                 .flatten()
         });
-        c.emit(json!({"type": "items.removed", "item_ids": gone}));
+        c.emit(json!({"type": "items.removed", "item_ids": gone, "indices": indices}));
+        self.retire();
+        let c = &mut self.core;
         c.set_thread(|t| {
             t.session_id = point.session_id;
             t.resume_at = resume_at;
@@ -1366,8 +1353,51 @@ impl Actor {
         c.add_item(
             json!({"id": new_id("n"), "type": "notice", "level": "info", "code": "rewind", "text": REWIND_TEXT}),
         );
-        c.effects.push_back(Effect::OptionsChanged);
         Ok(())
+    }
+
+    /// The next turn starts a new session. The caller checks no turn is running.
+    pub(crate) fn new_session(&mut self) {
+        if self.core.state.thread.session_id.is_none() {
+            return;
+        }
+        self.retire();
+        let c = &mut self.core;
+        c.set_thread(|t| {
+            t.session_id = None;
+            t.resume_at = None;
+        });
+        c.add_item(
+            json!({"id": new_id("n"), "type": "notice", "level": "info", "code": "session.new", "text": NEW_SESSION_TEXT}),
+        );
+    }
+
+    /// The harness's session changes (new_session, rewind): what's still going on in the old one
+    /// stops. Its running subagents (a background one, with no turn) are stopped and its open
+    /// requests cancelled, and its process is retired, so that nothing it says after reaches the
+    /// thread (Claude would start a turn of its own when a background subagent ended, in the old
+    /// session).
+    fn retire(&mut self) {
+        let c = &mut self.core;
+        let running: Vec<String> = c
+            .saved
+            .items
+            .iter()
+            .filter_map(|i| match i {
+                Item::ToolCall(t) if t.subagent.as_ref().is_some_and(|s| s.status == SubagentStatus::Running) => {
+                    Some(t.id.clone())
+                }
+                _ => None,
+            })
+            .collect();
+        c.stop_subagents(&running);
+        for id in c.open_request_ids() {
+            c.cancel_request(&id);
+        }
+        if c.turn.is_none() && c.state.thread.status == crate::protocol::ThreadStatus::Waiting {
+            c.set_thread(|t| t.status = crate::protocol::ThreadStatus::Idle);
+        }
+        self.session.retire(c);
     }
 
     /// Answers an open request; does nothing if it isn't open.

@@ -6,7 +6,8 @@ use std::any::Any;
 use std::sync::{Arc, Mutex};
 
 use agent_threads::protocol::TurnSession;
-use agent_threads::reducer::{apply_events, initial_state};
+use agent_threads::reducer::{apply_event, apply_events, initial_state};
+use agent_threads::window::with_page;
 use agent_threads::{
     AgentThreads, BoxFuture, Command, CreateOptions, Error, Harness, HarnessSession, MemoryStore, Message, Options,
     PermissionPolicy, RewindError, RewindPoint, SendOptions, SessionJob, ThreadContext, ThreadEvent, TurnEnd,
@@ -449,6 +450,37 @@ async fn rewind_goes_by_the_order_turns_ran_though_a_message_carried_over_to_a_l
     let s = b.snap().await;
     assert_eq!(turn_ids(&s), turn_ids(&before)[..2]);
     assert!(!has(&s, &steered));
+}
+
+#[tokio::test]
+async fn rewind_moves_a_clients_window_down_so_it_can_still_load_the_turns_kept_before_it() {
+    let mut env = setup(resume_at_point, None).await;
+    env.turn("one", Some("S"), Some("m1")).await;
+    env.turn("two", None, Some("m2")).await;
+    env.turn("three", None, Some("m3")).await;
+    // A client with a window of the last 3 items (turn three's), from 6.
+    let mut w = env.sdk.snapshot_window(&env.id, 3).await.unwrap();
+    assert_eq!(w.start, Some(6));
+    let from = env.events().len();
+    let t2 = turn_ids(&env.snap().await)[1].clone();
+    env.sdk.rewind(&env.id, &t2).await.unwrap();
+    env.snap().await;
+    for e in &env.events()[from..] {
+        apply_event(&mut w, e);
+    }
+    assert_eq!(w.start, Some(3));
+    let types: Vec<Value> = serde_json::to_value(&w.items)
+        .unwrap()
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|i| i["type"].clone())
+        .collect();
+    assert_eq!(types, [json!("notice")]);
+    // The page before it is turn one, and fits.
+    let page = env.sdk.items_before(&env.id, w.start.unwrap(), 10).await.unwrap();
+    assert!(with_page(&mut w, page));
+    assert_eq!(serde_json::to_value(&w.items).unwrap(), env.snap().await["items"]);
 }
 
 #[tokio::test]

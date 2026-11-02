@@ -505,6 +505,19 @@ func (s *codexSession) clearStop() {
 
 func (s *codexSession) OptionsChanged() { s.stale = true }
 
+func (s *codexSession) Retire() {
+	s.stale = true
+	s.clearStop()
+	// Stopped now, and retired: what it says on its way out is left out. It's the thread's run no
+	// more from now, so its end, whenever that comes, changes nothing.
+	if run := s.live(); run != nil {
+		s.stop(run, true, true, nil)
+		if r := s.ctx.Thread().Run; r != nil && r.ID == run.id {
+			s.ctx.SetThread(func(t *protocol.Thread) { t.Run = nil })
+		}
+	}
+}
+
 func (s *codexSession) Live() bool { return s.live() != nil }
 
 func (s *codexSession) Release() {

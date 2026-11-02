@@ -102,6 +102,28 @@ func apply(state Snapshot, event ThreadEvent) Snapshot {
 		if slices.ContainsFunc(state.Items, func(i Item) bool { return gone[i.ID()] }) {
 			state.Items = slices.DeleteFunc(slices.Clone(state.Items), func(i Item) bool { return gone[i.ID()] })
 		}
+		if state.Start == nil || *state.Start == 0 {
+			break
+		}
+		// A window: its start, and the indices of its context items left, go down by the removed
+		// items before them.
+		below := func(at int64) int64 {
+			n := int64(0)
+			for _, i := range e.Indices {
+				if i < at {
+					n++
+				}
+			}
+			return n
+		}
+		start := *state.Start - below(*state.Start)
+		var context []int64
+		for _, i := range state.Context {
+			if !slices.Contains(e.Indices, i) {
+				context = append(context, i-below(i))
+			}
+		}
+		state.Start, state.Context = &start, context
 	case *RequestOpenedEvent:
 		if at := indexOfRequest(state.Requests, e.Request.ID()); at >= 0 {
 			state.Requests = replaced(state.Requests, at, e.Request)

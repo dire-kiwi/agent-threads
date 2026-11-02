@@ -76,7 +76,10 @@ export class ThreadStore {
   private paging: Promise<void> | null = null;
   /** The saved events applied while a page loads, to apply to its items too (see loadEarlier). */
   private recorded: ThreadEvent[] | null = null;
-  /** Counts the snapshots a resync has put in place of the state, which make a page on its way stale. */
+  /**
+   * Counts what makes a page on its way stale: the snapshots a resync has put in place of the
+   * state, and the items.removed applied (which move the window's start, by which a page is placed).
+   */
   private snapshots = 0;
 
   constructor(readonly source: ThreadSource) {
@@ -168,8 +171,8 @@ export class ThreadStore {
   }
 
   /**
-   * Loads the page before the window's start and puts it in. A resync that brings a fresh snapshot
-   * meanwhile makes the page stale (its items may be older than the snapshot's, and events the
+   * Loads the page before the window's start and puts it in. A resync that brings a fresh snapshot,
+   * or an items.removed (which moves the window's start), meanwhile makes the page stale (its items may be older than the snapshot's, and events the
    * snapshot has in weren't applied, so can't be applied to the page): it's left out, and the page
    * before the new snapshot's start is asked for instead.
    */
@@ -328,6 +331,7 @@ export class ThreadStore {
   /** `state` with `event` applied: the snapshot, what's streaming, and the view. */
   private apply(state: ThreadState, event: ThreadEvent): ThreadState {
     const snapshot = applyEvent(state.snapshot, event);
+    if (event.type === "items.removed" && snapshot !== state.snapshot) this.snapshots++;
     if (this.recorded && event.type !== "delta" && snapshot.seq !== state.snapshot.seq) this.recorded.push(event);
     const streaming = streamingAfter(state.streaming, event, snapshot);
     if (snapshot === state.snapshot && streaming === state.streaming) return state;

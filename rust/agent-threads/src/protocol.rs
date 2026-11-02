@@ -392,9 +392,11 @@ pub struct ItemUpdatedEvent {
     pub seq: ::std::num::NonZeroU64,
     pub thread_id: ::std::string::String,
 }
-///Items were removed from the thread (a rewind took the conversation back to before them). Ids the thread doesn't have are skipped.
+///Items were removed from the thread (a rewind took the conversation back to before them). Ids the thread doesn't have are skipped. A window's start and context move down by the removed items before them (see indices).
 #[derive(::serde::Deserialize, ::serde::Serialize, Clone, Debug)]
 pub struct ItemsRemovedEvent {
+    ///The removed items' indices in the thread's whole list of items before they were removed, ascending, one for each of item_ids: what lets a window or a page placed by index move with them.
+    pub indices: ::std::vec::Vec<u64>,
     pub item_ids: ::std::vec::Vec<::std::string::String>,
     ///The harness's own payload, for debugging.
     #[serde(skip_serializing_if = "::std::option::Option::is_none")]
