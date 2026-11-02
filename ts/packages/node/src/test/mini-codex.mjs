@@ -22,6 +22,8 @@
 //   plan                two turn/plan/updated notifications
 //   search <query>      a web search
 //   sub <prompt>        spawns a subagent (a child thread), which replies, and waits for it
+//   bg <command>        spawns a subagent that runs on after the turn: it runs the command (asking
+//                       first), replies, and ends (its turn fails if the command is declined)
 //   sleep <ms>          waits (or until it's interrupted)
 //   slow                waits for an interrupt
 //   stubborn            ignores interrupts, and a closed stdin (saying "not stopping"), until it's
@@ -295,7 +297,33 @@ async function step(line) {
       item("item/started", { type: "userMessage", id: uid("um"), content: [{ type: "text", text: arg }] }, child);
       message(`child says ${arg}`, child);
       notify("turn/completed", { threadId: child, turn: { id: childTurn, status: "completed", items: [] } });
+      const wait = { type: "collabAgentToolCall", id: uid("wait"), tool: "wait", senderThreadId: thread.id, receiverThreadIds: [child], prompt: null };
+      item("item/started", { ...wait, status: "inProgress", agentsStates: {} });
+      item("item/completed", { ...wait, status: "completed", agentsStates: { [child]: { status: "completed", message: `child says ${arg}` } } });
       return message("the subagent is done");
+    }
+    case "bg": {
+      const id = uid("spawn");
+      const child = uid("child");
+      const base = { type: "collabAgentToolCall", id, tool: "spawnAgent", senderThreadId: thread.id, prompt: `run ${arg}`, model: "mini-child" };
+      item("item/started", { ...base, status: "inProgress", receiverThreadIds: [], agentsStates: {} });
+      item("item/completed", { ...base, status: "completed", receiverThreadIds: [child], agentsStates: { [child]: { status: "pendingInit", message: null } } });
+      const childTurn = uid("turn");
+      const on = (method, it) => notify(method, { item: it, threadId: child, turnId: childTurn });
+      notify("turn/started", { threadId: child, turn: { id: childTurn, status: "inProgress", items: [] } });
+      const cid = uid("exec");
+      const command = `/bin/bash -lc '${arg}'`;
+      const cbase = { type: "commandExecution", id: cid, command, cwd: process.cwd(), commandActions: [] };
+      on("item/started", { ...cbase, status: "inProgress", aggregatedOutput: null, exitCode: null });
+      // The child carries on by itself: this turn doesn't wait for it.
+      void request("item/commandExecution/requestApproval", { threadId: child, turnId: childTurn, itemId: cid, command, cwd: process.cwd() }).then((r) => {
+        const ok = r.result?.decision === "accept";
+        on("item/completed", { ...cbase, status: ok ? "completed" : "declined", aggregatedOutput: ok ? `ran ${arg}\n` : null, exitCode: ok ? 0 : null });
+        if (ok) message(`child ran ${arg}`, child);
+        const error = ok ? null : { message: "the child wasn't allowed to" };
+        notify("turn/completed", { threadId: child, turn: { id: childTurn, status: ok ? "completed" : "failed", error, items: [] } });
+      });
+      return message("started");
     }
     case "sleep":
       return wait(Number(arg));

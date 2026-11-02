@@ -113,8 +113,10 @@ A **background** subagent's call completes as soon as it has started the subagen
 on: its `subagent.status` stays `running`, and its items keep coming, after its turn has ended
 too. Its calls and requests aren't cancelled when its turn ends, so the thread can be `waiting`
 (on one of its requests) with no turn running; answering it leaves the thread `idle`. When it ends,
-its `subagent.summary` is its report (its call's `result` only says it started). A subagent still
-running when its harness process ends is `stopped`, and its calls still running are `cancelled`.
+its `subagent.summary` is its report (its call's `result`, if it has one, only says it started).
+A subagent still running when its harness process ends is `stopped`, and its calls still running
+are `cancelled`. Codex's child threads are background subagents: the `spawnAgent` call returns as
+soon as the child has started.
 
 The harness can start a **turn by itself**, with no `user_message`: Claude Code does when a
 background subagent ends, to tell the agent. It goes as any turn does (`turn.started`, the thread

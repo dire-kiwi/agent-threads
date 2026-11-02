@@ -233,8 +233,18 @@ backend drives each CLI:
 - **Statuses**: `completed`, `failed`, `declined` (which is `denied`). A command's `result` is its
   `aggregatedOutput` (`""` when it's `null`) with `exit_code`.
 - **Subagents**: a `spawnAgent` call's `receiverThreadIds` are its child threads. Their items have
-  the call's id as `parent_id`, and when the child's turn completes, so does the call, with the
-  child's last message as its result. The child's prompt isn't an item.
+  the call's id as `parent_id`; the child's prompt isn't an item. The spawn returns as soon as the
+  child has started, and the child runs on (after the parent's turn too), so it's a background
+  subagent: the spawn's completion completes the call (with no `result`) and sets its `subagent`
+  (`status: running`, `background`, and the item's `model`). A spawn that fails (or is
+  interrupted) makes the call `failed` (or `cancelled`), with no `subagent`. When the child's turn
+  completes, the subagent is `completed`, `failed` or (interrupted) `stopped`, with the child's
+  last message (a failed turn's error, if it has one) as its `summary`. A completed collab call's
+  `agentsStates` (the spawn's, `wait`'s...) say how its children are getting on: `pendingInit` and
+  `running` are `running` (and drop the `summary`), `completed` is `completed`, `errored` and
+  `notFound` are `failed`, and `shutdown` and `interrupted` are `stopped`, with the state's
+  `message`, if any, as the `summary`. A child's `turn/started` (a follow-up sent to it) makes its
+  subagent `running` again.
 - **Requests**: an approval is a `permission` for the item it names (an MCP elicitation, for the
   running call on that server). `item/tool/requestUserInput` adds a `tool_call` named
   `request_user_input` (`other`, `pending`) for it before the question; the answer completes it

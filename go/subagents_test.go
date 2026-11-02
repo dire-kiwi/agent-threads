@@ -1,8 +1,8 @@
 package agentthreads_test
 
 // Background subagents, which the recordings cover only when nothing goes wrong: their calls and
-// requests outlive their turn, and they're stopped when their run ends. mini-claude.mjs (the Node
-// backend's test harness) plays Claude.
+// requests outlive their turn, and they're stopped when their run ends. mini-claude.mjs and
+// mini-codex.mjs (the Node backend's test harnesses) play Claude and Codex.
 
 import (
 	"context"
@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	agentthreads "github.com/dire-kiwi/agent-threads/go"
 	"github.com/dire-kiwi/agent-threads/go/protocol"
@@ -23,6 +24,23 @@ func miniClaude(t *testing.T, policy agentthreads.PermissionPolicy, env map[stri
 		Store:        agentthreads.NewMemoryStore(),
 		Harnesses:    map[string]agentthreads.Harness{"claude": agentthreads.ClaudeCode(agentthreads.ClaudeOptions{Bin: mini, Env: env})},
 		Capabilities: agentthreads.Capabilities{Permissions: policy, Tools: tools},
+		Spawner:      agentthreads.Direct(),
+		OnError:      func(err error) { t.Errorf("OnError: %v", err) },
+	})
+	sdk.Subscribe(rec.add)
+	t.Cleanup(func() { sdk.Stop(context.Background()) })
+	return sdk, rec
+}
+
+func miniCodex(t *testing.T, policy agentthreads.PermissionPolicy) (*agentthreads.AgentThreads, *recorder) {
+	needNode(t)
+	mini := filepath.Join(specDir, "..", "ts", "packages", "node", "src", "test", "mini-codex.mjs")
+	rec := &recorder{}
+	codex := agentthreads.Codex(agentthreads.CodexOptions{Bin: mini, Home: t.TempDir(), NoLogin: true, Env: map[string]string{"HOME": t.TempDir()}, CloseGrace: time.Second})
+	sdk := agentthreads.New(agentthreads.Options{
+		Store:        agentthreads.NewMemoryStore(),
+		Harnesses:    map[string]agentthreads.Harness{"codex": codex},
+		Capabilities: agentthreads.Capabilities{Permissions: policy},
 		Spawner:      agentthreads.Direct(),
 		OnError:      func(err error) { t.Errorf("OnError: %v", err) },
 	})
@@ -300,5 +318,97 @@ func TestARestartTakesUpABackgroundSubagentsRequestWithNoTurnRunning(t *testing.
 	results := turnResults(snap)
 	if started != 1 || len(statuses) == 0 || statuses[0] != protocol.ThreadStatusIdle || len(results) != 2 || results[0].TurnID == results[1].TurnID {
 		t.Fatalf("started %d, statuses %v, results %s", started, statuses, mustMarshal(results))
+	}
+}
+
+// A Codex child thread runs on after its spawnAgent call (and its parent's turn): its subagent ends
+// with the child's turn.
+func TestACodexChildThreadOutlivesItsParentsTurn(t *testing.T) {
+	ctx := context.Background()
+	shell := agentthreads.PolicyFunc(func(_ context.Context, q agentthreads.PermissionQuery, _ agentthreads.PermissionContext) agentthreads.Decision {
+		if q.Kind == protocol.ToolKindShell {
+			return agentthreads.Ask
+		}
+		return agentthreads.Allow
+	})
+	for _, c := range []struct {
+		outcome protocol.ResolutionOutcome
+		want    string
+	}{
+		{protocol.ResolutionOutcomeAllow, `{"status":"completed","background":true,"model":"mini-child","summary":"child ran touch a.txt"}`},
+		{protocol.ResolutionOutcomeDeny, `{"status":"failed","background":true,"model":"mini-child","summary":"the child wasn't allowed to"}`},
+	} {
+		t.Run(string(c.outcome), func(t *testing.T) {
+			sdk, rec := miniCodex(t, shell)
+			th, err := sdk.Create(ctx, agentthreads.CreateOptions{Harness: "codex", Cwd: t.TempDir()})
+			if err != nil {
+				t.Fatal(err)
+			}
+			sdk.Send(ctx, th.ID, "bg touch a.txt", agentthreads.SendOptions{})
+			// The turn ends with the child's command waiting for the user, who's still asked.
+			if rec.waitFor(0, []byte(`{"type":"turn.completed"}`), waitFor) < 0 {
+				t.Fatal("the turn didn't end")
+			}
+			snap, _ := sdk.Snapshot(ctx, th.ID)
+			calls := toolCalls(snap)
+			if snap.Thread.Status != protocol.ThreadStatusWaiting || len(snap.Requests) != 1 || len(calls) != 2 {
+				t.Fatalf("after the turn:\n%s", show(rec.all()))
+			}
+			spawn, cmd := calls[0], calls[1]
+			if got := string(mustMarshal(spawn.Subagent)); spawn.Status != protocol.ToolStatusCompleted || got != `{"status":"running","background":true,"model":"mini-child"}` {
+				t.Fatalf("the spawnAgent call: %s", mustMarshal(spawn))
+			}
+			if cmd.Status != protocol.ToolStatusPending || cmd.ParentID != spawn.ID {
+				t.Fatalf("the child's call: %s", mustMarshal(cmd))
+			}
+
+			sdk.Respond(ctx, th.ID, snap.Requests[0].ID(), protocol.Resolution{Outcome: c.outcome})
+			until(t, func() bool {
+				snap, _ = sdk.Snapshot(ctx, th.ID)
+				calls = toolCalls(snap)
+				return snap.Thread.Status == protocol.ThreadStatusIdle && calls[0].Subagent.Status != protocol.SubagentStatusRunning
+			})
+			if got := string(mustMarshal(calls[0].Subagent)); got != c.want {
+				t.Fatalf("the subagent: %s", got)
+			}
+			want := protocol.ToolStatusCompleted
+			if c.outcome == protocol.ResolutionOutcomeDeny {
+				want = protocol.ToolStatusDenied
+			}
+			if calls[1].Status != want {
+				t.Fatalf("the child's call: %s", mustMarshal(calls[1]))
+			}
+		})
+	}
+}
+
+func TestARunsChildThreadsStopWithIt(t *testing.T) {
+	ctx := context.Background()
+	sdk, rec := miniCodex(t, agentthreads.Ask)
+	th, _ := sdk.Create(ctx, agentthreads.CreateOptions{Harness: "codex", Cwd: t.TempDir()})
+	sdk.Send(ctx, th.ID, "bg sleep 60", agentthreads.SendOptions{})
+	if rec.waitFor(0, []byte(`{"type":"turn.completed"}`), waitFor) < 0 {
+		t.Fatal("the turn didn't end")
+	}
+	if err := sdk.Close(ctx); err != nil {
+		t.Fatal(err)
+	}
+	var subagent, cancelled string
+	resolved := false
+	for _, e := range rec.all() {
+		switch v := e.Value.(type) {
+		case *protocol.ItemUpdatedEvent:
+			if s, ok := v.Patch["subagent"]; ok {
+				subagent = string(s)
+			}
+			if s, ok := v.Patch["status"]; ok && strings.Contains(string(s), "cancelled") {
+				cancelled = v.ItemID
+			}
+		case *protocol.RequestResolvedEvent:
+			resolved = true
+		}
+	}
+	if !strings.Contains(subagent, `"status":"stopped"`) || cancelled == "" || !resolved {
+		t.Fatalf("after closing:\n%s", show(rec.all()))
 	}
 }

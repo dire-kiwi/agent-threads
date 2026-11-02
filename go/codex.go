@@ -1202,6 +1202,12 @@ func (s *codexSession) exited(run *codexRun, status ExitStatus) {
 	if r := ctx.Thread().Run; r != nil && r.ID == run.id {
 		ctx.SetThread(func(t *protocol.Thread) { t.Run = nil })
 	}
+	// Its subagents (child threads) end with it.
+	calls := make([]string, 0, len(run.children))
+	for _, t := range sortedKeys(run.children) {
+		calls = append(calls, run.children[t])
+	}
+	ctx.StopSubagents(calls)
 	// A run that ends while its turn is running ends the turn (as interrupted, if it was).
 	if !run.retired && ctx.TurnID() != "" {
 		s.clearStop()
@@ -1288,6 +1294,12 @@ func (s *codexSession) notification(run *codexRun, m jmap) {
 			run.starting = true
 			run.errText = nil
 			run.setTurn(id)
+		}
+		if !own {
+			// A child taking up work again (a follow-up sent to it).
+			s.subagent(parent, func(st protocol.SubagentState) (protocol.SubagentState, bool) {
+				return collabSubagent(st, jmap{"status": mustJSON("running")})
+			})
 		}
 	case "turn/completed":
 		if own {
@@ -1401,23 +1413,33 @@ func (s *codexSession) item(run *codexRun, item jmap, done bool, parent, child s
 		}
 		return
 	case "collabAgentToolCall":
-		if item.str("tool") != "spawnAgent" {
-			return // wait, sendInput... aren't items of their own.
-		}
-		if !done {
+		// wait, sendInput... aren't items of their own.
+		spawn := item.str("tool") == "spawnAgent"
+		if spawn && !done {
 			if _, ok := ctx.Item(id); !ok {
 				prompt := item.str("prompt")
 				ctx.AddItem(&protocol.ToolCall{ID: id, Name: "spawnAgent", Kind: protocol.ToolKindSubagent, Input: mustJSON(map[string]any{"prompt": prompt}), Status: protocol.ToolStatusRunning, Title: prompt, ParentID: parent})
 			}
 			return
 		}
-		var receivers []string
-		json.Unmarshal(item.raw("receiverThreadIds"), &receivers)
-		for _, t := range receivers {
-			run.children[t] = id
+		if !done {
+			return
 		}
-		if item.str("status") == "failed" {
-			ctx.UpdateItem(id, Patch{"status": protocol.ToolStatusFailed})
+		if spawn {
+			var receivers []string
+			json.Unmarshal(item.raw("receiverThreadIds"), &receivers)
+			for _, t := range receivers {
+				run.children[t] = id
+			}
+			ctx.UpdateItem(id, spawnDone(item))
+		}
+		// Any collab call's completion says how the child threads it's about are getting on.
+		states := orObj(item.obj("agentsStates"))
+		for _, t := range sortedKeys(states) {
+			if call, ok := run.children[t]; ok {
+				state := orObj(states.obj(t))
+				s.subagent(call, func(st protocol.SubagentState) (protocol.SubagentState, bool) { return collabSubagent(st, state) })
+			}
 		}
 		return
 	case "contextCompaction":
@@ -1530,8 +1552,14 @@ func (s *codexSession) turnCompleted(run *codexRun, turn jmap) {
 	errText := run.errText
 	run.turnEnded()
 	run.errText = nil
-	// The turn's requests are moot now; its open ones are cancelled with it.
-	run.open, run.openOrder = map[string]*codexOpen{}, nil
+	// The turn's requests are moot now; its open ones are cancelled with it. A background
+	// subagent's carry on.
+	for _, key := range append([]string(nil), run.openOrder...) {
+		parent, _, _ := s.parent(run, orObj(run.open[key].Msg.obj("params")).raw("threadId"))
+		if !s.inBackground(parent) {
+			run.dropOpen(key)
+		}
+	}
 	// Codex reports the session's totals: the turn used how far they grew. (Where the session's
 	// totals before it aren't known, the thread's usage stands in for them.)
 	var usage *protocol.Usage
@@ -1568,22 +1596,32 @@ func (s *codexSession) turnCompleted(run *codexRun, turn jmap) {
 	ctx.EndTurn(end)
 }
 
-// childDone says a subagent's turn ended: so did its call, with the subagent's last message.
+// childDone says a subagent's turn ended: so did the subagent, with its last message.
 func (s *codexSession) childDone(run *codexRun, child string, turn jmap, callID string) {
-	status := protocol.ToolStatusFailed
-	switch turn.str("status") {
-	case "completed":
-		status = protocol.ToolStatusCompleted
-	case "interrupted":
-		status = protocol.ToolStatusCancelled
+	s.subagent(callID, func(st protocol.SubagentState) (protocol.SubagentState, bool) {
+		return childTurnSubagent(st, turn, run.lastChild[child]), true
+	})
+}
+
+// subagent changes a spawnAgent call's subagent, if it has one (change says !ok to leave it).
+func (s *codexSession) subagent(callID string, change func(protocol.SubagentState) (protocol.SubagentState, bool)) {
+	call, ok := s.callFields(callID)
+	if !ok || call.Subagent == nil {
+		return
 	}
-	content := run.lastChild[child]
-	if status == protocol.ToolStatusFailed {
-		if msg := turn.obj("error").str("message"); turn.obj("error").has("message") {
-			content = msg
-		}
+	if next, ok := change(*call.Subagent); ok {
+		s.ctx.UpdateItem(callID, Patch{"subagent": next})
 	}
-	s.ctx.UpdateItem(callID, Patch{"status": status, "result": protocol.ToolResult{Content: content}})
+}
+
+// inBackground says whether a request from the child thread of this subagent call is a background
+// subagent's, which carries on after its turn.
+func (s *codexSession) inBackground(parent string) bool {
+	if parent == "" {
+		return false
+	}
+	it, ok := s.ctx.Item(parent)
+	return (ok && runningInBackground(it)) || inBackground(s.ctx.Item, parent)
 }
 
 // ---------- the server's requests ----------
@@ -1606,11 +1644,12 @@ func (s *codexSession) request(run *codexRun, m jmap, resume *codexResume) {
 		turn, existing = resume.turn, resume.existing
 	}
 	run.setOpen(key, &codexOpen{Turn: turn, Msg: m})
-	// Whether Codex still wants this answered: not resolved, its turn not over, its run not gone. (Not
-	// once it's left running as the backend shuts down: what's open stays as it was saved.)
+	// Whether Codex still wants this answered: not resolved, its turn not over (unless it's a
+	// background subagent's, which carries on after it), its run not gone. (Not once it's left
+	// running as the backend shuts down: what's open stays as it was saved.)
 	wanted := func() bool {
 		_, open := run.open[key]
-		return open && !run.exited && !run.retired && !run.detached && s.run == run && ctx.TurnID() == turn
+		return open && !run.exited && !run.retired && !run.detached && s.run == run && (ctx.TurnID() == turn || s.inBackground(parent))
 	}
 	answer := func(result any) {
 		if !wanted() {
@@ -1967,14 +2006,14 @@ func (s *codexSession) mcpAppTool(run *codexRun, name string, args json.RawMessa
 		it, _ = s.callFields(matching[0].ID)
 	}
 	turn := ctx.TurnID()
-	wanted := func() bool {
-		return !run.exited && !run.retired && !run.detached && s.run == run && ctx.TurnID() == turn
-	}
-	t := &protocol.ToolCall{Name: name, Kind: protocol.ToolKindApp, Input: args, Title: name}
 	itemID, parent := "", ""
 	if it != nil {
 		itemID, parent = it.ID, it.ParentID
 	}
+	wanted := func() bool {
+		return !run.exited && !run.retired && !run.detached && s.run == run && (ctx.TurnID() == turn || s.inBackground(parent))
+	}
+	t := &protocol.ToolCall{Name: name, Kind: protocol.ToolKindApp, Input: args, Title: name}
 	answered := false
 	s.permit(run, "", s.query(t, itemID, "", parent), wanted, func(ok bool, message string) {
 		answered = true

@@ -28,19 +28,19 @@ use crate::harness::{BoxFuture, Harness, HarnessSession, Message, RunCheckpoint,
 use crate::ids::{new_id, now_iso, now_ms, private_temp_dir};
 use crate::mcp_http::{LoopbackMcp, ToolServer, serve_tools};
 use crate::permissions::{Decided, PermissionDecision, PermissionQuery, permission_key};
-use crate::protocol::{DeltaEventKind, Item, Resolution, ResolutionOutcome, ToolKind, ToolStatus};
+use crate::protocol::{DeltaEventKind, Item, Resolution, ResolutionOutcome, SubagentState, ToolKind, ToolStatus};
 use crate::skills::write_skills;
 use crate::spawner::{ExitStatus, HarnessProcess, ProcessEvent, Signal, SpawnOptions};
 use crate::store::RunRecord;
-use crate::thread::{SECRET, SessionJob, ThreadContext, Timer};
+use crate::thread::{SECRET, SessionJob, ThreadContext, Timer, running_in_background};
 use crate::tools::{Cancellation, Tool, ToolContext, ToolOutput, run_tool};
 use home::{
     SessionState, Totals, default_codex_home, prepare_codex_home, read_session_state, user_codex_home,
     write_session_state,
 };
 use translate::{
-    APP_SERVER, codex_done, codex_policy, codex_tool, codex_usage, is_tool_item, mcp_server_config, questions, todos,
-    totals_as_usage,
+    APP_SERVER, child_turn_subagent, codex_done, codex_policy, codex_tool, codex_usage, collab_subagent, is_tool_item,
+    mcp_server_config, questions, spawn_done, todos, totals_as_usage,
 };
 
 /// How the app's tools reach Codex.
@@ -494,14 +494,20 @@ fn id_string(id: &Value) -> String {
 /// Whether Codex still wants something answered.
 #[derive(Clone)]
 enum Wanted {
-    /// One of its requests: not resolved, its turn not over, its run not gone.
+    /// One of its requests: not resolved, its turn not over (unless it's a background subagent's,
+    /// which carries on after it: `parent` is the subagent call it's from), its run not gone.
     Request {
         run: String,
         id: Value,
         turn: Option<String>,
+        parent: Option<String>,
     },
-    /// A call on the loopback MCP server: its turn not over, its run not gone.
-    Run { run: String, turn: Option<String> },
+    /// A call on the loopback MCP server: the same, but for a request.
+    Run {
+        run: String,
+        turn: Option<String>,
+        parent: Option<String>,
+    },
 }
 
 /// A permission query and what's needed to answer it.
@@ -1355,6 +1361,8 @@ impl CodexSession {
         }
         let retired = run.retired;
         let error = exit_error(&status, &run.stderr, true);
+        let mut children: Vec<String> = run.children.values().cloned().collect();
+        children.sort();
         self.turn_ended(ctx, id);
         if self.current.as_deref() == Some(id) {
             self.current = None;
@@ -1367,6 +1375,8 @@ impl CodexSession {
         if ctx.thread().run.as_ref().is_some_and(|r| r.id == id) {
             ctx.set_thread(|t| t.run = None);
         }
+        // Its subagents (child threads) end with it.
+        ctx.stop_subagents(&children);
         // A run that ends while its turn is running ends the turn (as interrupted, if it was).
         if !retired && ctx.turn_id().is_some() {
             self.clear_stop();
@@ -1539,6 +1549,10 @@ impl CodexSession {
                     r.error = None;
                     self.set_turn(ctx, run, t.to_string());
                 }
+                // A child taking up work again (a follow-up sent to it).
+                if let Some(call) = parent.as_deref() {
+                    subagent(ctx, call, |s| collab_subagent(s, &json!({"status": "running"})));
+                }
             }
             "turn/completed" => {
                 if own {
@@ -1704,10 +1718,9 @@ impl CodexSession {
                 return;
             }
             "collabAgentToolCall" => {
-                if item["tool"] != "spawnAgent" {
-                    return; // wait, sendInput... aren't items of their own.
-                }
-                if !done {
+                // wait, sendInput... aren't items of their own.
+                let spawn = item["tool"] == "spawnAgent";
+                if spawn && !done {
                     if ctx.item(&item_id).is_none() {
                         let prompt = item["prompt"].as_str().unwrap_or("");
                         let mut call = json!({"id": item_id, "type": "tool_call", "name": "spawnAgent", "kind": "subagent", "input": {"prompt": prompt}, "status": "running"});
@@ -1718,17 +1731,28 @@ impl CodexSession {
                     }
                     return;
                 }
-                let r = self.run(run).unwrap();
-                for t in item["receiverThreadIds"]
-                    .as_array()
-                    .into_iter()
-                    .flatten()
-                    .filter_map(Value::as_str)
-                {
-                    r.children.insert(t.to_string(), item_id.clone());
+                if !done {
+                    return;
                 }
-                if item["status"] == "failed" {
-                    ctx.update_item(&item_id, json!({"status": "failed"}));
+                let r = self.run(run).unwrap();
+                if spawn {
+                    for t in item["receiverThreadIds"]
+                        .as_array()
+                        .into_iter()
+                        .flatten()
+                        .filter_map(Value::as_str)
+                    {
+                        r.children.insert(t.to_string(), item_id.clone());
+                    }
+                    ctx.update_item(&item_id, spawn_done(item));
+                }
+                // Any collab call's completion says how the child threads it's about are getting on.
+                let mut states: Vec<_> = item["agentsStates"].as_object().into_iter().flatten().collect();
+                states.sort_by(|a, b| a.0.cmp(b.0));
+                for (t, state) in states {
+                    if let Some(call) = r.children.get(t.as_str()).cloned() {
+                        subagent(ctx, &call, |s| collab_subagent(s, state));
+                    }
                 }
                 return;
             }
@@ -1833,8 +1857,18 @@ impl CodexSession {
         self.turn_ended(ctx, run);
         let r = self.run(run).unwrap();
         r.error = None;
-        // The turn's requests are moot now; its open ones are cancelled with it.
-        r.open.clear();
+        // The turn's requests are moot now; its open ones are cancelled with it. A background
+        // subagent's carry on.
+        let open = std::mem::take(&mut r.open);
+        let kept = open
+            .into_iter()
+            .filter(|(_, o)| {
+                let parent = self.parent(run, &o.msg["params"]["threadId"]).flatten();
+                in_background(ctx, parent.as_deref())
+            })
+            .collect();
+        let r = self.run(run).unwrap();
+        r.open = kept;
         // Codex reports the session's totals: the turn used how far they grew. (Where the
         // session's totals before it aren't known, the thread's usage stands in for them.)
         let usage = r.total.as_ref().map(|total| {
@@ -1871,24 +1905,10 @@ impl CodexSession {
         ctx.end_turn(end, live);
     }
 
-    /// A subagent's turn ended: so did its call, with the subagent's last message.
+    /// A subagent's turn ended: so did the subagent, with its last message.
     fn child_done(&mut self, ctx: &mut ThreadContext, run: &str, child: &str, turn: &Value, call: &str) {
-        let status = match turn["status"].as_str() {
-            Some("completed") => "completed",
-            Some("interrupted") => "cancelled",
-            _ => "failed",
-        };
         let last = self.runs.get(run).and_then(|r| r.last_child.get(child).cloned());
-        let content = if status == "failed" {
-            turn["error"]["message"]
-                .as_str()
-                .map(String::from)
-                .or(last)
-                .unwrap_or_default()
-        } else {
-            last.unwrap_or_default()
-        };
-        ctx.update_item(call, json!({"status": status, "result": {"content": content}}));
+        subagent(ctx, call, |s| Some(child_turn_subagent(s, turn, last)));
     }
 
     // ---------- the server's requests ----------
@@ -1931,6 +1951,7 @@ impl CodexSession {
             run: run.to_string(),
             id: id.clone(),
             turn,
+            parent: parent.clone(),
         };
         let decision = |ok: bool| json!({"decision": if ok { "accept" } else { "decline" }});
         match m["method"].as_str().unwrap_or("") {
@@ -2023,15 +2044,15 @@ impl CodexSession {
     }
 
     fn is_wanted(&self, ctx: &ThreadContext, w: &Wanted) -> bool {
-        let (run, turn, id) = match w {
-            Wanted::Request { run, id, turn } => (run, turn, Some(id)),
-            Wanted::Run { run, turn } => (run, turn, None),
+        let (run, turn, id, parent) = match w {
+            Wanted::Request { run, id, turn, parent } => (run, turn, Some(id), parent),
+            Wanted::Run { run, turn, parent } => (run, turn, None, parent),
         };
         self.runs
             .get(run)
             .is_some_and(|r| id.is_none_or(|id| r.is_open(id)) && !r.exited && !r.retired && !r.detached)
             && self.current.as_deref() == Some(run.as_str())
-            && ctx.turn_id() == turn.as_deref()
+            && (ctx.turn_id() == turn.as_deref() || in_background(ctx, parent.as_deref()))
     }
 
     /// Answers a request of Codex's, if it still wants an answer.
@@ -2452,6 +2473,7 @@ impl CodexSession {
         let wanted = Wanted::Run {
             run: run.into(),
             turn: ctx.turn_id().map(String::from),
+            parent: it.as_ref().and_then(|i| i.parent_id()).map(String::from),
         };
         let t = obj(json!({"name": name, "kind": "app", "input": args, "title": name}));
         let it_id = it.as_ref().map(|i| i.id().to_string());
@@ -2939,4 +2961,21 @@ fn exit_error(status: &ExitStatus, stderr: &VecDeque<String>, during_turn: bool)
     } else {
         format!("Codex {how}{during}.\n{}", last_chars(tail, 2000))
     }
+}
+
+/// Changes a spawnAgent call's subagent, if it has one (`change` returns None to leave it).
+fn subagent(ctx: &mut ThreadContext, call: &str, change: impl FnOnce(&SubagentState) -> Option<SubagentState>) {
+    let Some(Item::ToolCall(c)) = ctx.item(call) else {
+        return;
+    };
+    let Some(next) = c.subagent.as_ref().and_then(change) else {
+        return;
+    };
+    ctx.update_item(call, json!({ "subagent": next }));
+}
+
+/// Whether what comes from the child thread of this subagent call is a background subagent's, which
+/// carries on after its turn.
+fn in_background(ctx: &ThreadContext, parent: Option<&str>) -> bool {
+    parent.is_some_and(|p| ctx.item(p).is_some_and(running_in_background) || ctx.in_background(p))
 }
