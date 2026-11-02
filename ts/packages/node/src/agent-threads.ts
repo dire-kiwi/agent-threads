@@ -533,15 +533,16 @@ export class AgentThreads {
     let state = applyEvents(snap ?? initialState(thread), events);
     if (state.seq === 0) state = initialState(thread);
     const rt = this.#runtime(state, launch);
-    // Questions kept open after their turns ended are taken up again (or cancelled, if they can't
-    // be any more).
-    rt.takeUpRequests(false);
     if (await this.#reattach(rt)) return rt;
     // The process that ran its turn went with the backend before this one, or can't be followed.
     const s = rt.thread.status;
     if (s === "running" || s === "waiting" || rt.thread.run) {
       if (rt.thread.run) rt.lostRun = rt.thread.run.id;
       recoverLost(rt);
+    } else {
+      // Questions kept open after their turns ended are taken up again (or cancelled, if they
+      // can't be any more).
+      rt.takeUpRequests(false);
     }
     return rt;
   }
@@ -571,9 +572,10 @@ export class AgentThreads {
       await this.#abandon(record);
       return false;
     }
-    // Requests the session didn't take up again can't be answered (questions kept open after their
-    // turns were taken up before).
-    for (const r of openRequests(rt.snapshot)) if (!rt.isOpen(r.id)) rt.emit({ type: "request.resolved", request_id: r.id, resolution: { outcome: "cancel" } });
+    // Requests the session didn't take up again can't be answered by the harness: questions kept
+    // open after their turns (or given up by an interrupted one) stay open, the others are
+    // cancelled.
+    rt.takeUpRequests(false);
     // With none left (one answered before the restart is closed, say), the turn runs on, or the
     // thread is idle if none was running.
     if (!rt.openRequests.length && rt.thread.status === "waiting") rt.setThread({ status: rt.turn ? "running" : "idle" });

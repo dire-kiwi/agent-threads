@@ -762,11 +762,6 @@ export class ThreadRuntime implements ThreadContext {
     return false;
   }
 
-  /** Whether a request is open (taken up), a question kept open after its turn included. */
-  isOpen(id: string): boolean {
-    return this.#requests.has(id);
-  }
-
   /** The open requests, but for questions kept open after their turns. */
   get openRequests(): ThreadRequest[] {
     return [...this.#requests.values()].filter((r) => !r.late).map((r) => r.request);
@@ -775,13 +770,11 @@ export class ThreadRuntime implements ThreadContext {
   /**
    * Keeps a question open after its turn ended, with lateAnswers, if it can be: not a secret one
    * (its answer would be shown, as a message), not under dont_ask (which dismisses questions), and
-   * not when the conversation has moved on: messages are queued, or the user sent one since it was
-   * opened (when there were `users`). Whether it did.
+   * not when the conversation has moved on (see #movedOn). Whether it did.
    */
   #keepLate(request: ThreadRequest, users?: number): boolean {
     if (request.type !== "question" || !this.#host.lateAnswers || request.questions.some((q) => q.secret)) return false;
-    const movedOn = this.#queue.length > 0 || (users !== undefined && this.#userMessages() > users);
-    if (movedOn || this.thread.permission_mode === "dont_ask") return false;
+    if (this.#movedOn(request, users) || this.thread.permission_mode === "dont_ask") return false;
     this.#requests.set(request.id, {
       request,
       late: true,
@@ -792,6 +785,20 @@ export class ThreadRuntime implements ThreadContext {
       },
     });
     return true;
+  }
+
+  /**
+   * Whether the conversation has moved on since a request was asked: messages are queued, or the
+   * user sent one since. That's a user message after its tool call in the items, as saved (so it's
+   * known after a restart too); or, for a request with no call, more of them than `users` (how many
+   * there were when it was asked, if that's known).
+   */
+  #movedOn(request: ThreadRequest, users?: number): boolean {
+    if (this.#queue.length > 0) return true;
+    const items = this.#state.items;
+    const at = request.tool_call_id === undefined ? -1 : items.findIndex((i) => i.id === request.tool_call_id);
+    if (at >= 0) return items.slice(at + 1).some((i) => i.type === "user_message");
+    return users !== undefined && this.#userMessages() > users;
   }
 
   /** How many messages the user has sent. */
@@ -809,16 +816,20 @@ export class ThreadRuntime implements ThreadContext {
   }
 
   /**
-   * Takes up, as a thread is loaded, the requests open in its state that nothing will answer: those
-   * of turns that ended (or all of them), which aren't taken up already. A question is kept open
-   * after its turn as endTurn() keeps it; the others are cancelled.
+   * Takes up, as a thread is loaded, the requests open in its state that its session didn't take up
+   * again (after it re-attached to its run, if it did), which nothing will answer. A question whose
+   * turn is over (it has a result, or it's the turn running and was interrupted, so the harness gave
+   * the question up), or any with `all` (the turn was lost), is kept open as endTurn() and
+   * cancelRequest() keep it, if it can be; the others are cancelled.
    */
   takeUpRequests(all: boolean): void {
     const ended = new Set(this.#state.items.flatMap((i) => (i.type === "turn_result" && i.turn_id !== undefined ? [i.turn_id] : [])));
-    for (const r of this.#state.requests) {
+    const interrupted = this.turn?.interrupted ? this.turn.id : undefined;
+    for (const r of [...this.#state.requests]) {
       // One that's been resolved stays in the state, with its resolution.
-      if (r.resolution || this.#requests.has(r.id) || !(all || (r.turn_id !== undefined && ended.has(r.turn_id)))) continue;
-      if (!this.#keepLate(r)) this.emit({ type: "request.resolved", request_id: r.id, resolution: { outcome: "cancel" } });
+      if (r.resolution || this.#requests.has(r.id)) continue;
+      const over = all || (r.turn_id !== undefined && (ended.has(r.turn_id) || r.turn_id === interrupted));
+      if (!(over && this.#keepLate(r))) this.emit({ type: "request.resolved", request_id: r.id, resolution: { outcome: "cancel" } });
     }
   }
 

@@ -1361,8 +1361,7 @@ func (rt *threadRuntime) openRequestIDs() map[string]bool {
 // was opened (when there were *users; nil if that isn't known). It says whether it did.
 func (rt *threadRuntime) keepLate(id string, request protocol.ThreadRequest, users *int) bool {
 	q, ok := request.Value.(*protocol.QuestionRequest)
-	movedOn := len(rt.queue) > 0 || users != nil && rt.userMessages() > *users
-	if !ok || !rt.sdk.options.LateAnswers || movedOn || rt.state.Thread.PermissionMode == protocol.PermissionModeDontAsk {
+	if !ok || !rt.sdk.options.LateAnswers || rt.movedOn(request, users) || rt.state.Thread.PermissionMode == protocol.PermissionModeDontAsk {
 		return false
 	}
 	for _, x := range q.Questions {
@@ -1372,6 +1371,30 @@ func (rt *threadRuntime) keepLate(id string, request protocol.ThreadRequest, use
 	}
 	rt.addRequest(id, &openRequest{request: request, answered: rt.lateAnswered(q), late: true, users: rt.userMessages()})
 	return true
+}
+
+// movedOn says whether the conversation has moved on since a request was asked: messages are
+// queued, or the user sent one since. That's a user message after its tool call in the items, as
+// saved (so it's known after a restart too); or, for a request with no call, more of them than
+// users (how many there were when it was asked, if that's known).
+func (rt *threadRuntime) movedOn(request protocol.ThreadRequest, users *int) bool {
+	if len(rt.queue) > 0 {
+		return true
+	}
+	if call := request.ToolCallID(); call != "" {
+		for i, it := range rt.state.Items {
+			if it.ID() != call {
+				continue
+			}
+			for _, after := range rt.state.Items[i+1:] {
+				if after.Type() == "user_message" {
+					return true
+				}
+			}
+			return false
+		}
+	}
+	return users != nil && rt.userMessages() > *users
 }
 
 // userMessages is how many messages the user has sent.
@@ -1395,9 +1418,11 @@ func (rt *threadRuntime) cancelLate() {
 	}
 }
 
-// takeUpRequests takes up, as a thread is loaded, the requests open in its state that nothing will
-// answer: those of turns that ended (or all of them), which aren't taken up already. A question is
-// kept open after its turn as endTurn keeps it; the others are cancelled.
+// takeUpRequests takes up, as a thread is loaded, the requests open in its state that its session
+// didn't take up again (after it re-attached to its run, if it did), which nothing will answer. A
+// question whose turn is over (it has a result, or it's the turn running and was interrupted, so
+// the harness gave the question up), or any with all (the turn was lost), is kept open as endTurn
+// and CancelRequest keep it, if it can be; the others are cancelled.
 func (rt *threadRuntime) takeUpRequests(all bool) {
 	ended := map[string]bool{}
 	for _, it := range rt.state.Items {
@@ -1405,11 +1430,17 @@ func (rt *threadRuntime) takeUpRequests(all bool) {
 			ended[it.TurnID()] = true
 		}
 	}
+	interrupted := ""
+	if rt.turn != nil && rt.turn.Interrupted {
+		interrupted = rt.turn.ID
+	}
 	for _, r := range protocol.OpenRequests(rt.state) {
-		if rt.requests[r.ID()] != nil || !all && !ended[r.TurnID()] {
+		if rt.requests[r.ID()] != nil {
 			continue
 		}
-		if !rt.keepLate(r.ID(), r, nil) {
+		t := r.TurnID()
+		over := all || t != "" && (ended[t] || t == interrupted)
+		if !over || !rt.keepLate(r.ID(), r, nil) {
 			rt.emit(&protocol.RequestResolvedEvent{RequestID: r.ID(), Resolution: cancelled("")})
 		}
 	}

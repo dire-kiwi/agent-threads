@@ -508,3 +508,59 @@ func TestWithoutLateAnswersATurnThatEndsCancelsItsQuestions(t *testing.T) {
 }
 
 func jsonOf(v any) string { return string(mustMarshal(v)) }
+
+// The conversation moved on from a question (the user sent a message, which the harness took in)
+// before the backend stopped with its run: the question isn't kept open when the lost turn ends.
+func TestAQuestionIsntKeptOpenAfterALostRunOnceTheUserSentAMessage(t *testing.T) {
+	ctx := context.Background()
+	state := agentthreads.NewMemoryState()
+	sdk := newMiniWith(t, agentthreads.NewMemoryStoreOn(state), true, nil)
+	th, err := sdk.Create(ctx, agentthreads.CreateOptions{Cwd: t.TempDir()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	send(t, sdk, th.ID, "asking AskUserQuestion "+question)
+	q := openRequest(t, sdk, th.ID, "question", "")
+	send(t, sdk, th.ID, "reply hi")
+	// Taken in: nothing's queued.
+	until(t, func() bool {
+		s, _ := sdk.Snapshot(ctx, th.ID)
+		n := 0
+		for _, it := range s.Items {
+			if m, ok := it.Value.(*protocol.UserMessage); ok {
+				if m.Queued {
+					return false
+				}
+				n++
+			}
+		}
+		return n == 2
+	})
+	if _, err := sdk.EventsSince(ctx, th.ID, 0, 0); err != nil { // saved
+		t.Fatal(err)
+	}
+	// As if the backend died with the run: a copy of what was saved.
+	from := agentthreads.NewMemoryStoreOn(state)
+	crashed := agentthreads.NewMemoryStore()
+	saved, _ := from.GetThread(ctx, th.ID)
+	events, _ := from.ReadEvents(ctx, th.ID, 0, 0)
+	if err := crashed.CreateThread(ctx, *saved); err != nil {
+		t.Fatal(err)
+	}
+	if err := crashed.AppendEvents(ctx, th.ID, events, nil); err != nil {
+		t.Fatal(err)
+	}
+	sdk.Stop(ctx)
+
+	again := newMiniWith(t, crashed, true, nil)
+	s, err := again.Snapshot(ctx, th.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if open := protocol.OpenRequests(s); len(open) != 0 {
+		t.Fatalf("still open: %s", mustMarshal(open))
+	}
+	if r := resolutionOf(t, again, th.ID, q); r == nil || r.Outcome != protocol.ResolutionOutcomeCancel {
+		t.Fatalf("resolved with %s", mustMarshal(r))
+	}
+}

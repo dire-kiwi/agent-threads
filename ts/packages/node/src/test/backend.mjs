@@ -4,7 +4,8 @@
 // error}) and every event ({event}) to stdout, a line each.
 //
 // Environment: STORE, RUNS, CODEX_HOME_DIR (directories), SHIM (the binary), FAKE_CLI, and the fake
-// CLI's own (AGENT_THREADS_FIXTURE...). POLICY is the permission policy (allow or ask). CLAUDE_BIN
+// CLI's own (AGENT_THREADS_FIXTURE...). POLICY is the permission policy (allow or ask), and
+// LATE_ANSWERS turns lateAnswers on. CLAUDE_BIN
 // and CODEX_BIN run another `claude` or `codex` (mini-claude.mjs, mini-codex.mjs) instead of the
 // fake CLI. With TOOL_MARKER, there's an app
 // tool `lookup`, which appends a line to that file each time it runs, and then (with TOOL_HANG)
@@ -37,6 +38,7 @@ const sdk = new AgentThreads({
     codex: codex({ bin: env.CODEX_BIN ?? env.FAKE_CLI, env: fakeEnv, home: env.CODEX_HOME_DIR, login: false, ...graces }),
   },
   permissions: env.POLICY ?? "allow",
+  lateAnswers: !!env.LATE_ANSWERS,
   tools: env.TOOL_MARKER
     ? [
         defineTool({

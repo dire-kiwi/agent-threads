@@ -1077,9 +1077,6 @@ func (a *AgentThreads) fromStore(ctx context.Context, threadID string) (*threadR
 	}
 	var abandon *RunRecord
 	rt.loop.call(func() {
-		// Questions kept open after their turns ended are taken up again (or cancelled, if they can't
-		// be any more).
-		rt.takeUpRequests(false)
 		ok, stop := a.reattach(rt, record)
 		if ok {
 			return
@@ -1092,6 +1089,10 @@ func (a *AgentThreads) fromStore(ctx context.Context, threadID string) (*threadR
 				rt.lostRun = rt.state.Thread.Run.ID
 			}
 			recoverLost(rt)
+		} else {
+			// Questions kept open after their turns ended are taken up again (or cancelled, if they
+			// can't be any more).
+			rt.takeUpRequests(false)
 		}
 	})
 	if abandon != nil {
@@ -1134,13 +1135,10 @@ func (a *AgentThreads) reattach(rt *threadRuntime, record *RunRecord) (bool, *Ru
 		rt.turn = nil
 		return false, record
 	}
-	// Requests the session didn't take up again can't be answered.
+	// Requests the session didn't take up again can't be answered by the harness: questions kept
+	// open after their turns (or given up by an interrupted one) stay open, the others are cancelled.
+	rt.takeUpRequests(false)
 	open := rt.openRequestIDs()
-	for _, r := range protocol.OpenRequests(rt.state) {
-		if rt.requests[r.ID()] == nil {
-			rt.emit(&protocol.RequestResolvedEvent{RequestID: r.ID(), Resolution: protocol.Resolution{Outcome: protocol.ResolutionOutcomeCancel}})
-		}
-	}
 	// With none left (one answered before the restart is closed, say), the turn runs on, or the
 	// thread is idle if none was running.
 	if len(open) == 0 && rt.state.Thread.Status == protocol.ThreadStatusWaiting {

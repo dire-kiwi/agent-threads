@@ -924,6 +924,31 @@ describe("the Claude driver", () => {
     expect(await resolutionOf(sdk, t.id, q)).toEqual({ outcome: "cancel" });
   });
 
+  // The conversation moved on from a question (the user sent a message, which the harness took in)
+  // before the backend stopped with its run: the question isn't kept open when the lost turn ends.
+  it("doesn't keep a question open after a lost run once the user sent a message", async () => {
+    const store = new MemoryStore();
+    const { sdk, make } = setup({ store, permissions: "ask", lateAnswers: true });
+    const t = await sdk.create();
+    await sdk.send(t.id, `asking AskUserQuestion ${QUESTION}`);
+    const q = await openRequest(sdk, t.id, "question");
+    await sdk.send(t.id, "reply hi");
+    // Taken in: nothing's queued.
+    await until(async () => {
+      const messages = (await sdk.snapshot(t.id)).items.filter((i): i is UserMessage => i.type === "user_message");
+      return messages.length === 2 && messages.every((m) => !m.queued);
+    });
+    await sdk.eventsSince(t.id, 0); // saved
+    // As if the backend died with the run.
+    const crashed = structuredClone(store.state);
+    await sdk.close();
+    open = open.filter((x) => x !== sdk);
+
+    const again = make(new MemoryStore(crashed));
+    expect(openRequests(await again.snapshot(t.id))).toEqual([]);
+    expect(await resolutionOf(again, t.id, q)).toEqual({ outcome: "cancel" });
+  });
+
   it.each([false, true])("dismisses a question kept open after its turn when the mode changes to dont_ask (restarted: %s)", async (restart) => {
     const store = new MemoryStore();
     const { sdk, make } = setup({ store, permissions: "ask", lateAnswers: true });
