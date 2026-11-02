@@ -259,9 +259,10 @@ answer goes only to the harness: what's saved and sent shows `[secret]`.
 the harness stopped) is cancelled. With `lateAnswers` (Go `LateAnswers`, Rust `late_answers`) on the
 backend's options, a question stays open instead, while the thread is idle: answering it sends the
 answers to the agent as the user's next message (`My answer to the question you asked: ...`), which
-starts a turn. A question the conversation has moved on from is cancelled: when a turn starts (the
-user sent a message, or another late answer was sent), or if a message was left queued when its turn
-ended. Secret questions are cancelled still, since their answers would be shown in the message.
+starts a turn. A question the conversation has moved on from is cancelled: when the user sends a
+message after it was asked (another late answer included), or if a message was left queued when its
+turn ended. Secret questions are cancelled still, since their answers would be shown in the message,
+and `dont_ask` dismisses questions kept open too.
 
 **Permission modes** (`permission_mode` on `create`, or a `set_options` command) change what the
 harness asks about at all:

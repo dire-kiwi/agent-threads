@@ -116,8 +116,8 @@ pub struct Options {
     pub event_capacity: usize,
     /// Questions still open when their turn ends (it was interrupted, say) stay open, rather than
     /// being cancelled: an answer is sent to the agent as the user's next message, unless the
-    /// conversation has moved on first (a turn started, or a message was queued). Secret ones are
-    /// cancelled still.
+    /// conversation has moved on first (the user sent a message, or one was left queued). Secret
+    /// ones are cancelled still, and dont_ask dismisses them.
     pub late_answers: bool,
 }
 

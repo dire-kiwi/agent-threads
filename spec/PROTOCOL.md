@@ -135,10 +135,12 @@ when it creates it, and replace or clear them with `set_options`; open requests 
 answer is for are answered with it straight away.
 
 A backend can be set to keep **questions open after their turn**: one still open when its turn
-ends isn't cancelled (unless it has a `secret` question, or a message was left queued), and stays
-open while the thread is idle. Answering it sends the answers to the agent as the user's next
-message, as a `send` would, which starts a turn. It's cancelled when a turn starts first: the
-conversation has moved on.
+ends (or that the harness gives up on because the user interrupted the turn) isn't cancelled, and
+stays open while the thread is idle. Answering it sends the answers to the agent as the user's next
+message, as a `send` would, which starts a turn. It isn't kept, or stays open, once the
+conversation has moved on: when the user sends a message (after it was asked, before or after its
+turn ended), or a message was left queued when its turn ended. Nor is one with a `secret` question,
+or under `dont_ask`.
 
 ## Events
 
