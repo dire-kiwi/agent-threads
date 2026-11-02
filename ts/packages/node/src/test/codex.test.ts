@@ -56,10 +56,11 @@ function setup(options: Setup = {}) {
   /** What each run was started with and sent. */
   const runs = () => {
     if (!existsSync(log)) return [];
-    const out: { argv: string[]; codexHome: string; sent: { [k: string]: any }[]; notes: { [k: string]: any }[] }[] = [];
+    // Its CODEX_HOME, and the variables MINI_LOG_ENV names (null if unset).
+    const out: { argv: string[]; codexHome: string; env: { [k: string]: string | null }; sent: { [k: string]: any }[]; notes: { [k: string]: any }[] }[] = [];
     for (const l of readFileSync(log, "utf8").split("\n").filter(Boolean)) {
       const v = JSON.parse(l);
-      if (v.argv) out.push({ argv: v.argv, codexHome: v.codexHome, sent: [], notes: [] });
+      if (v.argv) out.push({ argv: v.argv, codexHome: v.codexHome, env: v.env ?? {}, sent: [], notes: [] });
       else if ("jsonrpc" in v || "method" in v || "id" in v) out[out.length - 1]!.sent.push(v);
       else out[out.length - 1]!.notes.push(v);
     }
@@ -709,6 +710,43 @@ describe("the Codex driver", () => {
       { type: "text", text: "Attached file notes.md:\n# Notes", text_elements: [] },
       { type: "text", text: "Attached file: /docs/report.pdf", text_elements: [] },
     ]);
+  });
+});
+
+describe("a thread's launch options", () => {
+  it("start Codex with its own CODEX_HOME (used as it is), arguments after the options', environment and writable roots, changed by setOptions", async () => {
+    const user = tempDir();
+    writeFileSync(join(user, "auth.json"), "{}");
+    const { sdk, runs, sent, store } = setup({
+      codex: { args: ["--own"], config: { "sandbox_workspace_write.writable_roots": ["/base"] }, login: user },
+      env: { MINI_LOG_ENV: "AT_SET,AT_GONE", AT_GONE: "instance" },
+    });
+    const [home, cwd] = [tempDir(), tempDir()];
+    const t = await sdk.create({
+      harness: "codex",
+      cwd,
+      launch: { args: ["-c", "a=1"], env: { AT_SET: "x y", AT_GONE: null }, addDirs: ["sub", "/abs"], configDir: home },
+    });
+    await sdk.send(t.id, "reply one");
+    expect(texts((await settle(sdk, t.id)).items)).toEqual(["one"]);
+    expect(runs()[0]!.argv).toEqual(["app-server", "--own", "-c", "a=1"]);
+    expect(runs()[0]!.codexHome).toBe(home);
+    expect(runs()[0]!.env).toEqual({ AT_SET: "x y", AT_GONE: null });
+    expect(sent("thread/start", 0)[0]!.params.config["sandbox_workspace_write.writable_roots"]).toEqual(["/base", join(cwd, "sub"), "/abs"]);
+    // Its own home, not the app's: no login was linked into it.
+    expect(existsSync(join(home, "auth.json"))).toBe(false);
+    expect(((await store.getThread(t.id)) as { launch?: { args?: string[] } }).launch?.args).toEqual(["-c", "a=1"]);
+    expect((await sdk.snapshot(t.id)).thread).not.toHaveProperty("launch");
+
+    // New arguments: the next turn resumes the thread in a new process that has them.
+    await sdk.setOptions(t.id, { launch: { args: ["-c", "a=2"], configDir: home } });
+    await sdk.send(t.id, "reply two");
+    expect(texts((await settle(sdk, t.id)).items)).toEqual(["one", "two"]);
+    expect(runs()).toHaveLength(2);
+    expect(runs()[1]!.argv).toEqual(["app-server", "--own", "-c", "a=2"]);
+    expect(runs()[1]!.env).toEqual({ AT_SET: null, AT_GONE: "instance" });
+    expect(sent("thread/resume")).toHaveLength(1);
+    expect(sent("thread/resume")[0]!.params.config["sandbox_workspace_write.writable_roots"]).toEqual(["/base"]);
   });
 });
 

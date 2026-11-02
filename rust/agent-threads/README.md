@@ -134,6 +134,12 @@ the graces: `stop_grace` (10s) for an interrupt to end the turn, `close_grace` (
 exit after its input closes, and Claude's `steer_grace` (30s) to take in steered messages after a
 turn.
 
+A thread's own `LaunchOptions` (`CreateOptions::launch`, or `ThreadOptions::launch` with
+`set_options`) add arguments, environment changes, directories (`--add-dir`, or Codex's writable
+roots) and a config directory (CLAUDE_CONFIG_DIR, or a CODEX_HOME used as it is) to those its
+process starts with. They're stored with the thread, but not sent to clients, and apply from its
+next process ([docs/tools.md](../../docs/tools.md#per-thread-launch-options)).
+
 Both drivers' Codex and Claude messages are handled as `serde_json::Value`s; Codex's app-server
 types aren't generated for Rust (the Node backend generates them for TypeScript).
 

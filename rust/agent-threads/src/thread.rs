@@ -19,7 +19,7 @@ use serde_json::{Map, Value, json};
 use tokio::sync::{broadcast, mpsc, oneshot};
 
 use crate::agent_threads::Error;
-use crate::harness::{HarnessSession, Message, RunCheckpoint, ThreadConfig, TurnEnd};
+use crate::harness::{HarnessSession, LaunchOptions, Message, RunCheckpoint, ThreadConfig, TurnEnd};
 use crate::ids::{new_id, now_iso};
 use crate::permissions::{Decided, PermissionContext, PermissionDecision, PermissionPolicy, PermissionQuery, decide};
 use crate::protocol::{
@@ -117,6 +117,8 @@ pub struct Actor {
 pub struct ThreadContext {
     thread_id: String,
     pub(crate) config: ThreadConfig,
+    /// How its harness process is started: stored with the thread.
+    pub(crate) launch: LaunchOptions,
     pub(crate) policy: PermissionPolicy,
     host: Arc<Host>,
     pub(crate) turn: Option<Turn>,
@@ -186,6 +188,12 @@ impl ThreadContext {
 
     pub fn config(&self) -> &ThreadConfig {
         &self.config
+    }
+
+    /// How the thread's harness process is started: its args, environment, directories and config
+    /// directory.
+    pub fn launch(&self) -> &LaunchOptions {
+        &self.launch
     }
 
     pub fn spawner(&self) -> &Arc<dyn Spawner> {
@@ -915,6 +923,7 @@ impl Actor {
         host: Arc<Host>,
         state: Snapshot,
         config: ThreadConfig,
+        launch: LaunchOptions,
         policy: PermissionPolicy,
         open: impl FnOnce(&ThreadContext) -> Box<dyn HarnessSession>,
     ) -> (mpsc::UnboundedSender<Job>, Actor, mpsc::UnboundedReceiver<Job>) {
@@ -932,6 +941,7 @@ impl Actor {
         let core = ThreadContext {
             thread_id: state.thread.id.clone(),
             config,
+            launch,
             policy,
             host,
             turn: None,
@@ -1082,10 +1092,7 @@ impl Actor {
             }
             if thread_changed {
                 c.thread_changed = false;
-                if let Err(e) = store
-                    .update_thread(&serde_json::to_value(&c.state.thread).unwrap())
-                    .await
-                {
+                if let Err(e) = store.update_thread(&c.stored_thread()).await {
                     c.thread_changed = true;
                     return Err(e);
                 }
@@ -1232,6 +1239,26 @@ pub(crate) fn round_cost(x: f64) -> f64 {
 }
 
 impl ThreadContext {
+    /// The thread as the store keeps it: with its launch options, which clients aren't sent.
+    pub(crate) fn stored_thread(&self) -> Value {
+        let mut thread = serde_json::to_value(&self.state.thread).unwrap();
+        if !self.launch.is_empty() {
+            thread["launch"] = serde_json::to_value(&self.launch).unwrap();
+        }
+        thread
+    }
+
+    /// Changes how the harness process is started, from the next one; it's saved with the thread.
+    pub(crate) fn set_launch(&mut self, launch: LaunchOptions) {
+        if launch == self.launch {
+            return;
+        }
+        self.launch = launch;
+        self.thread_changed = true;
+        self.flush_queued = true;
+        self.options_changed();
+    }
+
     /// Saves the thread's run (with a durable spawner) though no event changed.
     pub(crate) fn request_save(&mut self) {
         if self.host.spawner.durable() {
