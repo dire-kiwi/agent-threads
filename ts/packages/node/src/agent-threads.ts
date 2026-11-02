@@ -5,9 +5,13 @@
 import {
   applyEvents,
   initialState,
+  itemPage,
+  openRequests,
+  snapshotWindow,
   validate,
   type Attachment,
   type Command,
+  type ItemPage,
   type PermissionMode,
   type Resolution,
   type Snapshot,
@@ -173,10 +177,24 @@ export class AgentThreads {
     return this.store.deleteThread(threadId);
   }
 
-  /** The thread's state now, including text streamed so far. */
-  async snapshot(threadId: string): Promise<Snapshot> {
+  /**
+   * The thread's state now, including text streamed so far. With a `limit`, a window of it: its
+   * last `limit` items and what they need from before them, for a client that loads earlier ones
+   * with itemsBefore (spec/PROTOCOL.md, "Windows").
+   */
+  async snapshot(threadId: string, options?: { limit?: number }): Promise<Snapshot> {
     this.#open();
-    return structuredClone((await this.#load(threadId)).snapshot);
+    return structuredClone(snapshotWindow((await this.#load(threadId)).snapshot, options?.limit));
+  }
+
+  /**
+   * The thread's items before index `before` (a window's `start`), at most `limit` of them, with
+   * the subagent calls they belong to and the requests they have: a page for a client that has a
+   * window to load earlier items into.
+   */
+  async itemsBefore(threadId: string, before: number, limit: number): Promise<ItemPage> {
+    this.#open();
+    return structuredClone(itemPage((await this.#load(threadId)).snapshot, before, limit));
   }
 
   /** The thread's saved events after `seq`, for a client catching up. */
@@ -457,7 +475,7 @@ export class AgentThreads {
     }
     // Requests the session didn't take up again can't be answered.
     const open = new Set(rt.openRequests.map((r) => r.id));
-    for (const r of rt.snapshot.requests) if (!open.has(r.id)) rt.emit({ type: "request.resolved", request_id: r.id, resolution: { outcome: "cancel" } });
+    for (const r of openRequests(rt.snapshot)) if (!open.has(r.id)) rt.emit({ type: "request.resolved", request_id: r.id, resolution: { outcome: "cancel" } });
     // With none left (one answered before the restart is closed, say), the turn runs on.
     if (rt.turn && !open.size && rt.thread.status === "waiting") rt.setThread({ status: "running" });
     rt.setThread({ run: { ...run, reattached_at: new Date().toISOString() } });
@@ -496,7 +514,7 @@ function recoverLost(rt: ThreadRuntime): void {
     const items = rt.snapshot.items;
     const turnId = [...items].reverse().find((i) => i.turn_id)?.turn_id ?? newId("turn");
     rt.turn = { id: turnId, interrupted: false };
-    for (const r of rt.snapshot.requests) {
+    for (const r of openRequests(rt.snapshot)) {
       rt.emit({ type: "request.resolved", request_id: r.id, resolution: { outcome: "cancel" } });
     }
     rt.addItem({

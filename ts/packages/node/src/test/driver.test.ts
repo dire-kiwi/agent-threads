@@ -5,7 +5,7 @@ import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { afterEach, describe, expect, it } from "vitest";
-import { applyEvents, initialState, type Item, type ThreadEvent, type ToolCall, type TurnResult, type UserMessage } from "@dire-kiwi/agent-threads-protocol";
+import { applyEvents, initialState, openRequests, type Item, type ThreadEvent, type ToolCall, type TurnResult, type UserMessage } from "@dire-kiwi/agent-threads-protocol";
 import { AgentThreads, CommandError, type AgentThreadsOptions } from "../agent-threads.js";
 import { claudeCode, type ClaudeCodeOptions } from "../claude/driver.js";
 import type { Store } from "../store.js";
@@ -413,11 +413,35 @@ describe("the Claude driver", () => {
     await sdk.handle({ type: "respond", thread_id: t.id, request_id: req.type === "request.opened" ? req.request.id : "", resolution: { outcome: "allow", always: true } });
     await settle(sdk, t.id);
 
+    // The answered request stays, with its answer.
+    expect((await sdk.snapshot(t.id)).requests).toEqual([{ ...req.request, resolution: { outcome: "allow", always: true } }]);
+
     await sdk.send(t.id, 'tool Bash {"command":"pwd"}');
     s = await settle(sdk, t.id);
     expect(events.filter((e) => e.type === "request.opened")).toHaveLength(1);
     expect(seen).toEqual(["Read", "WebFetch", "Bash"]);
     expect(texts(s.items).at(-1)).toBe('ran with {"command":"pwd"}');
+  });
+
+  it("gives a window of a thread's last items, and pages of the items before it", async () => {
+    const { sdk } = setup();
+    const t = await sdk.create();
+    for (const n of ["one", "two", "three"]) {
+      await sdk.send(t.id, `reply ${n}`);
+      await settle(sdk, t.id);
+    }
+    const whole = await sdk.snapshot(t.id);
+    // A user message, the reply and the turn's result, for each turn.
+    expect(whole.items).toHaveLength(9);
+    expect(whole).not.toHaveProperty("start");
+    expect(await sdk.snapshot(t.id, { limit: 20 })).toEqual(whole);
+    const window = await sdk.snapshot(t.id, { limit: 4 });
+    expect(window).toMatchObject({ start: 5, seq: whole.seq, thread: whole.thread });
+    expect(window.items).toEqual(whole.items.slice(5));
+    const page = await sdk.itemsBefore(t.id, 5, 3);
+    expect(page).toEqual({ thread_id: t.id, items: whole.items.slice(2, 5), requests: [], start: 2, context: [], seq: whole.seq });
+    expect((await sdk.itemsBefore(t.id, 2, 3)).items).toEqual(whole.items.slice(0, 2));
+    await expect(sdk.itemsBefore("nope", 2, 3)).rejects.toThrow();
   });
 
   it("runs app tools with the thread's id, metadata and call, and keeps their structured output", async () => {
@@ -597,7 +621,7 @@ describe("the Claude driver", () => {
     await new Promise((r) => setTimeout(r, 50));
     const s = await sdk.snapshot(t.id);
     expect(s.thread.status).toBe("idle");
-    expect(s.requests).toEqual([]);
+    expect(openRequests(s)).toEqual([]);
     expect(s.items.find((i): i is ToolCall => i.type === "tool_call")!.status).toBe("failed");
     expect(runs()[0]!.sent.filter((m) => m.type === "control_response")).toEqual([]);
   });

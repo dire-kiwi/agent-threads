@@ -6,7 +6,7 @@ import { existsSync, lstatSync, mkdirSync, readFileSync, readlinkSync, realpathS
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { afterEach, describe, expect, it } from "vitest";
-import { applyEvents, initialState, type Item, type Notice, type ThreadEvent, type ToolCall, type TurnResult, type UserMessage } from "@dire-kiwi/agent-threads-protocol";
+import { applyEvents, initialState, openRequests, type Item, type Notice, type ThreadEvent, type ToolCall, type TurnResult, type UserMessage } from "@dire-kiwi/agent-threads-protocol";
 import { AgentThreads, type AgentThreadsOptions } from "../agent-threads.js";
 import { codex, type CodexOptions } from "../codex/driver.js";
 import { prepareCodexHome } from "../codex/home.js";
@@ -92,7 +92,7 @@ async function settle(sdk: AgentThreads, id: string, ms = 5000) {
 }
 
 /** Waits for the thread's one open request. */
-const request = (sdk: AgentThreads, id: string) => until(async () => (await sdk.snapshot(id)).requests[0]);
+const request = (sdk: AgentThreads, id: string) => until(async () => openRequests(await sdk.snapshot(id))[0]);
 
 const results = (items: Item[]) => items.filter((i): i is TurnResult => i.type === "turn_result");
 const texts = (items: Item[]) => items.filter((i) => i.type === "assistant_message").map((i) => (i as { text: string }).text);
@@ -205,7 +205,7 @@ describe("the Codex driver", () => {
     expect(calls(s.items)[0]).toMatchObject({ id: r.tool_call_id, status: "pending", command: "touch a.txt" });
     await sdk.respond(t.id, r.id, { outcome: "allow" });
 
-    r = await until(async () => (await sdk.snapshot(t.id)).requests.find((x) => x.id !== r.id));
+    r = await until(async () => openRequests(await sdk.snapshot(t.id)).find((x) => x.id !== r.id));
     expect(r).toMatchObject({ type: "permission", name: "fileChange", kind: "edit", title: "/w/notes.txt" });
     await sdk.respond(t.id, r.id, { outcome: "deny", message: "no edits" });
     s = await settle(sdk, t.id);
@@ -246,7 +246,7 @@ describe("the Codex driver", () => {
     expect(texts(s.items)).toEqual(['granted {"network":{"enabled":true}}']);
 
     await sdk.send(t.id, "perms");
-    r = await until(async () => (await sdk.snapshot(t.id)).requests[0]);
+    r = await until(async () => openRequests(await sdk.snapshot(t.id))[0]);
     await sdk.respond(t.id, r.id, { outcome: "deny" });
     s = await settle(sdk, t.id);
     expect(texts(s.items)[1]).toBe("granted {}");
