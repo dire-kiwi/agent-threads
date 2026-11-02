@@ -255,8 +255,24 @@ harness asks about at all:
 | --- | --- | --- |
 | `default` | asks the policy | approval policy `untrusted`, sandbox `workspace-write` |
 | `accept_edits` | edits in the thread's `cwd` go ahead without asking | `on-request` in `workspace-write` |
-| `plan` | plans, and changes nothing | `untrusted` in `read-only` |
+| `plan` | plans, and changes nothing | `untrusted` in `read-only`, collaboration mode `plan` |
 | `bypass` | nothing is asked | `never` in `danger-full-access` |
+
+A new mode or model applies straight away where it can: Claude Code's running process is switched
+(`set_permission_mode`, `set_model`), even mid-turn, and Codex takes them with its next turn, in
+the same process. (A new effort starts a new Claude Code process at the next turn, as does clearing
+Codex's model or effort. Claude Code
+can't be switched to bypass mode unless it was started in it: until the next turn's new process,
+the driver allows what it asks about.) A Codex thread is started in the `workspace-write` sandbox
+whatever its mode, and its first turn puts it in its mode's: Codex says what that sandbox is with
+all of its config (CODEX_HOME's `config.toml`, the thread's `addDirs`...), so switching back to it
+later, or approving a plan, keeps all of it.
+
+**Plans** aren't permissions either: in plan mode, Claude's `ExitPlanMode` and the plan Codex
+proposes at the end of a turn open a `plan` request (`PlanCard`), whatever the policy says.
+Approving it (`allow`, with the `permission_mode` to carry on in) switches the harness out of plan
+mode and the agent starts on the plan in the same turn; denying it, with feedback as the
+`message`, has it plan again.
 
 ## Config isolation
 
@@ -273,6 +289,38 @@ the user's (or one the app points at).
 
 Both drivers take `bin` (and `binArgs`, for a script run by `node`), extra `args` and `env`; Codex
 takes extra `config` for `thread/start` (its `config.toml` keys, dotted).
+
+### Per-thread launch options
+
+A thread can have launch options of its own, on top of the harness's: given when it's created, and
+changed with `setOptions` (Go `SetOptions`, Rust `set_options`). They're stored with the thread
+(in the store's thread record, as `launch`, not in the protocol's `Thread`, so clients never see
+them), so a thread picked up after a restart starts its processes with them. A change applies from
+the next process the thread starts, as a model change does; the `set_options` command from a client
+can't change them.
+
+```ts
+const thread = await sdk.create({
+  harness: "claude",
+  launch: {
+    args: ["--allowedTools", "Read Grep", "--settings", settingsJson],
+    env: { TMPDIR: "/tmp/thread-1", NO_COLOR: null }, // null removes a variable
+    addDirs: ["/srv/shared", "/srv/attachments"],
+    configDir: "/srv/profiles/team-a/claude",
+  },
+});
+await sdk.setOptions(thread.id, { launch: { ...launch, args: ["--disallowedTools", "Bash"] } }); // replaces them in full
+```
+
+| | Claude Code | Codex |
+| --- | --- | --- |
+| `args` | After the driver's and the options' `args`: `--allowedTools`, `--disallowedTools`, `--settings` and so on | After `app-server` and the options' `args`: `-c key=value`, say |
+| `env` | On top of the options' `env`; `null` (Go `nil`, Rust `None`) removes a variable | The same |
+| `addDirs` (Go `AddDirs`, Rust `add_dirs`) | `--add-dir`, once for each | Writable roots (`sandbox_workspace_write.writable_roots`, after any the options' `config` gives), relative ones in the thread's `cwd` |
+| `configDir` (Go `ConfigDir`, Rust `config_dir`) | `CLAUDE_CONFIG_DIR`, in place of the options' `configDir` | `CODEX_HOME`, in place of the app's `home`, used as it is: its own login and `config.toml`, nothing linked in |
+
+The harness keeps its sessions in its config directory, so a thread whose `configDir` changes can't
+resume the session it had.
 
 ## Subagents
 

@@ -9,9 +9,9 @@ import (
 // A thread's state, folded from its events, by the rules in spec/PROTOCOL.md ("Applying events"):
 // the same as applyEvent in @dire-kiwi/agent-threads-protocol.
 //
-// ApplyEvent never changes the state it's given: an event that changes an item puts a new Item in
-// a new Items slice, and leaves the others as they were. An event that changes nothing returns the
-// state as it was.
+// ApplyEvent never changes the state it's given: an event that changes an item or request puts a
+// new one in a new slice, and leaves the others as they were. An event that changes nothing
+// returns the state as it was.
 
 // deltaItemType is the type of item a delta of each kind streams into.
 var deltaItemType = map[DeltaEventKind]string{DeltaEventKindText: "assistant_message", DeltaEventKindReasoning: "reasoning"}
@@ -64,6 +64,17 @@ func ApplyEvents(state Snapshot, events []ThreadEvent) Snapshot {
 	return state
 }
 
+// OpenRequests is the state's requests that are open: those not resolved yet, oldest first.
+func OpenRequests(state Snapshot) []ThreadRequest {
+	out := []ThreadRequest{}
+	for _, r := range state.Requests {
+		if r.Resolution() == nil {
+			out = append(out, r)
+		}
+	}
+	return out
+}
+
 // IsGap says whether event shows that saved events before it were missed: it's saved, and its seq
 // is more than one past the state's. A client that sees one should catch up from state.Seq, or
 // take a fresh snapshot, rather than apply it.
@@ -90,8 +101,9 @@ func apply(state Snapshot, event ThreadEvent) Snapshot {
 			state.Requests = append(slices.Clip(state.Requests), e.Request)
 		}
 	case *RequestResolvedEvent:
+		// It stays, with its resolution, so a UI can show how it was answered.
 		if at := indexOfRequest(state.Requests, e.RequestID); at >= 0 {
-			state.Requests = slices.Delete(slices.Clone(state.Requests), at, at+1)
+			state.Requests = replaced(state.Requests, at, withResolution(state.Requests[at], e.Resolution))
 		}
 	}
 	// turn.* events change nothing but seq.
@@ -176,6 +188,25 @@ func withText(item Item, text string) Item {
 		return Item{Value: &c}
 	}
 	return item
+}
+
+// withResolution is a copy of the request with its resolution set.
+func withResolution(request ThreadRequest, res Resolution) ThreadRequest {
+	switch r := request.Value.(type) {
+	case *PermissionRequest:
+		c := *r
+		c.Resolution = &res
+		return ThreadRequest{Value: &c}
+	case *QuestionRequest:
+		c := *r
+		c.Resolution = &res
+		return ThreadRequest{Value: &c}
+	case *PlanRequest:
+		c := *r
+		c.Resolution = &res
+		return ThreadRequest{Value: &c}
+	}
+	return request
 }
 
 // Updates are nearly always to recent items and requests, so look from the end.

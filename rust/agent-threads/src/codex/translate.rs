@@ -6,7 +6,8 @@ use serde_json::{Map, Value, json};
 use super::home::Totals;
 use crate::claude::{result_text, slim};
 use crate::harness::McpServer;
-use crate::protocol::{PermissionMode, SubagentState, SubagentStatus};
+use crate::ids::unix_time;
+use crate::protocol::{PermissionMode, RateLimit, RateLimitStatus, SubagentState, SubagentStatus};
 
 /// The MCP server that serves a thread's app tools when Codex can't take them as dynamic tools.
 pub(crate) const APP_SERVER: &str = "app";
@@ -380,6 +381,38 @@ pub(crate) fn codex_policy(mode: Option<PermissionMode>) -> (&'static str, &'sta
     }
 }
 
+/// A sandbox mode as turn/start's sandboxPolicy has it. A workspace-write one keeps its settings
+/// (Codex takes those left out as false): the ones Codex last said the thread had (`workspace`), or
+/// else those of the config's `sandbox_workspace_write` (a table, or dotted keys).
+pub(crate) fn sandbox_policy(mode: &str, workspace: Option<&Value>, config: &Map<String, Value>) -> Value {
+    match mode {
+        "read-only" => return json!({"type": "readOnly"}),
+        "danger-full-access" => return json!({"type": "dangerFullAccess"}),
+        _ => {}
+    }
+    if let Some(w) = workspace {
+        return w.clone();
+    }
+    let setting = |key: &str| match config.get("sandbox_workspace_write") {
+        Some(Value::Object(table)) => table.get(key).cloned(),
+        _ => config.get(&format!("sandbox_workspace_write.{key}")).cloned(),
+    };
+    let mut p = json!({"type": "workspaceWrite"});
+    if let Some(roots @ Value::Array(_)) = setting("writable_roots") {
+        p["writableRoots"] = roots;
+    }
+    for (key, field) in [
+        ("network_access", "networkAccess"),
+        ("exclude_tmpdir_env_var", "excludeTmpdirEnvVar"),
+        ("exclude_slash_tmp", "excludeSlashTmp"),
+    ] {
+        if let Some(v @ Value::Bool(_)) = setting(key) {
+            p[field] = v;
+        }
+    }
+    p
+}
+
 /// An MCP server as Codex's `mcp_servers` config has it, or why it can't be.
 pub(crate) fn mcp_server_config(s: &McpServer) -> Result<Value, &'static str> {
     match s {
@@ -399,4 +432,36 @@ pub(crate) fn mcp_server_config(s: &McpServer) -> Result<Value, &'static str> {
             Ok(v)
         }
     }
+}
+
+/// The limits an `account/rateLimits/updated` notification's snapshot reports: its primary and
+/// secondary windows, named by its limitId when that isn't Codex's own. A used-up window is
+/// rejected, unless credits carry on past it.
+pub(crate) fn codex_rate_limits(rl: &Value) -> Vec<RateLimit> {
+    let prefix = match rl["limitId"].as_str() {
+        Some(l) if !l.is_empty() && l != "codex" => format!("{l}:"),
+        _ => String::new(),
+    };
+    let credits = rl["credits"]["hasCredits"] == true || rl["credits"]["unlimited"] == true;
+    let mut out = Vec::new();
+    for key in ["primary", "secondary"] {
+        let w = &rl[key];
+        if !w.is_object() {
+            continue;
+        }
+        let used = w["usedPercent"].as_f64().filter(|u| u.is_finite());
+        let status = match used {
+            Some(u) if u >= 100.0 && credits => RateLimitStatus::Warning,
+            Some(u) if u >= 100.0 => RateLimitStatus::Rejected,
+            _ => RateLimitStatus::Allowed,
+        };
+        out.push(RateLimit {
+            id: format!("{prefix}{key}"),
+            status,
+            used_percent: used,
+            resets_at: w["resetsAt"].as_f64().and_then(unix_time),
+            window_minutes: w["windowDurationMins"].as_u64(),
+        });
+    }
+    out
 }

@@ -2,6 +2,7 @@ package agentthreads
 
 import (
 	"encoding/json"
+	"math"
 	"regexp"
 	"strings"
 
@@ -300,6 +301,42 @@ func codexPolicy(mode protocol.PermissionMode) (approval, sandbox string) {
 	return "untrusted", "workspace-write"
 }
 
+// sandboxPolicy is a sandbox mode as turn/start's sandboxPolicy has it.
+//
+// A workspace-write one keeps its settings (Codex takes those left out as false): the ones Codex last
+// said the thread had (workspace), or else those of the config's sandbox_workspace_write (a table,
+// or dotted keys).
+func sandboxPolicy(mode string, workspace json.RawMessage, config map[string]any) any {
+	switch mode {
+	case "read-only":
+		return map[string]any{"type": "readOnly"}
+	case "danger-full-access":
+		return map[string]any{"type": "dangerFullAccess"}
+	}
+	if workspace != nil {
+		return workspace
+	}
+	table, _ := config["sandbox_workspace_write"].(map[string]any)
+	setting := func(key string) any {
+		if table != nil {
+			return table[key]
+		}
+		return config["sandbox_workspace_write."+key]
+	}
+	p := map[string]any{"type": "workspaceWrite"}
+	if roots, ok := setting("writable_roots").([]string); ok {
+		p["writableRoots"] = roots
+	} else if roots, ok := setting("writable_roots").([]any); ok {
+		p["writableRoots"] = roots
+	}
+	for key, field := range map[string]string{"network_access": "networkAccess", "exclude_tmpdir_env_var": "excludeTmpdirEnvVar", "exclude_slash_tmp": "excludeSlashTmp"} {
+		if v, ok := setting(key).(bool); ok {
+			p[field] = v
+		}
+	}
+	return p
+}
+
 // mcpServerConfig is an MCP server as Codex's mcp_servers config has it, or why it can't be.
 func mcpServerConfig(s MCPServer) (map[string]any, string) {
 	if s.URL != "" {
@@ -337,4 +374,42 @@ func rawObject(kv ...any) json.RawMessage {
 		m[kv[i].(string)] = v
 	}
 	return mustJSON(m)
+}
+
+// codexRateLimits is the limits an account/rateLimits/updated notification's snapshot reports: its
+// primary and secondary windows, named by its limitId when that isn't Codex's own.
+func codexRateLimits(rl jmap) []protocol.RateLimit {
+	prefix := ""
+	if id := rl.str("limitId"); id != "" && id != "codex" {
+		prefix = id + ":"
+	}
+	// Credits carry on past a used-up window.
+	credits := rl.obj("credits")
+	carryOn := credits != nil && (credits.bool("hasCredits") || credits.bool("unlimited"))
+	var out []protocol.RateLimit
+	for _, key := range []string{"primary", "secondary"} {
+		w := rl.obj(key)
+		if w == nil {
+			continue
+		}
+		limit := protocol.RateLimit{ID: prefix + key, Status: protocol.RateLimitStatusAllowed}
+		if used, ok := w.num("usedPercent"); ok {
+			limit.UsedPercent = &used
+			if used >= 100 {
+				limit.Status = protocol.RateLimitStatusRejected
+				if carryOn {
+					limit.Status = protocol.RateLimitStatusWarning
+				}
+			}
+		}
+		if t, ok := w.num("resetsAt"); ok {
+			limit.ResetsAt = unixTime(t)
+		}
+		if m, ok := w.num("windowDurationMins"); ok && m >= 0 && m == math.Trunc(m) {
+			n := int64(m)
+			limit.WindowMinutes = &n
+		}
+		out = append(out, limit)
+	}
+	return out
 }

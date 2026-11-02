@@ -79,7 +79,7 @@ func TestABackgroundSubagentOutlivesItsTurn(t *testing.T) {
 	}
 	snap, _ := sdk.Snapshot(ctx, th.ID)
 	calls := toolCalls(snap)
-	if snap.Thread.Status != protocol.ThreadStatusWaiting || len(snap.Requests) != 1 || len(calls) != 2 {
+	if snap.Thread.Status != protocol.ThreadStatusWaiting || len(protocol.OpenRequests(snap)) != 1 || len(calls) != 2 {
 		t.Fatalf("after the turn:\n%s", show(rec.all()))
 	}
 	agent, bash := calls[0], calls[1]
@@ -90,7 +90,7 @@ func TestABackgroundSubagentOutlivesItsTurn(t *testing.T) {
 		t.Fatalf("the subagent's call: %s", mustMarshal(bash))
 	}
 
-	sdk.Respond(ctx, th.ID, snap.Requests[0].ID(), protocol.Resolution{Outcome: protocol.ResolutionOutcomeAllow})
+	sdk.Respond(ctx, th.ID, protocol.OpenRequests(snap)[0].ID(), protocol.Resolution{Outcome: protocol.ResolutionOutcomeAllow})
 	until(t, func() bool {
 		snap, _ = sdk.Snapshot(ctx, th.ID)
 		results := 0
@@ -268,7 +268,7 @@ func TestALostRunStopsItsBackgroundSubagents(t *testing.T) {
 				t.Fatalf("the calls: %s", mustMarshal(calls))
 			}
 			// Its one turn had ended: it isn't ended again.
-			if snap.Thread.Status != protocol.ThreadStatusIdle || snap.Thread.Run != nil || len(snap.Requests) != 0 || len(turnResults(snap)) != 1 {
+			if snap.Thread.Status != protocol.ThreadStatusIdle || snap.Thread.Run != nil || len(protocol.OpenRequests(snap)) != 0 || len(turnResults(snap)) != 1 {
 				t.Fatalf("after: %s", mustMarshal(snap))
 			}
 		})
@@ -291,11 +291,11 @@ func TestARestartTakesUpABackgroundSubagentsRequestWithNoTurnRunning(t *testing.
 	b := s.start()
 	expectRecovered(t, b, id)
 	snap := snapshotOf(t, b, id)
-	if snap.Thread.Status != protocol.ThreadStatusWaiting || len(snap.Requests) != 1 {
+	if snap.Thread.Status != protocol.ThreadStatusWaiting || len(protocol.OpenRequests(snap)) != 1 {
 		t.Fatalf("after the restart: %s", mustMarshal(snap))
 	}
 	from := len(b.events.all())
-	b.call("handle", map[string]any{"type": "respond", "thread_id": id, "request_id": snap.Requests[0].ID(), "resolution": map[string]any{"outcome": "allow"}})
+	b.call("handle", map[string]any{"type": "respond", "thread_id": id, "request_id": protocol.OpenRequests(snap)[0].ID(), "resolution": map[string]any{"outcome": "allow"}})
 	// Answered with no turn running, the thread is idle; then Claude's report is a turn of its own.
 	completed := func() (started, done int, statuses []protocol.ThreadStatus) {
 		for _, e := range b.events.all()[from:] {
@@ -442,7 +442,7 @@ func TestACodexChildThreadThatEndsLeavesNothingRunning(t *testing.T) {
 				return snap.Thread.Status == protocol.ThreadStatusIdle
 			})
 			calls := toolCalls(snap)
-			if got := string(mustMarshal(calls[0].Subagent)); got != `{"status":"stopped","background":true,"model":"mini-child"}` || calls[1].Status != protocol.ToolStatusCancelled || len(snap.Requests) != 0 {
+			if got := string(mustMarshal(calls[0].Subagent)); got != `{"status":"stopped","background":true,"model":"mini-child"}` || calls[1].Status != protocol.ToolStatusCancelled || len(protocol.OpenRequests(snap)) != 0 {
 				t.Fatalf("after the child ended:\n%s", show(rec.all()))
 			}
 		})
@@ -472,7 +472,7 @@ func TestACodexChildThatEndsDuringItsParentsTurnLeavesItRunning(t *testing.T) {
 				t.Fatal("the request wasn't resolved")
 			}
 			snap, _ := sdk.Snapshot(ctx, th.ID)
-			if rec.waitFor(0, []byte(`{"type":"turn.completed"}`), time.Millisecond) >= 0 || snap.Thread.Status != protocol.ThreadStatusRunning || len(snap.Requests) != 0 || toolCalls(snap)[0].Subagent.Status != protocol.SubagentStatusStopped {
+			if rec.waitFor(0, []byte(`{"type":"turn.completed"}`), time.Millisecond) >= 0 || snap.Thread.Status != protocol.ThreadStatusRunning || len(protocol.OpenRequests(snap)) != 0 || toolCalls(snap)[0].Subagent.Status != protocol.SubagentStatusStopped {
 				t.Fatalf("once the child ended:\n%s", show(rec.all()))
 			}
 			sdk.Interrupt(ctx, th.ID)
@@ -537,7 +537,7 @@ func TestACodexChildsApprovalAboutNoneOfItsCallsGoesWithIt(t *testing.T) {
 					return snap.Thread.Status == protocol.ThreadStatusIdle
 				})
 				calls := toolCalls(snap)
-				if got := string(mustMarshal(calls[0].Subagent)); got != `{"status":"stopped","background":true,"model":"mini-child"}` || calls[1].Status != protocol.ToolStatusCancelled || calls[2].Status != protocol.ToolStatusCancelled || len(snap.Requests) != 0 {
+				if got := string(mustMarshal(calls[0].Subagent)); got != `{"status":"stopped","background":true,"model":"mini-child"}` || calls[1].Status != protocol.ToolStatusCancelled || calls[2].Status != protocol.ToolStatusCancelled || len(protocol.OpenRequests(snap)) != 0 {
 					t.Fatalf("after the child ended:\n%s", show(rec.all()))
 				}
 			})

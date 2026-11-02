@@ -12,18 +12,22 @@ use serde_json::{Map, Value, json};
 use tokio::sync::{Mutex, broadcast, oneshot};
 use tokio::task::JoinHandle;
 
-use crate::harness::{Harness, McpServer, Skill, ThreadConfig, TurnEnd};
+use crate::harness::{
+    ControlReply, Harness, HarnessMessageHandler, LaunchOptions, McpServer, Skill, ThreadConfig, TurnEnd,
+};
 use crate::ids::{new_id, now_iso};
 use crate::permissions::PermissionPolicy;
 use crate::protocol::{
-    Attachment, Command, Item, PermissionMode, Resolution, Snapshot, SubagentStatus, Thread, ThreadEvent, ThreadStatus,
+    Attachment, Command, Item, ItemPage, PermissionMode, Resolution, Snapshot, SubagentStatus, Thread, ThreadEvent,
+    ThreadStatus,
 };
-use crate::reducer::{apply_event, initial_state};
+use crate::reducer::{apply_event, initial_state, open_requests};
 use crate::spawner::{Spawner, direct};
 use crate::store::{RunRecord, Store, StoreError};
 use crate::stores::memory::MemoryStore;
 use crate::thread::{Actor, Host, Job, Outgoing, ThreadContext, Turn};
 use crate::tools::Tool;
+use crate::window::{item_page, snapshot_window};
 
 /// What goes wrong.
 #[derive(Clone, Debug)]
@@ -33,6 +37,10 @@ pub enum Error {
     Command(String),
     /// The store failed.
     Store(StoreError),
+    /// A control request ([`AgentThreads::control`]) the harness refused, or didn't answer: its
+    /// process exited first, or the backend closed. `error` is the harness's own error, when it
+    /// gave one (Claude Code's error text, or Codex's JSON-RPC error object).
+    Control { message: String, error: Option<Value> },
     /// Something else: a harness that misbehaved, say (for `on_error`).
     Other(String),
 }
@@ -40,7 +48,7 @@ pub enum Error {
 impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Error::Command(m) | Error::Other(m) => f.write_str(m),
+            Error::Command(m) | Error::Other(m) | Error::Control { message: m, .. } => f.write_str(m),
             Error::Store(e) => write!(f, "the store failed: {e}"),
         }
     }
@@ -112,6 +120,14 @@ pub struct Options {
     /// How many events a subscriber may fall behind by before it misses some (and gets
     /// `RecvError::Lagged`, after which it catches up with `events_since`). 4096 by default.
     pub event_capacity: usize,
+    /// Fill in `raw` on events, items and requests: the harness message each came from. Off by
+    /// default; it's saved with the events, so they take more room.
+    pub raw: bool,
+    /// Called with every line a thread's harness process writes, once its driver has dealt with it:
+    /// for what the protocol leaves out (Claude Code's system messages and rate limit events,
+    /// Codex's token usage...). It's called on the thread's task as the output is read, so it
+    /// should be quick, and mustn't wait on the backend.
+    pub on_harness_message: Option<HarnessMessageHandler>,
 }
 
 impl Default for Options {
@@ -123,6 +139,8 @@ impl Default for Options {
             capabilities: Capabilities::default(),
             on_error: None,
             event_capacity: 4096,
+            raw: false,
+            on_harness_message: None,
         }
     }
 }
@@ -146,6 +164,9 @@ pub struct CreateOptions {
     /// instance's. They aren't stored: after a restart, set them again with
     /// [`configure`](AgentThreads::configure).
     pub capabilities: Capabilities,
+    /// How its harness process is started (args, environment, directories, config directory), on
+    /// top of the harness's options. They're stored with the thread, but not sent to clients.
+    pub launch: LaunchOptions,
 }
 
 /// A message's options.
@@ -163,6 +184,9 @@ pub struct ThreadOptions {
     /// `Some("")` clears it.
     pub effort: Option<String>,
     pub permission_mode: Option<PermissionMode>,
+    /// Replaces how the thread's harness process is started, in full. Only the app sets it: the
+    /// `set_options` command doesn't.
+    pub launch: Option<LaunchOptions>,
 }
 
 /// What [`recover`](AgentThreads::recover) did.
@@ -261,6 +285,8 @@ struct Inner {
     spawner: Arc<dyn Spawner>,
     capabilities: Capabilities,
     on_error: Arc<dyn Fn(Error) + Send + Sync>,
+    raw: bool,
+    on_harness_message: Option<HarnessMessageHandler>,
     events: broadcast::Sender<ThreadEvent>,
     threads: StdMutex<Threads>,
     configs: StdMutex<HashMap<String, Capabilities>>,
@@ -303,6 +329,8 @@ impl AgentThreads {
                 spawner: options.spawner.unwrap_or_else(direct),
                 capabilities: options.capabilities,
                 on_error,
+                raw: options.raw,
+                on_harness_message: options.on_harness_message,
                 events,
                 threads: StdMutex::new(Threads::default()),
                 configs: StdMutex::new(HashMap::new()),
@@ -364,13 +392,17 @@ impl AgentThreads {
         }
         let typed: Thread = serde_json::from_value(thread.clone()).map_err(|e| Error::Command(e.to_string()))?;
         i.configs.lock().unwrap().insert(typed.id.clone(), options.capabilities);
-        i.store.create_thread(&thread).await?;
+        let mut stored = thread.clone();
+        if !options.launch.is_empty() {
+            stored["launch"] = serde_json::to_value(&options.launch).map_err(|e| Error::Command(e.to_string()))?;
+        }
+        i.store.create_thread(&stored).await?;
         let handle = {
             let mut threads = i.threads.lock().unwrap();
             // Checked again under the lock close() collects the threads under, so a close() that
             // started meanwhile either sees this one or refuses it here.
             self.open()?;
-            let (handle, mut actor, rx) = self.actor(initial_state(typed.clone()))?;
+            let (handle, mut actor, rx) = self.actor(initial_state(typed.clone()), options.launch)?;
             actor
                 .core
                 .emit_value(json!({"type": "thread.updated", "thread": thread}));
@@ -436,7 +468,7 @@ impl AgentThreads {
             h.call(move |a| {
                 a.core.config = config;
                 a.core.policy = policy;
-                a.core.options_changed();
+                a.core.config_changed();
                 // A run that outlives the backend is saved knowing it, without an event to save it
                 // with.
                 a.core.request_save();
@@ -541,6 +573,24 @@ impl AgentThreads {
         self.ready(thread_id).await?.call(|a| a.core.snapshot().clone()).await
     }
 
+    /// A window of the thread's state now: its last `limit` items, and what they need from before
+    /// them (spec/PROTOCOL.md, "Windows"); the whole state if it has no more than `limit`.
+    pub async fn snapshot_window(&self, thread_id: &str, limit: usize) -> Result<Snapshot> {
+        self.ready(thread_id)
+            .await?
+            .call(move |a| snapshot_window(a.core.snapshot(), limit))
+            .await
+    }
+
+    /// The thread's items before index `before` (a window's `start`), at most `limit` of them, as
+    /// they are now, for a client loading earlier ones into its window.
+    pub async fn items_before(&self, thread_id: &str, before: u64, limit: usize) -> Result<ItemPage> {
+        self.ready(thread_id)
+            .await?
+            .call(move |a| item_page(a.core.snapshot(), before, limit))
+            .await
+    }
+
     /// The thread's saved events after `seq` (at most `limit`), for a client catching up.
     pub async fn events_since(&self, thread_id: &str, seq: u64, limit: Option<usize>) -> Result<Vec<ThreadEvent>> {
         let handle = self.live(thread_id);
@@ -640,6 +690,31 @@ impl AgentThreads {
         abandon(&self.inner.spawner, &self.inner.store, &self.inner.on_error, run).await;
     }
 
+    /// Sends the thread's running harness process a request of the app's own, and returns its
+    /// answer: for Claude Code a control request's `request` (e.g. `{"subtype":
+    /// "get_context_usage"}`), answered with the control response's `response`; for Codex
+    /// `{"method", "params"?}`, answered with the JSON-RPC result. It's an `Error::Command` if the
+    /// thread has no running process or its harness takes no requests, and an `Error::Control` if
+    /// the harness refuses it, or its process exits (or the backend closes) before it answers. It
+    /// mustn't be used for what the driver does itself (starting turns, answering the harness's
+    /// requests...).
+    pub async fn control(&self, thread_id: &str, request: Value) -> Result<Value> {
+        let (tx, rx) = oneshot::channel();
+        let reply: ControlReply = Box::new(move |r| {
+            let _ = tx.send(r);
+        });
+        self.ready(thread_id)
+            .await?
+            .call(move |a| a.session.control(&mut a.core, request, reply))
+            .await?;
+        rx.await.unwrap_or_else(|_| {
+            Err(Error::Control {
+                message: "the harness didn't answer before the thread was closed".into(),
+                error: None,
+            })
+        })
+    }
+
     // ---------- commands ----------
 
     /// Carries out a command from a client. A command it can't carry out (an unknown thread, a
@@ -664,6 +739,7 @@ impl AgentThreads {
                     model: c.model,
                     effort: c.effort,
                     permission_mode: c.permission_mode,
+                    launch: None,
                 };
                 self.set_options(&c.thread_id, o).await
             }
@@ -713,7 +789,9 @@ impl AgentThreads {
             .await
     }
 
-    /// Changes the thread's model, effort or permission mode, from its next turn.
+    /// Changes the thread's model, effort, permission mode or launch options: the model and
+    /// permission mode straight away where the harness takes them in its running process, and
+    /// otherwise from the next turn.
     pub async fn set_options(&self, thread_id: &str, options: ThreadOptions) -> Result<()> {
         self.ready(thread_id)
             .await?
@@ -732,6 +810,9 @@ impl AgentThreads {
                 });
                 if serde_json::to_value(a.core.thread()).ok() != before {
                     a.core.options_changed();
+                }
+                if let Some(l) = options.launch {
+                    a.core.set_launch(l);
                 }
             })
             .await
@@ -950,11 +1031,17 @@ impl AgentThreads {
             spawner: i.spawner.clone(),
             events: i.events.clone(),
             on_error: i.on_error.clone(),
+            raw: i.raw,
+            on_harness_message: i.on_harness_message.clone(),
         })
     }
 
     /// A thread's actor, not yet running.
-    fn actor(&self, state: Snapshot) -> Result<(Handle, Actor, tokio::sync::mpsc::UnboundedReceiver<Job>)> {
+    fn actor(
+        &self,
+        state: Snapshot,
+        launch: LaunchOptions,
+    ) -> Result<(Handle, Actor, tokio::sync::mpsc::UnboundedReceiver<Job>)> {
         let id = state.thread.id.clone();
         let harness = self.harness(&state.thread.harness).ok_or_else(|| {
             Error::Command(format!(
@@ -962,7 +1049,7 @@ impl AgentThreads {
                 state.thread.harness
             ))
         })?;
-        let (tx, actor, rx) = Actor::start(self.host(), state, self.config(&id), self.policy(&id), |ctx| {
+        let (tx, actor, rx) = Actor::start(self.host(), state, self.config(&id), launch, self.policy(&id), |ctx| {
             harness.open(ctx)
         });
         Ok((
@@ -1066,6 +1153,7 @@ impl AgentThreads {
         let Some(thread) = store.get_thread(thread_id).await? else {
             return Err(Error::Command(format!("there's no thread {thread_id}")));
         };
+        let launch = LaunchOptions::from_stored(&thread);
         let thread: Thread = serde_json::from_value(thread)
             .map_err(|e| Error::Command(format!("thread {thread_id} can't be read: {e}")))?;
         let snap: Option<Snapshot> = store
@@ -1083,7 +1171,7 @@ impl AgentThreads {
         if state.seq == 0 {
             state = initial_state(thread);
         }
-        let (handle, mut actor, rx) = self.actor(state)?;
+        let (handle, mut actor, rx) = self.actor(state, launch)?;
         if !self.reattach(&mut actor).await? {
             // The process that ran its turn went with the backend before this one, or can't be
             // followed.
@@ -1156,10 +1244,7 @@ impl AgentThreads {
         let c = &mut actor.core;
         // Requests the session didn't take up again can't be answered.
         let open = c.open_request_ids();
-        let stale: Vec<String> = c
-            .snapshot()
-            .requests
-            .iter()
+        let stale: Vec<String> = open_requests(c.snapshot())
             .map(|r| r.id().to_string())
             .filter(|id| !open.contains(id))
             .collect();
@@ -1281,8 +1366,8 @@ fn recover_lost(c: &mut ThreadContext) {
         })
         .collect();
     c.stop_subagents(&running);
-    // Its requests can't be answered now.
-    let requests: Vec<String> = c.snapshot().requests.iter().map(|r| r.id().to_string()).collect();
+    // Its open requests can't be answered now.
+    let requests: Vec<String> = open_requests(c.snapshot()).map(|r| r.id().to_string()).collect();
     for id in requests {
         c.emit_resolved(&id, &cancel_resolution());
     }

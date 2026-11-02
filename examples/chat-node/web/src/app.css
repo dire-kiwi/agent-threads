@@ -195,6 +195,7 @@ textarea {
   font-size: 12px;
 }
 .model-form input,
+.model-form select,
 .model-field input {
   margin-left: 6px;
   padding: 3px 6px;

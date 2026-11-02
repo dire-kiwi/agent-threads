@@ -4,7 +4,7 @@
 
 import type { ToolCall } from "@dire-kiwi/agent-threads-protocol";
 import type { ToolMeta } from "./config.js";
-import { AppIcon, BotIcon, FileIcon, GlobeIcon, ListIcon, PencilIcon, PlugIcon, SearchIcon, TerminalIcon, WrenchIcon } from "./icons.js";
+import { AppIcon, BotIcon, FileIcon, GlobeIcon, ListIcon, MapIcon, PencilIcon, PlugIcon, SearchIcon, TerminalIcon, WrenchIcon } from "./icons.js";
 
 type Input = Record<string, unknown>;
 
@@ -60,8 +60,20 @@ export function toolMeta(call: ToolCall, cwd?: string): ToolMeta {
       return { icon: <ListIcon />, label: "Updated the plan", summary: todos.length ? `${done} of ${todos.length} done` : "" };
     }
     default:
+      if (call.name === "ExitPlanMode") return { icon: <MapIcon />, label: "Plan", summary: planTitle(str(input.plan)) };
       return { icon: <WrenchIcon />, label: call.name.replace(/^mcp__/, "").replace(/__/g, " · "), summary: call.title ?? brief(input) };
   }
+}
+
+/**
+ * A plan's title: its first line, if that's a heading, as plain text ("# Plan: add a `cache`" is
+ * "add a cache"); none if it's just "Plan".
+ */
+export function planTitle(plan: string): string {
+  const first = plan.split("\n").map((l) => l.trim()).find((l) => l) ?? "";
+  if (!first.startsWith("#")) return "";
+  const title = first.replace(/^#+\s*/, "").replace(/[`*_]/g, "");
+  return /^plan$/i.test(title) ? "" : title.replace(/^plan:\s*/i, "");
 }
 
 /** A short line for an input: its first few simple fields. */

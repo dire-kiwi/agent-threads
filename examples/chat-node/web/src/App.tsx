@@ -7,6 +7,8 @@ import {
   useSetOptions,
   useThreadState,
   type Command,
+  type ItemPage,
+  type PermissionMode,
   type Snapshot,
   type ThreadEvent,
   type ThreadInfo,
@@ -103,6 +105,12 @@ export function App() {
   );
 }
 
+/**
+ * How many items a thread starts with (the latest), and loads at a time as it's scrolled back:
+ * ?page=n in the URL to try it with a few.
+ */
+const PAGE = Math.max(1, Number(new URLSearchParams(location.search).get("page")) || 100);
+
 /** The open thread, from a snapshot taken on each connection, and the events after it. */
 function ThreadPane({ id, status, generation }: { id: string; status: string; generation: number }) {
   const [snapshot, setSnapshot] = useState<{ snap: Snapshot; generation: number } | null>(null);
@@ -113,7 +121,7 @@ function ThreadPane({ id, status, generation }: { id: string; status: string; ge
     // Asked again on each connection: an error from the last one (it dropped while the snapshot
     // was on its way, say) is gone until this one says otherwise.
     setError(null);
-    conn.call<Snapshot>("snapshot", { thread_id: id }).then(
+    conn.call<Snapshot>("snapshot", { thread_id: id, limit: PAGE }).then(
       (snap) => {
         if (!live) return;
         setError(null);
@@ -124,15 +132,17 @@ function ThreadPane({ id, status, generation }: { id: string; status: string; ge
     return () => void (live = false);
   }, [id, status, generation]);
 
-  // A new source for each snapshot (each connection): it starts from the snapshot, takes the
-  // thread's pushed events, and fetches what it missed (a gap in seq, or what came between the
-  // snapshot and subscribing) with events_since.
+  // A new source for each snapshot (each connection): it starts from the snapshot (a window of the
+  // latest items), takes the thread's pushed events, fetches what it missed (a gap in seq, or what
+  // came between the snapshot and subscribing) with events_since, and earlier items with
+  // items_before.
   const source = useMemo<ThreadSource | null>(
     () =>
       snapshot && {
         snapshot: snapshot.snap,
         subscribe: (fn) => conn.onEvent((e) => e.thread_id === id && fn(e)),
         resync: (seq) => conn.call<ThreadEvent[]>("events_since", { thread_id: id, seq }),
+        loadEarlier: (before) => conn.call<ItemPage>("items_before", { thread_id: id, before, limit: PAGE }),
       },
     [snapshot, id],
   );
@@ -149,7 +159,18 @@ function ThreadPane({ id, status, generation }: { id: string; status: string; ge
   );
 }
 
-/** The thread's title, harness and model, which can be changed for its next turn. */
+/** The permission modes, as the header's picker names them. */
+const MODES: { mode: PermissionMode; label: string }[] = [
+  { mode: "default", label: "ask" },
+  { mode: "accept_edits", label: "accept edits" },
+  { mode: "plan", label: "plan" },
+  { mode: "bypass", label: "bypass" },
+];
+
+/**
+ * The thread's title, harness, model and permission mode. A new model or mode goes to the running
+ * agent straight away where the harness allows, and otherwise from the next turn.
+ */
 function ThreadHeader() {
   const thread = useThreadState((s) => s.snapshot.thread);
   const setOptions = useSetOptions();
@@ -170,6 +191,16 @@ function ThreadHeader() {
           model <input value={model} onChange={(e) => setModel(e.target.value)} size={14} aria-label="Model" />
         </label>
       </form>
+      <label className="model-form">
+        mode{" "}
+        <select value={thread.permission_mode ?? "default"} aria-label="Permission mode" onChange={(e) => void setOptions({ permission_mode: e.target.value as PermissionMode })}>
+          {MODES.map((m) => (
+            <option key={m.mode} value={m.mode}>
+              {m.label}
+            </option>
+          ))}
+        </select>
+      </label>
     </header>
   );
 }

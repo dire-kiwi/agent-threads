@@ -1,8 +1,8 @@
 // Codex's items, plans, questions and usage in the protocol's terms (spec/fixtures/README.md,
 // "Codex").
 
-import type { FileChange, PermissionMode, Question, SubagentState, SubagentStatus, Todo, ToolStatus, Usage } from "@dire-kiwi/agent-threads-protocol";
-import type { McpServer } from "../harness.js";
+import type { FileChange, PermissionMode, Question, RateLimit, SubagentState, SubagentStatus, Todo, ToolStatus, Usage } from "@dire-kiwi/agent-threads-protocol";
+import { unixTime, type McpServer } from "../harness.js";
 import { resultText, slim, type ToolFields } from "../claude/translate.js";
 import type {
   AskForApproval,
@@ -15,6 +15,7 @@ import type {
   ImageViewThreadItem,
   McpToolCallThreadItem,
   SandboxMode,
+  SandboxPolicy,
   ThreadItem,
   TokenUsageBreakdown,
   ToolRequestUserInputQuestion,
@@ -201,6 +202,36 @@ export function codexPolicy(mode: PermissionMode | undefined): { approvalPolicy:
   }
 }
 
+/**
+ * A sandbox mode as turn/start's sandboxPolicy has it. A workspace-write one keeps its settings
+ * (Codex takes those left out as false): the ones Codex last said the thread had (`workspace`), or
+ * else those of the config's `sandbox_workspace_write` (a table, or dotted keys).
+ */
+export function sandboxPolicy(mode: SandboxMode, workspace: SandboxPolicy | undefined, config: { [k: string]: unknown } | undefined): SandboxPolicy {
+  switch (mode) {
+    case "read-only":
+      return { type: "readOnly" };
+    case "danger-full-access":
+      return { type: "dangerFullAccess" };
+  }
+  if (workspace?.type === "workspaceWrite") return workspace;
+  const table = config?.sandbox_workspace_write;
+  const setting = (key: string): unknown =>
+    table && typeof table === "object" && !Array.isArray(table) ? (table as { [k: string]: unknown })[key] : config?.[`sandbox_workspace_write.${key}`];
+  const p: SandboxPolicy = { type: "workspaceWrite" };
+  const roots = setting("writable_roots");
+  if (Array.isArray(roots) && roots.every((r) => typeof r === "string")) p.writableRoots = roots;
+  for (const [key, field] of [
+    ["network_access", "networkAccess"],
+    ["exclude_tmpdir_env_var", "excludeTmpdirEnvVar"],
+    ["exclude_slash_tmp", "excludeSlashTmp"],
+  ] as const) {
+    const v = setting(key);
+    if (typeof v === "boolean") p[field] = v;
+  }
+  return p;
+}
+
 /** An MCP server as Codex's `mcp_servers` config has it, or why it can't be. */
 export function mcpServerConfig(s: McpServer): { [k: string]: unknown } | { unsupported: string } {
   if ("url" in s) {
@@ -208,4 +239,27 @@ export function mcpServerConfig(s: McpServer): { [k: string]: unknown } | { unsu
     return { url: s.url, ...(s.headers && Object.keys(s.headers).length ? { http_headers: s.headers } : {}) };
   }
   return { command: s.command, ...(s.args ? { args: s.args } : {}), ...(s.env ? { env: s.env } : {}) };
+}
+
+/**
+ * The limits an `account/rateLimits/updated` notification's snapshot reports: its primary and
+ * secondary windows, named by its limitId when that isn't Codex's own. A used-up one is rejected,
+ * unless credits carry on past it.
+ */
+export function codexRateLimits(rl: { [k: string]: any }): RateLimit[] {
+  const prefix = typeof rl.limitId === "string" && rl.limitId && rl.limitId !== "codex" ? `${rl.limitId}:` : "";
+  // Credits carry on past a used-up window.
+  const credits = rl.credits?.hasCredits === true || rl.credits?.unlimited === true;
+  const out: RateLimit[] = [];
+  for (const key of ["primary", "secondary"]) {
+    const w = rl[key];
+    if (!w || typeof w !== "object") continue;
+    const used = typeof w.usedPercent === "number" && Number.isFinite(w.usedPercent) ? w.usedPercent : undefined;
+    const limit: RateLimit = { id: prefix + key, status: used !== undefined && used >= 100 ? (credits ? "warning" : "rejected") : "allowed" };
+    if (used !== undefined) limit.used_percent = used;
+    if (typeof w.resetsAt === "number" && Number.isFinite(w.resetsAt)) limit.resets_at = unixTime(w.resetsAt);
+    if (typeof w.windowDurationMins === "number" && Number.isInteger(w.windowDurationMins) && w.windowDurationMins >= 0) limit.window_minutes = w.windowDurationMins;
+    out.push(limit);
+  }
+  return out;
 }

@@ -1,8 +1,8 @@
 // Command chat-go is the chat example's server in Go: agent-threads' Go backend, and the app's own
 // transport, a WebSocket. The SDK has no network layer, so this file is the whole "seam": events
 // out (sdk.Subscribe → every client), commands in (a client's command → sdk.HandleJSON), plus
-// snapshots and EventsSince for clients that connect or reconnect. It speaks examples/PROTOCOL.md,
-// so chat-node's React frontend talks to it unchanged.
+// snapshots (or windows of them), ItemsBefore and EventsSince for clients that connect, scroll back
+// or reconnect. It speaks examples/PROTOCOL.md, so chat-node's React frontend talks to it unchanged.
 //
 //	go run .               the server (see the README)
 //	go run . supervise     the server, started again when it exits for a restart
@@ -71,14 +71,15 @@ func main() {
 	if cfg.shim != "" {
 		shim = ", under the shim"
 	}
-	// Unprefixed, so whatever starts it (chat-node's smoke tests) sees it's listening.
-	fmt.Printf("chat-go on http://127.0.0.1:%d with %s%s; data in %s\n", cfg.port, strings.Join(what, ", "), shim, cfg.data)
+	// Before it says it's listening, so a signal straight after that stops it as any other does.
 	signals := make(chan os.Signal, 1)
 	signal.Notify(signals, syscall.SIGINT, syscall.SIGTERM)
 	go func() {
 		<-signals
 		app.shutdown(0)
 	}()
+	// Unprefixed, so whatever starts it (chat-node's smoke tests) sees it's listening.
+	fmt.Printf("chat-go on http://127.0.0.1:%d with %s%s; data in %s\n", cfg.port, strings.Join(what, ", "), shim, cfg.data)
 	server := &http.Server{Handler: app, ReadHeaderTimeout: 30 * time.Second}
 	app.server = server
 	if err := server.Serve(ln); err != nil && !errors.Is(err, http.ErrServerClosed) {
@@ -392,6 +393,8 @@ func (a *app) call(ctx context.Context, method string, raw json.RawMessage) (any
 		Title    string          `json:"title"`
 		ThreadID string          `json:"thread_id"`
 		Seq      int64           `json:"seq"`
+		Before   int64           `json:"before"`
+		Limit    *int            `json:"limit"`
 		Command  json.RawMessage `json:"command"`
 	}
 	if len(raw) > 0 && json.Unmarshal(raw, &p) != nil {
@@ -425,7 +428,16 @@ func (a *app) call(ctx context.Context, method string, raw json.RawMessage) (any
 		}
 		return nil, &agentthreads.CommandError{Message: fmt.Sprintf("there's no harness %q", p.Harness)}
 	case "snapshot":
+		// With a limit, a window of its latest items; the client loads earlier ones with items_before.
+		if p.Limit != nil {
+			return a.sdk.SnapshotWindow(ctx, p.ThreadID, max(0, *p.Limit))
+		}
 		return a.sdk.Snapshot(ctx, p.ThreadID)
+	case "items_before":
+		if p.Limit == nil {
+			return nil, &agentthreads.CommandError{Message: "items_before needs a limit"}
+		}
+		return a.sdk.ItemsBefore(ctx, p.ThreadID, p.Before, *p.Limit)
 	case "events_since":
 		return a.sdk.EventsSince(ctx, p.ThreadID, p.Seq, 0)
 	case "command":
@@ -511,13 +523,42 @@ func supervise() int {
 	if err != nil {
 		log.Fatal(err)
 	}
-	// Ctrl-C goes to the whole process group, so the server gets it too and shuts down by itself.
-	signal.Ignore(syscall.SIGINT)
-	for {
+	signals := make(chan os.Signal, 1)
+	signal.Notify(signals, syscall.SIGINT, syscall.SIGTERM)
+	return superviseWith(func() *exec.Cmd {
 		cmd := exec.Command(exe)
 		cmd.Stdin, cmd.Stdout, cmd.Stderr = os.Stdin, os.Stdout, os.Stderr
 		cmd.Env = append(os.Environ(), "CHAT_SUPERVISED=1")
-		err := cmd.Run()
+		return cmd
+	}, signals)
+}
+
+// superviseWith runs the servers server makes, one after another while each exits asking for a
+// restart, and returns the last one's exit code. A signal from signals is passed on to the server,
+// which isn't started again: it returns once the server has exited, so it never leaves one behind.
+func superviseWith(server func() *exec.Cmd, signals <-chan os.Signal) int {
+	stopping := false
+	for {
+		cmd := server()
+		if err := cmd.Start(); err != nil {
+			log.Print(err)
+			return 1
+		}
+		done := make(chan error, 1)
+		go func() { done <- cmd.Wait() }()
+		var err error
+	wait:
+		for {
+			select {
+			case err = <-done:
+				break wait
+			// Ctrl-C goes to the whole process group, so the server has it already: having it twice
+			// is harmless.
+			case sig := <-signals:
+				stopping = true
+				cmd.Process.Signal(sig)
+			}
+		}
 		code := 0
 		if err != nil {
 			var exit *exec.ExitError
@@ -527,10 +568,12 @@ func supervise() int {
 			}
 			code = exit.ExitCode()
 		}
-		if code != restartCode {
-			if code < 0 {
-				return 1
-			}
+		switch {
+		case code < 0:
+			return 1
+		case code == restartCode && stopping:
+			return 0
+		case code != restartCode:
 			return code
 		}
 		log.Print("restarting the server…")

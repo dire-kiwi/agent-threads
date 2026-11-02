@@ -6,7 +6,9 @@ import type {
   Attachment,
   Item,
   PermissionRequest,
+  PlanRequest,
   QuestionRequest,
+  RateLimit,
   Resolution,
   SubagentState,
   Thread,
@@ -25,6 +27,32 @@ export type McpServer =
 
 /** A skill: a directory with a SKILL.md (and anything it refers to), or a SKILL.md's text. */
 export type Skill = string | { name: string; content: string };
+
+/**
+ * How a thread's harness process is started, on top of the harness's own options: stored with the
+ * thread (but not sent to clients), so a run started after a restart has them too. A change
+ * applies from the next process the thread starts, as a model change does.
+ */
+export interface LaunchOptions {
+  /**
+   * More arguments, after the harness's (and its options' `args`): for Claude Code, say,
+   * `--allowedTools`, `--disallowedTools` or `--settings`; for Codex, `-c key=value`.
+   */
+  args?: string[];
+  /** Changes to the environment, after the harness options' `env`: a value sets a variable, null removes it. */
+  env?: { [k: string]: string | null };
+  /**
+   * More directories the agent may use besides the working directory: `--add-dir` for Claude
+   * Code, writable roots (`sandbox_workspace_write.writable_roots`) for Codex.
+   */
+  addDirs?: string[];
+  /**
+   * The harness's config directory, in place of the harness options': CLAUDE_CONFIG_DIR for
+   * Claude Code, CODEX_HOME for Codex (used as it is, with its own login and config). The harness
+   * keeps its sessions there, so a thread that changes it can't resume what it had.
+   */
+  configDir?: string;
+}
 
 /** What a thread runs with: the instance's settings with the thread's own on top. */
 export interface ThreadConfig {
@@ -49,11 +77,40 @@ export interface TurnEnd {
   duration_ms?: number;
 }
 
+/** A line a thread's harness process wrote, for the app's onHarnessMessage. */
+export interface HarnessMessage {
+  threadId: string;
+  /** The process that wrote it (the thread's `run.id` while it runs). */
+  runId: string;
+  harness: string;
+  /** The line, without its newline. */
+  line: string;
+  /** The line parsed as JSON; absent if it isn't JSON. */
+  message?: unknown;
+}
+
+/** A line parsed as JSON, or undefined if it isn't JSON. */
+export function parseLine(line: string): unknown {
+  try {
+    return JSON.parse(line);
+  } catch {
+    return undefined;
+  }
+}
+
+/** Unix seconds as an RFC 3339 time, to the second: YYYY-MM-DDTHH:MM:SSZ. */
+export function unixTime(seconds: number): string {
+  return new Date(Math.floor(seconds) * 1000).toISOString().replace(/\.\d{3}Z$/, "Z");
+}
+
 /**
  * A request to open, without the fields the core fills in. Its `parent_id` says which subagent's
  * call it's from when it's about none of the calls (otherwise the call's is taken).
  */
-export type NewRequest = Omit<PermissionRequest, "id" | "turn_id" | "tool_call_id"> | Omit<QuestionRequest, "id" | "turn_id" | "tool_call_id">;
+export type NewRequest =
+  | Omit<PermissionRequest, "id" | "turn_id" | "tool_call_id">
+  | Omit<QuestionRequest, "id" | "turn_id" | "tool_call_id">
+  | Omit<PlanRequest, "id" | "turn_id" | "tool_call_id">;
 
 /** An item to add, without its turn (the core sets the running turn's). */
 export type NewItem = Item extends infer I ? (I extends Item ? Omit<I, "turn_id"> : never) : never;
@@ -63,6 +120,11 @@ export interface ThreadContext {
   readonly threadId: string;
   readonly thread: Thread;
   readonly config: ThreadConfig;
+  /**
+   * How the thread's harness process is started: its args, environment, directories and config
+   * directory (only the fields that are set).
+   */
+  readonly launch: LaunchOptions;
   readonly spawner: Spawner;
   /** The running turn's id, if one is running. */
   readonly turnId: string | undefined;
@@ -80,6 +142,17 @@ export interface ThreadContext {
   delta(itemId: string, kind: "text" | "reasoning", text: string): void;
   /** Changes the thread's fields (undefined removes one); sends nothing if nothing changes. */
   setThread(patch: Partial<Thread>): void;
+  /**
+   * The harness reported usage limits: they replace the thread's `rate_limits` with the same ids
+   * (sending a thread.updated if that changes them).
+   */
+  rateLimits(limits: RateLimit[]): void;
+  /**
+   * Handles a line the harness process `runId` wrote (`message` is it parsed, if it's JSON): runs
+   * `handle`, which translates it, with the events it makes taking it as their `raw` (with the
+   * raw option on), and then passes it to the app's onHarnessMessage.
+   */
+  fromHarness(runId: string, line: string, message: unknown, handle: () => void): void;
   /** The harness took in the queued message with this id. Whether it was queued. */
   tookIn(id: string): boolean;
   /**
@@ -199,10 +272,21 @@ export interface HarnessSession {
    * process that has them). They're sent again with the next turn's start().
    */
   release(): void;
-  /** The thread's options (model, effort, permission mode) or config changed. */
+  /**
+   * The thread's options (model, effort, permission mode) changed: they go to the running process
+   * where the harness takes them, and otherwise apply from the next turn.
+   */
   optionsChanged(): void;
+  /** The thread's config (tools, MCP servers, skills, system prompt) or launch options changed: the next turn needs a new process. */
+  configChanged(): void;
   /** Stop the harness process, if it's running. */
   close(): Promise<void>;
+  /**
+   * Sends the running process a request of the app's own (AgentThreads.control) and resolves with
+   * its answer; rejects with a CommandError if there's no process to send it to, or a ControlError
+   * if the harness refuses it or doesn't answer. A driver without it takes no requests.
+   */
+  control?(request: unknown): Promise<unknown>;
 
   // With a spawner whose processes outlive the backend (Spawner.durable). A driver that has none of
   // these has its runs stopped when the backend restarts, and their turns end.

@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"math"
+	"strconv"
 	"strings"
 	"unicode"
 
@@ -361,6 +362,14 @@ func askQuestions(input json.RawMessage) []protocol.Question {
 	return out
 }
 
+// claudeMode is a permission mode as Claude Code names it, for set_permission_mode and setMode.
+func claudeMode(mode protocol.PermissionMode) string {
+	if m := claudePermissionMode(mode); m != "" {
+		return m
+	}
+	return "default"
+}
+
 // claudePermissionMode is the permission mode as Claude Code names it, or "" for the default.
 func claudePermissionMode(mode protocol.PermissionMode) string {
 	switch mode {
@@ -372,4 +381,86 @@ func claudePermissionMode(mode protocol.PermissionMode) string {
 		return "bypassPermissions"
 	}
 	return ""
+}
+
+// claudeRateLimits is the limit a rate_limit_info reports (from a rate_limit_event, or a message
+// refused for the usage limit), if it says how it stands.
+func claudeRateLimits(info jmap) []protocol.RateLimit {
+	overage := info.bool("isUsingOverage") || info.str("overageStatus") == "allowed" || info.str("overageStatus") == "allowed_warning"
+	var status protocol.RateLimitStatus
+	switch info.str("status") {
+	case "allowed":
+		status = protocol.RateLimitStatusAllowed
+	case "allowed_warning":
+		status = protocol.RateLimitStatusWarning
+	case "rejected":
+		status = protocol.RateLimitStatusRejected
+		if overage {
+			status = protocol.RateLimitStatusWarning
+		}
+	default:
+		return nil
+	}
+	limit := protocol.RateLimit{ID: info.str("rateLimitType"), Status: status}
+	if limit.ID == "" {
+		limit.ID = "unknown"
+	}
+	if u, ok := info.num("utilization"); ok {
+		p := u * 100
+		limit.UsedPercent = &p
+	}
+	if t, ok := info.num("resetsAt"); ok {
+		limit.ResetsAt = unixTime(t)
+	}
+	return []protocol.RateLimit{limit}
+}
+
+// retryText is an api_retry system message's notice text.
+func retryText(m jmap) string {
+	var why []string
+	if e := m.str("error"); e != "" {
+		why = append(why, e)
+	}
+	if n, ok := m.num("error_status"); ok {
+		why = append(why, "status "+strconv.FormatFloat(n, 'f', -1, 64))
+	}
+	text := "API request failed"
+	if len(why) > 0 {
+		text += " (" + strings.Join(why, ", ") + ")"
+	}
+	delay, _ := m.num("retry_delay_ms")
+	return fmt.Sprintf("%s; retrying in %ds (attempt %s of %s).", text, int64(math.Ceil(delay/1000)), jsonText(m["attempt"]), jsonText(m["max_retries"]))
+}
+
+// jsonText is a JSON value as JavaScript's template strings show it: a number's digits,
+// "undefined" for none.
+func jsonText(v json.RawMessage) string {
+	if len(v) == 0 {
+		return "undefined"
+	}
+	if isStr(v) {
+		return rawStr(v)
+	}
+	return string(v)
+}
+
+// hookNotice is a hook_response system message's notice (its level, text and detail), if it makes
+// one: a hook that failed, or said something.
+func hookNotice(m jmap) *protocol.Notice {
+	output := strings.TrimSpace(m.str("output"))
+	if m.str("outcome") == "error" {
+		detail := strings.TrimSpace(m.str("stderr"))
+		if detail == "" {
+			detail = output
+		}
+		text := "Hook " + m.str("hook_name") + " failed"
+		if n, ok := m.num("exit_code"); ok {
+			text += " (exit code " + strconv.FormatFloat(n, 'f', -1, 64) + ")"
+		}
+		return &protocol.Notice{Level: protocol.NoticeLevelWarning, Text: text, Detail: detail}
+	}
+	if output == "" {
+		return nil
+	}
+	return &protocol.Notice{Level: protocol.NoticeLevelInfo, Text: "Hook " + m.str("hook_name") + " ran", Detail: output}
 }

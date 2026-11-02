@@ -10,7 +10,7 @@ import { join } from "node:path";
 import { createInterface } from "node:readline";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { beforeAll, describe, expect, it } from "vitest";
-import { applyEvents, initialState, type Command, type Snapshot, type ThreadEvent } from "@dire-kiwi/agent-threads-protocol";
+import { applyEvents, initialState, openRequests, type Command, type Snapshot, type ThreadEvent } from "@dire-kiwi/agent-threads-protocol";
 import { FileStore } from "../stores/file.js";
 import { shim } from "../shim.js";
 import { readJsonl, shimPath, specDir, tempDir } from "./spec.js";
@@ -162,8 +162,8 @@ describe.skipIf(process.platform === "win32")("a backend restart", () => {
       const snap = await b.call<Snapshot>("snapshot", thread.id);
       expect(snap.thread.status).toBe("waiting");
       expect(snap.thread.run?.reattached_at).toBeDefined();
-      expect(snap.requests).toHaveLength(1);
-      await b.call("handle", { type: "respond", thread_id: thread.id, request_id: snap.requests[0]!.id, resolution: { outcome: "allow" } } satisfies Command);
+      expect(openRequests(snap)).toHaveLength(1);
+      await b.call("handle", { type: "respond", thread_id: thread.id, request_id: openRequests(snap)[0]!.id, resolution: { outcome: "allow" } } satisfies Command);
       await b.waitFor({ type: "thread.updated", thread: { status: "idle" } });
       await b.call("close", { stop: true });
       await b.exited;
@@ -240,7 +240,7 @@ describe.skipIf(process.platform === "win32")("a backend restart", () => {
       const b = s.start();
       expect(await b.call("recover")).toEqual({ reattached: [thread.id], lost: [] });
       const snap = await b.call<Snapshot>("snapshot", thread.id);
-      await b.call("handle", { type: "respond", thread_id: thread.id, request_id: snap.requests[0]!.id, resolution: { outcome: "allow" } } satisfies Command);
+      await b.call("handle", { type: "respond", thread_id: thread.id, request_id: openRequests(snap)[0]!.id, resolution: { outcome: "allow" } } satisfies Command);
       await b.waitFor({ type: "thread.updated", thread: { status: "idle" } });
       await b.call("close", { stop: true });
       await b.exited;
@@ -269,8 +269,9 @@ describe.skipIf(process.platform === "win32")("a backend restart", () => {
     const a = s.start();
     const thread = await a.call<{ id: string }>("create", { harness, cwd: s.dirs.cwd });
     await a.call("handle", { type: "send", thread_id: thread.id, text: "app lookup {}" } satisfies Command);
-    // It has done what it does, and hasn't returned.
-    await until(() => existsSync(marker));
+    // It has done what it does, and hasn't returned. (The file is there before what's written to it.)
+    const ran = () => (existsSync(marker) ? readFileSync(marker, "utf8") : "");
+    await until(() => ran().includes("ran\n"));
     if (how === "died") await a.crash();
     else {
       // Shutting down aborts it, which it returns on: it isn't answered, but left for the next.
@@ -284,7 +285,7 @@ describe.skipIf(process.platform === "win32")("a backend restart", () => {
     const snap = await b.call<Snapshot>("snapshot", thread.id);
     await b.call("close", { stop: true });
     await b.exited;
-    expect(readFileSync(marker, "utf8")).toBe("ran\n");
+    expect(ran()).toBe("ran\n");
     // The agent was told it may have finished.
     const said = snap.items.filter((i) => i.type === "assistant_message").map((i) => (i.type === "assistant_message" ? i.text : ""));
     expect(said.join("\n")).toMatch(/may or may not have finished/);
@@ -313,7 +314,8 @@ describe.skipIf(process.platform === "win32")("a backend restart", () => {
       const [agent, bash] = snap.items.filter((i) => i.type === "tool_call");
       expect(agent).toMatchObject({ status: "completed", subagent: { status: "stopped", background: true } });
       expect(bash).toMatchObject({ status: "cancelled", parent_id: agent!.id });
-      expect(snap.requests).toEqual([]);
+      // None is still open (the subagent's was cancelled with it).
+      expect(openRequests(snap)).toEqual([]);
       expect(snap.thread).toMatchObject({ status: "idle" });
       expect(snap.thread.run).toBeUndefined();
       // Its one turn had ended: it isn't ended again.
@@ -337,7 +339,7 @@ describe.skipIf(process.platform === "win32")("a backend restart", () => {
     let snap = await b.call<Snapshot>("snapshot", thread.id);
     expect(snap.thread.status).toBe("waiting");
     const from = b.events.length;
-    await b.call("handle", { type: "respond", thread_id: thread.id, request_id: snap.requests[0]!.id, resolution: { outcome: "allow" } } satisfies Command);
+    await b.call("handle", { type: "respond", thread_id: thread.id, request_id: openRequests(snap)[0]!.id, resolution: { outcome: "allow" } } satisfies Command);
     // Answered with no turn running, the thread is idle; then Claude's report is a turn of its own.
     await until(() => b.events.slice(from).filter((e) => e.type === "turn.completed").length === 1);
     snap = await b.call<Snapshot>("snapshot", thread.id);
@@ -388,11 +390,12 @@ describe.skipIf(process.platform === "win32")("a backend restart", () => {
   it("starts a new process for the next turn after a restart if the options changed, as it would have", { timeout: 60_000 }, async () => {
     const s = mini();
     const a = s.start();
-    const thread = await a.call<{ id: string }>("create", { harness: "claude", model: "old", cwd: s.dirs.cwd });
+    // A new effort needs a new process (a model or permission mode doesn't).
+    const thread = await a.call<{ id: string }>("create", { harness: "claude", effort: "old", cwd: s.dirs.cwd });
     await a.call("handle", { type: "send", thread_id: thread.id, text: "reply one" } satisfies Command);
     await a.waitFor({ type: "turn.completed" });
-    await a.call("handle", { type: "set_options", thread_id: thread.id, model: "new" } satisfies Command);
-    await a.waitFor({ type: "thread.updated", thread: { model: "new" } });
+    await a.call("handle", { type: "set_options", thread_id: thread.id, effort: "new" } satisfies Command);
+    await a.waitFor({ type: "thread.updated", thread: { effort: "new" } });
     await a.call("saved", thread.id);
     await a.crash();
 
@@ -403,7 +406,7 @@ describe.skipIf(process.platform === "win32")("a backend restart", () => {
     await b.call("close", { stop: true });
     await b.exited;
     const argvs = readFileSync(s.log, "utf8").trim().split("\n").map((l) => JSON.parse(l)).filter((l) => l.argv).map((l) => l.argv as string[]);
-    expect(argvs.map((v) => v[v.indexOf("--model") + 1])).toEqual(["old", "new"]);
+    expect(argvs.map((v) => v[v.indexOf("--effort") + 1])).toEqual(["old", "new"]);
   });
 
   it("carries on stopping a run's process group after the backend that was stopping it exits, or is killed", { timeout: 60_000 }, async () => {
@@ -574,7 +577,7 @@ describe.skipIf(process.platform === "win32")("a backend restart", () => {
     // The tool's still running: nothing's asked of the user, and the turn runs on.
     await sleep(500);
     const snap = await b.call<Snapshot>("snapshot", thread.id);
-    expect(snap.requests).toEqual([]);
+    expect(openRequests(snap)).toEqual([]);
     expect(snap.thread.status).toBe("running");
     expect(b.events.some((e) => e.type === "request.opened")).toBe(false);
     if (opening === "saved") {

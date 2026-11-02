@@ -9,18 +9,20 @@
 
 import { mkdtempSync, realpathSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join, resolve, sep } from "node:path";
-import type { Resolution, SubagentState, ToolCall, Usage } from "@dire-kiwi/agent-threads-protocol";
+import { isAbsolute, join, resolve, sep } from "node:path";
+import type { PermissionMode, Resolution, SubagentState, ToolCall, Usage } from "@dire-kiwi/agent-threads-protocol";
 import { messageParts } from "../attachments.js";
 import { title } from "../claude/translate.js";
-import { ancestors, inBackground, runningInBackground, type Harness, type HarnessSession, type Message, type RunCheckpoint, type ThreadContext } from "../harness.js";
+import { CommandError, ControlError } from "../errors.js";
+import { ancestors, inBackground, parseLine, runningInBackground, type Harness, type HarnessSession, type Message, type RunCheckpoint, type ThreadContext } from "../harness.js";
 import { newId } from "../ids.js";
+import { applyLaunchEnv, launchedOf, launchFromStored, sameLaunch, withEnv, type Launched } from "../launch.js";
 import { serveTools, type LoopbackMcp } from "../mcp-http.js";
-import { permissionKey, type PermissionDecision, type PermissionQuery } from "../permissions.js";
+import { modeAfterPlan, permissionKey, type PermissionDecision, type PermissionQuery } from "../permissions.js";
 import { writeSkills } from "../skills.js";
 import type { ExitStatus, HarnessProcess, ProcessHandlers } from "../spawner.js";
 import type { RunRecord } from "../store.js";
-import { SECRET } from "../thread.js";
+import { addUsage, SECRET } from "../thread.js";
 import { runTool, type Tool } from "../tools.js";
 import { defaultCodexHome, prepareCodexHome, readSessionState, userCodexHome, writeSessionState, type SessionState } from "./home.js";
 import type {
@@ -39,6 +41,9 @@ import type {
   ToolRequestUserInputResponse,
   Turn,
   TurnPlanUpdatedNotification,
+  SandboxMode,
+  SandboxPolicy,
+  TurnStartParams,
   TurnStartResponse,
   UserInput,
 } from "./protocol.js";
@@ -48,12 +53,14 @@ import {
   childTurnSubagent,
   codexDone,
   codexPolicy,
+  codexRateLimits,
   codexTool,
   codexUsage,
   collabSubagent,
   isToolItem,
   mcpServerConfig,
   questions,
+  sandboxPolicy,
   spawnDone,
   todos,
   unwrapCommand,
@@ -118,8 +125,18 @@ interface OpenRequest {
 /** A message sent (by turn/start or turn/steer), by what Codex echoes when it takes it in. */
 type Sent = { ids: string[]; key: string };
 
-/** The thread's options a process is started with: a different one needs another. */
-type Launched = { model?: string; effort?: string; permission_mode?: string };
+/** What Codex is told when the user approves its plan, as its own client says it. */
+const IMPLEMENT = "Implement the plan.";
+
+/**
+ * A thread's turn that has had a plan from Codex: what its Codex turns so far used, and the plan
+ * request while the user hasn't answered it (the turn goes on meanwhile).
+ */
+interface Planned {
+  usage?: Usage;
+  duration_ms?: number;
+  request?: string;
+}
 
 /**
  * What a run's checkpoint holds (see HarnessSession.checkpoint): what's needed to carry on reading
@@ -153,6 +170,12 @@ interface RunState {
   held: string[];
   rpc: { next: number; pending: PendingRequest[] };
   launched?: Launched;
+  model?: string;
+  workspace?: SandboxPolicy;
+  sandbox?: SandboxMode;
+  collab?: "plan" | "default";
+  proposed?: string;
+  planned?: Planned;
   stale?: boolean;
   /** When the session's stop timer goes off (ms since the epoch). */
   stopAt?: number;
@@ -222,6 +245,18 @@ class Run {
   /** Queued messages this process has (it was sent them, and didn't refuse them). */
   held = new Set<string>();
   launched: Launched | undefined;
+  /** The model Codex says the thread runs, for a collaboration mode's settings when the thread has none of its own. */
+  model: string | undefined;
+  /** The workspace-write sandbox Codex last said the thread had, with its settings. */
+  workspace: SandboxPolicy | undefined;
+  /** The sandbox mode it has (none: its permission mode's, from a checkpoint from before this was kept). */
+  sandbox: SandboxMode | undefined;
+  /** The collaboration mode it was last given (none: it's in its default one). */
+  collab: "plan" | "default" | undefined;
+  /** The plan the running Codex turn proposed, in plan mode. */
+  proposed: string | undefined;
+  /** The thread's turn has had a plan. */
+  planned: Planned | undefined;
   /** Left running when the backend shut down: nothing more is read or written. */
   detached = false;
 
@@ -264,6 +299,12 @@ class Run {
       held: [...this.held],
       rpc: this.rpc.state(),
       ...(this.launched ? { launched: this.launched } : {}),
+      ...(this.model ? { model: this.model } : {}),
+      ...(this.workspace ? { workspace: this.workspace } : {}),
+      ...(this.sandbox ? { sandbox: this.sandbox } : {}),
+      ...(this.collab ? { collab: this.collab } : {}),
+      ...(this.proposed !== undefined ? { proposed: this.proposed } : {}),
+      ...(this.planned ? { planned: this.planned } : {}),
     };
   }
 
@@ -293,6 +334,12 @@ class Run {
     this.sent = st.sent;
     this.held = new Set(st.held);
     if (st.launched) this.launched = { ...st.launched };
+    this.model = st.model;
+    this.workspace = st.workspace;
+    this.sandbox = st.sandbox;
+    this.collab = st.collab;
+    this.proposed = st.proposed;
+    if (st.planned) this.planned = { ...st.planned };
     this.ready = Promise.resolve(st.threadId);
   }
 
@@ -332,6 +379,8 @@ class CodexSession implements HarnessSession {
   /** A directory for the thread's generated files (skills, attached files), made when needed. */
   #tmp: string | undefined;
   #closed = false;
+  /** The app's control requests not yet answered: what fails each, when the backend lets go of its run. */
+  #controls = new Set<(error: Error) => void>();
 
   constructor(ctx: ThreadContext, options: CodexOptions) {
     this.#ctx = ctx;
@@ -358,6 +407,12 @@ class CodexSession implements HarnessSession {
     // With no process, there's no turn to steer: the message stays queued, and the turn's end
     // carries it over.
     if (!run) return;
+    if (run.planned?.request) {
+      // A message instead of an answer to the plan: it goes to Codex, which keeps planning.
+      this.#ctx.cancelRequest(run.planned.request);
+      run.planned.request = undefined;
+      return this.#turnStart(run, [message]);
+    }
     const input = this.#input([message]);
     const sent = this.#sent(run, [message.id], input);
     run.withTurn((turnId) => {
@@ -383,6 +438,8 @@ class CodexSession implements HarnessSession {
   interrupt(): void {
     const run = this.#live();
     if (!run) return;
+    // Waiting on the user's answer to a plan, with no Codex turn to interrupt.
+    if (run.planned?.request) return this.#endPlanned(run);
     this.#stopAfter(run, this.#o.stopGraceMs ?? 10_000);
     const turn = this.#ctx.turnId;
     const send = () => {
@@ -415,6 +472,14 @@ class CodexSession implements HarnessSession {
   }
 
   optionsChanged(): void {
+    // Codex takes them with the next turn (#turnOptions), and keeps them: a model or effort that's
+    // cleared, which turn/start can't say, needs a new process, which starts with Codex's own.
+    const l = this.#live()?.launched;
+    const t = this.#ctx.thread;
+    if (l && ((l.model && !t.model) || (l.effort && !t.effort))) this.#stale = true;
+  }
+
+  configChanged(): void {
     this.#stale = true;
   }
 
@@ -497,10 +562,9 @@ class CodexSession implements HarnessSession {
         (e) => this.#notice(`The app's tools aren't available to this turn any more: ${e instanceof Error ? e.message : String(e)}`),
       );
     }
-    // A process started with other options than the thread's now is replaced at the next turn.
-    const t = ctx.thread;
-    const l = st.launched;
-    this.#stale = !!st.stale || !l || l.model !== t.model || l.effort !== t.effort || l.permission_mode !== t.permission_mode;
+    // The options it doesn't have go with its next turn; one whose options aren't known, or that was
+    // started with other launch options than the thread's now, is replaced.
+    this.#stale = !!st.stale || !st.launched || !sameLaunch(launchFromStored(st.launched.launch), ctx.launch);
     // Codex's requests that were open: the user's questions are taken up again, an app tool that
     // was running is answered (not run again), and the rest are dealt with again. One answered
     // before the restart, though that wasn't saved, is closed: Codex has its answer.
@@ -509,6 +573,9 @@ class CodexSession implements HarnessSession {
       else this.#reopen(run, id, open);
     }
     if (st.stopAt !== undefined) this.#stopAfter(run, Math.max(0, st.stopAt - Date.now()));
+    // A plan the user was asked about is still asked; if it's no longer open, its turn ends.
+    const plan = run.planned?.request;
+    if (plan && !ctx.reopen(plan, (res) => this.#planAnswered(run, res))) queueMicrotask(() => this.#endPlanned(run));
     return true;
   }
 
@@ -521,7 +588,36 @@ class CodexSession implements HarnessSession {
     run.proc.detach();
     run.abort.abort();
     void run.mcp?.close();
+    for (const fail of [...this.#controls]) fail(new ControlError("The backend closed before Codex answered."));
     return true;
+  }
+
+  control(request: unknown): Promise<unknown> {
+    const run = this.#live();
+    if (!run?.proc || !run.rpc || run.detached) return Promise.reject(new CommandError(`thread ${this.#ctx.threadId} has no running Codex process`));
+    const r = request as { method?: unknown; params?: unknown } | null;
+    if (!r || typeof r !== "object" || Array.isArray(r) || typeof r.method !== "string") {
+      return Promise.reject(new CommandError("a Codex control request is an object with a method (and params)"));
+    }
+    return new Promise((resolve, reject) => {
+      const fail = (e: Error) => {
+        this.#controls.delete(fail);
+        reject(e);
+      };
+      this.#controls.add(fail);
+      run.rpc.requestRaw(r.method as string, r.params).then(
+        (result) => {
+          if (!this.#controls.has(fail)) return;
+          this.#controls.delete(fail);
+          resolve(result);
+        },
+        (e: unknown) => {
+          if (!this.#controls.has(fail)) return;
+          this.#controls.delete(fail);
+          reject(e instanceof RpcError ? new ControlError(e.message, e.error) : e);
+        },
+      );
+    });
   }
 
   /** A request of Codex's that was open when the backend restarted. */
@@ -555,18 +651,54 @@ class CodexSession implements HarnessSession {
   /** Starts a Codex turn with the messages. */
   #turnStart(run: Run, messages: Message[]): void {
     const input = this.#input(messages);
-    const sent = this.#sent(run, messages.map((m) => m.id), input);
+    this.#startTurn(run, input, this.#sent(run, messages.map((m) => m.id), input));
+  }
+
+  /** Starts a Codex turn with the input: the messages `sent`, or the driver's own. */
+  #startTurn(run: Run, input: UserInput[], sent?: Sent): void {
     run.starting = true;
-    const effort = this.#ctx.thread.effort;
+    let before: Pick<Run, "launched" | "collab" | "sandbox"> | undefined;
     void run.ready
-      .then((threadId) => run.rpc.request<TurnStartResponse>("turn/start", { threadId, input, ...(effort ? { effort } : {}) }, { sent }))
+      .then((threadId) => {
+        before = { launched: run.launched, collab: run.collab, sandbox: run.sandbox };
+        return run.rpc.request<TurnStartResponse>("turn/start", { threadId, input, ...this.#turnOptions(run) }, sent ? { sent } : {});
+      })
       .then((r) => {
         if (r.turn?.id && run.starting && !run.turnId) run.setTurn(r.turn.id);
       })
       .catch((e) => {
-        this.#refused(run, sent);
+        // Refused, the process hasn't the options it was sent with it.
+        if (before && e instanceof RpcError) Object.assign(run, before);
+        if (sent) this.#refused(run, sent);
         this.#turnFailed(run, e);
       });
+  }
+
+  /**
+   * turn/start's options: the thread's effort, and what the process doesn't have yet (Codex keeps
+   * them for later turns): the model, the policy for the permission mode, and in plan mode the
+   * collaboration mode `plan` (and `default` after it).
+   */
+  #turnOptions(run: Run): Omit<TurnStartParams, "threadId" | "input"> {
+    const t = this.#ctx.thread;
+    const l = run.launched ?? {};
+    const o: Omit<TurnStartParams, "threadId" | "input"> = {};
+    if (t.effort) o.effort = t.effort;
+    if (t.model && t.model !== l.model) o.model = t.model;
+    const before = codexPolicy(l.permission_mode as PermissionMode | undefined);
+    const now = codexPolicy(t.permission_mode);
+    if (before.approvalPolicy !== now.approvalPolicy) o.approvalPolicy = now.approvalPolicy;
+    // Only a new sandbox, since what's sent replaces all of it.
+    if ((run.sandbox ?? before.sandbox) !== now.sandbox) o.sandboxPolicy = sandboxPolicy(now.sandbox, run.workspace, this.#o.config);
+    run.sandbox = now.sandbox;
+    const collab = t.permission_mode === "plan" ? "plan" : run.collab === "plan" ? "default" : undefined;
+    if (collab) {
+      const model = t.model ?? l.model ?? run.model ?? "";
+      o.collaborationMode = { mode: collab, settings: { model, reasoning_effort: t.effort ?? null, developer_instructions: null } };
+      run.collab = collab;
+    }
+    run.launched = { ...l, model: t.model ?? l.model, effort: t.effort, permission_mode: t.permission_mode };
+    return o;
   }
 
   /** Messages are being sent to the process, as this input. */
@@ -587,7 +719,14 @@ class CodexSession implements HarnessSession {
   #turnFailed(run: Run, e: unknown): void {
     if (run.exited || run.retired || run !== this.#run) return;
     run.turnEnded();
-    if (this.#ctx.turnId) this.#ctx.endTurn({ ok: false, error: e instanceof Error ? e.message : String(e) });
+    if (this.#ctx.turnId) this.#ctx.endTurn({ ok: false, error: e instanceof Error ? e.message : String(e), ...this.#plannedSoFar(run) });
+    run.planned = undefined;
+  }
+
+  /** What the turn's Codex turns that completed (its plans') used, for a turn that ends otherwise. */
+  #plannedSoFar(run: Run): { usage?: Usage; duration_ms?: number } {
+    const p = run.planned;
+    return { ...(p?.usage ? { usage: p.usage } : {}), ...(p?.duration_ms !== undefined ? { duration_ms: p.duration_ms } : {}) };
   }
 
   // ---------- the process ----------
@@ -659,9 +798,12 @@ class CodexSession implements HarnessSession {
     }
     const ctx = this.#ctx;
     const o = this.#o;
+    const launch = ctx.launch;
     let home: string;
     try {
-      home = o.userConfig ? userCodexHome() : prepareCodexHome(o.home ?? defaultCodexHome(), o.login ?? userCodexHome());
+      // The thread's own CODEX_HOME is used as it is.
+      if (launch.configDir) home = resolve(launch.configDir);
+      else home = o.userConfig ? userCodexHome() : prepareCodexHome(o.home ?? defaultCodexHome(), o.login ?? userCodexHome());
     } catch (e) {
       this.#exited(run, { code: null, signal: null, error: e instanceof Error ? e : new Error(String(e)) });
       throw e;
@@ -671,9 +813,9 @@ class CodexSession implements HarnessSession {
       proc = ctx.spawner.spawn(
         {
           command: o.bin ?? "codex",
-          args: [...(o.binArgs ?? []), "app-server", ...(o.args ?? [])],
+          args: [...(o.binArgs ?? []), "app-server", ...(o.args ?? []), ...(launch.args ?? [])],
           ...(ctx.thread.cwd ? { cwd: ctx.thread.cwd } : {}),
-          env: { ...process.env, ...o.env, CODEX_HOME: home },
+          env: { ...applyLaunchEnv(withEnv(o.env), launch), CODEX_HOME: home },
           threadId: ctx.threadId,
           runId: run.id,
         },
@@ -684,7 +826,6 @@ class CodexSession implements HarnessSession {
       throw e;
     }
     run.proc = proc;
-    run.launched = { model: ctx.thread.model, effort: ctx.thread.effort, permission_mode: ctx.thread.permission_mode };
     ctx.setThread({ run: { id: run.id, spawner: ctx.spawner.name, started_at: new Date().toISOString() } });
 
     try {
@@ -702,6 +843,8 @@ class CodexSession implements HarnessSession {
       if (!o.userConfig) run.hiddenSkills = await this.#ambientSkills(run);
       const r = await this.#startThread(run);
       run.threadId = r.thread.id;
+      if (r.model) run.model = r.model;
+      if (r.sandbox?.type === "workspaceWrite") run.workspace = r.sandbox;
       if (ctx.thread.session_id !== run.threadId) ctx.setThread({ session_id: run.threadId });
       return run.threadId;
     } catch (e) {
@@ -819,13 +962,20 @@ class CodexSession implements HarnessSession {
       "features.default_mode_request_user_input": true,
       suppress_unstable_features_warning: true,
       ...(Object.keys(servers).length ? { mcp_servers: servers } : {}),
+      ...writableRoots(this.#o.config, ctx.launch.addDirs, t.cwd),
       ...(run.hiddenSkills.length ? { skills: { config: run.hiddenSkills.map((path) => ({ path, enabled: false })) } } : {}),
     };
     const dynamic = fresh ? [...(run.dynamic?.values() ?? [])] : [];
+    run.launched = launchedOf(ctx);
+    // The thread starts in the workspace-write sandbox whatever its mode, so that Codex says what
+    // that sandbox is with all of its config (CODEX_HOME's, the thread's writable roots...): the
+    // first turn puts it in its mode's, and switching back to workspace-write later has it all.
+    run.sandbox = "workspace-write";
     return {
       ...(t.cwd ? { cwd: t.cwd } : {}),
       ...(t.model ? { model: t.model } : {}),
-      ...codexPolicy(t.permission_mode),
+      approvalPolicy: codexPolicy(t.permission_mode).approvalPolicy,
+      sandbox: "workspace-write",
       config,
       ...(dynamic.length ? { dynamicTools: dynamic.map((d) => ({ type: "function" as const, ...d })) } : {}),
       ...(systemPrompt ? { developerInstructions: systemPrompt } : {}),
@@ -834,7 +984,10 @@ class CodexSession implements HarnessSession {
 
   #handlers(run: Run): ProcessHandlers {
     return {
-      line: (line) => this.#line(run, line),
+      line: (line) => {
+        const m = parseLine(line);
+        this.#ctx.fromHarness(run.id, line, m, () => this.#line(run, m));
+      },
       stderr: (line) => {
         run.stderr.push(line);
         if (run.stderr.length > 20) run.stderr.shift();
@@ -863,8 +1016,9 @@ class CodexSession implements HarnessSession {
     // A run that ends while its turn is running ends the turn (as interrupted, if it was).
     if (!run.retired && ctx.turnId) {
       this.#clearStop();
-      ctx.endTurn({ ok: false, error: exitError(status, run.stderr, true) });
+      ctx.endTurn({ ok: false, error: exitError(status, run.stderr, true), ...this.#plannedSoFar(run) });
     }
+    run.planned = undefined;
     run.finish();
   }
 
@@ -874,14 +1028,11 @@ class CodexSession implements HarnessSession {
 
   // ---------- what Codex says ----------
 
-  #line(run: Run, line: string): void {
-    let m: Incoming;
-    try {
-      m = JSON.parse(line);
-    } catch {
-      return; // Not a message: the app server writes only JSON-RPC to stdout, but be safe.
-    }
-    if (!m || typeof m !== "object") return;
+  /** A line of Codex's output, parsed (undefined if it isn't JSON). */
+  #line(run: Run, parsed: unknown): void {
+    // Not a message: the app server writes only JSON-RPC to stdout, but be safe.
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return;
+    const m = parsed as Incoming;
     if (run.rpc.take(m)) return;
     if (run.retired || run !== this.#run) {
       // A run being stopped: its requests go unanswered.
@@ -945,8 +1096,17 @@ class CodexSession implements HarnessSession {
       case "turn/completed":
         if (own) return this.#turnCompleted(run, p.turn as Turn);
         return this.#childDone(run, p.threadId, p.turn as Turn, parent_id!);
+      case "thread/settings/updated": {
+        // Its workspace-write sandbox, kept for when it's switched back to it.
+        const sandbox = p.threadSettings?.sandboxPolicy;
+        if (own && sandbox?.type === "workspaceWrite") run.workspace = sandbox;
+        return;
+      }
       case "thread/tokenUsage/updated":
         if (own && p.tokenUsage?.total) run.total = p.tokenUsage.total;
+        return;
+      case "account/rateLimits/updated":
+        if (p.rateLimits && typeof p.rateLimits === "object") ctx.rateLimits(codexRateLimits(p.rateLimits));
         return;
       case "warning":
         if (own && p.threadId && p.message) this.#notice(p.message);
@@ -998,6 +1158,7 @@ class CodexSession implements HarnessSession {
             ? ((item.summary ?? []).join("\n\n") || (item.content ?? []).join("\n\n"))
             : (item.text ?? "");
         if (child && item.type === "agentMessage") run.lastChild.set(child, text);
+        if (!child && item.type === "plan") run.proposed = text;
         if (run.streamed.has(item.id)) ctx.updateItem(item.id, { text });
         else if (text) ctx.addItem({ id: item.id, type: item.type === "reasoning" ? "reasoning" : "assistant_message", text, ...under });
         return;
@@ -1066,6 +1227,8 @@ class CodexSession implements HarnessSession {
   #turnCompleted(run: Run, turn: Turn): void {
     const ctx = this.#ctx;
     const error = run.error;
+    const plan = run.proposed;
+    run.proposed = undefined;
     run.turnEnded();
     run.error = null;
     // The turn's requests are moot now; its open ones are cancelled with it. A background
@@ -1083,11 +1246,55 @@ class CodexSession implements HarnessSession {
     if (!ctx.turnId) return;
     this.#clearStop();
     const ok = turn?.status === "completed";
+    // The thread's turn is all of its Codex turns, the plans' included.
+    const sum: Planned = { ...run.planned };
+    sum.usage = addUsage(sum.usage, usage);
+    if (typeof turn?.durationMs === "number") sum.duration_ms = (sum.duration_ms ?? 0) + turn.durationMs;
+    delete sum.request;
+    if (plan !== undefined && ok && ctx.thread.permission_mode === "plan" && !ctx.interrupted) {
+      // A plan: the turn goes on while the user decides whether to start on it.
+      run.planned = sum;
+      run.planned.request = ctx.ask({ type: "plan", plan }, undefined, (res) => this.#planAnswered(run, res));
+      return;
+    }
+    run.planned = undefined;
     ctx.endTurn({
       ok,
       ...(turn?.status === "failed" ? { error: turn.error?.message ?? error ?? "The turn failed." } : {}),
-      ...(usage ? { usage } : {}),
-      ...(typeof turn?.durationMs === "number" ? { duration_ms: turn.durationMs } : {}),
+      ...(sum.usage ? { usage: sum.usage } : {}),
+      ...(sum.duration_ms !== undefined ? { duration_ms: sum.duration_ms } : {}),
+    });
+  }
+
+  /**
+   * The user answered a plan: approved, Codex implements it in the mode the thread carries on in;
+   * sent back with feedback, it plans again. Either way in another Codex turn of the same turn.
+   * Otherwise the turn ends.
+   */
+  #planAnswered(run: Run, res: Resolution): void {
+    if (run !== this.#live() || !run.planned?.request || run.detached) return;
+    run.planned.request = undefined;
+    const ctx = this.#ctx;
+    const text = (t: string): UserInput[] => [{ type: "text", text: t, text_elements: [] }];
+    if (res.outcome === "allow") {
+      ctx.setThread({ permission_mode: modeAfterPlan(ctx.thread.permission_mode, res.permission_mode) });
+      this.#startTurn(run, text(IMPLEMENT));
+    } else if (res.outcome === "deny" && res.message) this.#startTurn(run, text(res.message));
+    else this.#endPlanned(run);
+  }
+
+  /** Ends a turn that's waiting on its plan (or whose plan wasn't answered), as its Codex turns went. */
+  #endPlanned(run: Run): void {
+    const planned = run.planned;
+    if (!planned || run !== this.#run) return;
+    run.planned = undefined;
+    if (planned.request) this.#ctx.cancelRequest(planned.request);
+    this.#clearStop();
+    if (!this.#ctx.turnId) return;
+    this.#ctx.endTurn({
+      ok: true,
+      ...(planned.usage ? { usage: planned.usage } : {}),
+      ...(planned.duration_ms !== undefined ? { duration_ms: planned.duration_ms } : {}),
     });
   }
 
@@ -1405,6 +1612,21 @@ class CodexSession implements HarnessSession {
 
 type ToolSpec = { name: string; description: string; inputSchema: unknown };
 type Totals = NonNullable<SessionState["totals"]>;
+
+/** Where Codex's sandbox lets the agent write besides the working directory (a dotted config key). */
+const WRITABLE_ROOTS = "sandbox_workspace_write.writable_roots";
+
+/**
+ * The thread's other directories, as config: writable as its working directory is (relative ones
+ * are in it), after any the options' config gives. Nothing if it has none.
+ */
+function writableRoots(config: { [k: string]: unknown } | undefined, addDirs: string[] | undefined, cwd: string | undefined): { [k: string]: unknown } {
+  if (!addDirs?.length) return {};
+  const given = config?.[WRITABLE_ROOTS];
+  const roots = Array.isArray(given) ? [...given] : [];
+  for (const d of addDirs) roots.push(cwd && !isAbsolute(d) ? join(cwd, d) : d);
+  return { [WRITABLE_ROOTS]: roots };
+}
 
 /** A tool as Codex has it as a dynamic tool. */
 function toolSpec(t: Tool): ToolSpec {

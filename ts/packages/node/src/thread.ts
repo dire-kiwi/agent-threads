@@ -2,9 +2,10 @@
 // steering queue and open requests. Every change is an event, numbered, applied, sent to the
 // subscribers, and saved to the store in order (deltas aren't saved).
 
-import { applyEvent, type Attachment, type Item, type Resolution, type Snapshot, type SubagentState, type Thread, type ThreadEvent, type ThreadRequest, type Usage, type UserMessage } from "@dire-kiwi/agent-threads-protocol";
-import { ancestors, inBackground, requestInBackground, type HarnessSession, type Message, type NewItem, type NewRequest, type ThreadConfig, type ThreadContext, type TurnEnd } from "./harness.js";
+import { applyEvent, type Attachment, type Item, type RateLimit, type Resolution, type Snapshot, type SubagentState, type Thread, type ThreadEvent, type ThreadRequest, type Usage, type UserMessage } from "@dire-kiwi/agent-threads-protocol";
+import { ancestors, inBackground, requestInBackground, type HarnessMessage, type HarnessSession, type LaunchOptions, type Message, type NewItem, type NewRequest, type ThreadConfig, type ThreadContext, type TurnEnd } from "./harness.js";
 import { newId } from "./ids.js";
+import { normalLaunch, sameLaunch, storedThread, type StoredThread } from "./launch.js";
 import { decide, permissionKey, type PermissionDecision, type PermissionPolicy, type PermissionQuery } from "./permissions.js";
 import type { Spawner } from "./spawner.js";
 import { StoreError, type RunRecord, type Store } from "./store.js";
@@ -54,7 +55,11 @@ export interface Outgoing {
 export interface RuntimeHost {
   store: Store;
   spawner: Spawner;
+  /** Fill in events' `raw` (the raw option). */
+  raw: boolean;
   publish(event: ThreadEvent): void;
+  /** A line from the thread's harness, for the app's onHarnessMessage. */
+  harnessMessage(message: HarnessMessage): void;
   error(error: unknown): void;
 }
 
@@ -70,6 +75,8 @@ export class ThreadRuntime implements ThreadContext {
   lostRun: string | undefined;
 
   #host: RuntimeHost;
+  /** How its harness process is started: stored with the thread. */
+  #launch: LaunchOptions;
   /** The live state, with the text streamed so far. */
   #state: Snapshot;
   /** The saved events' state, without deltas: what a change is a change to. */
@@ -93,9 +100,12 @@ export class ThreadRuntime implements ThreadContext {
   #streaming = new Set<string>();
   /** App tools' structured output, by tool call, until the harness gives the call its result. */
   #structured = new Map<string, unknown>();
+  /** The harness message being handled, which events made now have as their `raw` (with the raw option). */
+  #raw: unknown = undefined;
 
-  constructor(host: RuntimeHost, state: Snapshot, config: ThreadConfig, policy: PermissionPolicy) {
+  constructor(host: RuntimeHost, state: Snapshot, config: ThreadConfig, launch: LaunchOptions, policy: PermissionPolicy) {
     this.#host = host;
+    this.#launch = normalLaunch(launch);
     this.#state = state;
     this.#saved = state;
     this.threadId = state.thread.id;
@@ -107,6 +117,9 @@ export class ThreadRuntime implements ThreadContext {
 
   get thread(): Thread {
     return this.#state.thread;
+  }
+  get launch(): LaunchOptions {
+    return this.#launch;
   }
   get snapshot(): Snapshot {
     return this.#state;
@@ -124,6 +137,13 @@ export class ThreadRuntime implements ThreadContext {
   // ---------- events ----------
 
   emit(event: Unnumbered): void {
+    // An item or request has the harness message it came from, and its event doesn't as well.
+    const raw = this.#raw;
+    if (raw !== undefined) {
+      if (event.type === "item.added") event = { ...event, item: { ...event.item, raw } };
+      else if (event.type === "request.opened") event = { ...event, request: { ...event.request, raw } };
+      else event = { ...event, raw };
+    }
     const saved = event.type !== "delta";
     const e = { ...event, thread_id: this.threadId, seq: this.#state.seq + (saved ? 1 : 0) } as ThreadEvent;
     this.#state = applyEvent(this.#state, e);
@@ -176,7 +196,7 @@ export class ThreadRuntime implements ThreadContext {
       if (threadChanged) {
         this.#threadChanged = false;
         try {
-          await store.updateThread(this.#state.thread);
+          await store.updateThread(this.storedThread());
         } catch (e) {
           this.#threadChanged = true;
           throw e;
@@ -335,6 +355,21 @@ export class ThreadRuntime implements ThreadContext {
 
   // ---------- items and the thread ----------
 
+  /** The thread as the store keeps it: with its launch options, which clients aren't sent. */
+  storedThread(): StoredThread {
+    return storedThread(this.#state.thread, this.#launch);
+  }
+
+  /** Changes how the harness process is started, from the next one; it's saved with the thread. */
+  setLaunch(launch: LaunchOptions): void {
+    if (sameLaunch(launch, this.#launch)) return;
+    this.#launch = normalLaunch(launch);
+    this.#threadChanged = true;
+    this.#scheduleFlush();
+    // Its process is started with them: the next turn needs another.
+    this.session?.configChanged();
+  }
+
   item(id: string): Item | undefined {
     const items = this.#saved.items;
     for (let i = items.length - 1; i >= 0; i--) if (items[i]!.id === id) return items[i];
@@ -390,6 +425,24 @@ export class ThreadRuntime implements ThreadContext {
     next.updated_at = new Date().toISOString();
     this.#threadChanged = true;
     this.emit({ type: "thread.updated", thread: next as unknown as Thread });
+  }
+
+  rateLimits(limits: RateLimit[]): void {
+    if (!limits.length) return;
+    const all = new Map((this.thread.rate_limits ?? []).map((l) => [l.id, l]));
+    for (const l of limits) all.set(l.id, l);
+    this.setThread({ rate_limits: [...all.values()].sort((a, b) => (a.id < b.id ? -1 : a.id > b.id ? 1 : 0)) });
+  }
+
+  fromHarness(runId: string, line: string, message: unknown, handle: () => void): void {
+    const before = this.#raw;
+    if (this.#host.raw && message !== undefined) this.#raw = message;
+    try {
+      handle();
+    } finally {
+      this.#raw = before;
+    }
+    this.#host.harnessMessage({ threadId: this.threadId, runId, harness: this.thread.harness, line, ...(message !== undefined ? { message } : {}) });
   }
 
   // ---------- turns ----------
@@ -583,7 +636,7 @@ export class ThreadRuntime implements ThreadContext {
   }
 
   ask(request: NewRequest, toolCallId: string | undefined, answered: (resolution: Resolution) => void, standing?: string): string {
-    const r = { ...request, id: newId(request.type === "question" ? "q" : "perm") } as ThreadRequest;
+    const r = { ...request, id: newId(request.type === "question" ? "q" : request.type === "plan" ? "plan" : "perm") } as ThreadRequest;
     if (this.turn) r.turn_id = this.turn.id;
     // A request about a call is from the subagent the call is (or the thread itself); one about
     // none says which it's from.
@@ -603,7 +656,7 @@ export class ThreadRuntime implements ThreadContext {
   reopen(requestId: string, answered: (resolution: Resolution) => void, standing?: string): boolean {
     if (this.#requests.has(requestId)) return false;
     const request = this.#state.requests.find((r) => r.id === requestId);
-    if (!request) return false;
+    if (!request || request.resolution) return false;
     this.#requests.set(requestId, { request, answered, ...(standing ? { standing } : {}) });
     return true;
   }

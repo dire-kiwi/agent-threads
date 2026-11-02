@@ -9,8 +9,10 @@ use std::path::PathBuf;
 use std::pin::Pin;
 use std::sync::Arc;
 
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+use crate::agent_threads::Error;
 use crate::protocol::{Attachment, Usage};
 use crate::store::RunRecord;
 use crate::thread::ThreadContext;
@@ -98,6 +100,54 @@ pub enum Skill {
     Inline { name: String, content: String },
 }
 
+/// How a thread's harness process is started, on top of the harness's own options: stored with the
+/// thread (but not sent to clients), so a run started after a restart has them too. A change
+/// applies from the next process the thread starts, as a model change does.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct LaunchOptions {
+    /// More arguments, after the harness's (and its options' `args`): for Claude Code, say,
+    /// `--allowedTools`, `--disallowedTools` or `--settings`; for Codex, `-c key=value`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub args: Vec<String>,
+    /// Changes to the environment, after the harness options' `env`: a value sets a variable,
+    /// `None` removes it.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub env: BTreeMap<String, Option<String>>,
+    /// More directories the agent may use besides the working directory: `--add-dir` for Claude
+    /// Code, writable roots (`sandbox_workspace_write.writable_roots`) for Codex.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub add_dirs: Vec<PathBuf>,
+    /// The harness's config directory, in place of the harness options': CLAUDE_CONFIG_DIR for
+    /// Claude Code, CODEX_HOME for Codex (used as it is, with its own login and config). The
+    /// harness keeps its sessions there, so a thread that changes it can't resume what it had.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub config_dir: Option<PathBuf>,
+}
+
+impl LaunchOptions {
+    pub fn is_empty(&self) -> bool {
+        self == &LaunchOptions::default()
+    }
+
+    /// Makes these changes to an environment (the backend's, with the harness options' changes).
+    pub(crate) fn apply_env(&self, env: &mut std::collections::HashMap<String, String>) {
+        for (k, v) in &self.env {
+            match v {
+                Some(v) => env.insert(k.clone(), v.clone()),
+                None => env.remove(k),
+            };
+        }
+    }
+
+    /// The launch options in a stored thread (its `launch` field), or none.
+    pub(crate) fn from_stored(thread: &Value) -> LaunchOptions {
+        thread
+            .get("launch")
+            .and_then(|l| serde_json::from_value(l.clone()).ok())
+            .unwrap_or_default()
+    }
+}
+
 /// What a thread runs with: the instance's settings with the thread's own on top.
 #[derive(Clone, Default)]
 pub struct ThreadConfig {
@@ -149,6 +199,29 @@ pub struct RunCheckpoint {
 
 pub type BoxFuture<T> = Pin<Box<dyn Future<Output = T> + Send>>;
 
+/// Where a control request's answer goes ([`HarnessSession::control`]): the harness's answer, an
+/// [`Error::Control`] if it refused it or didn't answer, or an [`Error::Command`] if there was
+/// nothing to send it to. Dropping it unanswered fails the request too.
+pub type ControlReply = Box<dyn FnOnce(Result<Value, Error>) + Send>;
+
+/// The app's handler for the lines harness processes write
+/// ([`on_harness_message`](crate::Options::on_harness_message)).
+pub type HarnessMessageHandler = Arc<dyn Fn(&HarnessMessage) + Send + Sync>;
+
+/// A line a thread's harness process wrote, for the app's
+/// [`on_harness_message`](crate::Options::on_harness_message).
+#[derive(Clone, Debug)]
+pub struct HarnessMessage {
+    pub thread_id: String,
+    /// The process that wrote it (the thread's `run.id` while it runs).
+    pub run_id: String,
+    pub harness: String,
+    /// The line, without its newline.
+    pub line: String,
+    /// The line parsed as JSON; none if it isn't JSON.
+    pub message: Option<Value>,
+}
+
 /// A driver's side, for one thread. Its methods are called on the thread's own task, one at a
 /// time, with the thread's [`ThreadContext`].
 pub trait HarnessSession: Send + Any {
@@ -166,10 +239,24 @@ pub trait HarnessSession: Send + Any {
     /// The core gave up carrying the queued messages over: make sure nothing acts on them (stop a
     /// process that has them). They're sent again with the next turn's start.
     fn release(&mut self, ctx: &mut ThreadContext);
-    /// The thread's options (model, effort, permission mode) or config changed.
+    /// The thread's options (model, effort, permission mode) changed: they go to the running process
+    /// where the harness takes them, and otherwise apply from the next turn.
     fn options_changed(&mut self, ctx: &mut ThreadContext);
+    /// The thread's config (tools, MCP servers, skills, system prompt) changed: the next turn needs a
+    /// new process.
+    fn config_changed(&mut self, ctx: &mut ThreadContext);
     /// Stop the harness process, if it's running; the future resolves once it has gone.
     fn close(&mut self, ctx: &mut ThreadContext) -> BoxFuture<()>;
+
+    /// Sends the running process a request of the app's own ([`AgentThreads::control`]) and gives
+    /// `reply` its answer. A driver without it takes no requests.
+    ///
+    /// [`AgentThreads::control`]: crate::AgentThreads::control
+    fn control(&mut self, _ctx: &mut ThreadContext, _request: Value, reply: ControlReply) {
+        reply(Err(Error::Command(
+            "this thread's harness doesn't take control requests".into(),
+        )));
+    }
 
     // With a spawner whose processes outlive the backend (Spawner::durable). A driver that has none
     // of these has its runs stopped when the backend restarts, and their turns end.

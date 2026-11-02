@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"slices"
 	"sort"
 	"strings"
 	"syscall"
@@ -75,15 +76,44 @@ type sentMessage struct {
 	Echo string   `json:"echo"`
 }
 
-// launched is the thread's options a process is started with: a different one needs another.
+// launched is the thread's options a process has: it's started with them, and Claude takes a new
+// model and permission mode as it runs, and Codex all three with a turn (a new effort needs another
+// Claude process). Bypass (Claude's) says it was started in bypass mode, so it can be switched to it
+// (Claude Code refuses otherwise).
 type launched struct {
-	Model          string `json:"model,omitempty"`
-	Effort         string `json:"effort,omitempty"`
-	PermissionMode string `json:"permission_mode,omitempty"`
+	Model          string         `json:"model,omitempty"`
+	Effort         string         `json:"effort,omitempty"`
+	PermissionMode string         `json:"permission_mode,omitempty"`
+	Launch         *LaunchOptions `json:"launch,omitempty"`
+	// Bypass says Claude Code was started in bypass mode, so it can be switched to it (it refuses
+	// otherwise).
+	Bypass bool `json:"bypass,omitempty"`
 }
 
-func launchedOf(t protocol.Thread) *launched {
-	return &launched{Model: t.Model, Effort: t.Effort, PermissionMode: string(t.PermissionMode)}
+func launchedOf(ctx ThreadContext) *launched {
+	t := ctx.Thread()
+	l := &launched{Model: t.Model, Effort: t.Effort, PermissionMode: string(t.PermissionMode)}
+	if launch := ctx.Launch(); !launch.IsEmpty() {
+		l.Launch = &launch
+	}
+	return l
+}
+
+// stale says whether a process started with l (as its checkpoint says) has other options than the
+// thread's now.
+func (l *launched) stale(ctx ThreadContext) bool {
+	return !l.has(ctx.Thread()) || l.launchStale(ctx)
+}
+
+// launchStale says whether a process started with l has other launch options than the thread's
+// now (or l isn't known).
+func (l *launched) launchStale(ctx ThreadContext) bool {
+	return l == nil || !sameJSONValue(l.Launch, launchedOf(ctx).Launch)
+}
+
+// has says whether a process has the thread's options.
+func (l *launched) has(t protocol.Thread) bool {
+	return l != nil && l.Model == t.Model && l.Effort == t.Effort && l.PermissionMode == string(t.PermissionMode)
 }
 
 // claudeRunState is what a run's checkpoint holds (see DurableSession.Checkpoint): what's needed to
@@ -117,6 +147,8 @@ type claudeRunState struct {
 type pendingControl struct {
 	subtype string
 	resolve func(jmap) // nil: refused, or the process went
+	// full, for the app's requests, is given the whole control response (nil: the process went).
+	full func(jmap)
 }
 
 // claudeRun is one claude process, and what's needed to read it.
@@ -160,7 +192,9 @@ type claudeRun struct {
 	heldUsage *protocol.Usage
 	// pluginDir is the generated plugin with the thread's skills, for this run only.
 	pluginDir string
-	launched  *launched
+	// launched is the thread's options it has: those it was started with, and the model and
+	// permission mode since.
+	launched *launched
 }
 
 func newClaudeRun(id string) *claudeRun {
@@ -206,13 +240,29 @@ func (r *claudeRun) send(ids []string, msg map[string]any) {
 	}
 }
 
-func (r *claudeRun) control(request map[string]any, resolve func(jmap)) {
+// control sends a control request (queue: once Claude is ready); resolve gets its response, or nil
+// if it failed.
+func (r *claudeRun) control(request map[string]any, queue bool, resolve func(jmap)) {
 	id := fmt.Sprintf("req_%d", r.nextRequest)
 	r.nextRequest++
 	subtype, _ := request["subtype"].(string)
 	r.pending[id] = &pendingControl{subtype: subtype, resolve: resolve}
 	r.pendingOrder = append(r.pendingOrder, id)
-	r.write(map[string]any{"type": "control_request", "request_id": id, "request": request})
+	msg := map[string]any{"type": "control_request", "request_id": id, "request": request}
+	if queue && !r.ready {
+		// Ahead of the messages waiting (after the requests already queued), so they run with it.
+		at := len(r.waiting)
+		for i, line := range r.waiting {
+			var w struct{ Type string }
+			if json.Unmarshal([]byte(line), &w) == nil && w.Type != "control_request" {
+				at = i
+				break
+			}
+		}
+		r.waiting = slices.Insert(r.waiting, at, string(mustJSON(msg)))
+		return
+	}
+	r.write(msg)
 }
 
 func (r *claudeRun) takePending(id string) *pendingControl {
@@ -466,13 +516,18 @@ type claudeSession struct {
 	// last is the run before, once it has exited (for its last checkpoint).
 	last     *claudeRun
 	stopping stopper
-	// stale says the options changed since the run started: the next turn starts a new one.
+	// stale says the run hasn't the thread's options or config as they are now (a new effort, or a
+	// mode Claude can't switch it to): the next turn starts a new one.
 	stale      bool
 	steerTimer *loopTimer
 	stopTimer  *loopTimer
 	// tmp is a directory for the thread's generated files (skills, attached files), made when needed.
 	tmp    string
 	closed bool
+	// controls is what fails each of the app's control requests not yet answered, when the backend
+	// lets go of its run.
+	controls    map[int]func(error)
+	nextControl int
 }
 
 // ---------- the core's side ----------
@@ -501,7 +556,7 @@ func (s *claudeSession) Steer(m Message) {
 func (s *claudeSession) CarryOver(messages []Message) {
 	run := s.live()
 	if run == nil || s.stale {
-		// The next turn runs with the options as they are now, so in a new process if they changed.
+		// The next turn runs with the options as they are now, so in a new process if this one can't.
 		// The old one has the messages on its stdin, and mustn't act on them: it's stopped at once.
 		if run != nil {
 			s.stop(run, true, true, nil)
@@ -536,7 +591,7 @@ func (s *claudeSession) Interrupt() {
 	turn := s.ctx.TurnID()
 	send := func(error) {
 		if s.live() == run && !run.detached && s.ctx.TurnID() == turn {
-			run.control(map[string]any{"subtype": "interrupt"}, func(jmap) {})
+			run.control(map[string]any{"subtype": "interrupt"}, false, func(jmap) {})
 		}
 	}
 	// A run that outlives the backend is saved first, its turn interrupted and when it's stopped if
@@ -565,7 +620,52 @@ func (s *claudeSession) clearStop() {
 	s.stopTimer = nil
 }
 
-func (s *claudeSession) OptionsChanged() { s.stale = true }
+func (s *claudeSession) OptionsChanged() {
+	run := s.live()
+	// A process yet to start is started with them.
+	if run == nil || run.launched == nil {
+		return
+	}
+	l := run.launched
+	t := s.ctx.Thread()
+	// Claude takes a new model and permission mode as it runs, even during a turn; a new effort needs
+	// a new process, at the next turn.
+	if l.Effort != t.Effort {
+		s.stale = true
+	}
+	// Set as they're asked for, so a restart before the answer doesn't ask again; one Claude refuses
+	// is the next process's.
+	refused := func(r jmap) {
+		if r == nil && s.run == run {
+			s.stale = true
+		}
+	}
+	if l.Model != t.Model {
+		l.Model = t.Model
+		model := t.Model
+		if model == "" {
+			model = "default"
+		}
+		run.control(map[string]any{"subtype": "set_model", "model": model}, true, refused)
+	}
+	if l.PermissionMode != string(t.PermissionMode) {
+		l.PermissionMode = string(t.PermissionMode)
+		run.control(map[string]any{"subtype": "set_permission_mode", "mode": s.liveMode(run, t.PermissionMode)}, true, refused)
+	}
+}
+
+func (s *claudeSession) ConfigChanged() { s.stale = true }
+
+// liveMode is Claude's name for a permission mode the running process is switched to. One not
+// started in bypass mode can't be switched to it: it goes to acceptEdits, the driver allows what it
+// asks about (see canUseTool), and the next turn has a new process, in bypass mode.
+func (s *claudeSession) liveMode(run *claudeRun, mode protocol.PermissionMode) string {
+	if mode == protocol.PermissionModeBypass && (run.launched == nil || !run.launched.Bypass) {
+		s.stale = true
+		return "acceptEdits"
+	}
+	return claudeMode(mode)
+}
 
 func (s *claudeSession) Live() bool { return s.live() != nil }
 
@@ -630,8 +730,16 @@ func (s *claudeSession) Reattach(record RunRecord) bool {
 	}
 	run := newClaudeRun(record.ID)
 	run.restore(*st, func(subtype string) func(jmap) {
-		if subtype == "initialize" {
+		switch subtype {
+		case "initialize":
 			return func(r jmap) { s.initialized(run, r) }
+		case "set_model", "set_permission_mode":
+			// A new model or mode Claude refuses after the restart is the next process's, as before it.
+			return func(r jmap) {
+				if r == nil && s.run == run {
+					s.stale = true
+				}
+			}
 		}
 		return func(jmap) {}
 	})
@@ -644,9 +752,7 @@ func (s *claudeSession) Reattach(record RunRecord) bool {
 	}
 	run.proc = proc
 	// A process started with other options than the thread's now is replaced at the next turn.
-	t := s.ctx.Thread()
-	l := st.Launched
-	s.stale = st.Stale || l == nil || *l != *launchedOf(t)
+	s.stale = st.Stale || st.Launched.stale(s.ctx)
 	// Claude's requests that were open: the user's questions are taken up again, and the rest (a
 	// policy that hadn't decided, a tool that was running) are dealt with again. One answered before
 	// the restart, though that wasn't saved, is closed: Claude has its answer.
@@ -683,7 +789,80 @@ func (s *claudeSession) Detach() bool {
 	run.detached = true
 	dp.Detach()
 	run.abort()
+	failControls(s.controls, "The backend closed before Claude Code answered.")
 	return true
+}
+
+// failControls fails the app's control requests not yet answered.
+func failControls(controls map[int]func(error), message string) {
+	for _, n := range sortedIntKeys(controls) {
+		if fail := controls[n]; fail != nil {
+			fail(&ControlError{Message: message})
+		}
+	}
+}
+
+func sortedIntKeys[V any](m map[int]V) []int {
+	keys := make([]int, 0, len(m))
+	for k := range m {
+		keys = append(keys, k)
+	}
+	sort.Ints(keys)
+	return keys
+}
+
+// addControl keeps an app's control request's reply until it's answered or failed; it returns the
+// reply to call, which does nothing after the first time.
+func addControl(controls *map[int]func(error), next *int, reply func(json.RawMessage, error)) func(json.RawMessage, error) {
+	if *controls == nil {
+		*controls = map[int]func(error){}
+	}
+	n := *next
+	*next++
+	done := func(result json.RawMessage, err error) {
+		if _, ok := (*controls)[n]; !ok {
+			return
+		}
+		delete(*controls, n)
+		reply(result, err)
+	}
+	(*controls)[n] = func(err error) { done(nil, err) }
+	return done
+}
+
+func (s *claudeSession) Control(request json.RawMessage, reply func(json.RawMessage, error)) error {
+	run := s.live()
+	if run == nil || run.proc == nil || run.detached {
+		return commandErr("thread %s has no running Claude Code process", s.ctx.ThreadID())
+	}
+	req := parseObj(request)
+	if req == nil || !isStr(req.raw("subtype")) {
+		return commandErr("a Claude Code control request is an object with a subtype")
+	}
+	done := addControl(&s.controls, &s.nextControl, reply)
+	id := fmt.Sprintf("req_%d", run.nextRequest)
+	run.nextRequest++
+	run.pending[id] = &pendingControl{subtype: req.str("subtype"), full: func(r jmap) {
+		switch {
+		case r == nil:
+			done(nil, &ControlError{Message: "Claude Code exited before it answered."})
+		case r.str("subtype") == "error":
+			msg := r.str("error")
+			if msg == "" {
+				msg = "Claude Code refused the request."
+			}
+			done(nil, &ControlError{Message: msg, Data: r.raw("error")})
+		default:
+			result := r.raw("response")
+			if result == nil {
+				result = json.RawMessage("null")
+			}
+			done(result, nil)
+		}
+	}}
+	run.pendingOrder = append(run.pendingOrder, id)
+	run.write(map[string]any{"type": "control_request", "request_id": id, "request": json.RawMessage(request)})
+	return nil
 }
 
 // answered says whether an answer to Claude's request id was written before the backend restarted.
@@ -764,7 +943,7 @@ func (s *claudeSession) live() *claudeRun {
 	return nil
 }
 
-// ensure is the running process, or a new one. A new turn (fresh) restarts it if the options changed.
+// ensure is the running process, or a new one. A new turn (fresh) restarts it if it's stale.
 func (s *claudeSession) ensure(fresh bool) *claudeRun {
 	live := s.live()
 	if live != nil && !(fresh && s.stale) {
@@ -856,9 +1035,14 @@ func (s *claudeSession) spawn(run *claudeRun) {
 		s.exited(run, ExitStatus{Err: err})
 		return
 	}
-	env := mergeEnv(os.Environ(), s.o.Env)
-	if s.o.ConfigDir != "" {
-		env = mergeEnv(env, map[string]string{"CLAUDE_CONFIG_DIR": s.o.ConfigDir})
+	launch := ctx.Launch()
+	env := launch.applyEnv(mergeEnv(os.Environ(), s.o.Env))
+	configDir := launch.ConfigDir
+	if configDir == "" {
+		configDir = s.o.ConfigDir
+	}
+	if configDir != "" {
+		env = mergeEnv(env, map[string]string{"CLAUDE_CONFIG_DIR": configDir})
 	}
 	proc, err := ctx.Spawner().Spawn(SpawnOptions{
 		Command: bin, Args: append(append([]string{}, s.o.BinArgs...), args...), Cwd: thread.Cwd, Env: env,
@@ -869,7 +1053,8 @@ func (s *claudeSession) spawn(run *claudeRun) {
 		return
 	}
 	run.proc = proc
-	run.launched = launchedOf(thread)
+	run.launched = launchedOf(ctx)
+	run.launched.Bypass = ctx.Thread().PermissionMode == protocol.PermissionModeBypass
 	ctx.SetThread(func(t *protocol.Thread) {
 		t.Run = &protocol.Run{ID: run.id, Spawner: protocol.RunSpawner(ctx.Spawner().Name()), StartedAt: now()}
 	})
@@ -877,7 +1062,7 @@ func (s *claudeSession) spawn(run *claudeRun) {
 	if len(cfg.Tools) > 0 {
 		init["sdkMcpServers"] = []string{appServer}
 	}
-	run.control(init, func(r jmap) { s.initialized(run, r) })
+	run.control(init, false, func(r jmap) { s.initialized(run, r) })
 }
 
 // mergeEnv is env with vars set (replacing any already there).
@@ -911,7 +1096,7 @@ func sortStrings(s []string) { sort.Strings(s) }
 
 func (s *claudeSession) handlers(run *claudeRun) ProcessHandlers {
 	return ProcessHandlers{
-		Line: func(line string) { s.line(run, line) },
+		Line: func(line string) { s.ctx.FromHarness(run.id, line, func() { s.line(run, line) }) },
 		Stderr: func(line string) {
 			run.stderr = append(run.stderr, line)
 			if len(run.stderr) > 20 {
@@ -952,7 +1137,7 @@ func (s *claudeSession) args(run *claudeRun) ([]string, error) {
 	if !s.o.UserSettings {
 		args = append(args, "--setting-sources", "", "--strict-mcp-config")
 	}
-	args = append(args, "--forward-subagent-text")
+	args = append(args, "--forward-subagent-text", "--include-hook-events")
 	if t.Model != "" {
 		args = append(args, "--model", t.Model)
 	}
@@ -1007,7 +1192,12 @@ func (s *claudeSession) args(run *claudeRun) ([]string, error) {
 	if cfg.SystemPrompt != "" {
 		args = append(args, "--append-system-prompt", cfg.SystemPrompt)
 	}
-	return append(args, s.o.Args...), nil
+	launch := s.ctx.Launch()
+	for _, d := range launch.AddDirs {
+		args = append(args, "--add-dir", d)
+	}
+	args = append(args, s.o.Args...)
+	return append(args, launch.Args...), nil
 }
 
 func orEmptyList(s []string) []string {
@@ -1030,7 +1220,9 @@ func (s *claudeSession) exited(run *claudeRun, status ExitStatus) {
 	order := run.pendingOrder
 	run.pending, run.pendingOrder = map[string]*pendingControl{}, nil
 	for _, id := range order {
-		if p := pending[id]; p != nil && p.resolve != nil {
+		if p := pending[id]; p != nil && p.full != nil {
+			p.full(nil)
+		} else if p != nil && p.resolve != nil {
 			p.resolve(nil)
 		}
 	}
@@ -1063,7 +1255,9 @@ func (s *claudeSession) line(run *claudeRun, line string) {
 	if m.str("type") == "control_response" {
 		// Claude echoes our own responses back too; those aren't for a request of ours.
 		r := m.obj("response")
-		if p := run.takePending(r.str("request_id")); p != nil && p.resolve != nil {
+		if p := run.takePending(r.str("request_id")); p != nil && p.full != nil {
+			p.full(r)
+		} else if p != nil && p.resolve != nil {
 			if r.str("subtype") == "error" {
 				p.resolve(nil)
 			} else if resp := r.obj("response"); resp != nil {
@@ -1083,7 +1277,17 @@ func (s *claudeSession) line(run *claudeRun, line string) {
 func (s *claudeSession) message(run *claudeRun, m jmap) {
 	ctx := s.ctx
 	parent := m.str("parent_tool_use_id")
+	// A message refused for the usage limit says which limit, before anything else it leads to.
+	if t := m.str("type"); (t == "assistant" || t == "user" || t == "result") && m.str("api_error") == "usage_limit_reached" {
+		if info := m.obj("api_error_params").obj("rate_limit_info"); info != nil {
+			ctx.RateLimits(claudeRateLimits(info))
+		}
+	}
 	switch m.str("type") {
+	case "rate_limit_event":
+		if info := m.obj("rate_limit_info"); info != nil {
+			ctx.RateLimits(claudeRateLimits(info))
+		}
 	case "system":
 		// Claude starts a turn by itself to tell the agent that a background subagent has ended.
 		if m.str("subtype") == "init" && ctx.TurnID() == "" {
@@ -1093,6 +1297,15 @@ func (s *claudeSession) message(run *claudeRun, m jmap) {
 		sid := m.str("session_id")
 		if m.str("subtype") == "init" && sid != "" && sid != ctx.Thread().SessionID {
 			ctx.SetThread(func(t *protocol.Thread) { t.SessionID = sid })
+		}
+		if m.str("subtype") == "api_retry" {
+			ctx.AddItem(&protocol.Notice{ID: NewID("n"), Level: protocol.NoticeLevelWarning, Code: "retry", Text: retryText(m), ParentID: parent})
+		}
+		if m.str("subtype") == "hook_response" {
+			if n := hookNotice(m); n != nil {
+				n.ID, n.Code, n.ParentID = NewID("n"), "hook", parent
+				ctx.AddItem(n)
+			}
 		}
 		if strings.HasPrefix(m.str("subtype"), "task_") {
 			s.task(run, m)
@@ -1416,9 +1629,15 @@ func (s *claudeSession) canUseTool(run *claudeRun, requestID string, req jmap, e
 		return open && !run.exited && !run.retired && !run.detached && s.run == run &&
 			(ctx.TurnID() == turn || (toolUseID != "" && inBackground(ctx.Item, toolUseID)))
 	}
-	allow := func(updated json.RawMessage) {
+	allow := func(updated json.RawMessage, more ...map[string]any) {
 		if wanted() {
-			run.respond(requestID, map[string]any{"behavior": "allow", "updatedInput": updated})
+			response := map[string]any{"behavior": "allow", "updatedInput": updated}
+			for _, m := range more {
+				for k, v := range m {
+					response[k] = v
+				}
+			}
+			run.respond(requestID, response)
 		}
 	}
 	deny := func(message string) {
@@ -1463,6 +1682,42 @@ func (s *claudeSession) canUseTool(run *claudeRun, requestID string, req jmap, e
 			}
 		}, "")
 		run.asked[requestID] = id
+		return
+	}
+
+	if req.str("tool_name") == "ExitPlanMode" {
+		// A plan, which only the user approves. Approved, Claude leaves plan mode for the mode the
+		// thread carries on in (setMode), as does the thread; sent back, it plans again.
+		id := ask(&protocol.PlanRequest{Plan: orObj(parseObj(input)).str("plan")}, toolUseID, func(res protocol.Resolution) {
+			if !wanted() {
+				return
+			}
+			if res.Outcome == protocol.ResolutionOutcomeAllow {
+				mode := modeAfterPlan(ctx.Thread().PermissionMode, res.PermissionMode)
+				allow(input, map[string]any{"updatedPermissions": []any{map[string]any{"type": "setMode", "mode": s.liveMode(run, mode), "destination": "session"}}})
+				if run.launched != nil {
+					run.launched.PermissionMode = string(mode)
+				}
+				ctx.SetThread(func(t *protocol.Thread) { t.PermissionMode = mode })
+				if toolUseID != "" {
+					ctx.UpdateItem(toolUseID, Patch{"status": protocol.ToolStatusRunning})
+				}
+			} else {
+				msg := res.Message
+				if msg == "" {
+					msg = "The user wants you to keep planning rather than start on this plan."
+				}
+				deny(msg)
+				denied()
+			}
+		}, "")
+		run.asked[requestID] = id
+		return
+	}
+
+	// The thread is in bypass mode, which its process couldn't be switched to: nothing is asked.
+	if ctx.Thread().PermissionMode == protocol.PermissionModeBypass && existing == "" {
+		allow(input)
 		return
 	}
 

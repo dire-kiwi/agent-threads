@@ -9,7 +9,7 @@ use std::sync::Arc;
 
 use serde_json::{Map, Value, json};
 
-use crate::protocol::{Thread, ToolKind};
+use crate::protocol::{PermissionMode, Thread, ToolKind};
 
 /// A tool call the agent wants to make.
 #[derive(Clone, Debug)]
@@ -152,4 +152,14 @@ pub(crate) fn decide(policy: &PermissionPolicy, query: PermissionQuery, ctx: Per
 /// two servers (or an app tool and a built-in) can have tools of the same name.
 pub(crate) fn permission_key(kind: ToolKind, server: Option<&str>, name: &str) -> String {
     json!([kind, server, name]).to_string()
+}
+
+/// The permission mode a thread carries on in once its plan is approved: the one the user picked,
+/// or else its own, or default if that's plan.
+pub(crate) fn mode_after_plan(current: Option<PermissionMode>, picked: Option<PermissionMode>) -> PermissionMode {
+    match (picked, current) {
+        (Some(p), _) if p != PermissionMode::Plan => p,
+        (_, Some(c)) if c != PermissionMode::Plan => c,
+        _ => PermissionMode::Default,
+    }
 }

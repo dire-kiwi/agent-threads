@@ -1,6 +1,9 @@
 // @vitest-environment jsdom
 
-import { applyEvents, initialState, type Command, type Item, type QuestionRequest, type ThreadEvent } from "@dire-kiwi/agent-threads-protocol";
+import { readFileSync } from "node:fs";
+import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
+import { applyEvents, initialState, itemPage, snapshotWindow, type Command, type Item, type QuestionRequest, type ThreadEvent } from "@dire-kiwi/agent-threads-protocol";
 import { act, cleanup, fireEvent, render, screen, within } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { AgentsPill } from "./components/AgentsPill.js";
@@ -41,7 +44,9 @@ describe("<Thread>", () => {
     for (const item of final.items)
       if (item.type === "assistant_message" && item.text.trim() && !item.parent_id) expect(container.textContent).toContain(item.text.trim().split("\n")[0]!.replaceAll("`", ""));
     expect(container.querySelectorAll(".at-turn-result")).toHaveLength(final.items.filter((i) => i.type === "turn_result").length);
-    expect(container.querySelector(".at-card")).toBeNull();
+    // Every request is answered: its card is where it was asked, greyed out, with its answer.
+    expect(container.querySelector(".at-card:not(.at-card-done)")).toBeNull();
+    expect(container.querySelectorAll(".at-card-done")).toHaveLength(final.requests.length);
   });
 
   it("redraws only the rows an event changes", () => {
@@ -212,12 +217,52 @@ describe("<Thread>", () => {
     expect((screen.getByRole("button", { name: /^Allow/ }) as HTMLButtonElement).disabled).toBe(false);
   });
 
-  it("drops a request's card once it's resolved", () => {
+  it("keeps a request's card once it's resolved, where it was asked, with its answer", () => {
     const { snapshot, rest } = fixture("claude/permission-allow", (e) => e.type === "request.opened");
     const { emit, container } = mount(snapshot);
-    expect(container.querySelector(".at-permission")).not.toBeNull();
+    const open = container.querySelector(".at-requests .at-permission");
+    expect(open).not.toBeNull();
+    expect(within(open as HTMLElement).getByRole("button", { name: /^Allow$/ })).toBeTruthy();
     act(() => emit(rest.find((e) => e.type === "request.resolved")!));
-    expect(container.querySelector(".at-permission")).toBeNull();
+    expect(container.querySelector(".at-requests")).toBeNull();
+    const done = container.querySelector(".at-message-list .at-permission.at-card-done") as HTMLElement;
+    expect(done.textContent).toContain("asked to use Bash");
+    expect(done.textContent).toContain("Allowed");
+    expect(within(done).queryByRole("button")).toBeNull();
+    // Just before the call it was for.
+    expect(done.nextElementSibling?.querySelector("[data-tool-row]")?.textContent).toContain("touch allowed.txt");
+  });
+
+  it("shows how a denied permission went, with the note for the agent", () => {
+    const { snapshot } = fixture("claude/permission-allow", (e) => e.type === "request.opened");
+    const request = snapshot.requests[0]!;
+    const denied = { ...snapshot, requests: [{ ...request, resolution: { outcome: "deny" as const, message: "Not that file." } }] };
+    const { container } = mount(denied);
+    const done = container.querySelector(".at-card-done") as HTMLElement;
+    expect(done.textContent).toContain("Denied");
+    expect(done.textContent).toContain("Not that file.");
+  });
+
+  it("shows an answered question's answers in place of its call, and one that wasn't answered", () => {
+    const { snapshot } = fixture("codex/ask-user-question");
+    const { container, unmount } = mount(snapshot);
+    const done = container.querySelector(".at-question.at-card-done") as HTMLElement;
+    expect(done.textContent).toContain("Answered");
+    const picked = within(done)
+      .getAllByRole("radio")
+      .filter((r) => r.getAttribute("aria-checked") === "true")
+      .map((r) => r.textContent);
+    const answer = (snapshot.requests[0]!.resolution!.answers ?? {}) as Record<string, string[]>;
+    const options = (snapshot.requests[0] as QuestionRequest).questions[0]!.options!.map((o) => o.label);
+    expect(picked.map((t) => options.find((o) => t?.includes(o)))).toEqual(Object.values(answer)[0]!.filter((a) => options.includes(a)));
+    expect(within(done).getAllByRole("radio").every((r) => (r as HTMLButtonElement).disabled)).toBe(true);
+    // The call's row isn't drawn as well: the card has the answers.
+    const call = (snapshot.requests[0] as QuestionRequest).tool_call_id!;
+    expect(container.querySelector(`[data-tool-row]`)?.textContent ?? "").not.toContain(call);
+    unmount();
+    const cancelled = { ...snapshot, requests: [{ ...snapshot.requests[0]!, resolution: { outcome: "cancel" as const } }] };
+    const again = mount(cancelled);
+    expect(again.container.querySelector(".at-card-done")?.textContent).toContain("Not answered");
   });
 
   it("answers a question with an option, or its own answer", () => {
@@ -249,6 +294,50 @@ describe("<Thread>", () => {
     fireEvent.click(screen.getByRole("checkbox", { name: /Olives/ }));
     fireEvent.click(answer);
     expect(commands.at(-1)).toMatchObject({ resolution: { outcome: "answer", answers: { size: ["M"], toppings: ["Cheese", "Olives"] } } });
+  });
+
+  it("shows a plan, and approves it in the mode picked", () => {
+    const { snapshot } = fixture("claude/plan", (e) => e.type === "request.opened");
+    const { commands, container } = mount(snapshot);
+    const card = container.querySelector(".at-plan-card") as HTMLElement;
+    expect(card.textContent).toContain("Claude has a plan");
+    expect(card.querySelector(".at-plan")?.textContent).toContain("Use the Edit tool on notes.txt");
+    expect(container.querySelector(".at-tool-status.at-attention")?.textContent).toContain("needs approval");
+    // The thread's in plan mode: it carries on asking, unless another mode's picked.
+    const mode = within(card).getByLabelText(/mode to carry on in/) as HTMLSelectElement;
+    expect(mode.value).toBe("default");
+    fireEvent.change(mode, { target: { value: "accept_edits" } });
+    fireEvent.click(within(card).getByRole("button", { name: /Approve/ }));
+    expect(commands).toEqual([{ type: "respond", thread_id: snapshot.thread.id, request_id: "{{pl1}}", resolution: { outcome: "allow", permission_mode: "accept_edits" } }]);
+  });
+
+  it("keeps planning, with the user's feedback", () => {
+    const { snapshot } = fixture("codex/plan", (e) => e.type === "request.opened" && e.request.type === "plan");
+    const { commands, container } = mount(snapshot);
+    const card = within(container.querySelector(".at-plan-card") as HTMLElement);
+    expect(card.getByText(/Codex has a plan/)).toBeTruthy();
+    fireEvent.click(card.getByRole("button", { name: /Keep planning/ }));
+    fireEvent.change(card.getByLabelText(/Feedback on the plan/), { target: { value: "Also change banana." } });
+    fireEvent.keyDown(card.getByLabelText(/Feedback on the plan/), { key: "Enter" });
+    expect(commands.at(-1)).toMatchObject({ type: "respond", resolution: { outcome: "deny", message: "Also change banana." } });
+  });
+
+  it("draws answered plans, with how they were answered", () => {
+    const { container } = mount(fixture("codex/plan").snapshot);
+    const done = [...container.querySelectorAll(".at-plan-card.at-card-done")];
+    expect(done.map((c) => c.querySelector(".at-outcome")?.textContent)).toEqual(["Kept planning", "Approved"]);
+    expect(done[0]!.textContent).toContain("Also change the line banana to blueberry.");
+  });
+
+  it("draws an ExitPlanMode call as its plan", () => {
+    const { snapshot } = fixture("claude/plan");
+    const { container } = mount(snapshot);
+    const rows = [...container.querySelectorAll(".at-tool")].filter((r) => r.querySelector(".at-tool-label")?.textContent === "Plan");
+    expect(rows).toHaveLength(2);
+    fireEvent.click(within(rows[0] as HTMLElement).getAllByRole("button")[0]!);
+    expect(rows[0]!.querySelector(".at-plan")?.textContent).toContain("Use the Edit tool on notes.txt");
+    // The plan sent back says what the agent was told.
+    expect(rows[0]!.textContent).toContain("Also change the line banana to blueberry.");
   });
 
   it("dismisses a question", () => {
@@ -292,5 +381,141 @@ describe("<Composer>", () => {
     await act(async () => fireEvent.keyDown(box, { key: "Enter" }));
     expect(box.value).toBe("Hello");
     expect(screen.getByText("offline")).toBeTruthy();
+  });
+});
+
+describe("a window of a long thread", () => {
+  /** A thread whose subagent (sa, at 2) has its last item at 18, and whose open request (at 19) is from it. */
+  function long() {
+    const items: Item[] = [];
+    for (let i = 0; i < 20; i++) {
+      if (i === 2) items.push({ id: "sa", type: "tool_call", name: "Agent", kind: "subagent", input: { description: "Dig in" }, status: "running", title: "Dig in" });
+      else if (i === 18 || i === 3) items.push({ id: `b${i}`, type: "assistant_message", text: `sub ${i}`, parent_id: "sa" });
+      else items.push({ id: `m${i}`, type: "assistant_message", text: `message ${i}` });
+    }
+    const events: ThreadEvent[] = items.map((item, i) => ({ type: "item.added", thread_id: "th", seq: i + 1, item }));
+    events.push({ type: "request.opened", thread_id: "th", seq: 21, request: { id: "p1", type: "permission", name: "Bash", kind: "shell", input: { command: "ls" }, parent_id: "sa" } });
+    return applyEvents(initialState(thread), events);
+  }
+
+  function mountWindow(limit: number, pageSize: number, scrollTop?: number) {
+    const whole = long();
+    const asked: number[] = [];
+    const t = testSource(snapshotWindow(whole, limit));
+    t.source.loadEarlier = async (before) => {
+      asked.push(before);
+      return itemPage(whole, before, pageSize);
+    };
+    // jsdom lays nothing out: scrollTop stays 0, as if it's at the top, unless set.
+    if (scrollTop !== undefined) vi.spyOn(HTMLElement.prototype, "scrollTop", "get").mockReturnValue(scrollTop);
+    const view = render(<Thread source={t.source} onCommand={() => {}} />);
+    return { ...view, asked, whole };
+  }
+
+  it("loads earlier items as it's scrolled near the top, until they're all in", async () => {
+    const { container, asked } = mountWindow(3, 6);
+    await act(async () => {
+      for (let i = 0; i < 5; i++) await new Promise((r) => setTimeout(r, 0));
+    });
+    expect(asked).toEqual([17, 11, 5]);
+    expect(container.textContent).toContain("message 0");
+    expect(container.querySelector(".at-earlier")).toBeNull();
+  });
+
+  it("loads a page with the button when it's not near the top", async () => {
+    const { container, asked } = mountWindow(3, 6, 5000);
+    expect(asked).toEqual([]);
+    expect(container.textContent).not.toContain("message 16");
+    await act(async () => fireEvent.click(screen.getByRole("button", { name: "Load earlier messages" })));
+    expect(asked).toEqual([17]);
+    expect(container.textContent).toContain("message 16");
+    expect(container.textContent).not.toContain("message 10");
+    // The subagent the open request is from is there for context, before what's loaded.
+    expect(container.querySelector('[data-subagent="sa"]')).not.toBeNull();
+  });
+
+  it("says when a page couldn't be loaded, and tries again with the button", async () => {
+    const whole = long();
+    const t = testSource(snapshotWindow(whole, 3));
+    let fail = true;
+    t.source.loadEarlier = async (before) => {
+      if (fail) throw new Error("offline");
+      return itemPage(whole, before, 50);
+    };
+    vi.spyOn(console, "error").mockImplementation(() => {});
+    const { container } = render(<Thread source={t.source} onCommand={() => {}} />);
+    await act(async () => new Promise((r) => setTimeout(r, 0)));
+    const retry = screen.getByRole("button", { name: /Couldn't load earlier messages/ });
+    fail = false;
+    await act(async () => fireEvent.click(retry));
+    expect(container.textContent).toContain("message 0");
+  });
+
+  it("loads back to where a subagent started when it's opened, or revealed from its request", async () => {
+    const { container, asked } = mountWindow(3, 4, 5000);
+    expect(container.textContent).not.toContain("sub 3");
+    // "from Dig in" on the open request reveals the subagent: it opens, with its earlier items loaded.
+    await act(async () => fireEvent.click(screen.getByRole("button", { name: /from Dig in/ })));
+    await act(async () => {
+      for (let i = 0; i < 6; i++) await new Promise((r) => setTimeout(r, 0));
+    });
+    expect(asked).toEqual([17, 13, 9, 5]);
+    const sub = container.querySelector('[data-subagent="sa"]') as HTMLElement;
+    expect(sub.querySelector(".at-subagent-body")?.textContent).toContain("sub 3");
+    expect(sub.querySelector(".at-earlier")).toBeNull();
+  });
+});
+
+describe("a window over a quiet subagent", () => {
+  it("has its call, so what it does after the snapshot is drawn under it", () => {
+    // A running subagent at 0, with nothing of its own since, then two messages: a window of two.
+    const items: Item[] = [
+      { id: "sa", type: "tool_call", name: "Agent", kind: "subagent", input: { description: "Dig in" }, status: "running", title: "Dig in" },
+      { id: "m1", type: "assistant_message", text: "message 1" },
+      { id: "m2", type: "assistant_message", text: "message 2" },
+    ];
+    const whole = applyEvents(initialState(thread), items.map((item, i): ThreadEvent => ({ type: "item.added", thread_id: "th", seq: i + 1, item })));
+    const t = testSource(snapshotWindow(whole, 2));
+    const { container } = render(<Thread source={t.source} onCommand={() => {}} />);
+    act(() => t.emit({ type: "item.added", thread_id: "th", seq: 4, item: { id: "b4", type: "assistant_message", text: "it goes on", parent_id: "sa" } }));
+    const row = container.querySelector('[data-subagent="sa"]') as HTMLElement;
+    expect(row).not.toBeNull();
+    fireEvent.click(within(row).getByRole("button", { name: /Dig in/ }));
+    expect(row.textContent).toContain("it goes on");
+  });
+});
+
+describe("themes", () => {
+  const css = readFileSync(join(dirname(fileURLToPath(import.meta.url)), "styles.css"), "utf8");
+  /** The --at-* variables a block of styles.css (from `selector {` to its closing brace) sets. */
+  const vars = (selector: string) => {
+    const at = css.indexOf(`${selector} {`);
+    expect(at, selector).toBeGreaterThanOrEqual(0);
+    const body = css.slice(at, css.indexOf("}", at));
+    return [...body.matchAll(/(--at-[\w-]+):/g)].map((m) => m[1]).sort();
+  };
+
+  it("has the dark theme set every colour the light one does, by preference and by class", () => {
+    const light = vars(":root,\n.at-theme-light").filter((v) => !/font|radius|max-width|mono/.test(v!));
+    const media = css.slice(css.indexOf("@media (prefers-color-scheme: dark)"));
+    expect(media.length).toBeGreaterThan(0);
+    const preferred = [...media.slice(0, media.indexOf("}\n}")).matchAll(/(--at-[\w-]+):/g)].map((m) => m[1]).sort();
+    expect(preferred).toEqual(light);
+    expect(vars(".at-theme-dark")).toEqual(light);
+  });
+
+  it("uses only variables the themes set", () => {
+    const set = new Set(vars(":root,\n.at-theme-light"));
+    const used = new Set([...css.matchAll(/var\((--at-[\w-]+)/g)].map((m) => m[1]!));
+    expect([...used].filter((v) => !set.has(v))).toEqual([]);
+  });
+
+  it("picks a theme with <Thread theme>", () => {
+    const { container } = mount(undefined, {});
+    expect(container.querySelector(".at-thread")?.className).not.toMatch(/at-theme/);
+    cleanup();
+    const t = testSource(fixture("claude/plain-reply").snapshot);
+    const dark = render(<Thread source={t.source} onCommand={() => {}} theme="dark" />);
+    expect(dark.container.querySelector(".at-thread")?.classList.contains("at-theme-dark")).toBe(true);
   });
 });

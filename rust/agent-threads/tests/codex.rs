@@ -7,10 +7,12 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
-use agent_threads::protocol::ToolKind;
+use agent_threads::protocol::{PermissionMode, ToolKind};
+use agent_threads::reducer::open_requests;
 use agent_threads::{
-    AgentThreads, AppTools, Capabilities, CodexOptions, CreateOptions, McpServer, MemoryStore, Options,
-    PermissionDecision, PermissionPolicy, SendOptions, Skill, Store, ThreadEvent, ToolContext, codex, tool,
+    AgentThreads, AppTools, Capabilities, CapabilitiesUpdate, CodexOptions, CreateOptions, LaunchOptions, McpServer,
+    MemoryStore, Options, PermissionDecision, PermissionPolicy, SendOptions, Skill, Store, ThreadEvent, ThreadOptions,
+    ToolContext, codex, tool,
 };
 use common::{items, mini_runs, settle, texts, until};
 use serde_json::{Value, json};
@@ -90,12 +92,8 @@ impl Env {
 
     async fn request(&self, id: &str) -> Value {
         until(5, || async {
-            self.sdk
-                .snapshot(id)
-                .await
-                .unwrap()
-                .requests
-                .first()
+            open_requests(&self.sdk.snapshot(id).await.unwrap())
+                .next()
                 .map(|r| serde_json::to_value(r).unwrap())
         })
         .await
@@ -264,7 +262,7 @@ async fn starts_the_thread_with_its_options_mcp_servers_app_tools_and_system_pro
             "cwd": cwd,
             "model": "gpt-test",
             "approvalPolicy": "untrusted",
-            "sandbox": "read-only",
+            "sandbox": "workspace-write",
             "developerInstructions": "Be brief.",
             "config": {
                 "model_reasoning_summary": "auto",
@@ -679,6 +677,500 @@ async fn sends_compact_as_thread_compact_start() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn gives_the_process_new_options_with_its_next_turn() {
+    let env = setup(Capabilities::default(), plain(), &[]);
+    let t = env
+        .sdk
+        .create(CreateOptions {
+            model: Some("a".into()),
+            effort: Some("low".into()),
+            ..create()
+        })
+        .await
+        .unwrap();
+    env.sdk.send(&t.id, "reply one", SendOptions::default()).await.unwrap();
+    settle(&env.sdk, &t.id).await;
+    let cmd =
+        json!({"type": "set_options", "thread_id": t.id, "model": "b", "effort": "high", "permission_mode": "bypass"});
+    env.sdk.handle_json(cmd).await.unwrap();
+    env.sdk.send(&t.id, "reply two", SendOptions::default()).await.unwrap();
+    settle(&env.sdk, &t.id).await;
+    env.sdk
+        .send(&t.id, "reply three", SendOptions::default())
+        .await
+        .unwrap();
+    settle(&env.sdk, &t.id).await;
+    assert_eq!(mini_runs(&env.log).len(), 1);
+    let turns: Vec<Value> = env.sent("turn/start").iter().map(|m| m["params"].clone()).collect();
+    assert!(turns[0].get("model").is_none() && turns[0].get("approvalPolicy").is_none());
+    let p = &turns[1];
+    assert_eq!(
+        (
+            p["model"].clone(),
+            p["effort"].clone(),
+            p["approvalPolicy"].clone(),
+            p["sandboxPolicy"].clone()
+        ),
+        (
+            json!("b"),
+            json!("high"),
+            json!("never"),
+            json!({"type": "dangerFullAccess"})
+        )
+    );
+    // Codex keeps them.
+    assert!(turns[2].get("model").is_none() && turns[2].get("approvalPolicy").is_none());
+    assert!(turns.iter().all(|p| p.get("collaborationMode").is_none()));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn starts_a_new_process_with_codexs_own_model_or_effort_when_the_threads_is_cleared() {
+    for option in ["model", "effort"] {
+        let env = setup(Capabilities::default(), plain(), &[]);
+        let t = env
+            .sdk
+            .create(CreateOptions {
+                model: Some("a".into()),
+                effort: Some("high".into()),
+                ..create()
+            })
+            .await
+            .unwrap();
+        env.sdk.send(&t.id, "reply one", SendOptions::default()).await.unwrap();
+        settle(&env.sdk, &t.id).await;
+        let cmd = json!({"type": "set_options", "thread_id": t.id, option: ""});
+        env.sdk.handle_json(cmd).await.unwrap();
+        env.sdk.send(&t.id, "reply two", SendOptions::default()).await.unwrap();
+        settle(&env.sdk, &t.id).await;
+        assert_eq!(mini_runs(&env.log).len(), 2, "{option}");
+        if option == "model" {
+            assert!(env.sent("thread/resume")[0]["params"].get("model").is_none());
+        }
+        assert!(env.sent("turn/start")[0]["params"].get(option).is_none(), "{option}");
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn starts_a_new_process_resuming_the_session_when_the_config_changes() {
+    let env = setup(Capabilities::default(), plain(), &[]);
+    let t = env
+        .sdk
+        .create(CreateOptions {
+            model: Some("a".into()),
+            ..create()
+        })
+        .await
+        .unwrap();
+    env.sdk.send(&t.id, "reply one", SendOptions::default()).await.unwrap();
+    settle(&env.sdk, &t.id).await;
+    let cmd = json!({"type": "set_options", "thread_id": t.id, "model": "b", "permission_mode": "bypass"});
+    env.sdk.handle_json(cmd).await.unwrap();
+    let update = CapabilitiesUpdate {
+        system_prompt: Some("Be brief.".into()),
+        ..Default::default()
+    };
+    env.sdk.configure(&t.id, update).await.unwrap();
+    env.sdk.send(&t.id, "reply two", SendOptions::default()).await.unwrap();
+    settle(&env.sdk, &t.id).await;
+    assert_eq!(mini_runs(&env.log).len(), 2);
+    let resume = env.sent("thread/resume")[0]["params"].clone();
+    assert_eq!(
+        (
+            resume["model"].clone(),
+            resume["approvalPolicy"].clone(),
+            resume["sandbox"].clone()
+        ),
+        (json!("b"), json!("never"), json!("workspace-write"))
+    );
+    // The new process has them (its sandbox comes with its first turn): its turn doesn't override
+    // the rest.
+    let turn = env.sent("turn/start")[0]["params"].clone();
+    assert!(turn.get("model").is_none() && turn.get("approvalPolicy").is_none());
+    assert_eq!(turn["sandboxPolicy"], json!({"type": "dangerFullAccess"}));
+}
+
+/// A thread in plan mode.
+async fn planning(env: &Env) -> String {
+    let t = env
+        .sdk
+        .create(CreateOptions {
+            permission_mode: Some(PermissionMode::Plan),
+            ..create()
+        })
+        .await
+        .unwrap();
+    t.id
+}
+
+fn turn_starts(env: &Env) -> Vec<Value> {
+    env.sent("turn/start").iter().map(|m| m["params"].clone()).collect()
+}
+
+fn respond(id: &str, request: &Value, resolution: Value) -> Value {
+    json!({"type": "respond", "thread_id": id, "request_id": request["id"], "resolution": resolution})
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn in_plan_mode_asks_the_user_about_a_proposed_plan_and_implements_it_in_the_same_turn_once_its_approved() {
+    let caps = Capabilities {
+        permissions: Some(PermissionPolicy::ask()),
+        ..Default::default()
+    };
+    let env = setup(caps, plain(), &[]);
+    let t = env
+        .sdk
+        .create(CreateOptions {
+            model: Some("m".into()),
+            permission_mode: Some(PermissionMode::Plan),
+            ..create()
+        })
+        .await
+        .unwrap();
+    env.sdk
+        .send(&t.id, "propose Change apple to apricot.", SendOptions::default())
+        .await
+        .unwrap();
+    let r = env.request(&t.id).await;
+    assert_eq!(
+        (r["type"].clone(), r["plan"].clone()),
+        (json!("plan"), json!("Change apple to apricot."))
+    );
+    let s = serde_json::to_value(env.sdk.snapshot(&t.id).await.unwrap()).unwrap();
+    assert_eq!(s["thread"]["status"], "waiting");
+    assert!(results(&s).is_empty());
+    env.sdk
+        .handle_json(respond(&t.id, &r, json!({"outcome": "allow"})))
+        .await
+        .unwrap();
+    let s = settle(&env.sdk, &t.id).await;
+    assert_eq!(s["thread"]["permission_mode"], "default");
+    assert_eq!(mini_runs(&env.log).len(), 1);
+    let turns = turn_starts(&env);
+    assert_eq!(turns[0]["collaborationMode"]["mode"], "plan");
+    assert_eq!(turns[0]["collaborationMode"]["settings"]["model"], "m");
+    assert_eq!(turns[1]["input"][0]["text"], "Implement the plan.");
+    assert_eq!(turns[1]["collaborationMode"]["mode"], "default");
+    // Its approval policy's the same.
+    assert_eq!(
+        (
+            turns[1].get("approvalPolicy"),
+            turns[1]["sandboxPolicy"]["type"].clone()
+        ),
+        (None, json!("workspaceWrite"))
+    );
+    // One turn, of both Codex turns.
+    let r = results(&s);
+    assert_eq!(r.len(), 1);
+    assert_eq!(
+        (r[0]["ok"].clone(), r[0]["duration_ms"].clone()),
+        (json!(true), json!(14))
+    );
+    assert_eq!(
+        r[0]["usage"],
+        json!({"input_tokens": 120, "cache_read_tokens": 80, "output_tokens": 20, "cache_write_tokens": 0})
+    );
+    assert_eq!(texts(&s), ["Change apple to apricot."]);
+
+    // Codex stays in its default mode, which isn't sent again.
+    env.sdk.send(&t.id, "reply done", SendOptions::default()).await.unwrap();
+    settle(&env.sdk, &t.id).await;
+    assert!(turn_starts(&env)[2].get("collaborationMode").is_none());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn in_plan_mode_sends_the_users_feedback_and_plans_again_denied_without_any_the_turn_ends() {
+    let env = setup(Capabilities::default(), plain(), &[]);
+    let t = planning(&env).await;
+    env.sdk.send(&t, "propose One.", SendOptions::default()).await.unwrap();
+    let r = env.request(&t).await;
+    env.sdk
+        .handle_json(respond(&t, &r, json!({"outcome": "deny", "message": "propose Two."})))
+        .await
+        .unwrap();
+    let r2 = until(5, || async {
+        env.sdk
+            .snapshot(&t)
+            .await
+            .unwrap()
+            .requests
+            .iter()
+            .find(|x| x.id() != r["id"])
+            .map(|x| serde_json::to_value(x).unwrap())
+    })
+    .await;
+    assert_eq!((r2["type"].clone(), r2["plan"].clone()), (json!("plan"), json!("Two.")));
+    env.sdk
+        .handle_json(respond(&t, &r2, json!({"outcome": "deny"})))
+        .await
+        .unwrap();
+    let s = settle(&env.sdk, &t).await;
+    assert_eq!(s["thread"]["permission_mode"], "plan");
+    let r = results(&s);
+    assert_eq!((r.len(), r[0]["ok"].clone()), (1, json!(true)));
+    let turns = turn_starts(&env);
+    assert_eq!(turns.len(), 2);
+    assert_eq!(
+        (
+            turns[1]["input"][0]["text"].clone(),
+            turns[1]["collaborationMode"]["mode"].clone()
+        ),
+        (json!("propose Two."), json!("plan"))
+    );
+    assert!(turns[1].get("approvalPolicy").is_none());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn in_plan_mode_keeps_the_configs_workspace_write_settings_when_a_plans_approved_out_of_the_read_only_sandbox() {
+    let sandbox = json!({"network_access": true, "exclude_tmpdir_env_var": true, "exclude_slash_tmp": true});
+    let config = [("sandbox_workspace_write".to_string(), sandbox)].into_iter().collect();
+    let env = setup(Capabilities::default(), CodexOptions { config, ..plain() }, &[]);
+    let t = planning(&env).await;
+    env.sdk.send(&t, "propose One.", SendOptions::default()).await.unwrap();
+    let r = env.request(&t).await;
+    env.sdk
+        .handle_json(respond(
+            &t,
+            &r,
+            json!({"outcome": "allow", "permission_mode": "accept_edits"}),
+        ))
+        .await
+        .unwrap();
+    settle(&env.sdk, &t).await;
+    assert_eq!(
+        turn_starts(&env)[1]["sandboxPolicy"],
+        json!({"type": "workspaceWrite", "writableRoots": [], "networkAccess": true, "excludeTmpdirEnvVar": true, "excludeSlashTmp": true})
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn starts_threads_in_the_workspace_write_sandbox_and_switches_back_to_it_as_codex_has_it() {
+    // In plan or bypass mode too, with its config dir's settings and its other directories.
+    for mode in [PermissionMode::Plan, PermissionMode::Bypass] {
+        let config = [("sandbox_workspace_write.writable_roots".to_string(), json!(["/base"]))]
+            .into_iter()
+            .collect();
+        let env = setup(Capabilities::default(), CodexOptions { config, ..plain() }, &[]);
+        let (home, cwd) = (common::temp_dir(), common::temp_dir());
+        std::fs::write(
+            home.join("config.toml"),
+            "[sandbox_workspace_write]\nexclude_tmpdir_env_var = true\nexclude_slash_tmp = true\n",
+        )
+        .unwrap();
+        let t = env
+            .sdk
+            .create(CreateOptions {
+                cwd: Some(cwd.clone()),
+                permission_mode: Some(mode),
+                launch: LaunchOptions {
+                    add_dirs: vec!["extra".into()],
+                    config_dir: Some(home),
+                    ..Default::default()
+                },
+                ..create()
+            })
+            .await
+            .unwrap();
+        if mode == PermissionMode::Plan {
+            env.sdk
+                .send(&t.id, "propose One.", SendOptions::default())
+                .await
+                .unwrap();
+            let r = env.request(&t.id).await;
+            env.sdk
+                .handle_json(respond(
+                    &t.id,
+                    &r,
+                    json!({"outcome": "allow", "permission_mode": "accept_edits"}),
+                ))
+                .await
+                .unwrap();
+        } else {
+            env.sdk.send(&t.id, "reply one", SendOptions::default()).await.unwrap();
+            settle(&env.sdk, &t.id).await;
+            let cmd = json!({"type": "set_options", "thread_id": t.id, "permission_mode": "accept_edits"});
+            env.sdk.handle_json(cmd).await.unwrap();
+            env.sdk.send(&t.id, "reply two", SendOptions::default()).await.unwrap();
+        }
+        settle(&env.sdk, &t.id).await;
+        let (approval, first) = if mode == PermissionMode::Plan {
+            ("untrusted", "readOnly")
+        } else {
+            ("never", "dangerFullAccess")
+        };
+        let start = env.sent("thread/start")[0]["params"].clone();
+        assert_eq!(
+            (start["approvalPolicy"].clone(), start["sandbox"].clone()),
+            (json!(approval), json!("workspace-write"))
+        );
+        let turns = turn_starts(&env);
+        assert_eq!(turns[0]["sandboxPolicy"], json!({"type": first}));
+        assert_eq!(
+            turns[1]["sandboxPolicy"],
+            json!({
+                "type": "workspaceWrite",
+                "writableRoots": ["/base", cwd.join("extra")],
+                "networkAccess": false,
+                "excludeTmpdirEnvVar": true,
+                "excludeSlashTmp": true,
+            })
+        );
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn changes_only_the_approval_policy_when_the_sandbox_stays_and_switches_back_to_the_sandbox_codex_had() {
+    // Codex takes a sandboxPolicy's settings that are left out as false.
+    let config = [
+        ("sandbox_workspace_write.network_access".to_string(), json!(true)),
+        ("sandbox_workspace_write.exclude_slash_tmp".to_string(), json!(true)),
+    ]
+    .into_iter()
+    .collect();
+    let env = setup(Capabilities::default(), CodexOptions { config, ..plain() }, &[]);
+    let t = env.sdk.create(create()).await.unwrap();
+    for mode in [None, Some("accept_edits"), Some("bypass"), Some("accept_edits")] {
+        if let Some(mode) = mode {
+            let cmd = json!({"type": "set_options", "thread_id": t.id, "permission_mode": mode});
+            env.sdk.handle_json(cmd).await.unwrap();
+        }
+        env.sdk.send(&t.id, "reply ok", SendOptions::default()).await.unwrap();
+        settle(&env.sdk, &t.id).await;
+    }
+    let turns = turn_starts(&env);
+    assert_eq!(
+        (turns[1]["approvalPolicy"].clone(), turns[1].get("sandboxPolicy")),
+        (json!("on-request"), None)
+    );
+    assert_eq!(
+        (turns[2]["approvalPolicy"].clone(), turns[2]["sandboxPolicy"].clone()),
+        (json!("never"), json!({"type": "dangerFullAccess"}))
+    );
+    assert_eq!(
+        turns[3]["sandboxPolicy"],
+        json!({"type": "workspaceWrite", "writableRoots": [], "networkAccess": true, "excludeTmpdirEnvVar": false, "excludeSlashTmp": true})
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn in_plan_mode_carries_on_in_the_mode_the_user_approves_the_plan_in() {
+    let env = setup(Capabilities::default(), plain(), &[]);
+    let t = planning(&env).await;
+    env.sdk.send(&t, "propose One.", SendOptions::default()).await.unwrap();
+    let r = env.request(&t).await;
+    env.sdk
+        .handle_json(respond(
+            &t,
+            &r,
+            json!({"outcome": "allow", "permission_mode": "accept_edits"}),
+        ))
+        .await
+        .unwrap();
+    let s = settle(&env.sdk, &t).await;
+    assert_eq!(s["thread"]["permission_mode"], "accept_edits");
+    let p = &turn_starts(&env)[1];
+    assert_eq!(
+        (
+            p["approvalPolicy"].clone(),
+            p["sandboxPolicy"]["type"].clone(),
+            p["collaborationMode"]["mode"].clone()
+        ),
+        (json!("on-request"), json!("workspaceWrite"), json!("default"))
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn in_plan_mode_takes_a_message_sent_while_a_plan_waits_as_more_to_plan_with() {
+    let env = setup(Capabilities::default(), plain(), &[]);
+    let t = planning(&env).await;
+    env.sdk.send(&t, "propose One.", SendOptions::default()).await.unwrap();
+    let r = env.request(&t).await;
+    let o = SendOptions {
+        client_id: Some("more".into()),
+        ..Default::default()
+    };
+    env.sdk.send(&t, "reply And two.", o).await.unwrap();
+    let s = settle(&env.sdk, &t).await;
+    let plan = s["requests"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|x| x["id"] == r["id"])
+        .unwrap();
+    assert_eq!(plan["resolution"], json!({"outcome": "cancel"}));
+    let m = items(&s, "user_message")
+        .into_iter()
+        .find(|i| i["client_id"] == "more")
+        .unwrap()
+        .clone();
+    assert_eq!(m["steered"], true);
+    assert_eq!(texts(&s), ["One.", "And two."]);
+    assert_eq!(results(&s).len(), 1);
+    let p = &turn_starts(&env)[1];
+    assert_eq!(
+        (p["input"][0]["text"].clone(), p["collaborationMode"]["mode"].clone()),
+        (json!("reply And two."), json!("plan"))
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn in_plan_mode_ends_the_turn_when_its_interrupted_while_a_plan_waits() {
+    let env = setup(Capabilities::default(), plain(), &[]);
+    let t = planning(&env).await;
+    env.sdk.send(&t, "propose One.", SendOptions::default()).await.unwrap();
+    let r = env.request(&t).await;
+    env.sdk.interrupt(&t).await.unwrap();
+    let s = settle(&env.sdk, &t).await;
+    let res = results(&s);
+    assert_eq!(
+        (res.len(), res[0]["ok"].clone(), res[0]["interrupted"].clone()),
+        (1, json!(false), json!(true))
+    );
+    // Kept, resolved.
+    assert_eq!(
+        (s["requests"][0]["id"].clone(), s["requests"][0]["resolution"].clone()),
+        (r["id"].clone(), json!({"outcome": "cancel"}))
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn in_plan_mode_keeps_what_the_plans_used_when_the_turn_fails_after_them() {
+    let env = setup(Capabilities::default(), plain(), &[]);
+    let t = planning(&env).await;
+    env.sdk.send(&t, "propose One.", SendOptions::default()).await.unwrap();
+    let r = env.request(&t).await;
+    env.sdk
+        .handle_json(respond(&t, &r, json!({"outcome": "deny", "message": "crash"})))
+        .await
+        .unwrap();
+    let s = settle(&env.sdk, &t).await;
+    let r = results(&s);
+    let used = json!({"input_tokens": 60, "cache_read_tokens": 40, "output_tokens": 10, "cache_write_tokens": 0});
+    assert_eq!(
+        (
+            r.len(),
+            r[0]["ok"].clone(),
+            r[0]["duration_ms"].clone(),
+            r[0]["usage"].clone()
+        ),
+        (1, json!(false), json!(7), used.clone())
+    );
+    assert_eq!(s["thread"]["usage"], used);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn in_plan_mode_doesnt_ask_about_a_plan_outside_plan_mode() {
+    let env = setup(Capabilities::default(), plain(), &[]);
+    let t = env.sdk.create(create()).await.unwrap();
+    env.sdk
+        .send(&t.id, "propose One.", SendOptions::default())
+        .await
+        .unwrap();
+    let s = settle(&env.sdk, &t.id).await;
+    let r = results(&s);
+    assert_eq!((r.len(), r[0]["ok"].clone()), (1, json!(true)));
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn turns_off_the_users_and_the_projects_skills_keeping_the_apps_and_codexs_own() {
     let skill = |root: &std::path::Path, name: &str| {
         let dir = root.join(".agents/skills").join(name);
@@ -773,6 +1265,17 @@ async fn links_the_users_login_into_the_apps_home() {
     let link = env.home.join("auth.json");
     assert!(std::fs::symlink_metadata(&link).unwrap().file_type().is_symlink());
     assert_eq!(std::fs::read_link(&link).unwrap(), user.join("auth.json"));
+}
+
+/// A snapshot's open requests (it keeps those resolved too).
+fn open(s: &Value) -> Value {
+    s["requests"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|r| r.get("resolution").is_none_or(Value::is_null))
+        .cloned()
+        .collect()
 }
 
 fn shell_asks() -> Capabilities {
@@ -935,7 +1438,7 @@ async fn cancels_what_a_child_thread_left_unfinished_when_it_ends_after_its_pare
             "{end}"
         );
         assert_eq!(c[1]["status"], "cancelled", "{end}");
-        assert_eq!(s["requests"], json!([]), "{end}");
+        assert_eq!(open(&s), json!([]), "{end}");
     }
 }
 
@@ -954,7 +1457,7 @@ async fn sets_the_thread_running_again_when_a_child_thread_ends_during_its_paren
             .unwrap();
         until(5, || async {
             let s = serde_json::to_value(env.sdk.snapshot(&t.id).await.unwrap()).unwrap();
-            (s["requests"].as_array().unwrap().len() == 1 && s["thread"]["status"] == "waiting").then_some(())
+            (open(&s).as_array().unwrap().len() == 1 && s["thread"]["status"] == "waiting").then_some(())
         })
         .await;
         let s = until(5, || async {
@@ -963,7 +1466,7 @@ async fn sets_the_thread_running_again_when_a_child_thread_ends_during_its_paren
         })
         .await;
         assert!(results(&s).is_empty(), "{end}");
-        assert_eq!(s["requests"], json!([]), "{end}");
+        assert_eq!(open(&s), json!([]), "{end}");
         assert_eq!(s["thread"]["status"], "running", "{end}");
         env.sdk.interrupt(&t.id).await.unwrap();
         until(5, || async {
@@ -1023,10 +1526,10 @@ async fn cancels_a_child_threads_approval_about_none_of_its_calls_when_it_ends()
             // outlives the turn.
             let s = until(5, || async {
                 let s = serde_json::to_value(env.sdk.snapshot(&t.id).await.unwrap()).unwrap();
-                (results(&s).len() == 1 && s["requests"].as_array().unwrap().len() == 1).then_some(s)
+                (results(&s).len() == 1 && open(&s).as_array().unwrap().len() == 1).then_some(s)
             })
             .await;
-            let r = &s["requests"][0];
+            let r = &open(&s)[0];
             assert_eq!(
                 (
                     r["tool_call_id"].clone(),
@@ -1053,7 +1556,87 @@ async fn cancels_a_child_threads_approval_about_none_of_its_calls_when_it_ends()
                 (json!("cancelled"), json!("cancelled")),
                 "{end}{late}"
             );
-            assert_eq!(s["requests"], json!([]), "{end}{late}");
+            assert_eq!(open(&s), json!([]), "{end}{late}");
         }
     }
+}
+
+/// A thread's launch options: its own CODEX_HOME (used as it is), arguments after the options',
+/// environment, and writable roots; stored with the thread, and changed by set_options.
+#[tokio::test(flavor = "multi_thread")]
+async fn starts_codex_with_the_threads_launch_options() {
+    let mut o = plain();
+    o.args = vec!["--own".into()];
+    o.config
+        .insert("sandbox_workspace_write.writable_roots".into(), json!(["/base"]));
+    let env = setup(
+        Capabilities::default(),
+        o,
+        &[("MINI_LOG_ENV", "AT_SET,AT_GONE"), ("AT_GONE", "instance")],
+    );
+    let (home, cwd) = (common::temp_dir(), common::temp_dir());
+    let t = env
+        .sdk
+        .create(CreateOptions {
+            cwd: Some(cwd.clone()),
+            launch: LaunchOptions {
+                args: vec!["-c".into(), "a=1".into()],
+                env: [
+                    ("AT_SET".to_string(), Some("x y".to_string())),
+                    ("AT_GONE".to_string(), None),
+                ]
+                .into(),
+                add_dirs: vec!["sub".into(), "/abs".into()],
+                config_dir: Some(home.clone()),
+            },
+            ..create()
+        })
+        .await
+        .unwrap();
+    env.sdk.send(&t.id, "reply one", SendOptions::default()).await.unwrap();
+    assert_eq!(texts(&settle(&env.sdk, &t.id).await), ["one"]);
+    let runs = mini_runs(&env.log);
+    assert_eq!(runs[0].argv, ["app-server", "--own", "-c", "a=1"]);
+    assert_eq!(runs[0].config_dir.as_deref(), Some(home.to_str().unwrap()));
+    assert_eq!(runs[0].env, json!({"AT_SET": "x y", "AT_GONE": null}));
+    assert_eq!(
+        env.sent("thread/start")[0]["params"]["config"]["sandbox_workspace_write.writable_roots"],
+        json!(["/base", cwd.join("sub"), "/abs"])
+    );
+    // Its own home, not the app's: no login was linked into it.
+    assert!(!home.join("auth.json").exists());
+    let stored = env.store.get_thread(&t.id).await.unwrap().unwrap();
+    assert_eq!(stored["launch"]["args"], json!(["-c", "a=1"]));
+    assert!(
+        serde_json::to_value(env.sdk.snapshot(&t.id).await.unwrap()).unwrap()["thread"]
+            .get("launch")
+            .is_none()
+    );
+
+    // New arguments: the next turn resumes the thread in a new process that has them.
+    env.sdk
+        .set_options(
+            &t.id,
+            ThreadOptions {
+                launch: Some(LaunchOptions {
+                    args: vec!["-c".into(), "a=2".into()],
+                    config_dir: Some(home.clone()),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    env.sdk.send(&t.id, "reply two", SendOptions::default()).await.unwrap();
+    assert_eq!(texts(&settle(&env.sdk, &t.id).await), ["one", "two"]);
+    let runs = mini_runs(&env.log);
+    assert_eq!(runs.len(), 2);
+    assert_eq!(runs[1].argv, ["app-server", "--own", "-c", "a=2"]);
+    assert_eq!(runs[1].env, json!({"AT_SET": null, "AT_GONE": "instance"}));
+    assert_eq!(env.sent("thread/resume").len(), 1);
+    assert_eq!(
+        env.sent("thread/resume")[0]["params"]["config"]["sandbox_workspace_write.writable_roots"],
+        json!(["/base"])
+    );
 }

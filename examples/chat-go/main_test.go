@@ -16,6 +16,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"syscall"
 	"testing"
 	"time"
 
@@ -272,6 +273,28 @@ func TestChat(t *testing.T) {
 	if json.Unmarshal(raw, &since) != nil || len(since) != 2 {
 		t.Fatalf("events_since: %s", raw)
 	}
+
+	// A window of the last 2 items, and the page before it, which has the rest.
+	n := len(snap.Items)
+	raw, _ = c.call("snapshot", map[string]any{"thread_id": th.ID, "limit": 2})
+	var window protocol.Snapshot
+	json.Unmarshal(raw, &window)
+	if window.Start == nil || *window.Start != int64(n-2) || len(window.Items) != 2 || window.Items[1].ID() != snap.Items[n-1].ID() || window.Seq != snap.Seq {
+		t.Fatalf("snapshot with a limit: %s", raw)
+	}
+	raw, _ = c.call("items_before", map[string]any{"thread_id": th.ID, "before": n - 2, "limit": 100})
+	var page protocol.ItemPage
+	json.Unmarshal(raw, &page)
+	if page.ThreadID != th.ID || page.Start != 0 || len(page.Items) != n-2 || page.Items[0].ID() != snap.Items[0].ID() || !strings.Contains(string(raw), `"context":[]`) {
+		t.Fatalf("items_before: %s", raw)
+	}
+	whole, _ := json.Marshal(snap)
+	if got, _ := json.Marshal(protocol.WithPage(window, page)); string(got) != string(whole) {
+		t.Fatalf("the window with the page:\n got %s\nwant %s", got, whole)
+	}
+	if _, errText := c.call("items_before", map[string]any{"thread_id": th.ID, "before": 2}); !strings.Contains(errText, "limit") {
+		t.Fatalf("items_before without a limit: %q", errText)
+	}
 }
 
 func TestTheServerRefusesOtherPagesAndBadInput(t *testing.T) {
@@ -333,5 +356,45 @@ func TestTheServerRefusesOtherPagesAndBadInput(t *testing.T) {
 	good := dial(t, host)
 	if _, errText := good.call("hello", nil); errText != "" {
 		t.Fatal(errText)
+	}
+}
+
+// A signal to the supervisor is passed on to the server, which isn't started again: the supervisor
+// returns once the server has exited (all that a test's teardown sends it is SIGTERM). And a server
+// that exits asking for a restart is started again.
+func TestSupervise(t *testing.T) {
+	dir := t.TempDir()
+	started, stopped := filepath.Join(dir, "started"), filepath.Join(dir, "stopped")
+	// The first asks for a restart; the second runs until it's signalled, then takes a while to stop.
+	script := fmt.Sprintf(`echo >> %[1]s
+if [ "$(wc -l < %[1]s)" -eq 1 ]; then exit %[3]d; fi
+trap 'sleep 0.3; echo stopped > %[2]s; exit 0' TERM
+echo ready > %[4]s
+while :; do sleep 0.05; done`, started, stopped, restartCode, filepath.Join(dir, "ready"))
+	signals := make(chan os.Signal, 1)
+	code := make(chan int, 1)
+	go func() { code <- superviseWith(func() *exec.Cmd { return exec.Command("sh", "-c", script) }, signals) }()
+	for deadline := time.Now().Add(10 * time.Second); ; time.Sleep(20 * time.Millisecond) {
+		if _, err := os.Stat(filepath.Join(dir, "ready")); err == nil {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("the server wasn't started again")
+		}
+	}
+	signals <- syscall.SIGTERM
+	select {
+	case c := <-code:
+		if c != 0 {
+			t.Fatalf("exit code %d", c)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("the supervisor didn't return")
+	}
+	if b, err := os.ReadFile(stopped); err != nil || string(b) != "stopped\n" {
+		t.Fatalf("the server hadn't stopped when the supervisor returned: %q, %v", b, err)
+	}
+	if b, _ := os.ReadFile(started); strings.Count(string(b), "\n") != 2 {
+		t.Fatalf("started %d times", strings.Count(string(b), "\n"))
 	}
 }

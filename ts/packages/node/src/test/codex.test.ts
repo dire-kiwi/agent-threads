@@ -6,7 +6,7 @@ import { existsSync, lstatSync, mkdirSync, readFileSync, readlinkSync, realpathS
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { afterEach, describe, expect, it } from "vitest";
-import { applyEvents, initialState, type Item, type Notice, type ThreadEvent, type ToolCall, type TurnResult, type UserMessage } from "@dire-kiwi/agent-threads-protocol";
+import { applyEvents, initialState, openRequests, type Item, type Notice, type ThreadEvent, type ToolCall, type TurnResult, type UserMessage } from "@dire-kiwi/agent-threads-protocol";
 import { AgentThreads, type AgentThreadsOptions } from "../agent-threads.js";
 import { codex, type CodexOptions } from "../codex/driver.js";
 import { prepareCodexHome } from "../codex/home.js";
@@ -56,10 +56,11 @@ function setup(options: Setup = {}) {
   /** What each run was started with and sent. */
   const runs = () => {
     if (!existsSync(log)) return [];
-    const out: { argv: string[]; codexHome: string; sent: { [k: string]: any }[]; notes: { [k: string]: any }[] }[] = [];
+    // Its CODEX_HOME, and the variables MINI_LOG_ENV names (null if unset).
+    const out: { argv: string[]; codexHome: string; env: { [k: string]: string | null }; sent: { [k: string]: any }[]; notes: { [k: string]: any }[] }[] = [];
     for (const l of readFileSync(log, "utf8").split("\n").filter(Boolean)) {
       const v = JSON.parse(l);
-      if (v.argv) out.push({ argv: v.argv, codexHome: v.codexHome, sent: [], notes: [] });
+      if (v.argv) out.push({ argv: v.argv, codexHome: v.codexHome, env: v.env ?? {}, sent: [], notes: [] });
       else if ("jsonrpc" in v || "method" in v || "id" in v) out[out.length - 1]!.sent.push(v);
       else out[out.length - 1]!.notes.push(v);
     }
@@ -92,7 +93,7 @@ async function settle(sdk: AgentThreads, id: string, ms = 5000) {
 }
 
 /** Waits for the thread's one open request. */
-const request = (sdk: AgentThreads, id: string) => until(async () => (await sdk.snapshot(id)).requests[0]);
+const request = (sdk: AgentThreads, id: string) => until(async () => openRequests(await sdk.snapshot(id))[0]);
 
 const results = (items: Item[]) => items.filter((i): i is TurnResult => i.type === "turn_result");
 const texts = (items: Item[]) => items.filter((i) => i.type === "assistant_message").map((i) => (i as { text: string }).text);
@@ -161,7 +162,8 @@ describe("the Codex driver", () => {
       cwd,
       model: "gpt-test",
       approvalPolicy: "untrusted",
-      sandbox: "read-only",
+      // Plan mode's read-only sandbox comes with the first turn.
+      sandbox: "workspace-write",
       developerInstructions: "Be brief.",
       config: {
         model_reasoning_summary: "auto",
@@ -184,7 +186,11 @@ describe("the Codex driver", () => {
       const t = await sdk.create({ harness: "codex", permission_mode: mode as keyof typeof modes, cwd: tempDir() });
       await sdk.send(t.id, "reply ok");
       await settle(sdk, t.id);
-      expect(sent("thread/start")[0]!.params).toMatchObject({ approvalPolicy, sandbox });
+      // The thread starts in the workspace-write sandbox, and the first turn puts it in another.
+      expect(sent("thread/start")[0]!.params).toMatchObject({ approvalPolicy, sandbox: "workspace-write" });
+      const turn = sent("turn/start")[0]!.params;
+      if (sandbox === "workspace-write") expect(turn).not.toHaveProperty("sandboxPolicy");
+      else expect(turn.sandboxPolicy).toEqual({ type: "dangerFullAccess" });
     }
   });
 
@@ -205,7 +211,7 @@ describe("the Codex driver", () => {
     expect(calls(s.items)[0]).toMatchObject({ id: r.tool_call_id, status: "pending", command: "touch a.txt" });
     await sdk.respond(t.id, r.id, { outcome: "allow" });
 
-    r = await until(async () => (await sdk.snapshot(t.id)).requests.find((x) => x.id !== r.id));
+    r = await until(async () => openRequests(await sdk.snapshot(t.id)).find((x) => x.id !== r.id));
     expect(r).toMatchObject({ type: "permission", name: "fileChange", kind: "edit", title: "/w/notes.txt" });
     await sdk.respond(t.id, r.id, { outcome: "deny", message: "no edits" });
     s = await settle(sdk, t.id);
@@ -246,7 +252,7 @@ describe("the Codex driver", () => {
     expect(texts(s.items)).toEqual(['granted {"network":{"enabled":true}}']);
 
     await sdk.send(t.id, "perms");
-    r = await until(async () => (await sdk.snapshot(t.id)).requests[0]);
+    r = await until(async () => openRequests(await sdk.snapshot(t.id))[0]);
     await sdk.respond(t.id, r.id, { outcome: "deny" });
     s = await settle(sdk, t.id);
     expect(texts(s.items)[1]).toBe("granted {}");
@@ -434,7 +440,7 @@ describe("the Codex driver", () => {
       const [spawn, cmd] = calls(s.items);
       expect(spawn!.subagent).toEqual({ status: "stopped", background: true, model: "mini-child" });
       expect(cmd).toMatchObject({ status: "cancelled", parent_id: spawn!.id });
-      expect(s.requests).toEqual([]);
+      expect(openRequests(s)).toEqual([]);
       expect(events).toContainEqual(expect.objectContaining({ type: "request.resolved", request_id: r.id, resolution: { outcome: "cancel" } }));
     });
   }
@@ -453,7 +459,7 @@ describe("the Codex driver", () => {
       const s = await sdk.snapshot(t.id);
       expect(events.some((e) => e.type === "turn.completed")).toBe(false);
       expect(calls(s.items)[0]!.subagent).toMatchObject({ status: "stopped" });
-      expect(s.requests).toEqual([]);
+      expect(openRequests(s)).toEqual([]);
       expect(s.thread.status).toBe("running");
       await sdk.interrupt(t.id);
       expect((await settle(sdk, t.id)).thread.status).toBe("idle");
@@ -481,7 +487,7 @@ describe("the Codex driver", () => {
         const [spawn, ...mcp] = calls(s.items);
         expect(spawn!.subagent).toEqual({ status: "stopped", background: true, model: "mini-child" });
         expect(mcp.map((c) => c.status)).toEqual(["cancelled", "cancelled"]);
-        expect(s.requests).toEqual([]);
+        expect(openRequests(s)).toEqual([]);
         expect(events).toContainEqual(expect.objectContaining({ type: "request.resolved", request_id: r.id, resolution: { outcome: "cancel" } }));
       });
     }
@@ -509,7 +515,7 @@ describe("the Codex driver", () => {
     const [spawn, cmd] = calls(s.items);
     expect(spawn).toMatchObject({ status: "completed", subagent: { status: "stopped", background: true } });
     expect(cmd).toMatchObject({ status: "cancelled", parent_id: spawn!.id });
-    expect(s.requests).toEqual([]);
+    expect(openRequests(s)).toEqual([]);
   });
 
   it("steers a running turn with turn/steer, and the message joins it when Codex takes it in", async () => {
@@ -639,16 +645,224 @@ describe("the Codex driver", () => {
     expect(results(s.items).map((r) => r.ok)).toEqual([true, true]);
   });
 
-  it("starts a new process, resuming the session, when the options change", async () => {
+  it("gives the process new options with its next turn", async () => {
+    const { sdk, sent, runs } = setup();
+    const t = await sdk.create({ harness: "codex", model: "a", effort: "low", cwd: tempDir() });
+    await sdk.send(t.id, "reply one");
+    await settle(sdk, t.id);
+    await sdk.setOptions(t.id, { model: "b", effort: "high", permission_mode: "bypass" });
+    await sdk.send(t.id, "reply two");
+    await settle(sdk, t.id);
+    await sdk.send(t.id, "reply three");
+    await settle(sdk, t.id);
+    expect(runs()).toHaveLength(1);
+    const turns = sent("turn/start").map((m) => m.params);
+    expect(turns[0]).not.toHaveProperty("model");
+    expect(turns[0]).not.toHaveProperty("approvalPolicy");
+    expect(turns[1]).toMatchObject({ model: "b", effort: "high", approvalPolicy: "never", sandboxPolicy: { type: "dangerFullAccess" } });
+    // Codex keeps them.
+    expect(turns[2]).not.toHaveProperty("model");
+    expect(turns[2]).not.toHaveProperty("approvalPolicy");
+    expect(turns.map((p) => p.collaborationMode)).toEqual([undefined, undefined, undefined]);
+  });
+
+  it.each(["plan", "bypass"] as const)(
+    "starts a thread in %s mode in the workspace-write sandbox, and switches back to it as Codex has it, with its config dir's settings and its other directories",
+    async (mode) => {
+      const { sdk, sent } = setup({ codex: { config: { "sandbox_workspace_write.writable_roots": ["/base"] } } });
+      const [home, cwd] = [tempDir(), tempDir()];
+      writeFileSync(join(home, "config.toml"), "[sandbox_workspace_write]\nexclude_tmpdir_env_var = true\nexclude_slash_tmp = true\n");
+      const t = await sdk.create({ harness: "codex", cwd, permission_mode: mode, launch: { addDirs: ["extra"], configDir: home } });
+      await sdk.send(t.id, mode === "plan" ? "propose One." : "reply one");
+      if (mode === "plan") {
+        const r = await request(sdk, t.id);
+        await sdk.respond(t.id, r.id, { outcome: "allow", permission_mode: "accept_edits" });
+      } else {
+        await settle(sdk, t.id);
+        await sdk.setOptions(t.id, { permission_mode: "accept_edits" });
+        await sdk.send(t.id, "reply two");
+      }
+      await settle(sdk, t.id);
+      expect(sent("thread/start")[0]!.params).toMatchObject({ approvalPolicy: mode === "plan" ? "untrusted" : "never", sandbox: "workspace-write" });
+      const turns = sent("turn/start").map((m) => m.params);
+      expect(turns[0]!.sandboxPolicy).toEqual({ type: mode === "plan" ? "readOnly" : "dangerFullAccess" });
+      expect(turns[1]!.sandboxPolicy).toEqual({
+        type: "workspaceWrite",
+        writableRoots: ["/base", join(cwd, "extra")],
+        networkAccess: false,
+        excludeTmpdirEnvVar: true,
+        excludeSlashTmp: true,
+      });
+    },
+  );
+
+  it("changes only the approval policy when the sandbox stays, and switches back to the sandbox Codex had", async () => {
+    // Codex takes a sandboxPolicy's settings that are left out as false.
+    const config = { "sandbox_workspace_write.network_access": true, "sandbox_workspace_write.exclude_slash_tmp": true };
+    const { sdk, sent } = setup({ codex: { config } });
+    const t = await sdk.create({ harness: "codex", cwd: tempDir() });
+    for (const mode of [undefined, "accept_edits", "bypass", "accept_edits"] as const) {
+      if (mode) await sdk.setOptions(t.id, { permission_mode: mode });
+      await sdk.send(t.id, "reply ok");
+      await settle(sdk, t.id);
+    }
+    const turns = sent("turn/start").map((m) => m.params);
+    expect(turns[1]).toMatchObject({ approvalPolicy: "on-request" });
+    expect(turns[1]).not.toHaveProperty("sandboxPolicy");
+    expect(turns[2]).toMatchObject({ approvalPolicy: "never", sandboxPolicy: { type: "dangerFullAccess" } });
+    expect(turns[3]!.sandboxPolicy).toEqual({ type: "workspaceWrite", writableRoots: [], networkAccess: true, excludeTmpdirEnvVar: false, excludeSlashTmp: true });
+  });
+
+  it.each(["model", "effort"] as const)("starts a new process, with Codex's own %s, when the thread's is cleared", async (option) => {
+    const { sdk, sent, runs } = setup();
+    const t = await sdk.create({ harness: "codex", model: "a", effort: "high", cwd: tempDir() });
+    await sdk.send(t.id, "reply one");
+    await settle(sdk, t.id);
+    await sdk.setOptions(t.id, { [option]: "" });
+    await sdk.send(t.id, "reply two");
+    await settle(sdk, t.id);
+    expect(runs()).toHaveLength(2);
+    if (option === "model") expect(sent("thread/resume")[0]!.params).not.toHaveProperty("model");
+    expect(sent("turn/start")[0]!.params).not.toHaveProperty(option);
+  });
+
+  it("starts a new process, resuming the session, when the config changes", async () => {
     const { sdk, sent, runs } = setup();
     const t = await sdk.create({ harness: "codex", model: "a", cwd: tempDir() });
     await sdk.send(t.id, "reply one");
     await settle(sdk, t.id);
     await sdk.setOptions(t.id, { model: "b", permission_mode: "bypass" });
+    await sdk.configure(t.id, { systemPrompt: "Be brief." });
     await sdk.send(t.id, "reply two");
     await settle(sdk, t.id);
     expect(runs()).toHaveLength(2);
-    expect(sent("thread/resume")[0]!.params).toMatchObject({ model: "b", approvalPolicy: "never", sandbox: "danger-full-access" });
+    expect(sent("thread/resume")[0]!.params).toMatchObject({ model: "b", approvalPolicy: "never", sandbox: "workspace-write" });
+    // The new process has them (its sandbox comes with its first turn): its turn doesn't override the rest.
+    expect(sent("turn/start")[0]!.params).not.toHaveProperty("model");
+    expect(sent("turn/start")[0]!.params).not.toHaveProperty("approvalPolicy");
+    expect(sent("turn/start")[0]!.params.sandboxPolicy).toEqual({ type: "dangerFullAccess" });
+  });
+
+  describe("in plan mode", () => {
+    const planTurns = (sent: (m: string) => { [k: string]: any }[]) => sent("turn/start").map((m) => m.params);
+
+    it("asks the user about a proposed plan, and implements it in the same turn once it's approved", async () => {
+      const { sdk, sent, runs } = setup({ permissions: "ask" });
+      const t = await sdk.create({ harness: "codex", model: "m", permission_mode: "plan", cwd: tempDir() });
+      await sdk.send(t.id, "propose Change apple to apricot.");
+      const r = await request(sdk, t.id);
+      expect(r).toMatchObject({ type: "plan", plan: "Change apple to apricot." });
+      let s = await sdk.snapshot(t.id);
+      expect(s.thread.status).toBe("waiting");
+      expect(results(s.items)).toEqual([]);
+      await sdk.respond(t.id, r.id, { outcome: "allow" });
+      s = await settle(sdk, t.id);
+      expect(s.thread.permission_mode).toBe("default");
+      expect(runs()).toHaveLength(1);
+      const turns = planTurns(sent);
+      expect(turns[0]).toMatchObject({ collaborationMode: { mode: "plan", settings: { model: "m" } } });
+      expect(turns[1]).toMatchObject({
+        input: [{ type: "text", text: "Implement the plan." }],
+        collaborationMode: { mode: "default" },
+        sandboxPolicy: { type: "workspaceWrite" },
+      });
+      // Its approval policy's the same.
+      expect(turns[1]).not.toHaveProperty("approvalPolicy");
+      // One turn, of both Codex turns.
+      expect(results(s.items)).toHaveLength(1);
+      expect(results(s.items)[0]).toMatchObject({ ok: true, duration_ms: 14, usage: { input_tokens: 120, cache_read_tokens: 80, output_tokens: 20 } });
+      expect(texts(s.items)).toEqual(["Change apple to apricot."]);
+
+      // Codex stays in its default mode, which isn't sent again.
+      await sdk.send(t.id, "reply done");
+      await settle(sdk, t.id);
+      expect(planTurns(sent)[2]).not.toHaveProperty("collaborationMode");
+    });
+
+    it("sends the user's feedback, and plans again; denied without any, the turn ends", async () => {
+      const { sdk, sent } = setup();
+      const t = await sdk.create({ harness: "codex", permission_mode: "plan", cwd: tempDir() });
+      await sdk.send(t.id, "propose One.");
+      let r = await request(sdk, t.id);
+      await sdk.respond(t.id, r.id, { outcome: "deny", message: "propose Two." });
+      r = await until(async () => (await sdk.snapshot(t.id)).requests.find((x) => x.id !== r.id));
+      expect(r).toMatchObject({ type: "plan", plan: "Two." });
+      await sdk.respond(t.id, r.id, { outcome: "deny" });
+      const s = await settle(sdk, t.id);
+      expect(s.thread.permission_mode).toBe("plan");
+      expect(results(s.items)).toMatchObject([{ ok: true }]);
+      const turns = planTurns(sent);
+      expect(turns).toHaveLength(2);
+      expect(turns[1]).toMatchObject({ input: [{ type: "text", text: "propose Two." }], collaborationMode: { mode: "plan" } });
+      expect(turns[1]).not.toHaveProperty("approvalPolicy");
+    });
+
+    it("keeps the config's workspace-write settings when a plan's approved out of the read-only sandbox", async () => {
+      const sandbox = { network_access: true, exclude_tmpdir_env_var: true, exclude_slash_tmp: true };
+      const { sdk, sent } = setup({ codex: { config: { sandbox_workspace_write: sandbox } } });
+      const t = await sdk.create({ harness: "codex", permission_mode: "plan", cwd: tempDir() });
+      await sdk.send(t.id, "propose One.");
+      const r = await request(sdk, t.id);
+      await sdk.respond(t.id, r.id, { outcome: "allow", permission_mode: "accept_edits" });
+      await settle(sdk, t.id);
+      expect(planTurns(sent)[1]!.sandboxPolicy).toEqual({ type: "workspaceWrite", writableRoots: [], networkAccess: true, excludeTmpdirEnvVar: true, excludeSlashTmp: true });
+    });
+
+    it("carries on in the mode the user approves the plan in", async () => {
+      const { sdk, sent } = setup();
+      const t = await sdk.create({ harness: "codex", permission_mode: "plan", cwd: tempDir() });
+      await sdk.send(t.id, "propose One.");
+      const r = await request(sdk, t.id);
+      await sdk.respond(t.id, r.id, { outcome: "allow", permission_mode: "accept_edits" });
+      const s = await settle(sdk, t.id);
+      expect(s.thread.permission_mode).toBe("accept_edits");
+      expect(planTurns(sent)[1]).toMatchObject({ approvalPolicy: "on-request", sandboxPolicy: { type: "workspaceWrite" }, collaborationMode: { mode: "default" } });
+    });
+
+    it("takes a message sent while a plan waits as more to plan with", async () => {
+      const { sdk, sent, events } = setup();
+      const t = await sdk.create({ harness: "codex", permission_mode: "plan", cwd: tempDir() });
+      await sdk.send(t.id, "propose One.");
+      const r = await request(sdk, t.id);
+      await sdk.send(t.id, "reply And two.", { client_id: "more" });
+      const s = await settle(sdk, t.id);
+      expect(events).toContainEqual(expect.objectContaining({ type: "request.resolved", request_id: r.id, resolution: { outcome: "cancel" } }));
+      expect(s.items.find((i) => i.type === "user_message" && i.client_id === "more")).toMatchObject({ steered: true });
+      expect(texts(s.items)).toEqual(["One.", "And two."]);
+      expect(results(s.items)).toHaveLength(1);
+      expect(planTurns(sent)[1]).toMatchObject({ input: [{ type: "text", text: "reply And two." }], collaborationMode: { mode: "plan" } });
+    });
+
+    it("ends the turn when it's interrupted while a plan waits", async () => {
+      const { sdk, events } = setup();
+      const t = await sdk.create({ harness: "codex", permission_mode: "plan", cwd: tempDir() });
+      await sdk.send(t.id, "propose One.");
+      const r = await request(sdk, t.id);
+      await sdk.interrupt(t.id);
+      const s = await settle(sdk, t.id);
+      expect(results(s.items)).toMatchObject([{ ok: false, interrupted: true }]);
+      expect(events).toContainEqual(expect.objectContaining({ type: "request.resolved", request_id: r.id, resolution: { outcome: "cancel" } }));
+      expect(s.requests).toMatchObject([{ id: r.id, resolution: { outcome: "cancel" } }]);
+    });
+
+    it("keeps what the plans used when the turn fails after them", async () => {
+      const { sdk } = setup();
+      const t = await sdk.create({ harness: "codex", permission_mode: "plan", cwd: tempDir() });
+      await sdk.send(t.id, "propose One.");
+      const r = await request(sdk, t.id);
+      await sdk.respond(t.id, r.id, { outcome: "deny", message: "crash" });
+      const s = await settle(sdk, t.id);
+      expect(results(s.items)).toMatchObject([{ ok: false, duration_ms: 7, usage: { input_tokens: 60, cache_read_tokens: 40, output_tokens: 10 } }]);
+      expect(s.thread.usage).toMatchObject({ input_tokens: 60, cache_read_tokens: 40, output_tokens: 10 });
+    });
+
+    it("doesn't ask about a plan outside plan mode", async () => {
+      const { sdk } = setup();
+      const t = await sdk.create({ harness: "codex", cwd: tempDir() });
+      await sdk.send(t.id, "propose One.");
+      const s = await settle(sdk, t.id);
+      expect(results(s.items)).toMatchObject([{ ok: true }]);
+    });
   });
 
   it("turns off the user's and the project's skills, keeping the app's and Codex's own", async () => {
@@ -847,6 +1061,43 @@ describe("the Codex driver", () => {
       { type: "text", text: "Attached file notes.md:\n# Notes", text_elements: [] },
       { type: "text", text: "Attached file: /docs/report.pdf", text_elements: [] },
     ]);
+  });
+});
+
+describe("a thread's launch options", () => {
+  it("start Codex with its own CODEX_HOME (used as it is), arguments after the options', environment and writable roots, changed by setOptions", async () => {
+    const user = tempDir();
+    writeFileSync(join(user, "auth.json"), "{}");
+    const { sdk, runs, sent, store } = setup({
+      codex: { args: ["--own"], config: { "sandbox_workspace_write.writable_roots": ["/base"] }, login: user },
+      env: { MINI_LOG_ENV: "AT_SET,AT_GONE", AT_GONE: "instance" },
+    });
+    const [home, cwd] = [tempDir(), tempDir()];
+    const t = await sdk.create({
+      harness: "codex",
+      cwd,
+      launch: { args: ["-c", "a=1"], env: { AT_SET: "x y", AT_GONE: null }, addDirs: ["sub", "/abs"], configDir: home },
+    });
+    await sdk.send(t.id, "reply one");
+    expect(texts((await settle(sdk, t.id)).items)).toEqual(["one"]);
+    expect(runs()[0]!.argv).toEqual(["app-server", "--own", "-c", "a=1"]);
+    expect(runs()[0]!.codexHome).toBe(home);
+    expect(runs()[0]!.env).toEqual({ AT_SET: "x y", AT_GONE: null });
+    expect(sent("thread/start", 0)[0]!.params.config["sandbox_workspace_write.writable_roots"]).toEqual(["/base", join(cwd, "sub"), "/abs"]);
+    // Its own home, not the app's: no login was linked into it.
+    expect(existsSync(join(home, "auth.json"))).toBe(false);
+    expect(((await store.getThread(t.id)) as { launch?: { args?: string[] } }).launch?.args).toEqual(["-c", "a=1"]);
+    expect((await sdk.snapshot(t.id)).thread).not.toHaveProperty("launch");
+
+    // New arguments: the next turn resumes the thread in a new process that has them.
+    await sdk.setOptions(t.id, { launch: { args: ["-c", "a=2"], configDir: home } });
+    await sdk.send(t.id, "reply two");
+    expect(texts((await settle(sdk, t.id)).items)).toEqual(["one", "two"]);
+    expect(runs()).toHaveLength(2);
+    expect(runs()[1]!.argv).toEqual(["app-server", "--own", "-c", "a=2"]);
+    expect(runs()[1]!.env).toEqual({ AT_SET: null, AT_GONE: "instance" });
+    expect(sent("thread/resume")).toHaveLength(1);
+    expect(sent("thread/resume")[0]!.params.config["sandbox_workspace_write.writable_roots"]).toEqual(["/base"]);
   });
 });
 

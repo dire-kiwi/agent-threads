@@ -2,6 +2,8 @@
   "name": "@dire-kiwi/agent-threads-node",
   "version": "0.0.0",
   "description": "agent-threads' Node backend: runs threads on Claude Code and Codex.",
+  "license": "MIT",
+  "repository": "github:dire-kiwi/agent-threads",
   "type": "module",
   "exports": {
     ".": { "types": "./dist/index.d.ts", "default": "./dist/index.js" }

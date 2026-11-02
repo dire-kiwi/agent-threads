@@ -3,7 +3,8 @@
 
 use serde_json::{Map, Value, json};
 
-use crate::protocol::{SubagentState, SubagentStatus, ToolCall, ToolKind};
+use crate::ids::unix_time;
+use crate::protocol::{RateLimit, RateLimitStatus, SubagentState, SubagentStatus, ToolCall, ToolKind};
 use crate::thread::round_cost;
 
 /// The in-process MCP server that serves a thread's app tools.
@@ -278,6 +279,11 @@ pub(crate) fn questions(input: &Value) -> Vec<Value> {
         .collect()
 }
 
+/// A permission mode as Claude Code names it, for set_permission_mode and setMode.
+pub(crate) fn claude_mode(mode: Option<crate::protocol::PermissionMode>) -> &'static str {
+    claude_permission_mode(mode).unwrap_or("default")
+}
+
 /// The permission mode as Claude Code names it, or nothing for the default.
 pub(crate) fn claude_permission_mode(mode: Option<crate::protocol::PermissionMode>) -> Option<&'static str> {
     use crate::protocol::PermissionMode::*;
@@ -407,4 +413,87 @@ pub(crate) fn subagent_result(
         };
     }
     Some(s)
+}
+
+/// The limit a `rate_limit_info` reports (from a rate_limit_event, or a message refused for the
+/// usage limit), if it says how it stands.
+pub(crate) fn claude_rate_limits(info: &Value) -> Vec<RateLimit> {
+    let overage =
+        info["isUsingOverage"] == true || matches!(info["overageStatus"].as_str(), Some("allowed" | "allowed_warning"));
+    let status = match info["status"].as_str() {
+        Some("allowed") => RateLimitStatus::Allowed,
+        Some("allowed_warning") => RateLimitStatus::Warning,
+        Some("rejected") if overage => RateLimitStatus::Warning,
+        Some("rejected") => RateLimitStatus::Rejected,
+        _ => return Vec::new(),
+    };
+    let id = info["rateLimitType"]
+        .as_str()
+        .filter(|s| !s.is_empty())
+        .unwrap_or("unknown");
+    vec![RateLimit {
+        id: id.to_string(),
+        status,
+        used_percent: info["utilization"]
+            .as_f64()
+            .filter(|u| u.is_finite())
+            .map(|u| u * 100.0),
+        resets_at: info["resetsAt"].as_f64().and_then(unix_time),
+        window_minutes: None,
+    }]
+}
+
+/// An `api_retry` system message's notice text.
+pub(crate) fn retry_text(m: &Value) -> String {
+    let why: Vec<String> = [
+        m["error"].as_str().filter(|e| !e.is_empty()).map(String::from),
+        m["error_status"]
+            .as_f64()
+            .map(|_| format!("status {}", m["error_status"])),
+    ]
+    .into_iter()
+    .flatten()
+    .collect();
+    let why = if why.is_empty() {
+        String::new()
+    } else {
+        format!(" ({})", why.join(", "))
+    };
+    let secs = (m["retry_delay_ms"].as_f64().unwrap_or(0.0) / 1000.0).ceil();
+    format!(
+        "API request failed{why}; retrying in {secs}s (attempt {} of {}).",
+        js(&m["attempt"]),
+        js(&m["max_retries"])
+    )
+}
+
+/// A JSON value as JavaScript's template strings write it (a missing one is `undefined`).
+fn js(v: &Value) -> String {
+    match v {
+        Value::Null => "undefined".into(),
+        Value::String(s) => s.clone(),
+        v => v.to_string(),
+    }
+}
+
+/// A `hook_response` system message's notice (level, text and detail), if it makes one: a hook
+/// that failed, or said something.
+pub(crate) fn hook_notice(m: &Value) -> Option<Value> {
+    let text = |v: &Value| v.as_str().unwrap_or("").trim().to_string();
+    let output = text(&m["output"]);
+    let name = js(&m["hook_name"]);
+    if m["outcome"] == "error" {
+        let stderr = text(&m["stderr"]);
+        let detail = if stderr.is_empty() { output } else { stderr };
+        let code = m["exit_code"]
+            .as_f64()
+            .map(|_| format!(" (exit code {})", m["exit_code"]))
+            .unwrap_or_default();
+        let mut n = json!({"level": "warning", "text": format!("Hook {name} failed{code}")});
+        if !detail.is_empty() {
+            n["detail"] = json!(detail);
+        }
+        return Some(n);
+    }
+    (!output.is_empty()).then(|| json!({"level": "info", "text": format!("Hook {name} ran"), "detail": output}))
 }

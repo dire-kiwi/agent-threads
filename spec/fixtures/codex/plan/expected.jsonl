@@ -1,0 +1,182 @@
+{"type":"thread.updated","thread_id":"{{thread}}","seq":1,"thread":{"id":"{{thread}}","harness":"codex","status":"idle","model":"gpt-5.6-luna","effort":"low","permission_mode":"plan","cwd":"{{cwd}}","created_at":"2026-11-01T00:00:00Z"}}
+{"type":"item.added","thread_id":"{{thread}}","seq":2,"item":{"id":"{{u1}}","type":"user_message","text":"Plan this change: in notes.txt, change the line apple to apricot. Don't ask me any questions, and keep the plan short.","client_id":"c1","turn_id":"{{t1}}"}}
+{"type":"turn.started","thread_id":"{{thread}}","seq":3,"turn_id":"{{t1}}"}
+{"type":"thread.updated","thread_id":"{{thread}}","seq":4,"thread":{"id":"{{thread}}","harness":"codex","status":"running","model":"gpt-5.6-luna","effort":"low","permission_mode":"plan","cwd":"{{cwd}}","created_at":"2026-11-01T00:00:00Z"}}
+{"type":"thread.updated","thread_id":"{{thread}}","seq":5,"thread":{"id":"{{thread}}","harness":"codex","status":"running","model":"gpt-5.6-luna","effort":"low","permission_mode":"plan","cwd":"{{cwd}}","created_at":"2026-11-01T00:00:00Z","session_id":"01a19a41-4007-74d0-8fae-416cb98e02c0"}}
+{"type":"item.added","thread_id":"{{thread}}","seq":6,"item":{"id":"msg_0470d1ee482ba867016ae800546128819186bc966f37782f6b","type":"assistant_message","text":"","turn_id":"{{t1}}"}}
+{"type":"delta","thread_id":"{{thread}}","seq":6,"item_id":"msg_0470d1ee482ba867016ae800546128819186bc966f37782f6b","kind":"text","offset":0,"text":"I"}
+{"type":"delta","thread_id":"{{thread}}","seq":6,"item_id":"msg_0470d1ee482ba867016ae800546128819186bc966f37782f6b","kind":"text","offset":1,"text":"’ll"}
+{"type":"delta","thread_id":"{{thread}}","seq":6,"item_id":"msg_0470d1ee482ba867016ae800546128819186bc966f37782f6b","kind":"text","offset":4,"text":" inspect"}
+{"type":"delta","thread_id":"{{thread}}","seq":6,"item_id":"msg_0470d1ee482ba867016ae800546128819186bc966f37782f6b","kind":"text","offset":12,"text":" `"}
+{"type":"delta","thread_id":"{{thread}}","seq":6,"item_id":"msg_0470d1ee482ba867016ae800546128819186bc966f37782f6b","kind":"text","offset":14,"text":"notes"}
+{"type":"delta","thread_id":"{{thread}}","seq":6,"item_id":"msg_0470d1ee482ba867016ae800546128819186bc966f37782f6b","kind":"text","offset":19,"text":".txt"}
+{"type":"delta","thread_id":"{{thread}}","seq":6,"item_id":"msg_0470d1ee482ba867016ae800546128819186bc966f37782f6b","kind":"text","offset":23,"text":"`"}
+{"type":"delta","thread_id":"{{thread}}","seq":6,"item_id":"msg_0470d1ee482ba867016ae800546128819186bc966f37782f6b","kind":"text","offset":24,"text":" to"}
+{"type":"delta","thread_id":"{{thread}}","seq":6,"item_id":"msg_0470d1ee482ba867016ae800546128819186bc966f37782f6b","kind":"text","offset":27,"text":" confirm"}
+{"type":"delta","thread_id":"{{thread}}","seq":6,"item_id":"msg_0470d1ee482ba867016ae800546128819186bc966f37782f6b","kind":"text","offset":35,"text":" the"}
+{"type":"delta","thread_id":"{{thread}}","seq":6,"item_id":"msg_0470d1ee482ba867016ae800546128819186bc966f37782f6b","kind":"text","offset":39,"text":" exact"}
+{"type":"delta","thread_id":"{{thread}}","seq":6,"item_id":"msg_0470d1ee482ba867016ae800546128819186bc966f37782f6b","kind":"text","offset":45,"text":" line"}
+{"type":"delta","thread_id":"{{thread}}","seq":6,"item_id":"msg_0470d1ee482ba867016ae800546128819186bc966f37782f6b","kind":"text","offset":50,"text":" and"}
+{"type":"delta","thread_id":"{{thread}}","seq":6,"item_id":"msg_0470d1ee482ba867016ae800546128819186bc966f37782f6b","kind":"text","offset":54,"text":" file"}
+{"type":"delta","thread_id":"{{thread}}","seq":6,"item_id":"msg_0470d1ee482ba867016ae800546128819186bc966f37782f6b","kind":"text","offset":59,"text":" location"}
+{"type":"delta","thread_id":"{{thread}}","seq":6,"item_id":"msg_0470d1ee482ba867016ae800546128819186bc966f37782f6b","kind":"text","offset":68,"text":","}
+{"type":"delta","thread_id":"{{thread}}","seq":6,"item_id":"msg_0470d1ee482ba867016ae800546128819186bc966f37782f6b","kind":"text","offset":69,"text":" then"}
+{"type":"delta","thread_id":"{{thread}}","seq":6,"item_id":"msg_0470d1ee482ba867016ae800546128819186bc966f37782f6b","kind":"text","offset":74,"text":" provide"}
+{"type":"delta","thread_id":"{{thread}}","seq":6,"item_id":"msg_0470d1ee482ba867016ae800546128819186bc966f37782f6b","kind":"text","offset":82,"text":" a"}
+{"type":"delta","thread_id":"{{thread}}","seq":6,"item_id":"msg_0470d1ee482ba867016ae800546128819186bc966f37782f6b","kind":"text","offset":84,"text":" concise"}
+{"type":"delta","thread_id":"{{thread}}","seq":6,"item_id":"msg_0470d1ee482ba867016ae800546128819186bc966f37782f6b","kind":"text","offset":92,"text":" implementation"}
+{"type":"delta","thread_id":"{{thread}}","seq":6,"item_id":"msg_0470d1ee482ba867016ae800546128819186bc966f37782f6b","kind":"text","offset":107,"text":" plan"}
+{"type":"delta","thread_id":"{{thread}}","seq":6,"item_id":"msg_0470d1ee482ba867016ae800546128819186bc966f37782f6b","kind":"text","offset":112,"text":" without"}
+{"type":"delta","thread_id":"{{thread}}","seq":6,"item_id":"msg_0470d1ee482ba867016ae800546128819186bc966f37782f6b","kind":"text","offset":120,"text":" modifying"}
+{"type":"delta","thread_id":"{{thread}}","seq":6,"item_id":"msg_0470d1ee482ba867016ae800546128819186bc966f37782f6b","kind":"text","offset":130,"text":" anything"}
+{"type":"delta","thread_id":"{{thread}}","seq":6,"item_id":"msg_0470d1ee482ba867016ae800546128819186bc966f37782f6b","kind":"text","offset":139,"text":"."}
+{"type":"item.updated","thread_id":"{{thread}}","seq":7,"item_id":"msg_0470d1ee482ba867016ae800546128819186bc966f37782f6b","patch":{"text":"I’ll inspect `notes.txt` to confirm the exact line and file location, then provide a concise implementation plan without modifying anything."}}
+{"type":"item.added","thread_id":"{{thread}}","seq":8,"item":{"id":"exec-8c73de56-22e7-4488-b627-334bd1c3ad7d","type":"tool_call","name":"commandExecution","kind":"shell","input":{"command":"/usr/bin/bash -lc \"pwd && rg --files -g 'notes.txt' -g '\"'!**/.git/**'\"' && printf '\\\\n--- notes.txt ---\\\\n' && sed -n '1,120p' notes.txt\"","cwd":"/work"},"command":"/usr/bin/bash -lc \"pwd && rg --files -g 'notes.txt' -g '\"'!**/.git/**'\"' && printf '\\\\n--- notes.txt ---\\\\n' && sed -n '1,120p' notes.txt\"","status":"running","turn_id":"{{t1}}"}}
+{"type":"item.updated","thread_id":"{{thread}}","seq":9,"item_id":"exec-8c73de56-22e7-4488-b627-334bd1c3ad7d","patch":{"status":"pending"}}
+{"type":"request.opened","thread_id":"{{thread}}","seq":10,"request":{"id":"{{p1}}","type":"permission","name":"commandExecution","kind":"shell","input":{"command":"/usr/bin/bash -lc \"pwd && rg --files -g 'notes.txt' -g '\"'!**/.git/**'\"' && printf '\\\\n--- notes.txt ---\\\\n' && sed -n '1,120p' notes.txt\"","cwd":"/work"},"title":"/usr/bin/bash -lc \"pwd && rg --files -g 'notes.txt' -g '\"'!**/.git/**'\"' && printf '\\\\n--- notes.txt ---\\\\n' && sed -n '1,120p' notes.txt\"","turn_id":"{{t1}}","tool_call_id":"exec-8c73de56-22e7-4488-b627-334bd1c3ad7d"}}
+{"type":"thread.updated","thread_id":"{{thread}}","seq":11,"thread":{"id":"{{thread}}","harness":"codex","status":"waiting","model":"gpt-5.6-luna","effort":"low","permission_mode":"plan","cwd":"{{cwd}}","created_at":"2026-11-01T00:00:00Z","session_id":"01a19a41-4007-74d0-8fae-416cb98e02c0"}}
+{"type":"request.resolved","thread_id":"{{thread}}","seq":12,"request_id":"{{p1}}","resolution":{"outcome":"allow"}}
+{"type":"thread.updated","thread_id":"{{thread}}","seq":13,"thread":{"id":"{{thread}}","harness":"codex","status":"running","model":"gpt-5.6-luna","effort":"low","permission_mode":"plan","cwd":"{{cwd}}","created_at":"2026-11-01T00:00:00Z","session_id":"01a19a41-4007-74d0-8fae-416cb98e02c0"}}
+{"type":"item.updated","thread_id":"{{thread}}","seq":14,"item_id":"exec-8c73de56-22e7-4488-b627-334bd1c3ad7d","patch":{"status":"running"}}
+{"type":"item.updated","thread_id":"{{thread}}","seq":15,"item_id":"exec-8c73de56-22e7-4488-b627-334bd1c3ad7d","patch":{"status":"completed","result":{"content":"/work\nnotes.txt\n\n--- notes.txt ---\napple\nbanana\ncherry\n","exit_code":0}}}
+{"type":"item.added","thread_id":"{{thread}}","seq":16,"item":{"id":"01a19a41-4157-7f42-b709-7dafbcff54dd-plan","type":"assistant_message","text":"","turn_id":"{{t1}}"}}
+{"type":"delta","thread_id":"{{thread}}","seq":16,"item_id":"01a19a41-4157-7f42-b709-7dafbcff54dd-plan","kind":"text","offset":0,"text":"#"}
+{"type":"delta","thread_id":"{{thread}}","seq":16,"item_id":"01a19a41-4157-7f42-b709-7dafbcff54dd-plan","kind":"text","offset":1,"text":" Update"}
+{"type":"delta","thread_id":"{{thread}}","seq":16,"item_id":"01a19a41-4157-7f42-b709-7dafbcff54dd-plan","kind":"text","offset":8,"text":" `"}
+{"type":"delta","thread_id":"{{thread}}","seq":16,"item_id":"01a19a41-4157-7f42-b709-7dafbcff54dd-plan","kind":"text","offset":10,"text":"notes"}
+{"type":"delta","thread_id":"{{thread}}","seq":16,"item_id":"01a19a41-4157-7f42-b709-7dafbcff54dd-plan","kind":"text","offset":15,"text":".txt"}
+{"type":"delta","thread_id":"{{thread}}","seq":16,"item_id":"01a19a41-4157-7f42-b709-7dafbcff54dd-plan","kind":"text","offset":19,"text":"`\n\n"}
+{"type":"delta","thread_id":"{{thread}}","seq":16,"item_id":"01a19a41-4157-7f42-b709-7dafbcff54dd-plan","kind":"text","offset":22,"text":"-"}
+{"type":"delta","thread_id":"{{thread}}","seq":16,"item_id":"01a19a41-4157-7f42-b709-7dafbcff54dd-plan","kind":"text","offset":23,"text":" Replace"}
+{"type":"delta","thread_id":"{{thread}}","seq":16,"item_id":"01a19a41-4157-7f42-b709-7dafbcff54dd-plan","kind":"text","offset":31,"text":" the"}
+{"type":"delta","thread_id":"{{thread}}","seq":16,"item_id":"01a19a41-4157-7f42-b709-7dafbcff54dd-plan","kind":"text","offset":35,"text":" line"}
+{"type":"delta","thread_id":"{{thread}}","seq":16,"item_id":"01a19a41-4157-7f42-b709-7dafbcff54dd-plan","kind":"text","offset":40,"text":" `"}
+{"type":"delta","thread_id":"{{thread}}","seq":16,"item_id":"01a19a41-4157-7f42-b709-7dafbcff54dd-plan","kind":"text","offset":42,"text":"apple"}
+{"type":"delta","thread_id":"{{thread}}","seq":16,"item_id":"01a19a41-4157-7f42-b709-7dafbcff54dd-plan","kind":"text","offset":47,"text":"`"}
+{"type":"delta","thread_id":"{{thread}}","seq":16,"item_id":"01a19a41-4157-7f42-b709-7dafbcff54dd-plan","kind":"text","offset":48,"text":" with"}
+{"type":"delta","thread_id":"{{thread}}","seq":16,"item_id":"01a19a41-4157-7f42-b709-7dafbcff54dd-plan","kind":"text","offset":53,"text":" `"}
+{"type":"delta","thread_id":"{{thread}}","seq":16,"item_id":"01a19a41-4157-7f42-b709-7dafbcff54dd-plan","kind":"text","offset":55,"text":"ap"}
+{"type":"delta","thread_id":"{{thread}}","seq":16,"item_id":"01a19a41-4157-7f42-b709-7dafbcff54dd-plan","kind":"text","offset":57,"text":"ric"}
+{"type":"delta","thread_id":"{{thread}}","seq":16,"item_id":"01a19a41-4157-7f42-b709-7dafbcff54dd-plan","kind":"text","offset":60,"text":"ot"}
+{"type":"delta","thread_id":"{{thread}}","seq":16,"item_id":"01a19a41-4157-7f42-b709-7dafbcff54dd-plan","kind":"text","offset":62,"text":"`.\n"}
+{"type":"delta","thread_id":"{{thread}}","seq":16,"item_id":"01a19a41-4157-7f42-b709-7dafbcff54dd-plan","kind":"text","offset":65,"text":"-"}
+{"type":"delta","thread_id":"{{thread}}","seq":16,"item_id":"01a19a41-4157-7f42-b709-7dafbcff54dd-plan","kind":"text","offset":66,"text":" Leave"}
+{"type":"delta","thread_id":"{{thread}}","seq":16,"item_id":"01a19a41-4157-7f42-b709-7dafbcff54dd-plan","kind":"text","offset":72,"text":" all"}
+{"type":"delta","thread_id":"{{thread}}","seq":16,"item_id":"01a19a41-4157-7f42-b709-7dafbcff54dd-plan","kind":"text","offset":76,"text":" other"}
+{"type":"delta","thread_id":"{{thread}}","seq":16,"item_id":"01a19a41-4157-7f42-b709-7dafbcff54dd-plan","kind":"text","offset":82,"text":" lines"}
+{"type":"delta","thread_id":"{{thread}}","seq":16,"item_id":"01a19a41-4157-7f42-b709-7dafbcff54dd-plan","kind":"text","offset":88,"text":" unchanged"}
+{"type":"delta","thread_id":"{{thread}}","seq":16,"item_id":"01a19a41-4157-7f42-b709-7dafbcff54dd-plan","kind":"text","offset":98,"text":".\n"}
+{"type":"delta","thread_id":"{{thread}}","seq":16,"item_id":"01a19a41-4157-7f42-b709-7dafbcff54dd-plan","kind":"text","offset":100,"text":"-"}
+{"type":"delta","thread_id":"{{thread}}","seq":16,"item_id":"01a19a41-4157-7f42-b709-7dafbcff54dd-plan","kind":"text","offset":101,"text":" Verify"}
+{"type":"delta","thread_id":"{{thread}}","seq":16,"item_id":"01a19a41-4157-7f42-b709-7dafbcff54dd-plan","kind":"text","offset":108,"text":" the"}
+{"type":"delta","thread_id":"{{thread}}","seq":16,"item_id":"01a19a41-4157-7f42-b709-7dafbcff54dd-plan","kind":"text","offset":112,"text":" resulting"}
+{"type":"delta","thread_id":"{{thread}}","seq":16,"item_id":"01a19a41-4157-7f42-b709-7dafbcff54dd-plan","kind":"text","offset":122,"text":" file"}
+{"type":"delta","thread_id":"{{thread}}","seq":16,"item_id":"01a19a41-4157-7f42-b709-7dafbcff54dd-plan","kind":"text","offset":127,"text":" contents"}
+{"type":"delta","thread_id":"{{thread}}","seq":16,"item_id":"01a19a41-4157-7f42-b709-7dafbcff54dd-plan","kind":"text","offset":136,"text":".\n"}
+{"type":"item.updated","thread_id":"{{thread}}","seq":17,"item_id":"01a19a41-4157-7f42-b709-7dafbcff54dd-plan","patch":{"text":"# Update `notes.txt`\n\n- Replace the line `apple` with `apricot`.\n- Leave all other lines unchanged.\n- Verify the resulting file contents.\n"}}
+{"type":"request.opened","thread_id":"{{thread}}","seq":18,"request":{"id":"{{pl1}}","type":"plan","plan":"# Update `notes.txt`\n\n- Replace the line `apple` with `apricot`.\n- Leave all other lines unchanged.\n- Verify the resulting file contents.\n","turn_id":"{{t1}}"}}
+{"type":"thread.updated","thread_id":"{{thread}}","seq":19,"thread":{"id":"{{thread}}","harness":"codex","status":"waiting","model":"gpt-5.6-luna","effort":"low","permission_mode":"plan","cwd":"{{cwd}}","created_at":"2026-11-01T00:00:00Z","session_id":"01a19a41-4007-74d0-8fae-416cb98e02c0"}}
+{"type":"request.resolved","thread_id":"{{thread}}","seq":20,"request_id":"{{pl1}}","resolution":{"outcome":"deny","message":"Also change the line banana to blueberry."}}
+{"type":"thread.updated","thread_id":"{{thread}}","seq":21,"thread":{"id":"{{thread}}","harness":"codex","status":"running","model":"gpt-5.6-luna","effort":"low","permission_mode":"plan","cwd":"{{cwd}}","created_at":"2026-11-01T00:00:00Z","session_id":"01a19a41-4007-74d0-8fae-416cb98e02c0"}}
+{"type":"item.added","thread_id":"{{thread}}","seq":22,"item":{"id":"01a19a41-51e7-76c0-a2c6-b72cd9d6dbb9-plan","type":"assistant_message","text":"","turn_id":"{{t1}}"}}
+{"type":"delta","thread_id":"{{thread}}","seq":22,"item_id":"01a19a41-51e7-76c0-a2c6-b72cd9d6dbb9-plan","kind":"text","offset":0,"text":"#"}
+{"type":"delta","thread_id":"{{thread}}","seq":22,"item_id":"01a19a41-51e7-76c0-a2c6-b72cd9d6dbb9-plan","kind":"text","offset":1,"text":" Update"}
+{"type":"delta","thread_id":"{{thread}}","seq":22,"item_id":"01a19a41-51e7-76c0-a2c6-b72cd9d6dbb9-plan","kind":"text","offset":8,"text":" `"}
+{"type":"delta","thread_id":"{{thread}}","seq":22,"item_id":"01a19a41-51e7-76c0-a2c6-b72cd9d6dbb9-plan","kind":"text","offset":10,"text":"notes"}
+{"type":"delta","thread_id":"{{thread}}","seq":22,"item_id":"01a19a41-51e7-76c0-a2c6-b72cd9d6dbb9-plan","kind":"text","offset":15,"text":".txt"}
+{"type":"delta","thread_id":"{{thread}}","seq":22,"item_id":"01a19a41-51e7-76c0-a2c6-b72cd9d6dbb9-plan","kind":"text","offset":19,"text":"`\n\n"}
+{"type":"delta","thread_id":"{{thread}}","seq":22,"item_id":"01a19a41-51e7-76c0-a2c6-b72cd9d6dbb9-plan","kind":"text","offset":22,"text":"-"}
+{"type":"delta","thread_id":"{{thread}}","seq":22,"item_id":"01a19a41-51e7-76c0-a2c6-b72cd9d6dbb9-plan","kind":"text","offset":23,"text":" Replace"}
+{"type":"delta","thread_id":"{{thread}}","seq":22,"item_id":"01a19a41-51e7-76c0-a2c6-b72cd9d6dbb9-plan","kind":"text","offset":31,"text":" `"}
+{"type":"delta","thread_id":"{{thread}}","seq":22,"item_id":"01a19a41-51e7-76c0-a2c6-b72cd9d6dbb9-plan","kind":"text","offset":33,"text":"apple"}
+{"type":"delta","thread_id":"{{thread}}","seq":22,"item_id":"01a19a41-51e7-76c0-a2c6-b72cd9d6dbb9-plan","kind":"text","offset":38,"text":"`"}
+{"type":"delta","thread_id":"{{thread}}","seq":22,"item_id":"01a19a41-51e7-76c0-a2c6-b72cd9d6dbb9-plan","kind":"text","offset":39,"text":" with"}
+{"type":"delta","thread_id":"{{thread}}","seq":22,"item_id":"01a19a41-51e7-76c0-a2c6-b72cd9d6dbb9-plan","kind":"text","offset":44,"text":" `"}
+{"type":"delta","thread_id":"{{thread}}","seq":22,"item_id":"01a19a41-51e7-76c0-a2c6-b72cd9d6dbb9-plan","kind":"text","offset":46,"text":"ap"}
+{"type":"delta","thread_id":"{{thread}}","seq":22,"item_id":"01a19a41-51e7-76c0-a2c6-b72cd9d6dbb9-plan","kind":"text","offset":48,"text":"ric"}
+{"type":"delta","thread_id":"{{thread}}","seq":22,"item_id":"01a19a41-51e7-76c0-a2c6-b72cd9d6dbb9-plan","kind":"text","offset":51,"text":"ot"}
+{"type":"delta","thread_id":"{{thread}}","seq":22,"item_id":"01a19a41-51e7-76c0-a2c6-b72cd9d6dbb9-plan","kind":"text","offset":53,"text":"`.\n"}
+{"type":"delta","thread_id":"{{thread}}","seq":22,"item_id":"01a19a41-51e7-76c0-a2c6-b72cd9d6dbb9-plan","kind":"text","offset":56,"text":"-"}
+{"type":"delta","thread_id":"{{thread}}","seq":22,"item_id":"01a19a41-51e7-76c0-a2c6-b72cd9d6dbb9-plan","kind":"text","offset":57,"text":" Replace"}
+{"type":"delta","thread_id":"{{thread}}","seq":22,"item_id":"01a19a41-51e7-76c0-a2c6-b72cd9d6dbb9-plan","kind":"text","offset":65,"text":" `"}
+{"type":"delta","thread_id":"{{thread}}","seq":22,"item_id":"01a19a41-51e7-76c0-a2c6-b72cd9d6dbb9-plan","kind":"text","offset":67,"text":"banana"}
+{"type":"delta","thread_id":"{{thread}}","seq":22,"item_id":"01a19a41-51e7-76c0-a2c6-b72cd9d6dbb9-plan","kind":"text","offset":73,"text":"`"}
+{"type":"delta","thread_id":"{{thread}}","seq":22,"item_id":"01a19a41-51e7-76c0-a2c6-b72cd9d6dbb9-plan","kind":"text","offset":74,"text":" with"}
+{"type":"delta","thread_id":"{{thread}}","seq":22,"item_id":"01a19a41-51e7-76c0-a2c6-b72cd9d6dbb9-plan","kind":"text","offset":79,"text":" `"}
+{"type":"delta","thread_id":"{{thread}}","seq":22,"item_id":"01a19a41-51e7-76c0-a2c6-b72cd9d6dbb9-plan","kind":"text","offset":81,"text":"blue"}
+{"type":"delta","thread_id":"{{thread}}","seq":22,"item_id":"01a19a41-51e7-76c0-a2c6-b72cd9d6dbb9-plan","kind":"text","offset":85,"text":"berry"}
+{"type":"delta","thread_id":"{{thread}}","seq":22,"item_id":"01a19a41-51e7-76c0-a2c6-b72cd9d6dbb9-plan","kind":"text","offset":90,"text":"`.\n"}
+{"type":"delta","thread_id":"{{thread}}","seq":22,"item_id":"01a19a41-51e7-76c0-a2c6-b72cd9d6dbb9-plan","kind":"text","offset":93,"text":"-"}
+{"type":"delta","thread_id":"{{thread}}","seq":22,"item_id":"01a19a41-51e7-76c0-a2c6-b72cd9d6dbb9-plan","kind":"text","offset":94,"text":" Leave"}
+{"type":"delta","thread_id":"{{thread}}","seq":22,"item_id":"01a19a41-51e7-76c0-a2c6-b72cd9d6dbb9-plan","kind":"text","offset":100,"text":" all"}
+{"type":"delta","thread_id":"{{thread}}","seq":22,"item_id":"01a19a41-51e7-76c0-a2c6-b72cd9d6dbb9-plan","kind":"text","offset":104,"text":" other"}
+{"type":"delta","thread_id":"{{thread}}","seq":22,"item_id":"01a19a41-51e7-76c0-a2c6-b72cd9d6dbb9-plan","kind":"text","offset":110,"text":" lines"}
+{"type":"delta","thread_id":"{{thread}}","seq":22,"item_id":"01a19a41-51e7-76c0-a2c6-b72cd9d6dbb9-plan","kind":"text","offset":116,"text":" unchanged"}
+{"type":"delta","thread_id":"{{thread}}","seq":22,"item_id":"01a19a41-51e7-76c0-a2c6-b72cd9d6dbb9-plan","kind":"text","offset":126,"text":" and"}
+{"type":"delta","thread_id":"{{thread}}","seq":22,"item_id":"01a19a41-51e7-76c0-a2c6-b72cd9d6dbb9-plan","kind":"text","offset":130,"text":" verify"}
+{"type":"delta","thread_id":"{{thread}}","seq":22,"item_id":"01a19a41-51e7-76c0-a2c6-b72cd9d6dbb9-plan","kind":"text","offset":137,"text":" the"}
+{"type":"delta","thread_id":"{{thread}}","seq":22,"item_id":"01a19a41-51e7-76c0-a2c6-b72cd9d6dbb9-plan","kind":"text","offset":141,"text":" result"}
+{"type":"delta","thread_id":"{{thread}}","seq":22,"item_id":"01a19a41-51e7-76c0-a2c6-b72cd9d6dbb9-plan","kind":"text","offset":148,"text":".\n"}
+{"type":"item.updated","thread_id":"{{thread}}","seq":23,"item_id":"01a19a41-51e7-76c0-a2c6-b72cd9d6dbb9-plan","patch":{"text":"# Update `notes.txt`\n\n- Replace `apple` with `apricot`.\n- Replace `banana` with `blueberry`.\n- Leave all other lines unchanged and verify the result.\n"}}
+{"type":"request.opened","thread_id":"{{thread}}","seq":24,"request":{"id":"{{pl2}}","type":"plan","plan":"# Update `notes.txt`\n\n- Replace `apple` with `apricot`.\n- Replace `banana` with `blueberry`.\n- Leave all other lines unchanged and verify the result.\n","turn_id":"{{t1}}"}}
+{"type":"thread.updated","thread_id":"{{thread}}","seq":25,"thread":{"id":"{{thread}}","harness":"codex","status":"waiting","model":"gpt-5.6-luna","effort":"low","permission_mode":"plan","cwd":"{{cwd}}","created_at":"2026-11-01T00:00:00Z","session_id":"01a19a41-4007-74d0-8fae-416cb98e02c0"}}
+{"type":"request.resolved","thread_id":"{{thread}}","seq":26,"request_id":"{{pl2}}","resolution":{"outcome":"allow","permission_mode":"accept_edits"}}
+{"type":"thread.updated","thread_id":"{{thread}}","seq":27,"thread":{"id":"{{thread}}","harness":"codex","status":"running","model":"gpt-5.6-luna","effort":"low","permission_mode":"plan","cwd":"{{cwd}}","created_at":"2026-11-01T00:00:00Z","session_id":"01a19a41-4007-74d0-8fae-416cb98e02c0"}}
+{"type":"thread.updated","thread_id":"{{thread}}","seq":28,"thread":{"id":"{{thread}}","harness":"codex","status":"running","model":"gpt-5.6-luna","effort":"low","permission_mode":"accept_edits","cwd":"{{cwd}}","created_at":"2026-11-01T00:00:00Z","session_id":"01a19a41-4007-74d0-8fae-416cb98e02c0"}}
+{"type":"item.added","thread_id":"{{thread}}","seq":29,"item":{"id":"msg_0470d1ee482ba867016ae80059caf88191b7ed8de65261b1d5","type":"assistant_message","text":"","turn_id":"{{t1}}"}}
+{"type":"delta","thread_id":"{{thread}}","seq":29,"item_id":"msg_0470d1ee482ba867016ae80059caf88191b7ed8de65261b1d5","kind":"text","offset":0,"text":"I"}
+{"type":"delta","thread_id":"{{thread}}","seq":29,"item_id":"msg_0470d1ee482ba867016ae80059caf88191b7ed8de65261b1d5","kind":"text","offset":1,"text":"’ll"}
+{"type":"delta","thread_id":"{{thread}}","seq":29,"item_id":"msg_0470d1ee482ba867016ae80059caf88191b7ed8de65261b1d5","kind":"text","offset":4,"text":" update"}
+{"type":"delta","thread_id":"{{thread}}","seq":29,"item_id":"msg_0470d1ee482ba867016ae80059caf88191b7ed8de65261b1d5","kind":"text","offset":11,"text":" the"}
+{"type":"delta","thread_id":"{{thread}}","seq":29,"item_id":"msg_0470d1ee482ba867016ae80059caf88191b7ed8de65261b1d5","kind":"text","offset":15,"text":" two"}
+{"type":"delta","thread_id":"{{thread}}","seq":29,"item_id":"msg_0470d1ee482ba867016ae80059caf88191b7ed8de65261b1d5","kind":"text","offset":19,"text":" specified"}
+{"type":"delta","thread_id":"{{thread}}","seq":29,"item_id":"msg_0470d1ee482ba867016ae80059caf88191b7ed8de65261b1d5","kind":"text","offset":29,"text":" lines"}
+{"type":"delta","thread_id":"{{thread}}","seq":29,"item_id":"msg_0470d1ee482ba867016ae80059caf88191b7ed8de65261b1d5","kind":"text","offset":35,"text":" in"}
+{"type":"delta","thread_id":"{{thread}}","seq":29,"item_id":"msg_0470d1ee482ba867016ae80059caf88191b7ed8de65261b1d5","kind":"text","offset":38,"text":" `"}
+{"type":"delta","thread_id":"{{thread}}","seq":29,"item_id":"msg_0470d1ee482ba867016ae80059caf88191b7ed8de65261b1d5","kind":"text","offset":40,"text":"notes"}
+{"type":"delta","thread_id":"{{thread}}","seq":29,"item_id":"msg_0470d1ee482ba867016ae80059caf88191b7ed8de65261b1d5","kind":"text","offset":45,"text":".txt"}
+{"type":"delta","thread_id":"{{thread}}","seq":29,"item_id":"msg_0470d1ee482ba867016ae80059caf88191b7ed8de65261b1d5","kind":"text","offset":49,"text":"`"}
+{"type":"delta","thread_id":"{{thread}}","seq":29,"item_id":"msg_0470d1ee482ba867016ae80059caf88191b7ed8de65261b1d5","kind":"text","offset":50,"text":" and"}
+{"type":"delta","thread_id":"{{thread}}","seq":29,"item_id":"msg_0470d1ee482ba867016ae80059caf88191b7ed8de65261b1d5","kind":"text","offset":54,"text":" verify"}
+{"type":"delta","thread_id":"{{thread}}","seq":29,"item_id":"msg_0470d1ee482ba867016ae80059caf88191b7ed8de65261b1d5","kind":"text","offset":61,"text":" that"}
+{"type":"delta","thread_id":"{{thread}}","seq":29,"item_id":"msg_0470d1ee482ba867016ae80059caf88191b7ed8de65261b1d5","kind":"text","offset":66,"text":" the"}
+{"type":"delta","thread_id":"{{thread}}","seq":29,"item_id":"msg_0470d1ee482ba867016ae80059caf88191b7ed8de65261b1d5","kind":"text","offset":70,"text":" remaining"}
+{"type":"delta","thread_id":"{{thread}}","seq":29,"item_id":"msg_0470d1ee482ba867016ae80059caf88191b7ed8de65261b1d5","kind":"text","offset":80,"text":" content"}
+{"type":"delta","thread_id":"{{thread}}","seq":29,"item_id":"msg_0470d1ee482ba867016ae80059caf88191b7ed8de65261b1d5","kind":"text","offset":88,"text":" is"}
+{"type":"delta","thread_id":"{{thread}}","seq":29,"item_id":"msg_0470d1ee482ba867016ae80059caf88191b7ed8de65261b1d5","kind":"text","offset":91,"text":" unchanged"}
+{"type":"delta","thread_id":"{{thread}}","seq":29,"item_id":"msg_0470d1ee482ba867016ae80059caf88191b7ed8de65261b1d5","kind":"text","offset":101,"text":"."}
+{"type":"item.updated","thread_id":"{{thread}}","seq":30,"item_id":"msg_0470d1ee482ba867016ae80059caf88191b7ed8de65261b1d5","patch":{"text":"I’ll update the two specified lines in `notes.txt` and verify that the remaining content is unchanged."}}
+{"type":"item.added","thread_id":"{{thread}}","seq":31,"item":{"id":"exec-489dd6f4-25a1-4791-9711-a821af46de34","type":"tool_call","name":"fileChange","kind":"edit","input":{"changes":[{"path":"/work/notes.txt","kind":{"type":"update","move_path":null},"diff":"@@ -1,3 +1,3 @@\n-apple\n-banana\n+apricot\n+blueberry\n cherry\n"}]},"changes":[{"path":"/work/notes.txt","op":"update","diff":"@@ -1,3 +1,3 @@\n-apple\n-banana\n+apricot\n+blueberry\n cherry\n"}],"status":"running","turn_id":"{{t1}}"}}
+{"type":"item.updated","thread_id":"{{thread}}","seq":32,"item_id":"exec-489dd6f4-25a1-4791-9711-a821af46de34","patch":{"status":"completed"}}
+{"type":"item.added","thread_id":"{{thread}}","seq":33,"item":{"id":"exec-bb7a78a0-a5e7-4a92-b9d8-403af6836446","type":"tool_call","name":"commandExecution","kind":"shell","input":{"command":"/usr/bin/bash -lc \"sed -n '1,120p' notes.txt\"","cwd":"/work"},"command":"sed -n '1,120p' notes.txt","status":"running","turn_id":"{{t1}}"}}
+{"type":"item.updated","thread_id":"{{thread}}","seq":34,"item_id":"exec-bb7a78a0-a5e7-4a92-b9d8-403af6836446","patch":{"status":"completed","result":{"content":"apricot\nblueberry\ncherry\n","exit_code":0}}}
+{"type":"item.added","thread_id":"{{thread}}","seq":35,"item":{"id":"msg_0470d1ee482ba867016ae8005b852c81919e3c6ceed774c471","type":"assistant_message","text":"","turn_id":"{{t1}}"}}
+{"type":"delta","thread_id":"{{thread}}","seq":35,"item_id":"msg_0470d1ee482ba867016ae8005b852c81919e3c6ceed774c471","kind":"text","offset":0,"text":"Updated"}
+{"type":"delta","thread_id":"{{thread}}","seq":35,"item_id":"msg_0470d1ee482ba867016ae8005b852c81919e3c6ceed774c471","kind":"text","offset":7,"text":" ["}
+{"type":"delta","thread_id":"{{thread}}","seq":35,"item_id":"msg_0470d1ee482ba867016ae8005b852c81919e3c6ceed774c471","kind":"text","offset":9,"text":"notes"}
+{"type":"delta","thread_id":"{{thread}}","seq":35,"item_id":"msg_0470d1ee482ba867016ae8005b852c81919e3c6ceed774c471","kind":"text","offset":14,"text":".txt"}
+{"type":"delta","thread_id":"{{thread}}","seq":35,"item_id":"msg_0470d1ee482ba867016ae8005b852c81919e3c6ceed774c471","kind":"text","offset":18,"text":"]"}
+{"type":"delta","thread_id":"{{thread}}","seq":35,"item_id":"msg_0470d1ee482ba867016ae8005b852c81919e3c6ceed774c471","kind":"text","offset":19,"text":"("}
+{"type":"delta","thread_id":"{{thread}}","seq":35,"item_id":"msg_0470d1ee482ba867016ae8005b852c81919e3c6ceed774c471","kind":"text","offset":20,"text":"/work"}
+{"type":"delta","thread_id":"{{thread}}","seq":35,"item_id":"msg_0470d1ee482ba867016ae8005b852c81919e3c6ceed774c471","kind":"text","offset":25,"text":"/"}
+{"type":"delta","thread_id":"{{thread}}","seq":35,"item_id":"msg_0470d1ee482ba867016ae8005b852c81919e3c6ceed774c471","kind":"text","offset":26,"text":"notes"}
+{"type":"delta","thread_id":"{{thread}}","seq":35,"item_id":"msg_0470d1ee482ba867016ae8005b852c81919e3c6ceed774c471","kind":"text","offset":31,"text":".txt"}
+{"type":"delta","thread_id":"{{thread}}","seq":35,"item_id":"msg_0470d1ee482ba867016ae8005b852c81919e3c6ceed774c471","kind":"text","offset":35,"text":"):\n\n"}
+{"type":"delta","thread_id":"{{thread}}","seq":35,"item_id":"msg_0470d1ee482ba867016ae8005b852c81919e3c6ceed774c471","kind":"text","offset":39,"text":"```"}
+{"type":"delta","thread_id":"{{thread}}","seq":35,"item_id":"msg_0470d1ee482ba867016ae8005b852c81919e3c6ceed774c471","kind":"text","offset":42,"text":"text"}
+{"type":"delta","thread_id":"{{thread}}","seq":35,"item_id":"msg_0470d1ee482ba867016ae8005b852c81919e3c6ceed774c471","kind":"text","offset":46,"text":"\n"}
+{"type":"delta","thread_id":"{{thread}}","seq":35,"item_id":"msg_0470d1ee482ba867016ae8005b852c81919e3c6ceed774c471","kind":"text","offset":47,"text":"ap"}
+{"type":"delta","thread_id":"{{thread}}","seq":35,"item_id":"msg_0470d1ee482ba867016ae8005b852c81919e3c6ceed774c471","kind":"text","offset":49,"text":"ric"}
+{"type":"delta","thread_id":"{{thread}}","seq":35,"item_id":"msg_0470d1ee482ba867016ae8005b852c81919e3c6ceed774c471","kind":"text","offset":52,"text":"ot"}
+{"type":"delta","thread_id":"{{thread}}","seq":35,"item_id":"msg_0470d1ee482ba867016ae8005b852c81919e3c6ceed774c471","kind":"text","offset":54,"text":"\n"}
+{"type":"delta","thread_id":"{{thread}}","seq":35,"item_id":"msg_0470d1ee482ba867016ae8005b852c81919e3c6ceed774c471","kind":"text","offset":55,"text":"blue"}
+{"type":"delta","thread_id":"{{thread}}","seq":35,"item_id":"msg_0470d1ee482ba867016ae8005b852c81919e3c6ceed774c471","kind":"text","offset":59,"text":"berry"}
+{"type":"delta","thread_id":"{{thread}}","seq":35,"item_id":"msg_0470d1ee482ba867016ae8005b852c81919e3c6ceed774c471","kind":"text","offset":64,"text":"\n"}
+{"type":"delta","thread_id":"{{thread}}","seq":35,"item_id":"msg_0470d1ee482ba867016ae8005b852c81919e3c6ceed774c471","kind":"text","offset":65,"text":"ch"}
+{"type":"delta","thread_id":"{{thread}}","seq":35,"item_id":"msg_0470d1ee482ba867016ae8005b852c81919e3c6ceed774c471","kind":"text","offset":67,"text":"erry"}
+{"type":"delta","thread_id":"{{thread}}","seq":35,"item_id":"msg_0470d1ee482ba867016ae8005b852c81919e3c6ceed774c471","kind":"text","offset":71,"text":"\n"}
+{"type":"delta","thread_id":"{{thread}}","seq":35,"item_id":"msg_0470d1ee482ba867016ae8005b852c81919e3c6ceed774c471","kind":"text","offset":72,"text":"```"}
+{"type":"item.updated","thread_id":"{{thread}}","seq":36,"item_id":"msg_0470d1ee482ba867016ae8005b852c81919e3c6ceed774c471","patch":{"text":"Updated [notes.txt](/work/notes.txt):\n\n```text\napricot\nblueberry\ncherry\n```"}}
+{"type":"item.added","thread_id":"{{thread}}","seq":37,"item":{"id":"{{tr1}}","type":"turn_result","ok":true,"usage":{"input_tokens":6950,"output_tokens":493,"cache_read_tokens":67584,"cache_write_tokens":0},"duration_ms":9531,"turn_id":"{{t1}}"}}
+{"type":"turn.completed","thread_id":"{{thread}}","seq":38,"turn_id":"{{t1}}"}
+{"type":"thread.updated","thread_id":"{{thread}}","seq":39,"thread":{"id":"{{thread}}","harness":"codex","status":"idle","model":"gpt-5.6-luna","effort":"low","permission_mode":"accept_edits","cwd":"{{cwd}}","created_at":"2026-11-01T00:00:00Z","session_id":"01a19a41-4007-74d0-8fae-416cb98e02c0","usage":{"input_tokens":6950,"output_tokens":493,"cache_read_tokens":67584,"cache_write_tokens":0}}}

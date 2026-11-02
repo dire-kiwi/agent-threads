@@ -276,6 +276,49 @@ export const scenarios = {
     },
   },
 
+  plan: {
+    description:
+      "Plan mode: the agent presents a plan with ExitPlanMode, which the user sends back with feedback; it presents another, which the user approves, switching the session to acceptEdits, and it makes the edit without asking.",
+    async run(ctx) {
+      let plans = 0;
+      const p = ctx.spawn(
+        args({ extra: ["--permission-mode", "plan"] }),
+        answers({
+          permission: (req) => {
+            if (req.tool_name !== "ExitPlanMode") return { behavior: "allow", updatedInput: req.input };
+            if (++plans === 1) return { behavior: "deny", message: "Also change the line banana to blueberry." };
+            return { behavior: "allow", updatedInput: req.input, updatedPermissions: [{ type: "setMode", mode: "acceptEdits", destination: "session" }] };
+          },
+        }),
+      );
+      await initialize(p);
+      user(
+        p,
+        "Plan this change: in notes.txt, change the line apple to apricot. Read notes.txt, then present a short plan (two or three lines) with the ExitPlanMode tool. Once a plan is approved, make the change with the Edit tool and reply with just: done",
+      );
+      await p.next(isResult, "the result");
+      p.close();
+      await p.exited;
+    },
+  },
+
+  "set-options": {
+    description:
+      "Options changed between turns while the process runs: set_model, and set_permission_mode to acceptEdits, so the next turn's edit isn't asked about.",
+    async run(ctx) {
+      const p = ctx.spawn(args(), answers());
+      await initialize(p);
+      user(p, "Reply with just: one");
+      await p.next(isResult, "the first result");
+      await control(p, { subtype: "set_model", model: "sonnet" });
+      await control(p, { subtype: "set_permission_mode", mode: "acceptEdits" });
+      user(p, "Use the Edit tool to change the line apple to apricot in notes.txt. Then reply with just: done");
+      await p.next(isResult, "the second result");
+      p.close();
+      await p.exited;
+    },
+  },
+
   error: {
     description: "A turn that fails: the model doesn't exist.",
     run: (ctx) => oneTurn(ctx, "Reply with: hi", { argv: args({ model: "claude-no-such-model" }), handlers: answers() }),

@@ -5,22 +5,34 @@ import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { afterEach, describe, expect, it } from "vitest";
-import { applyEvents, initialState, type Item, type ThreadEvent, type ToolCall, type TurnResult, type UserMessage } from "@dire-kiwi/agent-threads-protocol";
-import { AgentThreads, CommandError, type AgentThreadsOptions } from "../agent-threads.js";
+import { applyEvents, initialState, openRequests, type Item, type ThreadEvent, type ToolCall, type TurnResult, type UserMessage } from "@dire-kiwi/agent-threads-protocol";
+import { AgentThreads, CommandError, ControlError, type AgentThreadsOptions } from "../agent-threads.js";
+import type { HarnessMessage } from "../harness.js";
 import { claudeCode, type ClaudeCodeOptions } from "../claude/driver.js";
+import type { LaunchOptions } from "../harness.js";
+import { shim } from "../shim.js";
 import type { Store } from "../store.js";
 import { FileStore } from "../stores/file.js";
 import { MemoryStore } from "../stores/memory.js";
 import { SqliteStore } from "../stores/sqlite.js";
 import { defineTool, type ToolContext } from "../tools.js";
-import { tempDir } from "./spec.js";
+import { shimPath, tempDir } from "./spec.js";
 
 const mini = fileURLToPath(new URL("./mini-claude.mjs", import.meta.url));
 
 let open: AgentThreads[] = [];
+/** File stores, which are the app's to close (left open, their files are closed when they're collected, which fails). */
+const fileStores: FileStore[] = [];
 afterEach(async () => {
   await Promise.all(open.splice(0).map((s) => s.close()));
+  await Promise.all(fileStores.splice(0).map((s) => s.close()));
 });
+
+function fileStore(): FileStore {
+  const store = new FileStore(tempDir());
+  fileStores.push(store);
+  return store;
+}
 
 interface Setup extends AgentThreadsOptions {
   claude?: ClaudeCodeOptions;
@@ -55,10 +67,11 @@ function setup(options: Setup = {}) {
   /** What each run was started with and sent. */
   const runs = () => {
     if (!existsSync(log)) return [];
-    const out: { argv: string[]; sent: { type: string; [k: string]: unknown }[] }[] = [];
+    // Its CLAUDE_CONFIG_DIR, and the variables MINI_LOG_ENV names (null if unset).
+    const out: { argv: string[]; configDir?: string; env: { [k: string]: string | null }; sent: { type: string; [k: string]: unknown }[] }[] = [];
     for (const l of readFileSync(log, "utf8").split("\n").filter(Boolean)) {
       const v = JSON.parse(l);
-      if (v.argv) out.push({ argv: v.argv, sent: [] });
+      if (v.argv) out.push({ argv: v.argv, ...(v.configDir !== undefined ? { configDir: v.configDir } : {}), env: v.env ?? {}, sent: [] });
       else out[out.length - 1]!.sent.push(v);
     }
     return out;
@@ -157,13 +170,78 @@ describe("the Claude driver", () => {
     expect(events.filter((e) => e.type === "turn.started")).toHaveLength(2);
   });
 
+  it("gives a running process a new model and permission mode", async () => {
+    const { sdk, runs } = setup();
+    const t = await sdk.create({ model: "a" });
+    await sdk.send(t.id, "reply one");
+    await settle(sdk, t.id);
+    await sdk.setOptions(t.id, { model: "b", permission_mode: "accept_edits" });
+    await sdk.send(t.id, "reply two");
+    const s = await settle(sdk, t.id);
+    expect(texts(s.items)).toEqual(["one", "two"]);
+    expect(runs()).toHaveLength(1);
+    const controls = runs()[0]!.sent.filter((m) => m.type === "control_request").map((m) => m.request);
+    expect(controls).toContainEqual({ subtype: "set_model", model: "b" });
+    expect(controls).toContainEqual({ subtype: "set_permission_mode", mode: "acceptEdits" });
+  });
+
+  it("asks the user about a plan, and approving it leaves plan mode for the mode they pick", async () => {
+    const { sdk, runs } = setup({ permissions: "ask" });
+    const t = await sdk.create({ permission_mode: "plan" });
+    await sdk.send(t.id, 'tool ExitPlanMode {"plan":"#Plan\\n-one"}');
+    const r = await until(async () => (await sdk.snapshot(t.id)).requests[0]);
+    expect(r).toMatchObject({ type: "plan", plan: "#Plan\n-one" });
+    await sdk.respond(t.id, r.id, { outcome: "allow", permission_mode: "accept_edits" });
+    let s = await settle(sdk, t.id);
+    expect(s.thread.permission_mode).toBe("accept_edits");
+    const answer = runs()[0]!.sent.find((m) => m.type === "control_response") as unknown as { response: { response: unknown } };
+    expect(answer.response.response).toMatchObject({ behavior: "allow", updatedPermissions: [{ type: "setMode", mode: "acceptEdits", destination: "session" }] });
+    // The process has the mode: the next turn runs in it, and isn't told it again.
+    await sdk.send(t.id, "reply next");
+    s = await settle(sdk, t.id);
+    expect(runs()).toHaveLength(1);
+    expect(runs()[0]!.sent.filter((m) => m.type === "control_request" && (m.request as { subtype: string }).subtype === "set_permission_mode")).toEqual([]);
+  });
+
+  it("sends a plan back with the user's feedback", async () => {
+    const { sdk, runs } = setup();
+    const t = await sdk.create({ permission_mode: "plan" });
+    await sdk.send(t.id, 'tool ExitPlanMode {"plan":"p"}');
+    const r = await until(async () => (await sdk.snapshot(t.id)).requests[0]);
+    await sdk.respond(t.id, r.id, { outcome: "deny", message: "Not yet." });
+    const s = await settle(sdk, t.id);
+    expect(s.thread.permission_mode).toBe("plan");
+    expect(s.items.find((i) => i.type === "tool_call")).toMatchObject({ name: "ExitPlanMode", status: "denied", result: { content: "Not yet." } });
+    const answer = runs()[0]!.sent.find((m) => m.type === "control_response") as unknown as { response: { response: unknown } };
+    expect(answer.response.response).toEqual({ behavior: "deny", message: "Not yet." });
+  });
+
+  it("allows what a process that can't be switched to bypass mode asks, until a new one starts in it", async () => {
+    const { sdk, runs, events } = setup({ permissions: "ask", env: { MINI_CLAUDE_ASK_DELAY: "300" } });
+    const t = await sdk.create({});
+    await sdk.send(t.id, 'tool Bash {"command":"ls"}');
+    await sdk.setOptions(t.id, { permission_mode: "bypass" });
+    let s = await settle(sdk, t.id);
+    expect(events.filter((e) => e.type === "request.opened")).toEqual([]);
+    expect(s.items.filter((i) => i.type === "tool_call").map((i) => [i.name, i.status])).toEqual([["Bash", "completed"]]);
+    // It was put in acceptEdits mode, the nearest it could be.
+    const controls = runs()[0]!.sent.filter((m) => m.type === "control_request").map((m) => m.request);
+    expect(controls).toContainEqual({ subtype: "set_permission_mode", mode: "acceptEdits" });
+    // The next turn has a process started in bypass mode.
+    await sdk.send(t.id, "reply next");
+    s = await settle(sdk, t.id);
+    expect(runs()).toHaveLength(2);
+    expect(runs()[1]!.argv).toEqual(expect.arrayContaining(["--permission-mode", "bypassPermissions"]));
+  });
+
   it("runs a carried-over turn with options changed during the turn before", async () => {
     const { sdk, runs } = setup({ steer: "late" });
-    const t = await sdk.create({ model: "old-model" });
+    // A new effort needs a new process (a model or permission mode doesn't).
+    const t = await sdk.create({ effort: "low" });
     await sdk.send(t.id, "slow");
     await until(async () => (await sdk.snapshot(t.id)).thread.session_id);
     await sdk.send(t.id, "reply steered");
-    await sdk.setOptions(t.id, { model: "new-model" });
+    await sdk.setOptions(t.id, { effort: "high" });
     await sdk.interrupt(t.id);
     const s = await until(async () => {
       const s = await sdk.snapshot(t.id);
@@ -172,8 +250,8 @@ describe("the Claude driver", () => {
     expect(texts(s.items)).toEqual(["steered"]);
     expect(s.items.filter((i) => i.type === "user_message" && i.queued)).toEqual([]);
     const [first, second] = runs();
-    expect(first!.argv).toEqual(expect.arrayContaining(["--model", "old-model"]));
-    expect(second!.argv).toEqual(expect.arrayContaining(["--model", "new-model", "--resume", s.thread.session_id!]));
+    expect(first!.argv).toEqual(expect.arrayContaining(["--effort", "low"]));
+    expect(second!.argv).toEqual(expect.arrayContaining(["--effort", "high", "--resume", s.thread.session_id!]));
   });
 
   it("stops carrying a steered message over to a harness that keeps failing, and keeps it for a retry that works", async () => {
@@ -413,6 +491,9 @@ describe("the Claude driver", () => {
     await sdk.handle({ type: "respond", thread_id: t.id, request_id: req.type === "request.opened" ? req.request.id : "", resolution: { outcome: "allow", always: true } });
     await settle(sdk, t.id);
 
+    // The answered request stays, with its answer.
+    expect((await sdk.snapshot(t.id)).requests).toEqual([{ ...req.request, resolution: { outcome: "allow", always: true } }]);
+
     await sdk.send(t.id, 'tool Bash {"command":"pwd"}');
     s = await settle(sdk, t.id);
     expect(events.filter((e) => e.type === "request.opened")).toHaveLength(1);
@@ -429,7 +510,7 @@ describe("the Claude driver", () => {
     await until(() => events.some((e) => e.type === "turn.completed"));
     let s = await sdk.snapshot(t.id);
     expect(s.thread.status).toBe("waiting");
-    expect(s.requests).toHaveLength(1);
+    expect(openRequests(s)).toHaveLength(1);
     let [agent, bash] = s.items.filter((i): i is ToolCall => i.type === "tool_call");
     expect(agent).toMatchObject({ name: "Agent", kind: "subagent", status: "completed", subagent: { status: "running", background: true, agent_type: "general-purpose", model: "mini-1" } });
     expect(bash).toMatchObject({ name: "Bash", status: "pending", parent_id: agent!.id });
@@ -501,6 +582,27 @@ describe("the Claude driver", () => {
     expect(bash).toMatchObject({ status: "cancelled", parent_id: agent!.id });
   });
 
+  it("gives a window of a thread's last items, and pages of the items before it", async () => {
+    const { sdk } = setup();
+    const t = await sdk.create();
+    for (const n of ["one", "two", "three"]) {
+      await sdk.send(t.id, `reply ${n}`);
+      await settle(sdk, t.id);
+    }
+    const whole = await sdk.snapshot(t.id);
+    // A user message, the reply and the turn's result, for each turn.
+    expect(whole.items).toHaveLength(9);
+    expect(whole).not.toHaveProperty("start");
+    expect(await sdk.snapshot(t.id, { limit: 20 })).toEqual(whole);
+    const window = await sdk.snapshot(t.id, { limit: 4 });
+    expect(window).toMatchObject({ start: 5, seq: whole.seq, thread: whole.thread });
+    expect(window.items).toEqual(whole.items.slice(5));
+    const page = await sdk.itemsBefore(t.id, 5, 3);
+    expect(page).toEqual({ thread_id: t.id, items: whole.items.slice(2, 5), requests: [], start: 2, context: [], seq: whole.seq });
+    expect((await sdk.itemsBefore(t.id, 2, 3)).items).toEqual(whole.items.slice(0, 2));
+    await expect(sdk.itemsBefore("nope", 2, 3)).rejects.toThrow();
+  });
+
   it("runs app tools with the thread's id, metadata and call, and keeps their structured output", async () => {
     let ctx: ToolContext | undefined;
     const lookup = defineTool<{ id: string }>({
@@ -522,6 +624,35 @@ describe("the Claude driver", () => {
     expect(ctx).toMatchObject({ threadId: t.id, metadata: { user: "u1" }, toolCallId: call.id });
     const init = runs()[0]!.sent.find((m) => m.type === "control_request")!;
     expect(init).toMatchObject({ request: { subtype: "initialize", sdkMcpServers: ["app"] } });
+  });
+
+  it("leaves raw out unless it's turned on, and passes the app every line", async () => {
+    const messages: HarnessMessage[] = [];
+    const { sdk, events } = setup({ onHarnessMessage: (m) => messages.push(m) });
+    const t = await sdk.create();
+    await sdk.send(t.id, "reply hi");
+    const s = await settle(sdk, t.id);
+    expect(events.some((e) => "raw" in e || (e.type === "item.added" && "raw" in e.item))).toBe(false);
+    expect(s.items.some((i) => "raw" in i)).toBe(false);
+    const types = messages.map((m) => (m.message as { type?: string }).type);
+    expect(types).toEqual(expect.arrayContaining(["control_response", "system", "assistant", "result"]));
+    expect(messages.every((m) => m.threadId === t.id && m.harness === "claude" && m.runId === s.thread.run?.id && JSON.parse(m.line).type)).toBe(true);
+  });
+
+  it("sends control requests to the running process, and fails them when it can't", async () => {
+    const { sdk, runs } = setup();
+    const t = await sdk.create();
+    await expect(sdk.control(t.id, { subtype: "get_context_usage" })).rejects.toThrow(CommandError);
+    await sdk.send(t.id, "reply hi");
+    await settle(sdk, t.id);
+    await expect(sdk.control(t.id, { subtype: "get_context_usage" })).resolves.toEqual({});
+    await expect(sdk.control(t.id, "get_context_usage")).rejects.toThrow(CommandError);
+    // One the process exits before answering.
+    const pending = sdk.control(t.id, { subtype: "never_answered" }).catch((e: unknown) => e);
+    await until(() => runs()[0]?.sent.some((m) => (m.request as { subtype?: string } | undefined)?.subtype === "never_answered"));
+    await sdk.close();
+    expect(await pending).toBeInstanceOf(ControlError);
+    await expect(sdk.control(t.id, { subtype: "get_context_usage" })).rejects.toThrow(CommandError);
   });
 
   it("fails the turn when Claude can't be started, and tries again on the next send", async () => {
@@ -678,7 +809,7 @@ describe("the Claude driver", () => {
     await new Promise((r) => setTimeout(r, 50));
     const s = await sdk.snapshot(t.id);
     expect(s.thread.status).toBe("idle");
-    expect(s.requests).toEqual([]);
+    expect(openRequests(s)).toEqual([]);
     expect(s.items.find((i): i is ToolCall => i.type === "tool_call")!.status).toBe("failed");
     expect(runs()[0]!.sent.filter((m) => m.type === "control_response")).toEqual([]);
   });
@@ -779,7 +910,7 @@ describe("the Claude driver", () => {
 });
 
 describe.each([
-  ["FileStore", () => new FileStore(tempDir())],
+  ["FileStore", () => fileStore()],
   ["SqliteStore", () => new SqliteStore(join(tempDir(), "t.db"))],
 ])("AgentThreads on a %s", (_, makeStore) => {
   it("saves events, and picks a thread up again after a restart", async () => {
@@ -964,5 +1095,120 @@ describe("AgentThreads", () => {
     expect(await sdk.delete(t.id)).toBe(true);
     expect(await sdk.get(t.id)).toBeNull();
     await expect(sdk.snapshot(t.id)).rejects.toBeInstanceOf(CommandError);
+  });
+});
+
+/** The values `flag` is given in `argv`, in order. */
+const flagValues = (argv: string[], flag: string) => argv.flatMap((a, i) => (a === flag && i + 1 < argv.length ? [argv[i + 1]!] : []));
+
+describe("a thread's launch options", () => {
+  const first: LaunchOptions = {
+    args: ["--allowedTools", "Read Edit", "--settings", '{"a":1}'],
+    env: { AT_SET: "a b", AT_GONE: null },
+    addDirs: ["/one", "/two"],
+    configDir: "/profile-a",
+  };
+
+  it("start Claude with them, stored with the thread but not sent to clients, after setOptions changes them and after a restart", async () => {
+    const store = fileStore();
+    const { sdk, make, events, runs } = setup({
+      store,
+      claude: { args: ["--own"], configDir: "/instance-config" },
+      env: { MINI_LOG_ENV: "AT_SET,AT_GONE,AT_KEPT", AT_KEPT: "kept", AT_GONE: "instance" },
+    });
+    const t = await sdk.create({ launch: first });
+    expect(t).not.toHaveProperty("launch");
+    await sdk.send(t.id, "reply one");
+    await settle(sdk, t.id);
+    const run = runs()[0]!;
+    expect(flagValues(run.argv, "--add-dir")).toEqual(["/one", "/two"]);
+    // After the driver's arguments and the harness options'.
+    expect(run.argv.slice(-5)).toEqual(["--own", "--allowedTools", "Read Edit", "--settings", '{"a":1}']);
+    expect(run.configDir).toBe("/profile-a");
+    expect(run.env).toEqual({ AT_SET: "a b", AT_GONE: null, AT_KEPT: "kept" });
+    // Stored with the thread, as the other backends store them, and never sent to clients.
+    expect(((await store.getThread(t.id)) as { launch?: unknown }).launch).toEqual({
+      args: ["--allowedTools", "Read Edit", "--settings", '{"a":1}'],
+      env: { AT_GONE: null, AT_SET: "a b" },
+      add_dirs: ["/one", "/two"],
+      config_dir: "/profile-a",
+    });
+    expect(events.some((e) => JSON.stringify(e).includes("profile-a"))).toBe(false);
+    expect((await sdk.snapshot(t.id)).thread).not.toHaveProperty("launch");
+    expect(await sdk.get(t.id)).not.toHaveProperty("launch");
+
+    // Changed: the next turn's process has the new ones.
+    const second: LaunchOptions = { args: ["--disallowedTools", "Bash"], env: { AT_SET: "b" }, addDirs: ["/three"], configDir: "/profile-b" };
+    await sdk.setOptions(t.id, { launch: second });
+    await sdk.send(t.id, "reply two");
+    const s = await settle(sdk, t.id);
+    expect(runs()).toHaveLength(2);
+    const changed = runs()[1]!;
+    expect(flagValues(changed.argv, "--add-dir")).toEqual(["/three"]);
+    expect(changed.argv.slice(-2)).toEqual(["--disallowedTools", "Bash"]);
+    expect(changed.argv).not.toContain("--allowedTools");
+    expect(changed.configDir).toBe("/profile-b");
+    expect(changed.env).toEqual({ AT_SET: "b", AT_GONE: "instance", AT_KEPT: "kept" });
+    expect(((await store.getThread(t.id)) as { launch?: { config_dir?: string } }).launch?.config_dir).toBe("/profile-b");
+
+    // A new backend on the same store resumes the thread with them; a client sees none of them.
+    await sdk.close();
+    open = open.filter((x) => x !== sdk);
+    const again = make(store);
+    expect(await again.get(t.id)).not.toHaveProperty("launch");
+    expect((await again.list())[0]).not.toHaveProperty("launch");
+    expect((await again.snapshot(t.id)).thread).not.toHaveProperty("launch");
+    await again.send(t.id, "reply three");
+    await settle(again, t.id);
+    expect(runs()).toHaveLength(3);
+    const resumed = runs()[2]!;
+    expect(flagValues(resumed.argv, "--resume")).toEqual([s.thread.session_id]);
+    expect(flagValues(resumed.argv, "--add-dir")).toEqual(["/three"]);
+    expect(resumed.argv.slice(-2)).toEqual(["--disallowedTools", "Bash"]);
+    expect(resumed.configDir).toBe("/profile-b");
+    expect(resumed.env.AT_SET).toBe("b");
+    expect(events.some((e) => JSON.stringify(e).includes("profile-b"))).toBe(false);
+  });
+
+  it("are changed by setOptions only when they're different, and never by the set_options command", async () => {
+    const store = new MemoryStore();
+    const { sdk, runs } = setup({ store });
+    const t = await sdk.create({ launch: first });
+    await sdk.send(t.id, "reply one");
+    await settle(sdk, t.id);
+    // The same ones, given in another order: nothing to change, so the process carries on.
+    await sdk.setOptions(t.id, { launch: { configDir: "/profile-a", addDirs: ["/one", "/two"], env: { AT_GONE: null, AT_SET: "a b" }, args: first.args! } });
+    // A client can't set them.
+    await sdk.handle({ type: "set_options", thread_id: t.id, launch: { args: ["--evil"] } } as never);
+    await sdk.send(t.id, "reply two");
+    await settle(sdk, t.id);
+    expect(runs()).toHaveLength(1);
+    expect(runs()[0]!.argv).not.toContain("--evil");
+    expect(((await store.getThread(t.id)) as { launch?: { args?: string[] } }).launch?.args).toEqual(first.args);
+    // Cleared: the next process has none of them, and the stored thread has no launch.
+    await sdk.setOptions(t.id, { launch: {} });
+    await sdk.send(t.id, "reply three");
+    await settle(sdk, t.id);
+    expect(runs()).toHaveLength(2);
+    expect(runs()[1]!.argv).not.toContain("--add-dir");
+    expect(runs()[1]!.configDir).toBe(process.env.CLAUDE_CONFIG_DIR);
+    expect(await store.getThread(t.id)).not.toHaveProperty("launch");
+  });
+
+  it.skipIf(process.platform === "win32")("start Claude under the shim with them too", async () => {
+    const { sdk, runs } = setup({ spawner: shim(shimPath(), { runsDir: tempDir(), pollMs: 20 }), env: { MINI_LOG_ENV: "AT_SET" } });
+    open = open.filter((x) => x !== sdk);
+    try {
+      const t = await sdk.create({ launch: { args: ["--settings", "{}"], env: { AT_SET: "x y" }, addDirs: ["/one"], configDir: "/profile" } });
+      await sdk.send(t.id, "reply one");
+      expect(texts((await settle(sdk, t.id)).items)).toEqual(["one"]);
+      const run = runs()[0]!;
+      expect(flagValues(run.argv, "--add-dir")).toEqual(["/one"]);
+      expect(run.argv.slice(-2)).toEqual(["--settings", "{}"]);
+      expect(run.configDir).toBe("/profile");
+      expect(run.env).toEqual({ AT_SET: "x y" });
+    } finally {
+      await sdk.close({ stop: true });
+    }
   });
 });

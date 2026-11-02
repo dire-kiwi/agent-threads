@@ -187,12 +187,31 @@ class Draft {
     return bind;
   }
 
+  /** A control request the app sends (with `control`), and the harness's answer: `{result}` or `{error}`. */
+  control(request, answer) {
+    if (this.events.length > 1 || this.steps.length) this.waitForLast();
+    this.steps.push({ control: request, ...answer, from: this.events.length });
+  }
+
+  /** The harness reported usage limits: they replace the thread's with the same ids. */
+  rateLimits(limits) {
+    if (!limits.length) return;
+    const all = new Map((this.thread.rate_limits ?? []).map((l) => [l.id, l]));
+    for (const l of limits) all.set(l.id, l);
+    this.setThread({ rate_limits: [...all.values()].sort((a, b) => (a.id < b.id ? -1 : a.id > b.id ? 1 : 0)) });
+  }
+
   waitForLast() {
-    const e = this.events[this.events.length - 1];
-    const step = { wait: pattern(e) };
+    // The last event whose pattern an earlier one (since the step before) doesn't match too. The
+    // events after it don't depend on the command (a rate limit reported meanwhile, say).
+    const last = this.steps[this.steps.length - 1];
+    const start = !last ? 0 : last.wait ? last.at + 1 : last.from;
+    let at = this.events.length - 1;
+    while (at > start && this.events.findIndex((e, i) => i >= start && matches(e, pattern(this.events[at]))) !== at) at--;
+    const step = { wait: pattern(this.events[at]) };
     const prev = this.steps.findLast?.((s) => s.wait);
-    if (prev && JSON.stringify(prev.wait) === JSON.stringify(step.wait) && prev.at === this.events.length - 1) return;
-    step.at = this.events.length - 1;
+    if (prev && JSON.stringify(prev.wait) === JSON.stringify(step.wait) && prev.at === at) return;
+    step.at = at;
     this.steps.push(step);
   }
 
@@ -242,6 +261,12 @@ class Draft {
     if (i < 0) return;
     const [it] = this.queued.splice(i, 1);
     this.update(it.id, { queued: null });
+  }
+
+  /** set_options: the options change on the thread. */
+  setOptions(options) {
+    this.command({ type: "set_options", ...options });
+    this.setThread(options);
   }
 
   interrupt() {
@@ -427,16 +452,33 @@ function draftClaude(d, runs) {
     let held = null; // the usage of Claude's own turns held for a turn of the user's
     // The message that starts a run is sent before the process starts (backends start it then).
     const opener = entries.find((e) => e.dir === "in" && e.msg.type === "user");
+    // set_model and set_permission_mode requests in a row are one set_options command.
+    let options = null;
     for (const e of entries) {
       if (e.dir === "spawn" && opener) d.send(userText(opener.msg));
       const m = e.msg;
       if (!m) continue;
       if (e.dir === "in") {
+        const sub = m.type === "control_request" ? m.request.subtype : undefined;
+        if (sub === "set_model" || sub === "set_permission_mode") {
+          options ??= {};
+          if (sub === "set_model") options.model = m.request.model;
+          else options.permission_mode = threadMode(m.request.mode);
+          continue;
+        }
+        if (options) {
+          d.setOptions(options);
+          options = null;
+        }
         if (m.type === "user") {
           if (e !== opener) d.send(userText(m));
         } else if (m.type === "control_request" && m.request.subtype === "interrupt") {
           d.interrupt();
           interrupted = true;
+        } else if (m.type === "control_request" && m.request.subtype !== "initialize") {
+          // The app's own, sent with control().
+          const reply = entries.find((x) => x.dir === "out" && x.msg?.type === "control_response" && x.msg.response?.request_id === m.request_id)?.msg.response;
+          d.control(m.request, reply?.subtype === "success" ? { result: reply.response ?? {} } : { error: reply?.error ?? "" });
         } else if (m.type === "control_response") {
           const req = asked.get(m.response.request_id);
           const r = d.requests.get(m.response.request_id);
@@ -446,6 +488,13 @@ function draftClaude(d, runs) {
             const answers = {};
             for (const [q, a] of Object.entries(body.updatedInput.answers)) answers[q] = a.split(", ");
             d.respond(r, { outcome: "answer", answers });
+            d.update(req.tool_use_id, { status: "running" });
+          } else if (r.type === "plan" && body.behavior === "allow") {
+            // Approved: the session goes on in the mode the user picked (default, if none).
+            const set = (body.updatedPermissions ?? []).find((u) => u.type === "setMode");
+            const mode = set ? threadMode(set.mode) : undefined;
+            d.respond(r, { outcome: "allow", ...(mode ? { permission_mode: mode } : {}) });
+            d.setThread({ permission_mode: mode ?? (d.thread.permission_mode === "plan" ? "default" : d.thread.permission_mode) });
             d.update(req.tool_use_id, { status: "running" });
           } else {
             const resolution = body.behavior === "allow" ? { outcome: "allow" } : { outcome: "deny", message: body.message };
@@ -457,7 +506,14 @@ function draftClaude(d, runs) {
       }
       if (e.dir !== "out") continue;
       const parent = m.parent_tool_use_id ?? undefined;
+      // A message refused for the usage limit says which limit, before anything else it leads to.
+      if (["assistant", "user", "result"].includes(m.type) && m.api_error === "usage_limit_reached" && m.api_error_params?.rate_limit_info) {
+        d.rateLimits(claudeLimits(m.api_error_params.rate_limit_info));
+      }
       switch (m.type) {
+        case "rate_limit_event":
+          d.rateLimits(claudeLimits(m.rate_limit_info ?? {}));
+          break;
         case "system": {
           // Claude starts a turn by itself to tell the agent a background subagent ended.
           if (m.subtype === "init" && !d.turn) {
@@ -465,6 +521,11 @@ function draftClaude(d, runs) {
             autoTurn = d.turn.id;
           }
           if (m.subtype === "init" && m.session_id !== d.thread.session_id) d.setThread({ session_id: m.session_id });
+          if (m.subtype === "api_retry") d.item({ id: d.ph("n"), type: "notice", level: "warning", code: "retry", text: retryText(m), parent_id: parent });
+          if (m.subtype === "hook_response") {
+            const n = hookNotice(m);
+            if (n) d.item({ id: d.ph("n"), type: "notice", ...n, code: "hook", parent_id: parent });
+          }
           if (m.subtype === "compact_boundary") {
             d.item({ id: m.uuid, type: "compaction", trigger: m.compact_metadata.trigger, tokens_before: m.compact_metadata.pre_tokens });
             summaryNext = m.uuid;
@@ -591,6 +652,9 @@ function draftClaude(d, runs) {
             }));
             const r = d.open({ id: d.ph("q"), type: "question", questions }, req.tool_use_id);
             d.requests.set(m.request_id, r);
+          } else if (req.tool_name === "ExitPlanMode") {
+            const r = d.open({ id: d.ph("pl"), type: "plan", plan: typeof req.input.plan === "string" ? req.input.plan : "" }, req.tool_use_id);
+            d.requests.set(m.request_id, r);
           } else if (d.policy === "ask") {
             const t = claudeTool({ name: req.tool_name, input: req.input });
             const r = { id: d.ph("p"), type: "permission", name: t.name, kind: t.kind, input: req.input, title: title(t) };
@@ -638,6 +702,49 @@ export function claudeUsage(result) {
   return u;
 }
 
+/** Claude Code's permission mode as the thread's. */
+function threadMode(mode) {
+  return { acceptEdits: "accept_edits", bypassPermissions: "bypass", plan: "plan" }[mode] ?? "default";
+}
+
+/** Codex's approval policy and sandbox (as turn/start overrides them) as the thread's permission mode. */
+function codexMode(approvalPolicy, sandbox) {
+  if (approvalPolicy === "never") return "bypass";
+  if (sandbox === "readOnly") return "plan";
+  return approvalPolicy === "on-request" ? "accept_edits" : "default";
+}
+
+/** A Claude rate_limit_info as the rate limits it reports (none, or one). */
+export function claudeLimits(info) {
+  const overage = info.isUsingOverage === true || info.overageStatus === "allowed" || info.overageStatus === "allowed_warning";
+  const status = { allowed: "allowed", allowed_warning: "warning", rejected: overage ? "warning" : "rejected" }[info.status];
+  if (!status) return [];
+  const l = { id: info.rateLimitType || "unknown", status };
+  if (typeof info.utilization === "number") l.used_percent = info.utilization * 100;
+  if (typeof info.resetsAt === "number") l.resets_at = unixTime(info.resetsAt);
+  return [l];
+}
+
+/** Unix seconds as YYYY-MM-DDTHH:MM:SSZ. */
+const unixTime = (s) => new Date(Math.floor(s) * 1000).toISOString().replace(/\.\d{3}Z$/, "Z");
+
+/** An api_retry's notice text. */
+function retryText(m) {
+  const why = [m.error ? String(m.error) : "", m.error_status != null ? `status ${m.error_status}` : ""].filter(Boolean).join(", ");
+  return `API request failed${why ? ` (${why})` : ""}; retrying in ${Math.ceil((m.retry_delay_ms ?? 0) / 1000)}s (attempt ${m.attempt} of ${m.max_retries}).`;
+}
+
+/** A hook_response's notice (level, text and detail), if it makes one. */
+function hookNotice(m) {
+  const output = typeof m.output === "string" ? m.output.trim() : "";
+  if (m.outcome === "error") {
+    const detail = (typeof m.stderr === "string" ? m.stderr.trim() : "") || output;
+    const code = typeof m.exit_code === "number" ? ` (exit code ${m.exit_code})` : "";
+    return { level: "warning", text: `Hook ${m.hook_name} failed${code}`, ...(detail ? { detail } : {}) };
+  }
+  return output ? { level: "info", text: `Hook ${m.hook_name} ran`, detail: output } : null;
+}
+
 const userText = (m) => {
   const c = m.message.content;
   return typeof c === "string" ? c : c.filter((b) => b.type === "text").map((b) => b.text).join("\n");
@@ -653,6 +760,26 @@ function title(t) {
 
 // ---------- Codex ----------
 
+/** The requests a Codex driver sends itself: any other is the app's. */
+const DRIVER_METHODS = new Set(["initialize", "skills/list", "skills/extraRoots/set", "thread/start", "thread/resume", "turn/start", "turn/steer", "turn/interrupt", "thread/compact/start"]);
+
+/** A Codex rate limit snapshot as the rate limits it reports: its primary and secondary windows. */
+export function codexLimits(rl) {
+  const prefix = rl.limitId && rl.limitId !== "codex" ? `${rl.limitId}:` : "";
+  const out = [];
+  for (const key of ["primary", "secondary"]) {
+    const w = rl[key];
+    if (!w || typeof w !== "object") continue;
+    const credits = rl.credits?.hasCredits === true || rl.credits?.unlimited === true;
+    const l = { id: prefix + key, status: typeof w.usedPercent === "number" && w.usedPercent >= 100 ? (credits ? "warning" : "rejected") : "allowed" };
+    if (typeof w.usedPercent === "number") l.used_percent = w.usedPercent;
+    if (typeof w.resetsAt === "number") l.resets_at = unixTime(w.resetsAt);
+    if (typeof w.windowDurationMins === "number") l.window_minutes = w.windowDurationMins;
+    out.push(l);
+  }
+  return out;
+}
+
 function draftCodex(d, runs) {
   let first = true;
   let mainThread = null;
@@ -666,6 +793,10 @@ function draftCodex(d, runs) {
     let total = null;
     let lastChildMessage = new Map();
     let error = null;
+    // Plan mode: the plan the turn proposed, and the Codex turns of the thread's turn so far,
+    // which goes on while the user's asked about the plan.
+    let proposed = null;
+    let planned = null;
     const text = (m) => (m.params?.input ?? []).filter((i) => i.type === "text").map((i) => i.text).join("\n");
     // The message that starts a run is sent before the process starts (backends start it then).
     const opener = entries.find((e) => e.dir === "in" && (e.msg.method === "turn/start" || e.msg.method === "thread/compact/start"));
@@ -676,10 +807,34 @@ function draftCodex(d, runs) {
       if (e.dir === "in") {
         if (m.method !== undefined) {
           if (m.id !== undefined) sentReq.set(m.id, m.method);
+          const plan = [...d.requests.values()].find((r) => r.type === "plan" && !r.resolved);
+          if (m.method === "turn/start" && plan) {
+            // The answer to a plan: Codex's "Implement the plan." in its default mode, or the
+            // user's feedback in plan mode.
+            if (m.params.collaborationMode?.mode === "default") {
+              const mode = codexMode(m.params.approvalPolicy, m.params.sandboxPolicy?.type);
+              d.respond(plan, { outcome: "allow", permission_mode: mode });
+              d.setThread({ permission_mode: mode });
+            } else d.respond(plan, { outcome: "deny", message: text(m) });
+            continue;
+          }
+          if (m.method === "turn/start" && e !== opener && (m.params.model || m.params.approvalPolicy)) {
+            // A turn that changes the options: set_options, before the message.
+            const options = {};
+            if (m.params.model) options.model = m.params.model;
+            if (m.params.approvalPolicy) options.permission_mode = codexMode(m.params.approvalPolicy, m.params.sandboxPolicy?.type);
+            d.setOptions(options);
+          }
           if (m.method === "turn/start" || m.method === "thread/compact/start") {
             if (e !== opener) d.send(m.method === "turn/start" ? text(m) : "/compact");
           } else if (m.method === "turn/steer") d.send(text(m));
           else if (m.method === "turn/interrupt") d.interrupt();
+          else if (m.id !== undefined && !DRIVER_METHODS.has(m.method)) {
+            // The app's own, sent with control().
+            const reply = entries.find((x) => x.dir === "out" && x.msg?.id === m.id && x.msg.method === undefined)?.msg;
+            const request = { method: m.method, ...(m.params !== undefined ? { params: m.params } : {}) };
+            d.control(request, reply?.error ? { error: reply.error.message ?? "" } : { result: reply?.result ?? null });
+          }
           continue;
         }
         const req = asked.get(m.id);
@@ -765,12 +920,14 @@ function draftCodex(d, runs) {
               if (!child && !done) d.tookIn(item.content.filter((c) => c.type === "text").map((c) => c.text).join("\n"));
               break;
             case "agentMessage":
+            case "plan":
             case "reasoning": {
               if (!done) break;
-              const text = item.type === "agentMessage" ? item.text : [...(item.summary ?? [])].join("\n\n");
+              const text = item.type === "reasoning" ? [...(item.summary ?? [])].join("\n\n") : item.text;
+              if (item.type === "plan" && !child) proposed = item.text;
               if (child) lastChildMessage.set(child, item.text ?? lastChildMessage.get(child));
               if (streamed.has(item.id)) d.update(item.id, { text });
-              else if (text) d.item({ id: item.id, type: item.type === "agentMessage" ? "assistant_message" : "reasoning", text, parent_id: parent });
+              else if (text) d.item({ id: item.id, type: item.type === "reasoning" ? "reasoning" : "assistant_message", text, parent_id: parent });
               break;
             }
             case "commandExecution":
@@ -815,10 +972,11 @@ function draftCodex(d, runs) {
           break;
         }
         case "item/agentMessage/delta":
+        case "item/plan/delta":
         case "item/reasoning/summaryTextDelta":
         case "item/reasoning/textDelta": {
           if (!p.delta) break;
-          const kind = m.method === "item/agentMessage/delta" ? "text" : "reasoning";
+          const kind = m.method === "item/agentMessage/delta" || m.method === "item/plan/delta" ? "text" : "reasoning";
           if (!streamed.has(p.itemId)) {
             streamed.add(p.itemId);
             d.item({ id: p.itemId, type: kind === "text" ? "assistant_message" : "reasoning", text: "", parent_id: parent });
@@ -842,6 +1000,9 @@ function draftCodex(d, runs) {
           if (child) lastChildMessage.delete(child);
           if (child && d.items.get(parent)?.subagent) d.subagent(parent, { status: "running", summary: undefined });
           break;
+        case "account/rateLimits/updated":
+          d.rateLimits(codexLimits(p.rateLimits ?? {}));
+          break;
         case "turn/completed": {
           if (child) {
             // The child's turn ended, and with it its subagent, with its last message (or error).
@@ -852,6 +1013,16 @@ function draftCodex(d, runs) {
             break;
           }
           const turn = p.turn;
+          const plan = proposed;
+          proposed = null;
+          if (plan !== null && turn.status === "completed" && d.thread.permission_mode === "plan" && !d.turn?.interrupted) {
+            // A plan: the turn waits for the user to approve it, or send feedback.
+            planned = { duration_ms: (planned?.duration_ms ?? 0) + (turn.durationMs ?? 0) };
+            d.requests.set(`plan:${turn.id}`, d.open({ id: d.ph("pl"), type: "plan", plan }));
+            break;
+          }
+          const duration_ms = turn.durationMs === undefined || turn.durationMs === null ? undefined : (planned?.duration_ms ?? 0) + turn.durationMs;
+          planned = null;
           // Codex reports the thread's running totals (again after a resume), so a turn used what
           // they've grown by since the thread's usage before it.
           const usage = total ? codexUsage(total, d.thread.usage) : undefined;
@@ -859,7 +1030,7 @@ function draftCodex(d, runs) {
             ok: turn.status === "completed",
             error: turn.status === "failed" ? (turn.error?.message ?? error ?? "the turn failed") : undefined,
             usage,
-            duration_ms: turn.durationMs ?? undefined,
+            duration_ms,
           });
           error = null;
           break;

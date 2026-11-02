@@ -47,7 +47,8 @@ and gets exactly one reply with that `id`, either a `result` or an `error` (a me
 | `hello` | | `{harnesses, restart}`: the harnesses threads can run on, as `[{name, label, model, models}]` (`model` the default, `models` suggestions; the user may type another), and whether `restart` is offered (chat-node offers it only when its runs are under the shim, which a restart doesn't lose). |
 | `list` | | `Thread[]`, newest first. |
 | `create` | `{harness, model?, title?}` | The new `Thread`, with the server's defaults for what's left out (the harness's model, an effort, the working directory). Its first `thread.updated` is pushed too. |
-| `snapshot` | `{thread_id}` | The thread's `Snapshot` (`sdk.snapshot`). |
+| `snapshot` | `{thread_id, limit?}` | The thread's `Snapshot` (`sdk.snapshot`); with a `limit`, a window of its last `limit` items (and what they need from before them). |
+| `items_before` | `{thread_id, before, limit}` | An `ItemPage`: the thread's items before index `before` (a window's `start`), at most `limit` of them (`sdk.itemsBefore`). |
 | `events_since` | `{thread_id, seq}` | `ThreadEvent[]`: its saved events after `seq` (`sdk.eventsSince`). |
 | `command` | `{command}` | `null` once the backend has taken the `Command` (`sdk.handle`); an error if it refused it. |
 | `restart` | | `null`, then the server shuts down (leaving shim runs going) and is started again by whatever runs it. Only when `hello` said `restart: true`. |
@@ -66,8 +67,9 @@ Replies have an `id` and pushes a `type`, so a client tells them apart by that.
 
 - On connecting it calls `hello` and `list`, and keeps the list up to date from the
   `thread.updated` events (one for a thread it hasn't seen adds it).
-- Opening a thread is `snapshot`; its `ThreadSource` takes the pushed events for that thread, and
-  its `resync(seq)` is `events_since`. After the WebSocket reconnects, it takes a fresh `snapshot`
+- Opening a thread is `snapshot` with a `limit` (a window of its latest items); its `ThreadSource`
+  takes the pushed events for that thread, its `resync(seq)` is `events_since`, and its
+  `loadEarlier(before, limit)` is `items_before`, as the user scrolls back. After the WebSocket reconnects, it takes a fresh `snapshot`
   (which has any text streamed so far) and a new source, which catches up from there with
   `events_since`.
 - The user's actions are `command`s: `send`, `interrupt`, `respond` and `set_options`, made by the
@@ -91,8 +93,12 @@ command that runs it under its supervisor (`$CHAT_E2E_SERVER supervise` by defau
 | `CHAT_SHIM` | The `agent-threads-shim` binary to run the harnesses under. |
 
 It must print a line starting `chat-<name> on ` (on stdout or stderr) once it's listening, and
-again after each restart, and stop on SIGTERM. Supervised, `restart` must start it again with the
-same environment, and `hello` must say `restart: true`.
+again after each restart, and stop on SIGTERM (handling it already when it prints that line).
+Supervised, `restart` must start it again with the same environment, `hello` must say
+`restart: true`, and SIGTERM to the supervisor must stop the server too: the supervisor passes it
+on, and exits once the server has. Its runs needn't stop (they're under the shim): the tests stop
+them, from `CHAT_DATA/runs`. The tests run it in a process group of its own, and fail one that
+leaves anything in it running 15s after SIGTERM.
 
 ## The app's tool
 
