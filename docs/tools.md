@@ -255,8 +255,20 @@ harness asks about at all:
 | --- | --- | --- |
 | `default` | asks the policy | approval policy `untrusted`, sandbox `workspace-write` |
 | `accept_edits` | edits in the thread's `cwd` go ahead without asking | `on-request` in `workspace-write` |
-| `plan` | plans, and changes nothing | `untrusted` in `read-only` |
+| `plan` | plans, and changes nothing | `untrusted` in `read-only`, collaboration mode `plan` |
 | `bypass` | nothing is asked | `never` in `danger-full-access` |
+
+A new mode or model applies straight away where it can: Claude Code's running process is switched
+(`set_permission_mode`, `set_model`), even mid-turn, and Codex takes them with its next turn, in
+the same process. (A new effort starts a new Claude Code process at the next turn. Claude Code
+can't be switched to bypass mode unless it was started in it: until the next turn's new process,
+the driver allows what it asks about.)
+
+**Plans** aren't permissions either: in plan mode, Claude's `ExitPlanMode` and the plan Codex
+proposes at the end of a turn open a `plan` request (`PlanCard`), whatever the policy says.
+Approving it (`allow`, with the `permission_mode` to carry on in) switches the harness out of plan
+mode and the agent starts on the plan in the same turn; denying it, with feedback as the
+`message`, has it plan again.
 
 ## Config isolation
 

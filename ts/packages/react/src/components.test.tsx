@@ -38,7 +38,8 @@ describe("<Thread>", () => {
     // Each of the agent's replies in the main thread is there, as is each turn's end.
     const final = applyEvents(start, events);
     for (const item of final.items)
-      if (item.type === "assistant_message" && item.text.trim() && !item.parent_id) expect(container.textContent).toContain(item.text.trim().split("\n")[0]);
+      // (Its first line, as Markdown draws it: `code` without its backticks.)
+      if (item.type === "assistant_message" && item.text.trim() && !item.parent_id) expect(container.textContent).toContain(item.text.trim().split("\n")[0]!.replace(/`/g, ""));
     expect(container.querySelectorAll(".at-turn-result")).toHaveLength(final.items.filter((i) => i.type === "turn_result").length);
     expect(container.querySelector(".at-card")).toBeNull();
   });
@@ -221,6 +222,43 @@ describe("<Thread>", () => {
     fireEvent.click(screen.getByRole("checkbox", { name: /Olives/ }));
     fireEvent.click(answer);
     expect(commands.at(-1)).toMatchObject({ resolution: { outcome: "answer", answers: { size: ["M"], toppings: ["Cheese", "Olives"] } } });
+  });
+
+  it("shows a plan, and approves it in the mode picked", () => {
+    const { snapshot } = fixture("claude/plan", (e) => e.type === "request.opened");
+    const { commands, container } = mount(snapshot);
+    const card = container.querySelector(".at-plan-card") as HTMLElement;
+    expect(card.textContent).toContain("Claude has a plan");
+    expect(card.querySelector(".at-plan")?.textContent).toContain("Use the Edit tool on notes.txt");
+    expect(container.querySelector(".at-tool-status.at-attention")?.textContent).toContain("needs approval");
+    // The thread's in plan mode: it carries on asking, unless another mode's picked.
+    const mode = within(card).getByLabelText(/mode to carry on in/) as HTMLSelectElement;
+    expect(mode.value).toBe("default");
+    fireEvent.change(mode, { target: { value: "accept_edits" } });
+    fireEvent.click(within(card).getByRole("button", { name: /Approve/ }));
+    expect(commands).toEqual([{ type: "respond", thread_id: snapshot.thread.id, request_id: "{{pl1}}", resolution: { outcome: "allow", permission_mode: "accept_edits" } }]);
+  });
+
+  it("keeps planning, with the user's feedback", () => {
+    const { snapshot } = fixture("codex/plan", (e) => e.type === "request.opened" && e.request.type === "plan");
+    const { commands, container } = mount(snapshot);
+    const card = within(container.querySelector(".at-plan-card") as HTMLElement);
+    expect(card.getByText(/Codex has a plan/)).toBeTruthy();
+    fireEvent.click(card.getByRole("button", { name: /Keep planning/ }));
+    fireEvent.change(card.getByLabelText(/Feedback on the plan/), { target: { value: "Also change banana." } });
+    fireEvent.keyDown(card.getByLabelText(/Feedback on the plan/), { key: "Enter" });
+    expect(commands.at(-1)).toMatchObject({ type: "respond", resolution: { outcome: "deny", message: "Also change banana." } });
+  });
+
+  it("draws an ExitPlanMode call as its plan", () => {
+    const { snapshot } = fixture("claude/plan");
+    const { container } = mount(snapshot);
+    const rows = [...container.querySelectorAll(".at-tool")].filter((r) => r.textContent?.includes("Plan"));
+    expect(rows).toHaveLength(2);
+    fireEvent.click(within(rows[0] as HTMLElement).getAllByRole("button")[0]!);
+    expect(rows[0]!.querySelector(".at-plan")?.textContent).toContain("Use the Edit tool on notes.txt");
+    // The plan sent back says what the agent was told.
+    expect(rows[0]!.textContent).toContain("Also change the line banana to blueberry.");
   });
 
   it("dismisses a question", () => {

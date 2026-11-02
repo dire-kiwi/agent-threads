@@ -805,6 +805,51 @@ button.at-line-rule:not(:disabled):hover {
   border-color: var(--at-accent);
 }
 
+.at-textarea {
+  height: auto;
+  padding: 6px 10px;
+  line-height: 1.45;
+  resize: vertical;
+}
+
+.at-select {
+  height: 30px;
+  padding: 0 8px;
+  border: 1px solid var(--at-line-strong);
+  border-radius: 6px;
+  background: var(--at-panel-2);
+  color: var(--at-fg);
+  font: inherit;
+  font-size: 0.89em;
+}
+
+/* A plan: its Markdown, scrolled within the card while it's open. */
+.at-plan-scroll {
+  max-height: 28rem;
+  overflow: auto;
+  padding: 8px 12px;
+  border: 1px solid var(--at-line);
+  border-radius: 6px;
+  background: var(--at-panel-2);
+}
+
+/* Plain Markdown runs a plan's lines together. */
+.at-plan p {
+  white-space: pre-line;
+}
+
+.at-plan-title {
+  font-weight: 500;
+}
+
+.at-plan-mode {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  color: var(--at-muted);
+  font-size: 0.89em;
+}
+
 .at-questions {
   display: flex;
   flex-direction: column;

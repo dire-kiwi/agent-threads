@@ -55,7 +55,8 @@ this way, over a WebSocket. `onCommand` can return a promise, and the components
 ## Components
 
 `<Thread>`, `<MessageList>` (a `parentId` draws a subagent's own thread), `<StreamingText>`,
-`<ToolCall>`, `<Subagent>`, `<PermissionCard>`, `<QuestionCard>`, `<OpenRequests>`,
+`<ToolCall>`, `<Subagent>`, `<PermissionCard>`, `<QuestionCard>`, `<PlanCard>` (approve a plan
+in a permission mode, or keep planning with feedback), `<OpenRequests>`,
 `<CompactionLine>`, `<TurnResult>`, `<Notice>`, `<Composer>` and `<AgentsPill>`. Each takes a
 `className`.
 
