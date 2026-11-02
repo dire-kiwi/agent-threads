@@ -170,7 +170,8 @@ ends (or that the harness gives up on because the user interrupted the turn) isn
 stays open while the thread is idle. Answering it sends the answers to the agent as the user's next
 message, as a `send` would, which starts a turn. It isn't kept, or stays open, once the
 conversation has moved on: when the user sends a message (after it was asked, before or after its
-turn ended), or a message was left queued when its turn ended. Nor is one with a `secret` question,
+turn ended), or a message was left queued when its turn ended. A question has `user_messages`, how
+many `user_message` items the thread had when it was asked, so that's known after a restart too. Nor is one with a `secret` question,
 or under `dont_ask`. Such a question stays open across a backend restart, as does one the harness gave up
 because its turn was interrupted, while that turn hasn't ended yet; a request the harness still has
 (a background subagent's, say) is taken up again as it was.

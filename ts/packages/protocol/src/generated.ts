@@ -710,6 +710,10 @@ export interface QuestionRequest {
   parent_id?: string;
   resolution?: Resolution;
   turn_id?: string;
+  /**
+   * How many user_message items the thread had when it was asked: the conversation has moved on since once it has more (see keeping questions open after their turn).
+   */
+  user_messages?: number;
   created_at?: string;
   /**
    * The harness's own payload, for debugging.

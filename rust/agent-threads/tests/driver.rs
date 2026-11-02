@@ -977,14 +977,26 @@ async fn dont_ask_dismisses_questions_kept_open_after_their_turns_before_and_aft
 }
 
 /// The conversation moved on from a question (the user sent a message, which the harness took in)
-/// before the backend stopped with its run: the question isn't kept open when the lost turn ends.
+/// before the backend stopped with its run: the question isn't kept open when the lost turn ends,
+/// whether or not it has a tool_call item.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_question_isnt_kept_open_after_a_lost_run_once_the_user_sent_a_message() {
+    for unlinked in [false, true] {
+        lost_run_after_a_message(unlinked).await;
+    }
+}
+
+async fn lost_run_after_a_message(unlinked: bool) {
     let state = MemoryState::new();
     let make = |store: MemoryStore| {
         setup(Setup {
             store: Some(Arc::new(store)),
             late_answers: true,
+            env: if unlinked {
+                vec![("MINI_CLAUDE_UNLINKED", "1".into())]
+            } else {
+                vec![]
+            },
             ..asking(PermissionPolicy::ask())
         })
     };
@@ -999,6 +1011,7 @@ async fn a_question_isnt_kept_open_after_a_lost_run_once_the_user_sent_a_message
         .await
         .unwrap();
     let q = open_request(&env.sdk, &t.id, "question", None).await;
+    assert_eq!(q.get("tool_call_id").is_none(), unlinked, "{q}");
     env.sdk.send(&t.id, "reply hi", SendOptions::default()).await.unwrap();
     // Taken in: nothing's queued.
     until(5, || async {
@@ -1015,8 +1028,50 @@ async fn a_question_isnt_kept_open_after_a_lost_run_once_the_user_sent_a_message
 
     let again = make(crashed);
     let s = serde_json::to_value(again.sdk.snapshot(&t.id).await.unwrap()).unwrap();
-    assert!(open(&s).is_empty(), "{s}");
+    assert!(open(&s).is_empty(), "unlinked: {unlinked}: {s}");
     assert_eq!(resolution_of(&again.sdk, &t.id, &q).await, json!({"outcome": "cancel"}));
+}
+
+/// A message the harness took in between a tool call and the question it asks for it came before
+/// the question: the conversation hasn't moved on from it.
+#[tokio::test(flavor = "multi_thread")]
+async fn keeps_a_question_open_after_a_message_taken_in_before_it_was_asked() {
+    let env = setup(Setup {
+        late_answers: true,
+        env: vec![("MINI_CLAUDE_ASK_DELAY", "500".into())],
+        ..asking(PermissionPolicy::ask())
+    });
+    let t = env.sdk.create(create()).await.unwrap();
+    env.sdk
+        .send(
+            &t.id,
+            &format!("asking AskUserQuestion {QUESTION}"),
+            SendOptions::default(),
+        )
+        .await
+        .unwrap();
+    until(5, || async {
+        let s = serde_json::to_value(env.sdk.snapshot(&t.id).await.unwrap()).unwrap();
+        (!items(&s, "tool_call").is_empty()).then_some(())
+    })
+    .await;
+    env.sdk.send(&t.id, "reply hi", SendOptions::default()).await.unwrap();
+    let q = open_request(&env.sdk, &t.id, "question", None).await;
+    let s = serde_json::to_value(env.sdk.snapshot(&t.id).await.unwrap()).unwrap();
+    let messages = items(&s, "user_message");
+    assert!(
+        messages.len() == 2 && messages.iter().all(|m| m.get("queued").is_none()),
+        "{s}"
+    );
+    assert_eq!(q["user_messages"], 2);
+    env.sdk.interrupt(&t.id).await.unwrap();
+    let s = settle(&env.sdk, &t.id).await;
+    assert_eq!(open(&s).first().map(|r| &r["id"]), Some(&q["id"]), "{s}");
+    let answer = resolution(json!({"outcome": "answer", "answers": {"Colour?": ["Red"]}}));
+    env.sdk.respond(&t.id, q["id"].as_str().unwrap(), answer).await.unwrap();
+    let s = settle(&env.sdk, &t.id).await;
+    let text = "My answer to the question you asked:\n\n- Colour?\n  Red";
+    assert_eq!(items(&s, "user_message").last().unwrap()["text"], text);
 }
 
 #[tokio::test(flavor = "multi_thread")]

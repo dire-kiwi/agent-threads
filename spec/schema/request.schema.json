@@ -44,6 +44,7 @@
         "parent_id": { "type": "string", "description": "The subagent tool_call that's asking, if one is." },
         "resolution": { "$ref": "#/$defs/Resolution", "description": "How it was resolved, once it is (request.resolved): the state keeps resolved requests with this set. Absent while it's open." },
         "turn_id": { "type": "string" },
+        "user_messages": { "type": "integer", "minimum": 0, "description": "How many user_message items the thread had when it was asked: the conversation has moved on since once it has more (see keeping questions open after their turn)." },
         "created_at": { "type": "string", "format": "date-time" },
         "raw": { "description": "The harness's own payload, for debugging." }
       }

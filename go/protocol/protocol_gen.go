@@ -1755,7 +1755,11 @@ type QuestionRequest struct {
 	// set. Absent while it's open.
 	Resolution *Resolution `json:"resolution,omitempty"`
 	TurnID     string      `json:"turn_id,omitempty"`
-	CreatedAt  string      `json:"created_at,omitempty"`
+
+	// How many user_message items the thread had when it was asked: the conversation has moved on since
+	// once it has more (see keeping questions open after their turn).
+	UserMessages *int64 `json:"user_messages,omitempty"`
+	CreatedAt    string `json:"created_at,omitempty"`
 
 	// The harness's own payload, for debugging.
 	Raw json.RawMessage `json:"raw,omitempty"`
@@ -1765,7 +1769,7 @@ type QuestionRequest struct {
 	Extra map[string]json.RawMessage `json:"-"`
 }
 
-var knownQuestionRequest = fieldSet("type", "id", "questions", "tool_call_id", "parent_id", "resolution", "turn_id", "created_at", "raw")
+var knownQuestionRequest = fieldSet("type", "id", "questions", "tool_call_id", "parent_id", "resolution", "turn_id", "user_messages", "created_at", "raw")
 
 func (v QuestionRequest) MarshalJSON() ([]byte, error) {
 	type plain QuestionRequest

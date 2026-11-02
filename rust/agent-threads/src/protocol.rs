@@ -568,6 +568,9 @@ pub struct QuestionRequest {
     pub tool_call_id: ::std::option::Option<::std::string::String>,
     #[serde(skip_serializing_if = "::std::option::Option::is_none")]
     pub turn_id: ::std::option::Option<::std::string::String>,
+    ///How many user_message items the thread had when it was asked: the conversation has moved on since once it has more (see keeping questions open after their turn).
+    #[serde(skip_serializing_if = "::std::option::Option::is_none")]
+    pub user_messages: ::std::option::Option<u64>,
 }
 ///A usage limit of the account the harness runs on (a subscription's session or weekly limit, say), as the harness last reported it.
 #[derive(::serde::Deserialize, ::serde::Serialize, Clone, Debug)]

@@ -14,7 +14,10 @@
 //   asking <tool> <json>  calls a tool as `tool` does, but an interrupt while it's asking cancels the
 //                         request (as Claude does) and ends the turn as interrupted
 //                         (MINI_CLAUDE_INTERRUPT_DELAY=<ms> after cancelling it); a message that
-//                         comes while it's asking is taken in at once
+//                         comes while it's asking is taken in at once. With MINI_CLAUDE_ASK_DELAY,
+//                         it waits that long after the call, then takes in the messages that came,
+//                         before asking; with MINI_CLAUDE_UNLINKED=1, it asks without saying it
+//                         made the call (so the request has no tool_call item)
 //   slow                  waits for an interrupt, then ends the turn as interrupted
 //   stubborn              ignores interrupts, and a closed stdin (saying "not stopping"), until
 //                         it's signalled
@@ -140,6 +143,12 @@ const result = (extra = {}) => {
 };
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
+// Takes in the messages that came during the turn (as Claude takes in a steer between tool calls).
+function takeIn() {
+  for (const w of inbox.filter((x) => x.during)) out({ type: "user", message: w.message, isReplay: true, session_id: session, parent_tool_use_id: null });
+  inbox.splice(0, inbox.length, ...inbox.filter((x) => !x.during));
+}
+
 async function turn(m) {
   busy = true;
   wasInterrupted = false;
@@ -157,10 +166,7 @@ async function turn(m) {
     }
   }
   // Messages that came during the turn are taken in before it ends, unless they're taken in late.
-  if (steer === "now") {
-    for (const w of inbox.filter((x) => x.during)) out({ type: "user", message: w.message, isReplay: true, session_id: session, parent_tool_use_id: null });
-    inbox.splice(0, inbox.length, ...inbox.filter((x) => !x.during));
-  }
+  if (steer === "now") takeIn();
   result();
   busy = false;
 }
@@ -196,7 +202,12 @@ async function step(text) {
     const [name, json = "{}"] = rest;
     const id = `toolu_${process.pid}_${++ids}`;
     const input = JSON.parse(json);
-    out({ type: "assistant", message: { id: `msg_${process.pid}_${++msgs}`, model: "mini", content: [{ type: "tool_use", id, name, input }] }, parent_tool_use_id: null, session_id: session });
+    if (!process.env.MINI_CLAUDE_UNLINKED) out({ type: "assistant", message: { id: `msg_${process.pid}_${++msgs}`, model: "mini", content: [{ type: "tool_use", id, name, input }] }, parent_tool_use_id: null, session_id: session });
+    const delay = Number(process.env.MINI_CLAUDE_ASK_DELAY ?? 0);
+    if (delay) {
+      await sleep(delay);
+      takeIn();
+    }
     const request_id = `cli_${++ids}`;
     const answer = new Promise((resolve) => waiting.set(request_id, resolve));
     out({ type: "control_request", request_id, request: { subtype: "can_use_tool", tool_name: name, input, tool_use_id: id } });
@@ -205,9 +216,7 @@ async function step(text) {
       r = await Promise.race([answer, new Promise((r) => (interrupted = r)), new Promise((r) => (wake = r))]);
       wake = null;
       if (r || wasInterrupted) break;
-      // A message that came meanwhile, taken in (as Claude takes in a steer between tool calls).
-      for (const w of inbox.filter((x) => x.during)) out({ type: "user", message: w.message, isReplay: true, session_id: session, parent_tool_use_id: null });
-      inbox.splice(0, inbox.length, ...inbox.filter((x) => !x.during));
+      takeIn(); // a message that came meanwhile
     }
     if (wasInterrupted) {
       waiting.delete(request_id);

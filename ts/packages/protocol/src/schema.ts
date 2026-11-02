@@ -960,6 +960,10 @@ export const schema: { readonly $defs: { readonly [name: string]: unknown } } = 
         "turn_id": {
           "type": "string"
         },
+        "user_messages": {
+          "type": "integer",
+          "minimum": 0
+        },
         "created_at": {
           "type": "string",
           "format": "date-time"

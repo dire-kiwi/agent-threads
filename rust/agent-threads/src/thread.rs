@@ -85,9 +85,6 @@ struct OpenRequest {
     /// A question kept open after its turn ended (Options::late_answers): its answer is sent as
     /// the next message, unless the user sends one first.
     late: bool,
-    /// How many messages the user had sent when it was opened: one sent since means the
-    /// conversation has moved on, and it isn't kept open after its turn.
-    users: usize,
 }
 
 /// What the core asks of the session, once the job that asked is done with it.
@@ -648,7 +645,7 @@ impl ThreadContext {
             };
             if keep {
                 self.requests.push((id, open));
-            } else if open.late || !self.keep_late(&id, &open.request, Some(open.users)) {
+            } else if open.late || !self.keep_late(&id, &open.request) {
                 self.emit_resolved(&id, &cancel());
             }
         }
@@ -956,6 +953,9 @@ impl ThreadContext {
         if let Some(turn) = &self.turn {
             request["turn_id"] = json!(turn.id);
         }
+        if question {
+            request["user_messages"] = json!(self.user_messages());
+        }
         let call = tool_call_id
             .and_then(|c| self.item(c))
             .map(|i| (i.id().to_string(), i.parent_id().map(String::from)));
@@ -975,7 +975,6 @@ impl ThreadContext {
                 return id;
             }
         };
-        let users = self.user_messages();
         self.requests.push((
             id.clone(),
             OpenRequest {
@@ -983,7 +982,6 @@ impl ThreadContext {
                 answered,
                 standing,
                 late: false,
-                users,
             },
         ));
         self.emit(json!({"type": "request.opened", "request": request}));
@@ -1005,7 +1003,6 @@ impl ThreadContext {
         let Some(request) = open_requests(&self.state).find(|r| r.id() == request_id).cloned() else {
             return Err(answered);
         };
-        let users = self.user_messages();
         self.requests.push((
             request_id.to_string(),
             OpenRequest {
@@ -1013,7 +1010,6 @@ impl ThreadContext {
                 answered,
                 standing,
                 late: false,
-                users,
             },
         ));
         Ok(())
@@ -1047,7 +1043,7 @@ impl ThreadContext {
             return;
         };
         let (_, open) = self.requests.remove(at);
-        if !(self.interrupted() && self.keep_late(id, &open.request, Some(open.users))) {
+        if !(self.interrupted() && self.keep_late(id, &open.request)) {
             self.emit_resolved(id, &cancel());
         }
         self.requests_done();
@@ -1075,18 +1071,17 @@ impl ThreadContext {
     /// Keeps a question open after its turn ended, with late_answers, if it can be: not a secret one
     /// (its answer would be shown, as a message), not under dont_ask (which dismisses questions),
     /// and not when the conversation has moved on (see moved_on()). Whether it did.
-    fn keep_late(&mut self, id: &str, request: &ThreadRequest, users: Option<usize>) -> bool {
+    fn keep_late(&mut self, id: &str, request: &ThreadRequest) -> bool {
         let ThreadRequest::Question(q) = request else {
             return false;
         };
         if !self.host.late_answers
-            || self.moved_on(request, users)
+            || self.moved_on(q)
             || q.questions.iter().any(|q| q.secret)
             || self.state.thread.permission_mode == Some(PermissionMode::DontAsk)
         {
             return false;
         }
-        let users = self.user_messages();
         self.requests.push((
             id.to_string(),
             OpenRequest {
@@ -1094,31 +1089,19 @@ impl ThreadContext {
                 answered: late_answered(q.clone()),
                 standing: None,
                 late: true,
-                users,
             },
         ));
         true
     }
 
-    /// Whether the conversation has moved on since a request was asked: messages are queued, or the
-    /// user sent one since. That's a user message after its tool call in the items, as saved (so
-    /// it's known after a restart too); or, for a request with no call, more of them than `users`
-    /// (how many there were when it was asked, if that's known).
-    fn moved_on(&self, request: &ThreadRequest, users: Option<usize>) -> bool {
-        if !self.queue.is_empty() {
-            return true;
-        }
-        let items = &self.saved.items;
-        match request
-            .tool_call_id()
-            .and_then(|c| items.iter().position(|i| i.id() == c))
-        {
-            Some(at) => items[at + 1..].iter().any(|i| matches!(i, Item::UserMessage(_))),
-            None => users.is_some_and(|n| self.user_messages() > n),
-        }
+    /// Whether the conversation has moved on since a question was asked: messages are queued, or the
+    /// user sent one since (there are more than its user_messages, which is saved with it, so it's
+    /// known after a restart too; one without is taken to have been passed by).
+    fn moved_on(&self, q: &QuestionRequest) -> bool {
+        !self.queue.is_empty() || q.user_messages.is_none_or(|n| self.user_messages() as u64 > n)
     }
 
-    /// How many messages the user has sent.
+    /// How many messages the user has sent (user_message items).
     fn user_messages(&self) -> usize {
         self.saved
             .items
@@ -1163,7 +1146,7 @@ impl ThreadContext {
             let over = all
                 || r.turn_id()
                     .is_some_and(|t| ended.contains(t) || interrupted.as_deref() == Some(t));
-            if !(over && self.keep_late(&id, &r, None)) {
+            if !(over && self.keep_late(&id, &r)) {
                 self.emit_resolved(&id, &cancel());
             }
         }
