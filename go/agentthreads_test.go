@@ -161,13 +161,62 @@ func TestRequestsAndStandingAnswers(t *testing.T) {
 		t.Fatal(err)
 	}
 	sdk.Respond(ctx, th.ID, snap.Requests[0].ID(), protocol.Resolution{Outcome: protocol.ResolutionOutcomeAllow, Always: true})
-	if snap, _ = sdk.Snapshot(ctx, th.ID); snap.Thread.Status != protocol.ThreadStatusIdle || len(snap.Requests) != 0 {
+	// Answered, it stays in the state with its resolution.
+	if snap, _ = sdk.Snapshot(ctx, th.ID); snap.Thread.Status != protocol.ThreadStatusIdle || len(protocol.OpenRequests(snap)) != 0 || len(snap.Requests) != 1 || snap.Requests[0].Resolution().Outcome != protocol.ResolutionOutcomeAllow {
 		t.Fatalf("got %s", mustMarshal(snap))
 	}
 	// Allowed always: the next one isn't asked.
 	sdk.Send(ctx, th.ID, "ask", agentthreads.SendOptions{})
 	if snap, _ = sdk.Snapshot(ctx, th.ID); snap.Thread.Status != protocol.ThreadStatusIdle {
 		t.Fatalf("asked again: %s", mustMarshal(snap))
+	}
+}
+
+func TestWindowsAndPages(t *testing.T) {
+	ctx := context.Background()
+	sdk := newEcho(t, nil, agentthreads.Ask)
+	th, _ := sdk.Create(ctx, agentthreads.CreateOptions{})
+	// 0-2 the first turn; 3-6 one that asks (4 the tool call), answered; 7-9 the last.
+	sdk.Send(ctx, th.ID, "one", agentthreads.SendOptions{})
+	sdk.Send(ctx, th.ID, "ask", agentthreads.SendOptions{})
+	snap, _ := sdk.Snapshot(ctx, th.ID)
+	sdk.Respond(ctx, th.ID, protocol.OpenRequests(snap)[0].ID(), protocol.Resolution{Outcome: protocol.ResolutionOutcomeAllow})
+	sdk.Send(ctx, th.ID, "two", agentthreads.SendOptions{})
+	snap, _ = sdk.Snapshot(ctx, th.ID)
+	if len(snap.Items) != 10 || len(snap.Requests) != 1 {
+		t.Fatalf("got %s", mustMarshal(snap))
+	}
+
+	// A window of the last 4: the request, answered at 4, is before it.
+	w, err := sdk.SnapshotWindow(ctx, th.ID, 4)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if w.Start == nil || *w.Start != 6 || w.Context != nil || len(w.Items) != 4 || w.Items[0].ID() != snap.Items[6].ID() || len(w.Requests) != 0 || w.Seq != snap.Seq {
+		t.Fatalf("got %s", mustMarshal(w))
+	}
+	if whole, _ := sdk.SnapshotWindow(ctx, th.ID, -1); string(mustMarshal(whole)) != string(mustMarshal(snap)) {
+		t.Fatalf("got %s", mustMarshal(whole))
+	}
+
+	// The page of 3 before it has the request.
+	page, err := sdk.ItemsBefore(ctx, th.ID, 6, 3)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if page.ThreadID != th.ID || page.Start != 3 || len(page.Items) != 3 || page.Items[1].ID() != snap.Items[4].ID() || len(page.Requests) != 1 || page.Seq != snap.Seq {
+		t.Fatalf("got %s", mustMarshal(page))
+	}
+	if got, want := mustMarshal(protocol.WithPage(w, page)), mustMarshal(protocol.SnapshotWindow(snap, 7)); string(got) != string(want) {
+		t.Fatalf("got  %s\nwant %s", got, want)
+	}
+
+	var ce *agentthreads.CommandError
+	if _, err := sdk.SnapshotWindow(ctx, "nope", 4); !errors.As(err, &ce) {
+		t.Errorf("an unknown thread's window: %v", err)
+	}
+	if _, err := sdk.ItemsBefore(ctx, "nope", 6, 3); !errors.As(err, &ce) {
+		t.Errorf("an unknown thread's page: %v", err)
 	}
 }
 

@@ -1,8 +1,9 @@
 //! The chat example's server: agent-threads' Rust backend, and the app's own transport, a
 //! WebSocket (axum). The SDK has no network layer, so this file is the whole "seam": events out
 //! (`sdk.subscribe()` → every client), commands in (a client's `command` → `sdk.handle_json`), plus
-//! snapshots and `events_since` for clients that connect or reconnect. examples/PROTOCOL.md has the
-//! wire format, which the React frontend in examples/chat-node speaks.
+//! snapshots (or windows of them), `items_before` and `events_since` for clients that connect,
+//! scroll back or reconnect. examples/PROTOCOL.md has the wire format, which the React frontend in
+//! examples/chat-node speaks.
 //!
 //!   cargo run                  the server, on http://127.0.0.1:3001
 //!   cargo run -- supervise     the same, started again when it asks to (the restart demo)
@@ -372,6 +373,8 @@ async fn call(app: &App, method: &str, p: Value) -> Result<Value, String> {
             .map(String::from)
             .ok_or_else(|| "thread_id is missing".to_string())
     };
+    // A count the client gave (less than 0 is 0).
+    let count = |name: &str| p[name].as_i64().map(|n| n.max(0) as usize);
     match method {
         "hello" => {
             let harnesses: Vec<Value> = app
@@ -411,7 +414,19 @@ async fn call(app: &App, method: &str, p: Value) -> Result<Value, String> {
             };
             Ok(json!(sdk.create(o).await.map_err(text)?))
         }
-        "snapshot" => Ok(json!(sdk.snapshot(&thread_id()?).await.map_err(text)?)),
+        // With a limit, a window of its latest items; the client loads earlier ones with
+        // items_before.
+        "snapshot" => match count("limit") {
+            Some(limit) => Ok(json!(sdk.snapshot_window(&thread_id()?, limit).await.map_err(text)?)),
+            None => Ok(json!(sdk.snapshot(&thread_id()?).await.map_err(text)?)),
+        },
+        "items_before" => {
+            let limit = count("limit").ok_or("items_before needs a limit")?;
+            let before = count("before").unwrap_or(0) as u64;
+            Ok(json!(
+                sdk.items_before(&thread_id()?, before, limit).await.map_err(text)?
+            ))
+        }
         "events_since" => {
             let seq = p["seq"].as_u64().unwrap_or(0);
             Ok(json!(sdk.events_since(&thread_id()?, seq, None).await.map_err(text)?))

@@ -3,11 +3,13 @@
 
 import type { Item, ToolCall } from "@dire-kiwi/agent-threads-protocol";
 import { memo, useEffect, useMemo, useRef, useState } from "react";
-import { useRevealed, useThreadState } from "../hooks.js";
+import { useLoadEarlier, useRevealed, useThreadState } from "../hooks.js";
+import { isLoaded } from "../store.js";
 import { BotIcon, CheckIcon, FileIcon, ShieldIcon, SpinnerIcon, XIcon } from "../icons.js";
 import { toolMeta } from "../toolMeta.js";
 import { NO_ITEMS, type SubagentInfo, type SubagentStatus } from "../view.js";
 import { MessageList } from "./MessageList.js";
+import { LoadEarlier } from "./LoadEarlier.js";
 import { Chevron, CodeBlock, Collapsible, cx, Markdown, plural } from "./ui.js";
 
 type Input = Record<string, unknown>;
@@ -108,6 +110,13 @@ export const Subagent = memo(function Subagent({ call, className }: { call: Tool
     const t = setTimeout(() => setFlash(false), 1500);
     return () => clearTimeout(t);
   }, [flash]);
+  // One that started before the items loaded has them loaded back to its start once it's opened.
+  // They come in below its row, and the thread keeps its place from the end: it's shown again after.
+  const loaded = useThreadState((s) => isLoaded(s.snapshot, call.id));
+  const loadEarlier = useLoadEarlier();
+  useEffect(() => {
+    if (open && !loaded) void loadEarlier({ to: call.id }).then(() => ref.current?.scrollIntoView?.({ block: "start" }));
+  }, [open, loaded, loadEarlier, call.id]);
   const items = sub?.items ?? NO_ITEMS;
   const status = sub?.status ?? "running";
   return (
@@ -121,13 +130,13 @@ export const Subagent = memo(function Subagent({ call, className }: { call: Tool
         <span className="at-tool-summary at-subagent-title">{subagentTitle(call)}</span>
         <SubagentStatusBadge status={status} waiting={sub?.waiting} activity={status === "running" ? activity(items, cwd) : undefined} />
       </button>
-      {open && sub && <SubagentBody sub={sub} />}
+      {open && sub && <SubagentBody sub={sub} loaded={loaded} />}
     </div>
   );
 });
 
 /** What a subagent did, under its row: its prompt, its items and its report. */
-function SubagentBody({ sub }: { sub: SubagentInfo }) {
+function SubagentBody({ sub, loaded }: { sub: SubagentInfo; loaded: boolean }) {
   const { call } = sub;
   const input = inputOf(call);
   const meta = [str(input.model), sub.toolUses > 0 && plural(sub.toolUses, "tool use")].filter(Boolean);
@@ -142,6 +151,7 @@ function SubagentBody({ sub }: { sub: SubagentInfo }) {
           <div className="at-pre-wrap">{prompt}</div>
         </Collapsible>
       )}
+      {!loaded && <LoadEarlier to={sub.id} />}
       <MessageList parentId={sub.id} />
       {sub.status === "running" && (
         <div className="at-working">

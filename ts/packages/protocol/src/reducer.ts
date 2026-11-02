@@ -37,6 +37,11 @@ export function applyEvent(state: Snapshot, event: ThreadEvent): Snapshot {
   return { ...next, seq: event.seq };
 }
 
+/** The requests that are open: those not resolved yet. */
+export function openRequests(state: Pick<Snapshot, "requests">): ThreadRequest[] {
+  return state.requests.filter((r) => !r.resolution);
+}
+
 /** The state after each of `events` in turn. */
 export function applyEvents(state: Snapshot, events: Iterable<ThreadEvent>): Snapshot {
   for (const event of events) state = applyEvent(state, event);
@@ -73,8 +78,10 @@ function apply(state: Snapshot, event: Exclude<ThreadEvent, { type: "delta" }>):
       };
     }
     case "request.resolved": {
+      // It stays, with its resolution, so a UI can show how it was answered.
       const at = indexOf(state.requests, event.request_id);
-      return at < 0 ? state : { ...state, requests: state.requests.filter((_, i) => i !== at) };
+      if (at < 0) return state;
+      return { ...state, requests: replace(state.requests, at, { ...state.requests[at]!, resolution: event.resolution }) };
     }
     default:
       // A newer backend's event type: there's nothing to do with it but count it.

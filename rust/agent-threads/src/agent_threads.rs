@@ -12,18 +12,20 @@ use serde_json::{Map, Value, json};
 use tokio::sync::{Mutex, broadcast, oneshot};
 use tokio::task::JoinHandle;
 
-use crate::harness::{Harness, McpServer, Skill, ThreadConfig, TurnEnd};
+use crate::harness::{Harness, LaunchOptions, McpServer, Skill, ThreadConfig, TurnEnd};
 use crate::ids::{new_id, now_iso};
 use crate::permissions::PermissionPolicy;
 use crate::protocol::{
-    Attachment, Command, Item, PermissionMode, Resolution, Snapshot, StandingAnswer, Thread, ThreadEvent, ThreadStatus,
+    Attachment, Command, Item, ItemPage, PermissionMode, Resolution, Snapshot, StandingAnswer, Thread, ThreadEvent,
+    ThreadStatus,
 };
-use crate::reducer::{apply_event, initial_state};
+use crate::reducer::{apply_event, initial_state, open_requests};
 use crate::spawner::{Spawner, direct};
 use crate::store::{RunRecord, Store, StoreError};
 use crate::stores::memory::MemoryStore;
 use crate::thread::{Actor, Host, Job, Outgoing, ThreadContext, Turn};
 use crate::tools::Tool;
+use crate::window::{item_page, snapshot_window};
 
 /// What goes wrong.
 #[derive(Clone, Debug)]
@@ -155,6 +157,9 @@ pub struct CreateOptions {
     /// instance's. They aren't stored: after a restart, set them again with
     /// [`configure`](AgentThreads::configure).
     pub capabilities: Capabilities,
+    /// How its harness process is started (args, environment, directories, config directory), on
+    /// top of the harness's options. They're stored with the thread, but not sent to clients.
+    pub launch: LaunchOptions,
 }
 
 /// A message's options.
@@ -174,6 +179,9 @@ pub struct ThreadOptions {
     pub permission_mode: Option<PermissionMode>,
     /// Replaces the thread's standing answers; `Some(vec![])` clears them.
     pub standing_answers: Option<Vec<StandingAnswer>>,
+    /// Replaces how the thread's harness process is started, in full. Only the app sets it: the
+    /// `set_options` command doesn't.
+    pub launch: Option<LaunchOptions>,
 }
 
 /// What [`recover`](AgentThreads::recover) did.
@@ -380,13 +388,17 @@ impl AgentThreads {
         }
         let typed: Thread = serde_json::from_value(thread.clone()).map_err(|e| Error::Command(e.to_string()))?;
         i.configs.lock().unwrap().insert(typed.id.clone(), options.capabilities);
-        i.store.create_thread(&thread).await?;
+        let mut stored = thread.clone();
+        if !options.launch.is_empty() {
+            stored["launch"] = serde_json::to_value(&options.launch).map_err(|e| Error::Command(e.to_string()))?;
+        }
+        i.store.create_thread(&stored).await?;
         let handle = {
             let mut threads = i.threads.lock().unwrap();
             // Checked again under the lock close() collects the threads under, so a close() that
             // started meanwhile either sees this one or refuses it here.
             self.open()?;
-            let (handle, mut actor, rx) = self.actor(initial_state(typed.clone()))?;
+            let (handle, mut actor, rx) = self.actor(initial_state(typed.clone()), options.launch)?;
             actor
                 .core
                 .emit_value(json!({"type": "thread.updated", "thread": thread}));
@@ -557,6 +569,24 @@ impl AgentThreads {
         self.ready(thread_id).await?.call(|a| a.core.snapshot().clone()).await
     }
 
+    /// A window of the thread's state now: its last `limit` items, and what they need from before
+    /// them (spec/PROTOCOL.md, "Windows"); the whole state if it has no more than `limit`.
+    pub async fn snapshot_window(&self, thread_id: &str, limit: usize) -> Result<Snapshot> {
+        self.ready(thread_id)
+            .await?
+            .call(move |a| snapshot_window(a.core.snapshot(), limit))
+            .await
+    }
+
+    /// The thread's items before index `before` (a window's `start`), at most `limit` of them, as
+    /// they are now, for a client loading earlier ones into its window.
+    pub async fn items_before(&self, thread_id: &str, before: u64, limit: usize) -> Result<ItemPage> {
+        self.ready(thread_id)
+            .await?
+            .call(move |a| item_page(a.core.snapshot(), before, limit))
+            .await
+    }
+
     /// The thread's saved events after `seq` (at most `limit`), for a client catching up.
     pub async fn events_since(&self, thread_id: &str, seq: u64, limit: Option<usize>) -> Result<Vec<ThreadEvent>> {
         let handle = self.live(thread_id);
@@ -681,6 +711,7 @@ impl AgentThreads {
                     effort: c.effort,
                     permission_mode: c.permission_mode,
                     standing_answers: c.standing_answers,
+                    launch: None,
                 };
                 self.set_options(&c.thread_id, o).await
             }
@@ -730,9 +761,9 @@ impl AgentThreads {
             .await
     }
 
-    /// Changes the thread's model, effort or permission mode, from its next turn, or its standing
-    /// answers. Open permission requests the new mode or standing answers answer (bypass allows
-    /// them, dont_ask denies them) are answered at once.
+    /// Changes the thread's model, effort, permission mode or launch options, from its next turn, or
+    /// its standing answers. Open permission requests the new mode or standing answers answer
+    /// (bypass allows them, dont_ask denies them) are answered at once.
     pub async fn set_options(&self, thread_id: &str, options: ThreadOptions) -> Result<()> {
         self.ready(thread_id)
             .await?
@@ -755,6 +786,9 @@ impl AgentThreads {
                 });
                 if options_of(a.core.thread()) != before {
                     a.core.options_changed();
+                }
+                if let Some(l) = options.launch {
+                    a.core.set_launch(l);
                 }
                 a.settle();
             })
@@ -979,7 +1013,11 @@ impl AgentThreads {
     }
 
     /// A thread's actor, not yet running.
-    fn actor(&self, state: Snapshot) -> Result<(Handle, Actor, tokio::sync::mpsc::UnboundedReceiver<Job>)> {
+    fn actor(
+        &self,
+        state: Snapshot,
+        launch: LaunchOptions,
+    ) -> Result<(Handle, Actor, tokio::sync::mpsc::UnboundedReceiver<Job>)> {
         let id = state.thread.id.clone();
         let harness = self.harness(&state.thread.harness).ok_or_else(|| {
             Error::Command(format!(
@@ -987,7 +1025,7 @@ impl AgentThreads {
                 state.thread.harness
             ))
         })?;
-        let (tx, actor, rx) = Actor::start(self.host(), state, self.config(&id), self.policy(&id), |ctx| {
+        let (tx, actor, rx) = Actor::start(self.host(), state, self.config(&id), launch, self.policy(&id), |ctx| {
             harness.open(ctx)
         });
         Ok((
@@ -1091,6 +1129,7 @@ impl AgentThreads {
         let Some(thread) = store.get_thread(thread_id).await? else {
             return Err(Error::Command(format!("there's no thread {thread_id}")));
         };
+        let launch = LaunchOptions::from_stored(&thread);
         let thread: Thread = serde_json::from_value(thread)
             .map_err(|e| Error::Command(format!("thread {thread_id} can't be read: {e}")))?;
         let snap: Option<Snapshot> = store
@@ -1108,7 +1147,7 @@ impl AgentThreads {
         if state.seq == 0 {
             state = initial_state(thread);
         }
-        let (handle, mut actor, rx) = self.actor(state)?;
+        let (handle, mut actor, rx) = self.actor(state, launch)?;
         // Questions kept open after their turns ended are taken up again (or cancelled, if they
         // can't be any more).
         actor.core.take_up_requests(false);
@@ -1180,10 +1219,7 @@ impl AgentThreads {
         let c = &mut actor.core;
         // Requests the session didn't take up again can't be answered.
         let open = c.open_request_ids();
-        let stale: Vec<String> = c
-            .snapshot()
-            .requests
-            .iter()
+        let stale: Vec<String> = open_requests(c.snapshot())
             .map(|r| r.id().to_string())
             .filter(|id| !c.is_taken_up(id))
             .collect();

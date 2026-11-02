@@ -48,9 +48,11 @@ await sdk.close(); // on shutdown: stops the harness processes (or with the shim
   the protocol's schema, which is checked before anything changes). `send`, `interrupt`, `respond`
   and `setOptions` do the same from code. After `close()`, they're all refused.
 - `get`, `list` and `delete` look threads up and remove them.
-- `snapshot(id)` is the thread's state now; `eventsSince(id, seq, limit?)` its saved events after
-  `seq`; `subscribe(fn)` calls `fn` with every thread's events as they happen, and returns how to
-  stop.
+- `snapshot(id)` is the thread's state now, and `snapshot(id, { limit })` a window of it (its last
+  `limit` items, and what they need from before them); `itemsBefore(id, before, limit)` is a page of
+  the items before a window's `start`, for a client loading earlier ones; `eventsSince(id, seq,
+  limit?)` its saved events after `seq`; `subscribe(fn)` calls `fn` with every thread's events as
+  they happen, and returns how to stop.
 - `recover()`, with the shim spawner, re-attaches to runs that outlived the last process; `close()`
   stops the harnesses (or leaves shim runs going) and saves everything. See below.
 - `CommandError` is what `handle` and the rest throw for a command the client got wrong; `onError`
@@ -78,7 +80,10 @@ await sdk.close(); // on shutdown: stops the harness processes (or with the shim
 Events go to subscribers as they happen and to the store in order, those of the same tick in one
 `appendEvents` (deltas aren't saved). `eventsSince()` waits for what's been sent to be saved, and
 `snapshot()` is the thread's events folded with the protocol's `applyEvent`, including text
-streamed so far.
+streamed so far, and answered requests with their `resolution`. A thread can run to thousands of
+items: give `snapshot()` a `limit` for a window of its latest, and a client loads the earlier ones a
+page at a time with `itemsBefore()` (spec/PROTOCOL.md, "Windows"; the React package's
+`ThreadSource.loadEarlier`).
 
 ## Stores
 

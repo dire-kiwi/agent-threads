@@ -78,6 +78,7 @@ type threadRuntime struct {
 	id      string
 	loop    *loop
 	config  ThreadConfig
+	launch  LaunchOptions // how its harness process is started: stored with the thread
 	policy  PermissionPolicy
 	session Session
 	turn    *turnState
@@ -127,13 +128,14 @@ type threadRuntime struct {
 	detached    bool
 }
 
-func newRuntime(sdk *AgentThreads, state protocol.Snapshot, config ThreadConfig, policy PermissionPolicy) *threadRuntime {
+func newRuntime(sdk *AgentThreads, state protocol.Snapshot, config ThreadConfig, launch LaunchOptions, policy PermissionPolicy) *threadRuntime {
 	rt := &threadRuntime{
 		sdk:        sdk,
 		id:         state.Thread.ID,
 		state:      state,
 		saved:      state,
 		config:     config,
+		launch:     launch,
 		policy:     policy,
 		requests:   map[string]*openRequest{},
 		streaming:  map[string]bool{},
@@ -157,6 +159,8 @@ func (rt *threadRuntime) ThreadID() string { return rt.id }
 func (rt *threadRuntime) Thread() protocol.Thread { return rt.state.Thread }
 
 func (rt *threadRuntime) Config() ThreadConfig { return rt.config }
+
+func (rt *threadRuntime) Launch() LaunchOptions { return rt.launch }
 
 func (rt *threadRuntime) Spawner() Spawner { return rt.sdk.spawner }
 
@@ -221,7 +225,7 @@ func (rt *threadRuntime) take() {
 	b.runs = rt.runs()
 	if rt.threadChanged {
 		rt.threadChanged = false
-		t := clone(rt.saved.Thread)
+		t := withLaunch(clone(rt.saved.Thread), rt.launch)
 		b.thread = &t
 	}
 	if rt.snapshotDue {
@@ -696,6 +700,18 @@ func (rt *threadRuntime) SetThread(change func(*protocol.Thread)) {
 	rt.emit(&protocol.ThreadUpdatedEvent{Thread: next})
 }
 
+// setLaunch changes how the harness process is started, from the next one; it's saved with the
+// thread.
+func (rt *threadRuntime) setLaunch(launch LaunchOptions) {
+	if sameJSONValue(launch, rt.launch) {
+		return
+	}
+	rt.launch = clone(launch)
+	rt.threadChanged = true
+	rt.flushQueued = true
+	rt.session.OptionsChanged()
+}
+
 func sameJSONValue(a, b any) bool {
 	x, err1 := json.Marshal(a)
 	y, err2 := json.Marshal(b)
@@ -1022,7 +1038,8 @@ func (rt *threadRuntime) Reopen(requestID string, answered func(protocol.Resolut
 		return false
 	}
 	for _, r := range rt.state.Requests {
-		if r.ID() == requestID {
+		// One that's been resolved stays in the state, with its resolution, but can't be reopened.
+		if r.ID() == requestID && r.Resolution() == nil {
 			rt.addRequest(requestID, &openRequest{request: r, answered: answered, standing: standing})
 			return true
 		}
@@ -1168,7 +1185,7 @@ func (rt *threadRuntime) takeUpRequests(all bool) {
 			ended[it.TurnID()] = true
 		}
 	}
-	for _, r := range append([]protocol.ThreadRequest(nil), rt.state.Requests...) {
+	for _, r := range protocol.OpenRequests(rt.state) {
 		if rt.requests[r.ID()] != nil || !all && !ended[r.TurnID()] {
 			continue
 		}

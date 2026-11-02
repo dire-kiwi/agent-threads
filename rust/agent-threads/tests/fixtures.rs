@@ -8,7 +8,7 @@ mod common;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use agent_threads::reducer::{apply_events, initial_state};
+use agent_threads::reducer::{apply_events, initial_state, open_requests};
 use agent_threads::{
     AgentThreads, Capabilities, ClaudeCodeOptions, CodexOptions, CreateOptions, McpServer, MemoryStore, Options,
     PermissionPolicy, Spawner, ThreadEvent, claude_code, codex, direct, tool,
@@ -209,8 +209,9 @@ async fn run_fixture(scenario: &str, spawner_name: &str) {
             command["thread_id"] = json!(thread.id);
             if command["type"] == "respond" {
                 let snap = sdk.snapshot(&thread.id).await.unwrap();
-                assert_eq!(snap.requests.len(), 1, "{at}: open requests");
-                command["request_id"] = json!(snap.requests[0].id());
+                let open: Vec<_> = open_requests(&snap).collect();
+                assert_eq!(open.len(), 1, "{at}: open requests");
+                command["request_id"] = json!(open[0].id());
             }
             from = events.pump().len();
             sdk.handle_json(command).await.unwrap_or_else(|e| panic!("{at}: {e}"));

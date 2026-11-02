@@ -27,7 +27,7 @@ after a restart.
 cargo build --release   # target/release/agent-threads-shim
 cargo test              # runs the shim on sh scripts
 make shim               # from the repository's root: shim/target/debug/agent-threads-shim, which the backends' tests use
-CARGO_NET_GIT_FETCH_WITH_CLI=true cargo install --git https://github.com/dire-kiwi/agent-threads agent-threads-shim
+cargo install --git https://github.com/dire-kiwi/agent-threads agent-threads-shim
 ```
 
 Ship the binary with the app (it's not published anywhere yet), and give the backend its path.
