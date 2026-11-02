@@ -19,21 +19,29 @@ use serde_json::{Map, Value, json};
 use tokio::sync::{broadcast, mpsc, oneshot};
 
 use crate::agent_threads::Error;
-use crate::harness::{HarnessSession, LaunchOptions, Message, RunCheckpoint, ThreadConfig, TurnEnd};
+use crate::harness::{
+    HarnessMessage, HarnessMessageHandler, HarnessSession, LaunchOptions, Message, RunCheckpoint, ThreadConfig, TurnEnd,
+};
 use crate::ids::{new_id, now_iso};
 use crate::permissions::{
     DONT_ASK_DENIAL, Decided, PermissionContext, PermissionDecision, PermissionPolicy, PermissionQuery, StandingKey,
     decide, mode_decision, permission_key,
 };
 use crate::protocol::{
-    Attachment, DeltaEventKind, Item, PermissionMode, QuestionRequest, Resolution, ResolutionOutcome, Snapshot,
-    StandingAnswerOutcome, Thread, ThreadEvent, ThreadRequest, Usage, UserMessage,
+    Attachment, DeltaEventKind, Item, PermissionMode, QuestionRequest, RateLimit, Resolution, ResolutionOutcome,
+    Snapshot, StandingAnswerOutcome, SubagentState, SubagentStatus, Thread, ThreadEvent, ThreadRequest, Usage,
+    UserMessage,
 };
 use crate::reducer::{apply_event, open_requests, utf16_len};
 use crate::spawner::Spawner;
 use crate::store::{RunRecord, Store, StoreError, StoreErrorKind};
 
 pub(crate) type Job = Box<dyn FnOnce(&mut Actor) + Send>;
+
+/// Whether an item is a background subagent's call that's still running.
+pub fn running_in_background(it: &Item) -> bool {
+    matches!(it, Item::ToolCall(c) if c.subagent.as_ref().is_some_and(|s| s.background && s.status == SubagentStatus::Running))
+}
 /// A job for a thread's session (a `S`), as [`ThreadContext::poster`] posts it.
 pub type SessionJob<S> = Box<dyn FnOnce(&mut S, &mut ThreadContext) + Send>;
 /// What's done with the user's answer to a request.
@@ -116,6 +124,9 @@ pub(crate) struct Host {
     pub on_error: Arc<dyn Fn(Error) + Send + Sync>,
     /// Options::late_answers.
     pub late_answers: bool,
+    /// Fill in events' `raw` (the raw option).
+    pub raw: bool,
+    pub on_harness_message: Option<HarnessMessageHandler>,
 }
 
 /// A thread on its task: the core and the driver's session.
@@ -161,6 +172,9 @@ pub struct ThreadContext {
     structured: HashMap<String, Value>,
     effects: VecDeque<Effect>,
     waiters: Vec<Waiter>,
+    /// The harness message being handled, which events made now have as their `raw` (with the raw
+    /// option).
+    raw: Option<Value>,
     tx: mpsc::UnboundedSender<Job>,
     /// Stops retrying writes: the backend is closing.
     pub(crate) disposed: bool,
@@ -236,6 +250,27 @@ impl ThreadContext {
         self.saved.items.iter().rev().find(|i| i.id() == id)
     }
 
+    /// The calls of the subagents an item is inside, innermost first.
+    pub fn ancestors(&self, id: &str) -> Vec<&Item> {
+        let mut out: Vec<&Item> = Vec::new();
+        let mut parent = self.item(id).and_then(Item::parent_id);
+        while let Some(p) = parent {
+            if out.iter().any(|a| a.id() == p) {
+                break;
+            }
+            let Some(it) = self.item(p) else { break };
+            out.push(it);
+            parent = it.parent_id();
+        }
+        out
+    }
+
+    /// Whether an item is inside a background subagent that's still running: what it does carries
+    /// on after the turn it was started in has ended.
+    pub fn in_background(&self, id: &str) -> bool {
+        self.ancestors(id).into_iter().any(running_in_background)
+    }
+
     // ---------- jobs ----------
 
     /// Runs `f` with the session (a `S`) as a job of its own, after the one running now.
@@ -297,6 +332,14 @@ impl ThreadContext {
 
     /// Numbers an event (`type` and its fields), applies it, sends it, and queues it to be saved.
     fn emit(&mut self, mut event: Value) {
+        // An item or request has the harness message it came from, and its event doesn't as well.
+        if let Some(raw) = &self.raw {
+            match event["type"].as_str() {
+                Some("item.added") => event["item"]["raw"] = raw.clone(),
+                Some("request.opened") => event["request"]["raw"] = raw.clone(),
+                _ => event["raw"] = raw.clone(),
+            }
+        }
         let saved = event["type"] != "delta";
         event["thread_id"] = json!(self.thread_id);
         event["seq"] = json!(self.state.seq + saved as u64);
@@ -414,6 +457,54 @@ impl ThreadContext {
         self.emit(json!({"type": "thread.updated", "thread": next}));
     }
 
+    /// The harness reported usage limits: they replace the thread's `rate_limits` with the same
+    /// ids, which are kept sorted by id (with a thread.updated if that changes them).
+    pub fn rate_limits(&mut self, limits: Vec<RateLimit>) {
+        if limits.is_empty() {
+            return;
+        }
+        self.set_thread(|t| {
+            for l in limits {
+                match t.rate_limits.iter_mut().find(|x| x.id == l.id) {
+                    Some(x) => *x = l,
+                    None => t.rate_limits.push(l),
+                }
+            }
+            t.rate_limits.sort_by(|a, b| a.id.cmp(&b.id));
+        });
+    }
+
+    /// Handles a line the harness process `run_id` wrote (`message` is it parsed, if it's JSON):
+    /// runs `handle`, which translates it, with the events it makes taking it as their `raw` (with
+    /// the raw option on), and then passes it to the app's `on_harness_message`.
+    pub fn from_harness(
+        &mut self,
+        run_id: &str,
+        line: &str,
+        message: Option<Value>,
+        handle: impl FnOnce(&mut ThreadContext, Option<&Value>),
+    ) {
+        let before = if self.host.raw && message.is_some() {
+            std::mem::replace(&mut self.raw, message.clone())
+        } else {
+            self.raw.take()
+        };
+        handle(self, message.as_ref());
+        self.raw = before;
+        if let Some(f) = self.host.on_harness_message.clone() {
+            let m = HarnessMessage {
+                thread_id: self.thread_id.clone(),
+                run_id: run_id.to_string(),
+                harness: self.state.thread.harness.clone(),
+                line: line.to_string(),
+                message,
+            };
+            if std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| f(&m))).is_err() {
+                self.error(Error::Other("the app's on_harness_message panicked".into()));
+            }
+        }
+    }
+
     /// The harness took in the queued message with this id. Whether it was queued.
     pub fn took_in(&mut self, id: &str) -> bool {
         let Some(at) = self.queue.iter().position(|q| q == id) else {
@@ -500,23 +591,21 @@ impl ThreadContext {
     /// false (shutting down, or recovering a turn the backend lost), or they've been tried enough.
     pub(crate) fn finish_turn(&mut self, end: TurnEnd, live: bool, carry: bool) {
         let Some(turn) = self.turn.clone() else { return };
+        // What a background subagent that's still running does carries on after the turn: its
+        // text still streaming, its calls (and their structured output, still to go with their
+        // results) and its requests.
         // Text streamed but never finished (its process went first) is kept as it was shown.
-        let unfinished: Vec<(String, String)> = self
-            .state
-            .items
-            .iter()
-            .filter_map(|it| {
-                let text = it.streamed_text()?;
-                let saved = self.item(it.id())?.streamed_text()?;
-                (saved != text).then(|| (it.id().to_string(), text.to_string()))
-            })
+        self.finish_text(|c, id| !c.in_background(id));
+        let ending: Vec<String> = self
+            .structured
+            .keys()
+            .filter(|id| !self.in_background(id))
+            .cloned()
             .collect();
-        for (id, text) in unfinished {
-            self.update_item(&id, json!({"text": text}));
+        for id in ending {
+            self.structured.remove(&id);
         }
-        self.streaming.clear();
-        self.structured.clear();
-        let cut: Vec<String> = self
+        let cut: Vec<(String, Option<SubagentState>)> = self
             .state
             .items
             .iter()
@@ -526,24 +615,36 @@ impl ThreadContext {
                         && matches!(
                             c.status,
                             crate::protocol::ToolStatus::Running | crate::protocol::ToolStatus::Pending
-                        ) =>
+                        )
+                        && !self.in_background(&c.id) =>
                 {
-                    Some(c.id.clone())
+                    let subagent = match self.item(&c.id) {
+                        Some(Item::ToolCall(saved)) => saved.subagent.clone(),
+                        _ => None,
+                    };
+                    Some((c.id.clone(), subagent))
                 }
                 _ => None,
             })
             .collect();
-        for id in cut {
-            self.update_item(&id, json!({"status": "cancelled"}));
+        for (id, subagent) in cut {
+            let mut patch = json!({"status": "cancelled"});
+            // A subagent cut short (by an interrupt, or its process ending) is stopped with its call.
+            if let Some(mut s) = subagent.filter(|s| s.status == SubagentStatus::Running) {
+                s.status = SubagentStatus::Stopped;
+                patch["subagent"] = json!(s);
+            }
+            self.update_item(&id, patch);
         }
         // Questions are kept open after the turn (some may be already: see cancel_request()), unless
         // messages are left queued, which a turn carries over or the next message sends: the
-        // conversation has moved on.
+        // conversation has moved on. A background subagent's requests stay open, for it.
         for (id, open) in std::mem::take(&mut self.requests) {
             let keep = if open.late {
                 self.queue.is_empty()
             } else {
                 open.request.turn_id().is_some_and(|t| t != turn.id)
+                    || open.request.tool_call_id().is_some_and(|c| self.in_background(c))
             };
             if keep {
                 self.requests.push((id, open));
@@ -594,9 +695,12 @@ impl ThreadContext {
             || (retry && turn.interrupted)
             || (carried > 0 && !ok && !live);
         if give_up {
+            let waiting = self.waiting();
             self.set_thread(|t| {
                 t.status = if error.is_some() {
                     crate::protocol::ThreadStatus::Error
+                } else if waiting {
+                    crate::protocol::ThreadStatus::Waiting
                 } else {
                     crate::protocol::ThreadStatus::Idle
                 };
@@ -632,6 +736,127 @@ impl ThreadContext {
         });
         self.effects
             .push_back(Effect::CarryOver(left.iter().map(queued_message).collect()));
+    }
+
+    /// Keeps text streamed into the items `which` picks, but never finished, as it was shown.
+    fn finish_text(&mut self, which: impl Fn(&ThreadContext, &str) -> bool) {
+        let unfinished: Vec<(String, String)> = self
+            .state
+            .items
+            .iter()
+            .filter(|it| which(self, it.id()))
+            .filter_map(|it| {
+                let text = it.streamed_text()?;
+                let saved = self.item(it.id())?.streamed_text()?;
+                (saved != text).then(|| (it.id().to_string(), text.to_string()))
+            })
+            .collect();
+        for (id, text) in unfinished {
+            self.update_item(&id, json!({"text": text}));
+        }
+        let done: Vec<String> = self.streaming.iter().filter(|id| which(self, id)).cloned().collect();
+        self.streaming.retain(|id| !done.contains(id));
+    }
+
+    /// The harness started a turn by itself, with no message (Claude does, to tell the agent that a
+    /// background subagent has ended). Does nothing if a turn is running.
+    pub fn begin_turn(&mut self) {
+        if self.turn.is_some() || self.closing || self.disposed {
+            return;
+        }
+        let turn = Turn {
+            id: new_id("turn"),
+            interrupted: false,
+            carried: 0,
+            progressed: false,
+        };
+        let id = turn.id.clone();
+        self.turn = Some(turn);
+        self.emit(json!({"type": "turn.started", "turn_id": id}));
+        self.set_thread(|t| {
+            t.status = crate::protocol::ThreadStatus::Running;
+            t.error = None;
+        });
+    }
+
+    /// The subagents of these calls that are still running were stopped (their harness process
+    /// ended): their calls still running are cancelled, and their open requests too.
+    pub fn stop_subagents(&mut self, ids: &[String]) {
+        let mut stopped: Vec<String> = Vec::new();
+        for id in ids {
+            let Some(Item::ToolCall(c)) = self.item(id) else {
+                continue;
+            };
+            let Some(mut s) = c.subagent.clone().filter(|s| s.status == SubagentStatus::Running) else {
+                continue;
+            };
+            if stopped.contains(id) {
+                continue;
+            }
+            stopped.push(id.clone());
+            s.status = SubagentStatus::Stopped;
+            self.update_item(id, json!({"subagent": s}));
+        }
+        if stopped.is_empty() {
+            return;
+        }
+        let within =
+            |ctx: &ThreadContext, id: &str| ctx.ancestors(id).iter().any(|a| stopped.iter().any(|s| s == a.id()));
+        self.finish_text(within);
+        let done: Vec<String> = self.structured.keys().filter(|id| within(self, id)).cloned().collect();
+        for id in done {
+            self.structured.remove(&id);
+        }
+        let cut: Vec<String> = self
+            .state
+            .items
+            .iter()
+            .filter_map(|it| match it {
+                Item::ToolCall(c)
+                    if matches!(
+                        c.status,
+                        crate::protocol::ToolStatus::Running | crate::protocol::ToolStatus::Pending
+                    ) && within(self, &c.id) =>
+                {
+                    Some(c.id.clone())
+                }
+                _ => None,
+            })
+            .collect();
+        for id in cut {
+            self.update_item(&id, json!({"status": "cancelled"}));
+        }
+        let mut i = 0;
+        while i < self.requests.len() {
+            if !self.requests[i]
+                .1
+                .request
+                .tool_call_id()
+                .is_some_and(|c| within(self, c))
+            {
+                i += 1;
+                continue;
+            }
+            let (id, _) = self.requests.remove(i);
+            self.emit_resolved(&id, &cancel());
+        }
+        if !self.waiting() && self.turn.is_none() && self.state.thread.status == crate::protocol::ThreadStatus::Waiting
+        {
+            self.set_thread(|t| t.status = crate::protocol::ThreadStatus::Idle);
+        }
+    }
+
+    /// Sets the thread running again once it has no open requests, or idle if no turn is running
+    /// (a background subagent's request can be answered after its turn).
+    pub(crate) fn requests_done(&mut self) {
+        if self.waiting() {
+            return;
+        }
+        if self.turn.is_some() {
+            self.set_thread(|t| t.status = crate::protocol::ThreadStatus::Running);
+        } else if self.state.thread.status == crate::protocol::ThreadStatus::Waiting {
+            self.set_thread(|t| t.status = crate::protocol::ThreadStatus::Idle);
+        }
     }
 
     fn undelivered(&mut self, n: usize) {
@@ -825,12 +1050,10 @@ impl ThreadContext {
         if !(self.interrupted() && self.keep_late(id, &open.request, Some(open.users))) {
             self.emit_resolved(id, &cancel());
         }
-        if !self.waiting() && self.turn.is_some() {
-            self.set_thread(|t| t.status = crate::protocol::ThreadStatus::Running);
-        }
+        self.requests_done();
     }
 
-    /// Whether the turn waits on a request (one that isn't kept open after its turn).
+    /// Whether the thread waits on a request (one that isn't kept open after its turn).
     fn waiting(&self) -> bool {
         self.requests.iter().any(|(_, o)| !o.late)
     }
@@ -1136,6 +1359,7 @@ impl Actor {
             structured: HashMap::new(),
             effects: VecDeque::new(),
             waiters: Vec::new(),
+            raw: None,
             tx: tx.clone(),
             disposed: false,
             exit: false,
@@ -1197,9 +1421,7 @@ impl Actor {
         let (_, open) = c.requests.remove(at);
         // The answers to secret questions go only to the harness: what's sent and saved hides them.
         c.emit_resolved(request_id, &redact(&open.request, &resolution));
-        if !c.waiting() && c.turn.is_some() {
-            c.set_thread(|t| t.status = crate::protocol::ThreadStatus::Running);
-        }
+        c.requests_done();
         let standing = match (resolution.always, &open.standing, resolution.outcome) {
             (true, Some(key), ResolutionOutcome::Allow) => Some(key.answer(StandingAnswerOutcome::Allow)),
             (true, Some(key), ResolutionOutcome::Deny) => Some(key.answer(StandingAnswerOutcome::Deny)),

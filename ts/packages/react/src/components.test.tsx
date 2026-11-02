@@ -38,10 +38,11 @@ describe("<Thread>", () => {
     const { events, start } = fixture(name, () => false);
     const { emit, container } = mount(start);
     for (const e of events) act(() => emit(e));
-    // Each of the agent's replies in the main thread is there, as is each turn's end.
+    // Each of the agent's replies in the main thread is there (as Markdown, so without inline
+    // code's backticks), as is each turn's end.
     const final = applyEvents(start, events);
     for (const item of final.items)
-      if (item.type === "assistant_message" && item.text.trim() && !item.parent_id) expect(container.textContent).toContain(item.text.trim().split("\n")[0]);
+      if (item.type === "assistant_message" && item.text.trim() && !item.parent_id) expect(container.textContent).toContain(item.text.trim().split("\n")[0]!.replaceAll("`", ""));
     expect(container.querySelectorAll(".at-turn-result")).toHaveLength(final.items.filter((i) => i.type === "turn_result").length);
     // Every request is answered: its card is where it was asked, greyed out, with its answer.
     expect(container.querySelector(".at-card:not(.at-card-done)")).toBeNull();
@@ -105,6 +106,33 @@ describe("<Thread>", () => {
     const row = container.querySelector(".at-subagent") as HTMLElement;
     expect(row.textContent).toContain("Read notes.txt first line");
     expect(row.querySelector(".at-tool-read")).toBeNull();
+    fireEvent.click(row.querySelector(".at-tool-head")!);
+    expect(row.querySelector(".at-tool-read")?.textContent).toContain("notes.txt");
+  });
+
+  it("shows a background subagent running after its call has returned, and its summary once it's done", () => {
+    // After the turn that started it: its call has completed, and it's still working.
+    const running = mount(fixture("claude/background-subagent", (e) => e.type === "turn.completed").snapshot).container;
+    let row = running.querySelector(".at-subagent") as HTMLElement;
+    expect(row.querySelector(".at-subagent-tag")?.textContent).toBe("background");
+    expect(row.querySelector(".at-progress")).not.toBeNull();
+    fireEvent.click(row.querySelector(".at-tool-head")!);
+    expect(row.textContent).toContain("Working in the background…");
+    cleanup();
+
+    const done = mount(fixture("claude/background-subagent").snapshot).container;
+    row = done.querySelector(".at-subagent") as HTMLElement;
+    expect(row.querySelector(".at-good")).not.toBeNull();
+    fireEvent.click(row.querySelector(".at-tool-head")!);
+    expect(row.querySelector(".at-subagent-meta")?.textContent).toBe("claude-haiku-5-5 · in the background · 2 tool uses");
+    expect(row.textContent).not.toContain("Async agent launched");
+  });
+
+  it("shows a skill's forked subagent as a Skill", () => {
+    const { container } = mount(fixture("claude/skill-fork").snapshot);
+    const row = container.querySelector(".at-subagent") as HTMLElement;
+    expect(row.querySelector(".at-tool-label")?.textContent).toBe("Skill");
+    expect(row.querySelector(".at-subagent-title")?.textContent).toBe("/app:first-line");
     fireEvent.click(row.querySelector(".at-tool-head")!);
     expect(row.querySelector(".at-tool-read")?.textContent).toContain("notes.txt");
   });

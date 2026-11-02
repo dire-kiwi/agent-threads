@@ -22,6 +22,7 @@
         "error": { "type": "string", "description": "What went wrong, when status is error." },
         "run": { "$ref": "#/$defs/Run", "description": "The harness process running the thread, if one is. Absent when it's idle with no process." },
         "standing_answers": { "type": "array", "items": { "$ref": "#/$defs/StandingAnswer" }, "description": "Answers that stand for the rest of the thread: a permission request for a tool one matches gets its outcome without asking. Added by a respond with always, and set by the app (when it creates the thread, or with set_options)." },
+        "rate_limits": { "type": "array", "items": { "$ref": "#/$defs/RateLimit" }, "description": "The usage limits of the account the harness runs on, as it last reported them in this thread, sorted by id. Absent until it reports one." },
         "metadata": { "type": "object", "additionalProperties": true, "description": "The app's own data, given when the thread was created. Backends store it and pass it to tools; they don't read it." },
         "created_at": { "type": "string", "format": "date-time" },
         "updated_at": { "type": "string", "format": "date-time" }
@@ -57,6 +58,18 @@
         "spawner": { "type": "string", "enum": ["direct", "shim"], "description": "direct: a child process of the backend, which ends with it. shim: supervised by agent-threads-shim, so it survives a backend restart." },
         "started_at": { "type": "string", "format": "date-time" },
         "reattached_at": { "type": "string", "format": "date-time", "description": "When a restarted backend last re-attached to the run. Absent if it never has." }
+      }
+    },
+    "RateLimit": {
+      "type": "object",
+      "description": "A usage limit of the account the harness runs on (a subscription's session or weekly limit, say), as the harness last reported it.",
+      "required": ["id", "status"],
+      "properties": {
+        "id": { "type": "string", "description": "Which limit, by the harness's name for it: Claude Code's rateLimitType (five_hour, seven_day, seven_day_opus...), Codex's primary and secondary windows." },
+        "status": { "type": "string", "enum": ["allowed", "warning", "rejected"], "description": "allowed: there's room. warning: it's nearly used up, or used up with extra usage carrying on. rejected: the harness refuses turns until it resets." },
+        "used_percent": { "type": "number", "minimum": 0, "description": "How much of it is used, from 0 to 100, when the harness says." },
+        "resets_at": { "type": "string", "format": "date-time", "description": "When it resets, when the harness says." },
+        "window_minutes": { "type": "integer", "minimum": 0, "description": "How long its window is, when the harness says." }
       }
     },
     "Usage": {

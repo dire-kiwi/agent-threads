@@ -79,3 +79,12 @@ fn base36(mut n: u64) -> String {
     out.reverse();
     String::from_utf8(out).unwrap()
 }
+
+/// Unix seconds as an RFC 3339 time, to the second (`YYYY-MM-DDTHH:MM:SSZ`), if it's a time.
+pub(crate) fn unix_time(seconds: f64) -> Option<String> {
+    if !seconds.is_finite() {
+        return None;
+    }
+    let t = chrono::DateTime::from_timestamp(seconds.floor() as i64, 0)?;
+    Some(t.format("%Y-%m-%dT%H:%M:%SZ").to_string())
+}

@@ -13,7 +13,8 @@ import { isAbsolute, join, resolve, sep } from "node:path";
 import type { Resolution, ToolCall, Usage } from "@dire-kiwi/agent-threads-protocol";
 import { messageParts } from "../attachments.js";
 import { title } from "../claude/translate.js";
-import type { Harness, HarnessSession, Message, RunCheckpoint, ThreadContext } from "../harness.js";
+import { CommandError, ControlError } from "../errors.js";
+import { parseLine, type Harness, type HarnessSession, type Message, type RunCheckpoint, type ThreadContext } from "../harness.js";
 import { newId } from "../ids.js";
 import { applyLaunchEnv, launchedNow, launchedOf, withEnv, type Launched } from "../launch.js";
 import { serveTools, type LoopbackMcp } from "../mcp-http.js";
@@ -44,7 +45,7 @@ import type {
   UserInput,
 } from "./protocol.js";
 import { Rpc, RpcError, type Incoming, type PendingRequest, type RequestId } from "./rpc.js";
-import { APP_SERVER, codexDone, codexPolicy, codexTool, codexUsage, isToolItem, mcpServerConfig, questions, todos, unwrapCommand } from "./translate.js";
+import { APP_SERVER, codexDone, codexPolicy, codexRateLimits, codexTool, codexUsage, isToolItem, mcpServerConfig, questions, todos, unwrapCommand } from "./translate.js";
 
 export interface CodexOptions {
   /** The `codex` binary. */
@@ -316,6 +317,8 @@ class CodexSession implements HarnessSession {
   /** A directory for the thread's generated files (skills, attached files), made when needed. */
   #tmp: string | undefined;
   #closed = false;
+  /** The app's control requests not yet answered: what fails each, when the backend lets go of its run. */
+  #controls = new Set<(error: Error) => void>();
 
   constructor(ctx: ThreadContext, options: CodexOptions) {
     this.#ctx = ctx;
@@ -503,7 +506,36 @@ class CodexSession implements HarnessSession {
     run.proc.detach();
     run.abort.abort();
     void run.mcp?.close();
+    for (const fail of [...this.#controls]) fail(new ControlError("The backend closed before Codex answered."));
     return true;
+  }
+
+  control(request: unknown): Promise<unknown> {
+    const run = this.#live();
+    if (!run?.proc || !run.rpc || run.detached) return Promise.reject(new CommandError(`thread ${this.#ctx.threadId} has no running Codex process`));
+    const r = request as { method?: unknown; params?: unknown } | null;
+    if (!r || typeof r !== "object" || Array.isArray(r) || typeof r.method !== "string") {
+      return Promise.reject(new CommandError("a Codex control request is an object with a method (and params)"));
+    }
+    return new Promise((resolve, reject) => {
+      const fail = (e: Error) => {
+        this.#controls.delete(fail);
+        reject(e);
+      };
+      this.#controls.add(fail);
+      run.rpc.requestRaw(r.method as string, r.params).then(
+        (result) => {
+          if (!this.#controls.has(fail)) return;
+          this.#controls.delete(fail);
+          resolve(result);
+        },
+        (e: unknown) => {
+          if (!this.#controls.has(fail)) return;
+          this.#controls.delete(fail);
+          reject(e instanceof RpcError ? new ControlError(e.message, e.error) : e);
+        },
+      );
+    });
   }
 
   /** A request of Codex's that was open when the backend restarted. */
@@ -820,7 +852,10 @@ class CodexSession implements HarnessSession {
 
   #handlers(run: Run): ProcessHandlers {
     return {
-      line: (line) => this.#line(run, line),
+      line: (line) => {
+        const m = parseLine(line);
+        this.#ctx.fromHarness(run.id, line, m, () => this.#line(run, m));
+      },
       stderr: (line) => {
         run.stderr.push(line);
         if (run.stderr.length > 20) run.stderr.shift();
@@ -858,14 +893,11 @@ class CodexSession implements HarnessSession {
 
   // ---------- what Codex says ----------
 
-  #line(run: Run, line: string): void {
-    let m: Incoming;
-    try {
-      m = JSON.parse(line);
-    } catch {
-      return; // Not a message: the app server writes only JSON-RPC to stdout, but be safe.
-    }
-    if (!m || typeof m !== "object") return;
+  /** A line of Codex's output, parsed (undefined if it isn't JSON). */
+  #line(run: Run, parsed: unknown): void {
+    // Not a message: the app server writes only JSON-RPC to stdout, but be safe.
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return;
+    const m = parsed as Incoming;
     if (run.rpc.take(m)) return;
     if (run.retired || run !== this.#run) {
       // A run being stopped: its requests go unanswered.
@@ -926,6 +958,9 @@ class CodexSession implements HarnessSession {
         return this.#childDone(run, p.threadId, p.turn as Turn, parent_id!);
       case "thread/tokenUsage/updated":
         if (own && p.tokenUsage?.total) run.total = p.tokenUsage.total;
+        return;
+      case "account/rateLimits/updated":
+        if (p.rateLimits && typeof p.rateLimits === "object") ctx.rateLimits(codexRateLimits(p.rateLimits));
         return;
       case "warning":
         if (own && p.threadId && p.message) this.#notice(p.message);

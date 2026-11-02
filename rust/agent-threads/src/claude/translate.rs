@@ -3,6 +3,8 @@
 
 use serde_json::{Map, Value, json};
 
+use crate::ids::unix_time;
+use crate::protocol::{RateLimit, RateLimitStatus, SubagentState, SubagentStatus, ToolCall, ToolKind};
 use crate::thread::round_cost;
 
 /// The in-process MCP server that serves a thread's app tools.
@@ -288,4 +290,207 @@ pub(crate) fn claude_permission_mode(mode: Option<crate::protocol::PermissionMod
         // allows what it allows).
         Default | DontAsk => None,
     }
+}
+
+/// How Claude says a subagent ended (in its task_* messages and the Agent call's result), as a
+/// SubagentStatus; none if what it says isn't an end.
+fn subagent_end(status: &Value) -> Option<SubagentStatus> {
+    match status.as_str()? {
+        "completed" | "success" => Some(SubagentStatus::Completed),
+        "failed" | "error" => Some(SubagentStatus::Failed),
+        "killed" | "stopped" | "cancelled" | "interrupted" => Some(SubagentStatus::Stopped),
+        _ => None,
+    }
+}
+
+fn running() -> SubagentState {
+    SubagentState {
+        status: SubagentStatus::Running,
+        background: false,
+        agent_type: None,
+        model: None,
+        activity: None,
+        tool_uses: None,
+        summary: None,
+    }
+}
+
+/// A subagent call's subagent, as a task_started (of a local_agent) says it has started.
+pub(crate) fn subagent_started(call: &ToolCall, m: &Value) -> SubagentState {
+    let mut s = call.subagent.clone().unwrap_or_else(running);
+    s.status = SubagentStatus::Running;
+    if m["is_backgrounded"] == true {
+        s.background = true;
+    }
+    if let Some(t) = str_arg(m, "subagent_type") {
+        s.agent_type = Some(t.into());
+    }
+    if let Some(model) = str_arg(m, "model").or_else(|| str_arg(&call.input, "model")) {
+        s.model = Some(model.into());
+    }
+    s
+}
+
+/// A subagent after a task_progress, task_updated or task_notification about it.
+pub(crate) fn subagent_task(s: &SubagentState, m: &Value) -> SubagentState {
+    let mut next = s.clone();
+    let running = s.status == SubagentStatus::Running;
+    match m["subtype"].as_str() {
+        Some("task_progress") => {
+            if let Some(d) = str_arg(m, "description") {
+                next.activity = Some(d.into());
+            }
+            if let Some(n) = m["usage"]["tool_uses"].as_u64() {
+                next.tool_uses = Some(n);
+            }
+        }
+        Some("task_updated") => {
+            // Continued (with SendMessage) after it ended, it runs again.
+            if m["patch"]["status"] == "running" {
+                next.status = SubagentStatus::Running;
+                next.summary = None;
+            } else if let Some(end) = subagent_end(&m["patch"]["status"]).filter(|_| running) {
+                next.status = end;
+            }
+        }
+        Some("task_notification") => {
+            if let Some(end) = subagent_end(&m["status"]).filter(|_| running) {
+                next.status = end;
+            }
+            if let Some(n) = m["usage"]["tool_uses"].as_u64() {
+                next.tool_uses = Some(n);
+            }
+            // A foreground subagent's report is its call's result.
+            if s.background
+                && let Some(summary) = str_arg(m, "summary")
+            {
+                next.summary = slim(summary)["content"].as_str().map(String::from);
+            }
+        }
+        _ => {}
+    }
+    next
+}
+
+/// A subagent call's subagent, as its result says (`meta` is the result's tool_use_result, `text`
+/// its content); none for a call whose subagent never started (it failed, or was denied).
+pub(crate) fn subagent_result(
+    call: &ToolCall,
+    is_error: bool,
+    interrupted: bool,
+    meta: &Value,
+    text: &str,
+) -> Option<SubagentState> {
+    if call.kind != ToolKind::Subagent || (call.subagent.is_none() && is_error) {
+        return None;
+    }
+    let mut s = call.subagent.clone().unwrap_or_else(running);
+    if let Some(m) = str_arg(meta, "resolvedModel") {
+        s.model = Some(m.into());
+    }
+    if let Some(t) = str_arg(meta, "agentType") {
+        s.agent_type = Some(t.into());
+    }
+    if let Some(n) = meta["totalToolUseCount"].as_u64() {
+        s.tool_uses = Some(n);
+    }
+    // A background subagent's call returns as soon as it has started it.
+    if meta["isAsync"] == true
+        || meta["status"] == "async_launched"
+        || text.trim_start().starts_with("Async agent launched")
+    {
+        s.background = true;
+    } else if s.status == SubagentStatus::Running {
+        s.status = if is_error && interrupted {
+            SubagentStatus::Stopped
+        } else if is_error {
+            SubagentStatus::Failed
+        } else {
+            subagent_end(&meta["status"]).unwrap_or(SubagentStatus::Completed)
+        };
+    }
+    Some(s)
+}
+
+/// The limit a `rate_limit_info` reports (from a rate_limit_event, or a message refused for the
+/// usage limit), if it says how it stands.
+pub(crate) fn claude_rate_limits(info: &Value) -> Vec<RateLimit> {
+    let overage =
+        info["isUsingOverage"] == true || matches!(info["overageStatus"].as_str(), Some("allowed" | "allowed_warning"));
+    let status = match info["status"].as_str() {
+        Some("allowed") => RateLimitStatus::Allowed,
+        Some("allowed_warning") => RateLimitStatus::Warning,
+        Some("rejected") if overage => RateLimitStatus::Warning,
+        Some("rejected") => RateLimitStatus::Rejected,
+        _ => return Vec::new(),
+    };
+    let id = info["rateLimitType"]
+        .as_str()
+        .filter(|s| !s.is_empty())
+        .unwrap_or("unknown");
+    vec![RateLimit {
+        id: id.to_string(),
+        status,
+        used_percent: info["utilization"]
+            .as_f64()
+            .filter(|u| u.is_finite())
+            .map(|u| u * 100.0),
+        resets_at: info["resetsAt"].as_f64().and_then(unix_time),
+        window_minutes: None,
+    }]
+}
+
+/// An `api_retry` system message's notice text.
+pub(crate) fn retry_text(m: &Value) -> String {
+    let why: Vec<String> = [
+        m["error"].as_str().filter(|e| !e.is_empty()).map(String::from),
+        m["error_status"]
+            .as_f64()
+            .map(|_| format!("status {}", m["error_status"])),
+    ]
+    .into_iter()
+    .flatten()
+    .collect();
+    let why = if why.is_empty() {
+        String::new()
+    } else {
+        format!(" ({})", why.join(", "))
+    };
+    let secs = (m["retry_delay_ms"].as_f64().unwrap_or(0.0) / 1000.0).ceil();
+    format!(
+        "API request failed{why}; retrying in {secs}s (attempt {} of {}).",
+        js(&m["attempt"]),
+        js(&m["max_retries"])
+    )
+}
+
+/// A JSON value as JavaScript's template strings write it (a missing one is `undefined`).
+fn js(v: &Value) -> String {
+    match v {
+        Value::Null => "undefined".into(),
+        Value::String(s) => s.clone(),
+        v => v.to_string(),
+    }
+}
+
+/// A `hook_response` system message's notice (level, text and detail), if it makes one: a hook
+/// that failed, or said something.
+pub(crate) fn hook_notice(m: &Value) -> Option<Value> {
+    let text = |v: &Value| v.as_str().unwrap_or("").trim().to_string();
+    let output = text(&m["output"]);
+    let name = js(&m["hook_name"]);
+    if m["outcome"] == "error" {
+        let stderr = text(&m["stderr"]);
+        let detail = if stderr.is_empty() { output } else { stderr };
+        let code = m["exit_code"]
+            .as_f64()
+            .map(|_| format!(" (exit code {})", m["exit_code"]))
+            .unwrap_or_default();
+        let mut n = json!({"level": "warning", "text": format!("Hook {name} failed{code}")});
+        if !detail.is_empty() {
+            n["detail"] = json!(detail);
+        }
+        return Some(n);
+    }
+    (!output.is_empty()).then(|| json!({"level": "info", "text": format!("Hook {name} ran"), "detail": output}))
 }

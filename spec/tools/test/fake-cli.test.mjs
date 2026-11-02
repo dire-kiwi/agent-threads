@@ -28,7 +28,14 @@ function start(dir, argv, state) {
   let stderr = "";
   let waiter = null;
   createInterface({ input: child.stdout }).on("line", (l) => {
-    out.push(JSON.parse(l));
+    // A line that isn't JSON is recorded as {line}.
+    let msg;
+    try {
+      msg = JSON.parse(l);
+    } catch {
+      msg = { line: l };
+    }
+    out.push(msg);
     waiter?.();
   });
   child.stderr.on("data", (d) => (stderr += d));
@@ -71,8 +78,8 @@ for (const dir of fixtureDirs()) {
       let outs = 0;
       const want = [];
       for (const e of rest) {
-        if (e.dir === "out" && e.msg !== undefined) {
-          want.push(expectedOut(meta.harness, e.msg, sentIds));
+        if (e.dir === "out") {
+          want.push(e.msg !== undefined ? expectedOut(meta.harness, e.msg, sentIds) : { line: e.line });
           outs++;
         } else if (e.dir === "in") {
           await cli.until(outs);

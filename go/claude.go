@@ -114,6 +114,10 @@ type claudeRunState struct {
 	Asked       [][2]string     `json:"asked"`
 	Open        [][2]any        `json:"open"`
 	Sent        []sentMessage   `json:"sent"`
+	Tasks       [][2]string     `json:"tasks,omitempty"`  // [a subagent's task id, its call's id]
+	Agents      []string        `json:"agents,omitempty"` // the calls whose subagents it ran
+	AutoTurn    string          `json:"autoTurn,omitempty"`
+	HeldUsage   *protocol.Usage `json:"heldUsage,omitempty"`
 	PluginDir   string          `json:"pluginDir,omitempty"`
 	Launched    *launched       `json:"launched,omitempty"`
 	Stale       bool            `json:"stale,omitempty"`
@@ -125,6 +129,8 @@ type claudeRunState struct {
 type pendingControl struct {
 	subtype string
 	resolve func(jmap) // nil: refused, or the process went
+	// full, for the app's requests, is given the whole control response (nil: the process went).
+	full func(jmap)
 }
 
 // claudeRun is one claude process, and what's needed to read it.
@@ -158,6 +164,14 @@ type claudeRun struct {
 	openOrder []string
 	// sent is the messages sent, oldest first, by what Claude echoes when it takes one in.
 	sent []sentMessage
+	// tasks is its subagents' task ids (which some task_* messages name them by) -> their calls'
+	// ids, and agents the calls whose subagents it ran, which are stopped when it ends.
+	tasks  map[string]string
+	agents []string
+	// autoTurn is the turn it started by itself (BeginTurn), and heldUsage the usage of turns
+	// Claude made by itself while one of the user's waited, for that turn's.
+	autoTurn  string
+	heldUsage *protocol.Usage
 	// pluginDir is the generated plugin with the thread's skills, for this run only.
 	pluginDir string
 	launched  *launched
@@ -171,8 +185,18 @@ func newClaudeRun(id string) *claudeRun {
 	return &claudeRun{
 		id: id, pending: map[string]*pendingControl{}, nextRequest: 1, toolCtx: ctx, abort: cancel,
 		msgOfParent: map[string]string{}, blockCount: map[string]int{}, streamed: map[string]bool{},
-		asked: map[string]string{}, open: map[string]*claudeOpen{},
+		asked: map[string]string{}, open: map[string]*claudeOpen{}, tasks: map[string]string{},
 	}
+}
+
+// addAgent notes a call whose subagent the run runs.
+func (r *claudeRun) addAgent(id string) {
+	for _, a := range r.agents {
+		if a == id {
+			return
+		}
+	}
+	r.agents = append(r.agents, id)
 }
 
 func (r *claudeRun) write(msg any) {
@@ -273,6 +297,11 @@ func (r *claudeRun) state() claudeRunState {
 	for _, id := range r.openOrder {
 		st.Open = append(st.Open, [2]any{id, r.open[id]})
 	}
+	for _, k := range sortedKeys(r.tasks) {
+		st.Tasks = append(st.Tasks, [2]string{k, r.tasks[k]})
+	}
+	st.Agents = append([]string(nil), r.agents...)
+	st.AutoTurn, st.HeldUsage = r.autoTurn, r.heldUsage
 	return st
 }
 
@@ -316,6 +345,11 @@ func (r *claudeRun) restore(st claudeRunState, answered func(subtype string) fun
 		r.setOpen(id, &o)
 	}
 	r.sent = append([]sentMessage{}, st.Sent...)
+	for _, kv := range st.Tasks {
+		r.tasks[kv[0]] = kv[1]
+	}
+	r.agents = append([]string(nil), st.Agents...)
+	r.autoTurn, r.heldUsage = st.AutoTurn, st.HeldUsage
 	r.pluginDir = st.PluginDir
 	r.launched = st.Launched
 }
@@ -453,6 +487,10 @@ type claudeSession struct {
 	// tmp is a directory for the thread's generated files (skills, attached files), made when needed.
 	tmp    string
 	closed bool
+	// controls is what fails each of the app's control requests not yet answered, when the backend
+	// lets go of its run.
+	controls    map[int]func(error)
+	nextControl int
 }
 
 // ---------- the core's side ----------
@@ -661,7 +699,80 @@ func (s *claudeSession) Detach() bool {
 	run.detached = true
 	dp.Detach()
 	run.abort()
+	failControls(s.controls, "The backend closed before Claude Code answered.")
 	return true
+}
+
+// failControls fails the app's control requests not yet answered.
+func failControls(controls map[int]func(error), message string) {
+	for _, n := range sortedIntKeys(controls) {
+		if fail := controls[n]; fail != nil {
+			fail(&ControlError{Message: message})
+		}
+	}
+}
+
+func sortedIntKeys[V any](m map[int]V) []int {
+	keys := make([]int, 0, len(m))
+	for k := range m {
+		keys = append(keys, k)
+	}
+	sort.Ints(keys)
+	return keys
+}
+
+// addControl keeps an app's control request's reply until it's answered or failed; it returns the
+// reply to call, which does nothing after the first time.
+func addControl(controls *map[int]func(error), next *int, reply func(json.RawMessage, error)) func(json.RawMessage, error) {
+	if *controls == nil {
+		*controls = map[int]func(error){}
+	}
+	n := *next
+	*next++
+	done := func(result json.RawMessage, err error) {
+		if _, ok := (*controls)[n]; !ok {
+			return
+		}
+		delete(*controls, n)
+		reply(result, err)
+	}
+	(*controls)[n] = func(err error) { done(nil, err) }
+	return done
+}
+
+func (s *claudeSession) Control(request json.RawMessage, reply func(json.RawMessage, error)) error {
+	run := s.live()
+	if run == nil || run.proc == nil || run.detached {
+		return commandErr("thread %s has no running Claude Code process", s.ctx.ThreadID())
+	}
+	req := parseObj(request)
+	if req == nil || !isStr(req.raw("subtype")) {
+		return commandErr("a Claude Code control request is an object with a subtype")
+	}
+	done := addControl(&s.controls, &s.nextControl, reply)
+	id := fmt.Sprintf("req_%d", run.nextRequest)
+	run.nextRequest++
+	run.pending[id] = &pendingControl{subtype: req.str("subtype"), full: func(r jmap) {
+		switch {
+		case r == nil:
+			done(nil, &ControlError{Message: "Claude Code exited before it answered."})
+		case r.str("subtype") == "error":
+			msg := r.str("error")
+			if msg == "" {
+				msg = "Claude Code refused the request."
+			}
+			done(nil, &ControlError{Message: msg, Data: r.raw("error")})
+		default:
+			result := r.raw("response")
+			if result == nil {
+				result = json.RawMessage("null")
+			}
+			done(result, nil)
+		}
+	}}
+	run.pendingOrder = append(run.pendingOrder, id)
+	run.write(map[string]any{"type": "control_request", "request_id": id, "request": json.RawMessage(request)})
+	return nil
 }
 
 // answered says whether an answer to Claude's request id was written before the backend restarted.
@@ -894,7 +1005,7 @@ func sortStrings(s []string) { sort.Strings(s) }
 
 func (s *claudeSession) handlers(run *claudeRun) ProcessHandlers {
 	return ProcessHandlers{
-		Line: func(line string) { s.line(run, line) },
+		Line: func(line string) { s.ctx.FromHarness(run.id, line, func() { s.line(run, line) }) },
 		Stderr: func(line string) {
 			run.stderr = append(run.stderr, line)
 			if len(run.stderr) > 20 {
@@ -935,7 +1046,7 @@ func (s *claudeSession) args(run *claudeRun) ([]string, error) {
 	if !s.o.UserSettings {
 		args = append(args, "--setting-sources", "", "--strict-mcp-config")
 	}
-	args = append(args, "--forward-subagent-text")
+	args = append(args, "--forward-subagent-text", "--include-hook-events")
 	if t.Model != "" {
 		args = append(args, "--model", t.Model)
 	}
@@ -1018,7 +1129,9 @@ func (s *claudeSession) exited(run *claudeRun, status ExitStatus) {
 	order := run.pendingOrder
 	run.pending, run.pendingOrder = map[string]*pendingControl{}, nil
 	for _, id := range order {
-		if p := pending[id]; p != nil && p.resolve != nil {
+		if p := pending[id]; p != nil && p.full != nil {
+			p.full(nil)
+		} else if p != nil && p.resolve != nil {
 			p.resolve(nil)
 		}
 	}
@@ -1030,6 +1143,8 @@ func (s *claudeSession) exited(run *claudeRun, status ExitStatus) {
 	if r := ctx.Thread().Run; r != nil && r.ID == run.id {
 		ctx.SetThread(func(t *protocol.Thread) { t.Run = nil })
 	}
+	// Its subagents end with it.
+	ctx.StopSubagents(run.agents)
 	// A run that ends while its turn is running ends the turn (as interrupted, if it was).
 	if !run.retired && ctx.TurnID() != "" {
 		s.clearStop()
@@ -1049,7 +1164,9 @@ func (s *claudeSession) line(run *claudeRun, line string) {
 	if m.str("type") == "control_response" {
 		// Claude echoes our own responses back too; those aren't for a request of ours.
 		r := m.obj("response")
-		if p := run.takePending(r.str("request_id")); p != nil && p.resolve != nil {
+		if p := run.takePending(r.str("request_id")); p != nil && p.full != nil {
+			p.full(r)
+		} else if p != nil && p.resolve != nil {
 			if r.str("subtype") == "error" {
 				p.resolve(nil)
 			} else if resp := r.obj("response"); resp != nil {
@@ -1069,11 +1186,38 @@ func (s *claudeSession) line(run *claudeRun, line string) {
 func (s *claudeSession) message(run *claudeRun, m jmap) {
 	ctx := s.ctx
 	parent := m.str("parent_tool_use_id")
+	// A message refused for the usage limit says which limit, before anything else it leads to.
+	if t := m.str("type"); (t == "assistant" || t == "user" || t == "result") && m.str("api_error") == "usage_limit_reached" {
+		if info := m.obj("api_error_params").obj("rate_limit_info"); info != nil {
+			ctx.RateLimits(claudeRateLimits(info))
+		}
+	}
 	switch m.str("type") {
+	case "rate_limit_event":
+		if info := m.obj("rate_limit_info"); info != nil {
+			ctx.RateLimits(claudeRateLimits(info))
+		}
 	case "system":
+		// Claude starts a turn by itself to tell the agent that a background subagent has ended.
+		if m.str("subtype") == "init" && ctx.TurnID() == "" {
+			ctx.BeginTurn()
+			run.autoTurn = ctx.TurnID()
+		}
 		sid := m.str("session_id")
 		if m.str("subtype") == "init" && sid != "" && sid != ctx.Thread().SessionID {
 			ctx.SetThread(func(t *protocol.Thread) { t.SessionID = sid })
+		}
+		if m.str("subtype") == "api_retry" {
+			ctx.AddItem(&protocol.Notice{ID: NewID("n"), Level: protocol.NoticeLevelWarning, Code: "retry", Text: retryText(m), ParentID: parent})
+		}
+		if m.str("subtype") == "hook_response" {
+			if n := hookNotice(m); n != nil {
+				n.ID, n.Code, n.ParentID = NewID("n"), "hook", parent
+				ctx.AddItem(n)
+			}
+		}
+		if strings.HasPrefix(m.str("subtype"), "task_") {
+			s.task(run, m)
 		}
 		if m.str("subtype") == "compact_boundary" {
 			meta := m.obj("compact_metadata")
@@ -1176,16 +1320,38 @@ func (s *claudeSession) message(run *claudeRun, m jmap) {
 			ctx.CancelRequest(ours)
 		}
 	case "result":
-		// The turn's requests are moot now; its open questions are cancelled with it.
-		run.open, run.openOrder = map[string]*claudeOpen{}, nil
-		// Its messages are done with: what was kept to translate them needn't be any more.
-		run.msgOfParent, run.blockCount, run.streamed = map[string]string{}, map[string]int{}, map[string]bool{}
+		// The turn's requests are moot now; its open questions are cancelled with it. A background
+		// subagent's carry on.
+		for _, id := range append([]string(nil), run.openOrder...) {
+			if call := toolUseOf(run.open[id].Request); call == "" || !inBackground(ctx.Item, call) {
+				run.dropOpen(id)
+			}
+		}
+		// Its messages are done with: what was kept to translate them needn't be any more, unless a
+		// background subagent is still sending its own.
+		background := false
+		for _, id := range run.agents {
+			if it, ok := ctx.Item(id); ok && runningInBackground(it) {
+				background = true
+			}
+		}
+		if !background {
+			run.msgOfParent, run.blockCount, run.streamed = map[string]string{}, map[string]int{}, map[string]bool{}
+		}
 		if ctx.TurnID() == "" {
+			return
+		}
+		// The end of a turn Claude made by itself (to tell the agent a background subagent ended)
+		// while a turn of the user's waited for it: the user's goes on to its own result, which gets
+		// this one's usage too.
+		if m.obj("origin").str("kind") == "task-notification" && ctx.TurnID() != run.autoTurn {
+			run.heldUsage = addUsage(run.heldUsage, claudeUsage(m))
 			return
 		}
 		s.clearStop()
 		failed := m.bool("is_error")
-		end := TurnEnd{OK: !failed, Usage: claudeUsage(m)}
+		end := TurnEnd{OK: !failed, Usage: addUsage(run.heldUsage, claudeUsage(m))}
+		run.heldUsage = nil
 		if failed {
 			end.Error = m.str("result")
 			if end.Error == "" {
@@ -1278,8 +1444,58 @@ func (s *claudeSession) user(run *claudeRun, m jmap) {
 				patch["changes"] = []protocol.FileChange{*change}
 			}
 		}
+		result := patch["result"].(protocol.ToolResult)
+		if sub := subagentResult(call, b.bool("is_error"), ctx.Interrupted(), m.obj("tool_use_result"), result.Content); sub != nil {
+			patch["subagent"] = sub
+			run.addAgent(call.ID)
+		}
 		ctx.UpdateItem(call.ID, patch)
 	}
+}
+
+// task takes Claude's task_* messages about a subagent: an Agent call's, or a skill's forked one
+// (whose Skill call becomes a subagent call). Other tasks (a command run in the background) aren't.
+func (s *claudeSession) task(run *claudeRun, m jmap) {
+	ctx := s.ctx
+	if m.str("subtype") == "task_started" && m.str("task_type") == "local_agent" && m.str("tool_use_id") != "" {
+		it, ok := ctx.Item(m.str("tool_use_id"))
+		call, isCall := it.Value.(*protocol.ToolCall)
+		if !ok || !isCall {
+			return
+		}
+		if t := m.str("task_id"); t != "" {
+			run.tasks[t] = call.ID
+		}
+		run.addAgent(call.ID)
+		patch := Patch{"subagent": subagentStarted(call, m)}
+		if call.Kind != protocol.ToolKindSubagent {
+			patch["kind"] = protocol.ToolKindSubagent
+			if d := m.str("description"); call.Title == "" && d != "" {
+				patch["title"] = d
+			}
+		}
+		ctx.UpdateItem(call.ID, patch)
+		return
+	}
+	id := m.str("tool_use_id")
+	if id == "" {
+		id = run.tasks[m.str("task_id")]
+	}
+	it, ok := ctx.Item(id)
+	call, isCall := it.Value.(*protocol.ToolCall)
+	if id == "" || !ok || !isCall || call.Subagent == nil {
+		return
+	}
+	ctx.UpdateItem(call.ID, Patch{"subagent": subagentTask(*call.Subagent, m)})
+}
+
+// toolUseOf is the tool call a request of Claude's is about: a can_use_tool's, or an app tool's
+// mcp_message.
+func toolUseOf(req jmap) string {
+	if id := req.str("tool_use_id"); id != "" {
+		return id
+	}
+	return req.obj("message").obj("params").obj("_meta").str("claudecode/toolUseId")
 }
 
 func (s *claudeSession) controlRequest(run *claudeRun, requestID string, req jmap) {
@@ -1315,10 +1531,12 @@ func (s *claudeSession) canUseTool(run *claudeRun, requestID string, req jmap, e
 		}
 		return ctx.Ask(request, toolCallID, answered, standing)
 	}
-	// Whether Claude still wants this answered: not cancelled, its turn not over, its run not gone.
+	// Whether Claude still wants this answered: not cancelled, its turn not over (unless it's a
+	// background subagent's, which carries on after it), its run not gone.
 	wanted := func() bool {
 		_, open := run.open[requestID]
-		return open && !run.exited && !run.retired && !run.detached && s.run == run && ctx.TurnID() == turn
+		return open && !run.exited && !run.retired && !run.detached && s.run == run &&
+			(ctx.TurnID() == turn || (toolUseID != "" && inBackground(ctx.Item, toolUseID)))
 	}
 	allow := func(updated json.RawMessage) {
 		if wanted() {

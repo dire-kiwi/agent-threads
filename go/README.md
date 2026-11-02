@@ -111,6 +111,27 @@ fallback, child-thread subagents, `skills/list` and `skills/extraRoots/set`, an 
 `CODEX_HOME`) holds here too, with the options named the Go way (`ClaudeOptions.StopGrace`,
 `CodexOptions.AppToolsOverMCP`...).
 
+## What the protocol leaves out
+
+See [Pass-through](../spec/PROTOCOL.md#pass-through) in the protocol:
+
+```go
+sdk := agentthreads.New(agentthreads.Options{
+	Raw: true, // events, items and requests carry the harness message they came from
+	OnHarnessMessage: func(m agentthreads.HarnessMessage) {
+		// every line a harness writes (m.Line, and m.Message if it's JSON), e.g. Claude's system
+		// messages or Codex's token usage; on the thread's goroutine, so keep it quick
+	},
+})
+usage, err := sdk.Control(ctx, threadID, json.RawMessage(`{"subtype":"get_context_usage"}`))  // Claude Code
+limits, err := sdk.Control(ctx, threadID, json.RawMessage(`{"method":"account/rateLimits/read"}`)) // Codex
+```
+
+`Control` needs the thread's process to be running (it is from the first `Send` until the SDK
+closes): it returns a `*CommandError` when it isn't, and a `*ControlError` when the harness refuses
+the request or exits first. Usage limits are in each thread's `RateLimits`, and Claude's API retries
+and hooks are `notice` items (codes `retry` and `hook`).
+
 ## Stores
 
 `NewMemoryStore()`, `NewFileStore(dir)` (one JSONL file per thread, synced on each write) and

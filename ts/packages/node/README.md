@@ -85,6 +85,26 @@ items: give `snapshot()` a `limit` for a window of its latest, and a client load
 page at a time with `itemsBefore()` (spec/PROTOCOL.md, "Windows"; the React package's
 `ThreadSource.loadEarlier`).
 
+## What the protocol leaves out
+
+See [Pass-through](../../../spec/PROTOCOL.md#pass-through) in the protocol:
+
+```ts
+const sdk = new AgentThreads({
+  raw: true, // events, items and requests carry the harness message they came from
+  onHarnessMessage: ({ threadId, runId, harness, line, message }) => {
+    // every line a harness writes, e.g. Claude's system messages or Codex's token usage
+  },
+});
+const usage = await sdk.control(threadId, { subtype: "get_context_usage" }); // Claude Code
+const limits = await sdk.control(threadId, { method: "account/rateLimits/read" }); // Codex
+```
+
+`control()` needs the thread's process to be running (it is from the first `send` until the SDK
+closes): it rejects with a `CommandError` when it isn't, and with a `ControlError` when the harness
+refuses the request or exits first. Usage limits are in each thread's `rate_limits`, and Claude's
+API retries and hooks are `notice` items (codes `retry` and `hook`).
+
 ## Stores
 
 `MemoryStore`, `FileStore(dir)` (one JSONL file per thread, synced on each write) and

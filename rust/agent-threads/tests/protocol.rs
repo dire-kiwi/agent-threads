@@ -342,6 +342,22 @@ fn a_window_brings_the_subagents_still_running_with_theirs() {
     assert_eq!(ids(&w["items"]), ["sa", "sb", "m8", "m9"]);
     assert_eq!(value(snapshot_window(&quiet("pending"), 2))["context"], json!([1, 3]));
     assert!(value(snapshot_window(&quiet("cancelled"), 2)).get("context").is_none());
+    // Where the call has its subagent's own status, that says: a background subagent runs on after
+    // its call has completed, and one that ended with its call still running doesn't.
+    let with_subagent = |status: &str| {
+        let mut s = value(quiet("completed"));
+        s["items"][3]["subagent"] = json!({"status": status, "background": true});
+        from::<Snapshot>(s)
+    };
+    assert_eq!(
+        value(snapshot_window(&with_subagent("running"), 2))["context"],
+        json!([1, 3])
+    );
+    assert!(
+        value(snapshot_window(&with_subagent("completed"), 2))
+            .get("context")
+            .is_none()
+    );
 }
 
 #[test]

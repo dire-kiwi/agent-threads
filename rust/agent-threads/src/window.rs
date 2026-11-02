@@ -6,7 +6,7 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
-use crate::protocol::{Item, ItemPage, Snapshot, ThreadRequest, ToolKind, ToolStatus};
+use crate::protocol::{Item, ItemPage, Snapshot, SubagentStatus, ThreadRequest, ToolKind, ToolStatus};
 
 /// The window of `state` with its last `limit` items, and what they need from before them: the
 /// subagent calls they and the open requests belong to, and the open requests' tool calls. With a
@@ -152,9 +152,16 @@ fn indices(items: &[Item]) -> HashMap<&str, usize> {
     items.iter().enumerate().map(|(i, item)| (item.id(), i)).collect()
 }
 
-/// Whether `item` is a subagent's call that hasn't finished.
+/// Whether `item` is a subagent's call whose subagent hasn't finished: by its subagent's status
+/// where it has one (a background subagent's call completes as soon as it has started it), or else
+/// by the call's.
 fn is_running_subagent(item: &Item) -> bool {
-    matches!(item, Item::ToolCall(c) if c.kind == ToolKind::Subagent && matches!(c.status, ToolStatus::Pending | ToolStatus::Running))
+    let Item::ToolCall(c) = item else { return false };
+    c.kind == ToolKind::Subagent
+        && match &c.subagent {
+            Some(s) => s.status == SubagentStatus::Running,
+            None => matches!(c.status, ToolStatus::Pending | ToolStatus::Running),
+        }
 }
 
 /// The indices before `start` of the items with an id in `need`, and of their parents, however

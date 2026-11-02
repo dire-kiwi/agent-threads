@@ -6,7 +6,8 @@ import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { afterEach, describe, expect, it } from "vitest";
 import { applyEvents, initialState, openRequests, type Item, type ThreadEvent, type ThreadRequest, type ToolCall, type TurnResult, type UserMessage } from "@dire-kiwi/agent-threads-protocol";
-import { AgentThreads, CommandError, type AgentThreadsOptions } from "../agent-threads.js";
+import { AgentThreads, CommandError, ControlError, type AgentThreadsOptions } from "../agent-threads.js";
+import type { HarnessMessage } from "../harness.js";
 import { claudeCode, type ClaudeCodeOptions } from "../claude/driver.js";
 import type { LaunchOptions } from "../harness.js";
 import { DONT_ASK_DENIAL } from "../permissions.js";
@@ -21,12 +22,18 @@ import { shimPath, tempDir } from "./spec.js";
 const mini = fileURLToPath(new URL("./mini-claude.mjs", import.meta.url));
 
 let open: AgentThreads[] = [];
-/** Stores to close after the test (AgentThreads leaves its store open): a FileStore's handles. */
-let stores: Store[] = [];
+/** File stores, which are the app's to close (left open, their files are closed when they're collected, which fails). */
+const fileStores: FileStore[] = [];
 afterEach(async () => {
   await Promise.all(open.splice(0).map((s) => s.close()));
-  await Promise.all(stores.splice(0).map((s) => s.close?.()));
+  await Promise.all(fileStores.splice(0).map((s) => s.close()));
 });
+
+function fileStore(): FileStore {
+  const store = new FileStore(tempDir());
+  fileStores.push(store);
+  return store;
+}
 
 interface Setup extends AgentThreadsOptions {
   claude?: ClaudeCodeOptions;
@@ -437,6 +444,87 @@ describe("the Claude driver", () => {
     expect(texts(s.items).at(-1)).toBe('ran with {"command":"pwd"}');
   });
 
+  it("keeps a background subagent's calls and requests after its turn, and runs the turn Claude starts when it ends", async () => {
+    const { sdk, events, runs } = setup({ permissions: (q) => (q.kind === "shell" ? "ask" : "allow") });
+    const t = await sdk.create({ model: "mini" });
+    await sdk.send(t.id, "background 0 apple");
+    // The turn ends with the subagent's call waiting for the user, who's still asked.
+    const req = await until(() => events.find((e) => e.type === "request.opened"));
+    await until(() => events.some((e) => e.type === "turn.completed"));
+    let s = await sdk.snapshot(t.id);
+    expect(s.thread.status).toBe("waiting");
+    expect(openRequests(s)).toHaveLength(1);
+    let [agent, bash] = s.items.filter((i): i is ToolCall => i.type === "tool_call");
+    expect(agent).toMatchObject({ name: "Agent", kind: "subagent", status: "completed", subagent: { status: "running", background: true, agent_type: "general-purpose", model: "mini-1" } });
+    expect(bash).toMatchObject({ name: "Bash", status: "pending", parent_id: agent!.id });
+
+    await sdk.handle({ type: "respond", thread_id: t.id, request_id: req.type === "request.opened" ? req.request.id : "", resolution: { outcome: "allow" } });
+    s = await until(async () => {
+      const x = await sdk.snapshot(t.id);
+      return results(x.items).length === 2 && x.thread.status === "idle" && x;
+    });
+    [agent, bash] = s.items.filter((i): i is ToolCall => i.type === "tool_call");
+    expect(agent!.subagent).toEqual({ status: "completed", background: true, agent_type: "general-purpose", model: "mini-1", activity: "Running true", tool_uses: 1, summary: "apple" });
+    expect(bash).toMatchObject({ status: "completed", result: { content: "done" } });
+    expect(runs()[0]!.sent).toContainEqual(expect.objectContaining({ type: "control_response", response: expect.objectContaining({ response: expect.objectContaining({ behavior: "allow" }) }) }));
+    // Claude's own turn has no message of the user's.
+    const [, second] = results(s.items);
+    expect(s.items.filter((i) => i.type === "user_message" && i.turn_id === second!.turn_id)).toEqual([]);
+    expect(texts(s.items).at(-1)).toBe("the subagent said apple");
+    expectTracked(events, runs());
+  });
+
+  it("keeps a turn of the user's going past a turn Claude makes by itself before taking the user's message in", async () => {
+    const { sdk, events } = setup({ env: { MINI_CLAUDE_NOTIFY_FIRST: "1" } });
+    const t = await sdk.create({ model: "mini" });
+    await sdk.send(t.id, "background 300 apple");
+    await until(() => events.some((e) => e.type === "turn.completed"));
+    // Sent before the subagent is done: Claude reports the subagent first, then takes this in.
+    const from = events.length;
+    await sdk.send(t.id, "reply hi");
+    const s = await until(async () => {
+      const x = await sdk.snapshot(t.id);
+      return texts(x.items).at(-1) === "hi" && x.thread.status === "idle" && x;
+    });
+    expectIdleAfter(events, from, "hi");
+    const [, second] = results(s.items);
+    expect(results(s.items)).toHaveLength(2);
+    // The user's turn has its message, both replies, and both results' usage.
+    expect(s.items.filter((i) => i.turn_id === second!.turn_id && i.type !== "turn_result").map((i) => (i.type === "user_message" || i.type === "assistant_message" ? i.text : i.type))).toEqual([
+      "reply hi",
+      "the subagent said apple",
+      "hi",
+    ]);
+    expect(second!.usage).toMatchObject({ input_tokens: 2, output_tokens: 4 });
+  });
+
+  it("keeps a background subagent's app tool's structured output for the result that comes after its turn", async () => {
+    const lookup = defineTool({ name: "lookup", description: "Looks it up.", input: { type: "object" }, run: () => ({ text: "42", structured: { answer: 42 } }) });
+    const { sdk } = setup({ tools: [lookup], env: { MINI_CLAUDE_BACKGROUND_APP: "lookup" } });
+    const t = await sdk.create({ model: "mini" });
+    await sdk.send(t.id, "background 200 apple");
+    const s = await until(async () => {
+      const x = await sdk.snapshot(t.id);
+      return results(x.items).length === 2 && x.thread.status === "idle" && x;
+    });
+    const call = s.items.find((i): i is ToolCall => i.type === "tool_call" && i.name === "lookup");
+    expect(call).toMatchObject({ status: "completed", result: { content: "42", structured: { answer: 42 } } });
+  });
+
+  it("stops a run's subagents when it ends, and cancels what they were doing", async () => {
+    const { sdk, events } = setup();
+    const t = await sdk.create({ model: "mini" });
+    await sdk.send(t.id, "background 60000 apple");
+    await until(async () => {
+      const x = await sdk.snapshot(t.id);
+      return x.thread.status === "idle" && x.items.some((i) => i.type === "tool_call" && i.name === "Bash" && i.status === "running");
+    });
+    await sdk.close();
+    const [agent, bash] = applyEvents(initialState(t), events).items.filter((i): i is ToolCall => i.type === "tool_call");
+    expect(agent).toMatchObject({ status: "completed", subagent: { status: "stopped", background: true } });
+    expect(bash).toMatchObject({ status: "cancelled", parent_id: agent!.id });
+  });
+
   it("gives a window of a thread's last items, and pages of the items before it", async () => {
     const { sdk } = setup();
     const t = await sdk.create();
@@ -479,6 +567,35 @@ describe("the Claude driver", () => {
     expect(ctx).toMatchObject({ threadId: t.id, metadata: { user: "u1" }, toolCallId: call.id });
     const init = runs()[0]!.sent.find((m) => m.type === "control_request")!;
     expect(init).toMatchObject({ request: { subtype: "initialize", sdkMcpServers: ["app"] } });
+  });
+
+  it("leaves raw out unless it's turned on, and passes the app every line", async () => {
+    const messages: HarnessMessage[] = [];
+    const { sdk, events } = setup({ onHarnessMessage: (m) => messages.push(m) });
+    const t = await sdk.create();
+    await sdk.send(t.id, "reply hi");
+    const s = await settle(sdk, t.id);
+    expect(events.some((e) => "raw" in e || (e.type === "item.added" && "raw" in e.item))).toBe(false);
+    expect(s.items.some((i) => "raw" in i)).toBe(false);
+    const types = messages.map((m) => (m.message as { type?: string }).type);
+    expect(types).toEqual(expect.arrayContaining(["control_response", "system", "assistant", "result"]));
+    expect(messages.every((m) => m.threadId === t.id && m.harness === "claude" && m.runId === s.thread.run?.id && JSON.parse(m.line).type)).toBe(true);
+  });
+
+  it("sends control requests to the running process, and fails them when it can't", async () => {
+    const { sdk, runs } = setup();
+    const t = await sdk.create();
+    await expect(sdk.control(t.id, { subtype: "get_context_usage" })).rejects.toThrow(CommandError);
+    await sdk.send(t.id, "reply hi");
+    await settle(sdk, t.id);
+    await expect(sdk.control(t.id, { subtype: "get_context_usage" })).resolves.toEqual({});
+    await expect(sdk.control(t.id, "get_context_usage")).rejects.toThrow(CommandError);
+    // One the process exits before answering.
+    const pending = sdk.control(t.id, { subtype: "never_answered" }).catch((e: unknown) => e);
+    await until(() => runs()[0]?.sent.some((m) => (m.request as { subtype?: string } | undefined)?.subtype === "never_answered"));
+    await sdk.close();
+    expect(await pending).toBeInstanceOf(ControlError);
+    await expect(sdk.control(t.id, { subtype: "get_context_usage" })).rejects.toThrow(CommandError);
   });
 
   it("fails the turn when Claude can't be started, and tries again on the next send", async () => {
@@ -949,12 +1066,11 @@ describe("the Claude driver", () => {
 });
 
 describe.each([
-  ["FileStore", () => new FileStore(tempDir())],
+  ["FileStore", () => fileStore()],
   ["SqliteStore", () => new SqliteStore(join(tempDir(), "t.db"))],
 ])("AgentThreads on a %s", (_, makeStore) => {
   it("saves events, and picks a thread up again after a restart", async () => {
     const store = makeStore();
-    stores.push(store);
     const { sdk, make, events } = setup({ store });
     const t = await sdk.create({ title: "kept" });
     await sdk.send(t.id, "reply one");
@@ -1150,8 +1266,7 @@ describe("a thread's launch options", () => {
   };
 
   it("start Claude with them, stored with the thread but not sent to clients, after setOptions changes them and after a restart", async () => {
-    const store = new FileStore(tempDir());
-    stores.push(store);
+    const store = fileStore();
     const { sdk, make, events, runs } = setup({
       store,
       claude: { args: ["--own"], configDir: "/instance-config" },

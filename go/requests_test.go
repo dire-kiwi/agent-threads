@@ -58,8 +58,8 @@ func handle(t *testing.T, sdk *agentthreads.AgentThreads, command string) {
 	}
 }
 
-// settled waits until the thread is idle (or failed), with no message queued.
-func settled(t *testing.T, sdk *agentthreads.AgentThreads, id string) protocol.Snapshot {
+// settledQueue waits until the thread is idle (or failed), with no message queued.
+func settledQueue(t *testing.T, sdk *agentthreads.AgentThreads, id string) protocol.Snapshot {
 	t.Helper()
 	var s protocol.Snapshot
 	until(t, func() bool {
@@ -155,14 +155,14 @@ func TestStandingAnswersAreKeptWithTheThreadAndTheAppSeedsAndClearsThem(t *testi
 		t.Fatal(err)
 	}
 	send(t, sdk, th.ID, `tool WebFetch {"url":"https://example.com"}`)
-	if got := lastText(settled(t, sdk, th.ID)); got != "denied: The user has denied this tool for the rest of the thread." {
+	if got := lastText(settledQueue(t, sdk, th.ID)); got != "denied: The user has denied this tool for the rest of the thread." {
 		t.Fatalf("got %q", got)
 	}
 
 	send(t, sdk, th.ID, `tool Bash {"command":"ls"}`)
 	r := openRequest(t, sdk, th.ID, "permission", "")
 	sdk.Respond(ctx, th.ID, r.ID(), protocol.Resolution{Outcome: protocol.ResolutionOutcomeAllow, Always: true})
-	s := settled(t, sdk, th.ID)
+	s := settledQueue(t, sdk, th.ID)
 	standing := `[{"kind":"web","name":"WebFetch","outcome":"deny"},{"kind":"shell","name":"Bash","outcome":"allow"}]`
 	if got := jsonOf(s.Thread.StandingAnswers); got != standing {
 		t.Fatalf("got %s", got)
@@ -182,7 +182,7 @@ func TestStandingAnswersAreKeptWithTheThreadAndTheAppSeedsAndClearsThem(t *testi
 		t.Fatalf("stored %s", jsonOf(stored))
 	}
 	send(t, sdk, th.ID, `tool Bash {"command":"pwd"}`)
-	if s := settled(t, sdk, th.ID); lastText(s) != `ran with {"command":"pwd"}` || len(protocol.OpenRequests(s)) != 0 {
+	if s := settledQueue(t, sdk, th.ID); lastText(s) != `ran with {"command":"pwd"}` || len(protocol.OpenRequests(s)) != 0 {
 		t.Fatalf("got %s", jsonOf(s))
 	}
 
@@ -198,7 +198,7 @@ func TestStandingAnswersAreKeptWithTheThreadAndTheAppSeedsAndClearsThem(t *testi
 
 	// Seeding one answers the open requests it's for.
 	handle(t, sdk, `{"type":"set_options","thread_id":"`+th.ID+`","standing_answers":[{"kind":"shell","name":"Bash","outcome":"allow"}]}`)
-	if got := lastText(settled(t, sdk, th.ID)); got != `ran with {"command":"pwd"}` {
+	if got := lastText(settledQueue(t, sdk, th.ID)); got != `ran with {"command":"pwd"}` {
 		t.Fatalf("got %q", got)
 	}
 }
@@ -212,7 +212,7 @@ func TestAnAnswerGivenAlwaysAnswersTheOpenRequestsForTheSameTool(t *testing.T) {
 	first := openRequest(t, sdk, th.ID, "permission", "")
 	openRequest(t, sdk, th.ID, "permission", first.ID())
 	sdk.Respond(ctx, th.ID, first.ID(), protocol.Resolution{Outcome: protocol.ResolutionOutcomeDeny, Always: true, Message: "No."})
-	s := settled(t, sdk, th.ID)
+	s := settledQueue(t, sdk, th.ID)
 	var got []string
 	for _, r := range resolutions(t, sdk, th.ID) {
 		got = append(got, jsonOf(r.Resolution))
@@ -248,13 +248,13 @@ func TestAModeChangeAnswersOpenPermissionRequestsAndDecidesLaterOnes(t *testing.
 		t.Fatalf("got %s", jsonOf(s))
 	}
 	sdk.Respond(ctx, th.ID, q.ID(), protocol.Resolution{Outcome: protocol.ResolutionOutcomeAnswer, Answers: map[string][]string{"Colour?": {"Blue"}}})
-	settled(t, sdk, th.ID)
+	settledQueue(t, sdk, th.ID)
 
 	mode(protocol.PermissionModeDefault)
 	send(t, sdk, th.ID, `tool Bash {"command":"ls"}`)
 	openRequest(t, sdk, th.ID, "permission", "")
 	mode(protocol.PermissionModeBypass)
-	if got := lastText(settled(t, sdk, th.ID)); got != `ran with {"command":"ls"}` {
+	if got := lastText(settledQueue(t, sdk, th.ID)); got != `ran with {"command":"ls"}` {
 		t.Fatalf("got %q", got)
 	}
 
@@ -263,12 +263,12 @@ func TestAModeChangeAnswersOpenPermissionRequestsAndDecidesLaterOnes(t *testing.
 	send(t, sdk, th.ID, `tool Bash {"command":"pwd"}`)
 	openRequest(t, sdk, th.ID, "permission", "")
 	mode(protocol.PermissionModeDontAsk)
-	if got := lastText(settled(t, sdk, th.ID)); got != "denied: "+agentthreads.DontAskDenial {
+	if got := lastText(settledQueue(t, sdk, th.ID)); got != "denied: "+agentthreads.DontAskDenial {
 		t.Fatalf("got %q", got)
 	}
 	for _, text := range []string{`tool Bash {"command":"id"}`, "tool AskUserQuestion " + question} {
 		send(t, sdk, th.ID, text)
-		if got := lastText(settled(t, sdk, th.ID)); got != "denied: "+agentthreads.DontAskDenial {
+		if got := lastText(settledQueue(t, sdk, th.ID)); got != "denied: "+agentthreads.DontAskDenial {
 			t.Fatalf("%s: got %q", text, got)
 		}
 	}
@@ -296,7 +296,7 @@ func TestAQuestionLeftOpenWhenItsTurnEndsIsAnsweredWithAMessage(t *testing.T) {
 	send(t, sdk, th.ID, "asking AskUserQuestion "+question)
 	q := openRequest(t, sdk, th.ID, "question", "")
 	sdk.Interrupt(ctx, th.ID)
-	s := settled(t, sdk, th.ID)
+	s := settledQueue(t, sdk, th.ID)
 	if s.Thread.Status != protocol.ThreadStatusIdle || len(protocol.OpenRequests(s)) != 1 || protocol.OpenRequests(s)[0].ID() != q.ID() {
 		t.Fatalf("got %s", jsonOf(s))
 	}
@@ -311,7 +311,7 @@ func TestAQuestionLeftOpenWhenItsTurnEndsIsAnsweredWithAMessage(t *testing.T) {
 	}
 	before := len(resolutions(t, sdk, th.ID))
 	handle(t, sdk, `{"type":"respond","thread_id":"`+th.ID+`","request_id":"`+q.ID()+`","resolution":{"outcome":"answer","answers":{"Colour?":["Blue"]},"message":"Thanks."}}`)
-	s = settled(t, sdk, th.ID)
+	s = settledQueue(t, sdk, th.ID)
 	texts := userTexts(s)
 	if got := texts[len(texts)-1]; got != "My answer to the question you asked:\n\n- Colour?\n  Blue\n\nThanks." {
 		t.Fatalf("got %q", got)
@@ -333,11 +333,11 @@ func TestAQuestionLeftOpenWhenItsTurnEndsIsAnsweredWithAMessage(t *testing.T) {
 	send(t, sdk, th.ID, "asking AskUserQuestion "+question)
 	q2 := openRequest(t, sdk, th.ID, "question", "")
 	sdk.Interrupt(ctx, th.ID)
-	if s := settled(t, sdk, th.ID); len(protocol.OpenRequests(s)) != 1 || protocol.OpenRequests(s)[0].ID() != q2.ID() {
+	if s := settledQueue(t, sdk, th.ID); len(protocol.OpenRequests(s)) != 1 || protocol.OpenRequests(s)[0].ID() != q2.ID() {
 		t.Fatalf("got %s", jsonOf(s))
 	}
 	send(t, sdk, th.ID, "reply hi")
-	s = settled(t, sdk, th.ID)
+	s = settledQueue(t, sdk, th.ID)
 	rs := resolutions(t, sdk, th.ID)
 	if last := rs[len(rs)-1]; len(protocol.OpenRequests(s)) != 0 || last.RequestID != q2.ID() || last.Resolution.Outcome != protocol.ResolutionOutcomeCancel {
 		t.Fatalf("got %s", jsonOf(rs))
@@ -345,7 +345,7 @@ func TestAQuestionLeftOpenWhenItsTurnEndsIsAnsweredWithAMessage(t *testing.T) {
 	// Answering it now does nothing.
 	n := len(userTexts(s))
 	sdk.Respond(ctx, th.ID, q2.ID(), protocol.Resolution{Outcome: protocol.ResolutionOutcomeAnswer, Answers: map[string][]string{"Colour?": {"Red"}}})
-	if s := settled(t, sdk, th.ID); len(userTexts(s)) != n {
+	if s := settledQueue(t, sdk, th.ID); len(userTexts(s)) != n {
 		t.Fatalf("got %s", jsonOf(s))
 	}
 }
@@ -389,13 +389,13 @@ func TestAQuestionIsntKeptOpenOnceTheUserSendsAMessageDuringItsTurn(t *testing.T
 		t.Fatalf("got %s", jsonOf(r))
 	}
 	send(t, sdk, th.ID, "reply hi")
-	s := settled(t, sdk, th.ID)
+	s := settledQueue(t, sdk, th.ID)
 	if r := resolutionOf(t, sdk, th.ID, q); len(protocol.OpenRequests(s)) != 0 || r == nil || jsonOf(r) != jsonOf(cancelled) {
 		t.Fatalf("got %s", jsonOf(s))
 	}
 	n := len(userTexts(s))
 	sdk.Respond(ctx, th.ID, q.ID(), protocol.Resolution{Outcome: protocol.ResolutionOutcomeAnswer, Answers: map[string][]string{"Colour?": {"Red"}}})
-	if s := settled(t, sdk, th.ID); len(userTexts(s)) != n {
+	if s := settledQueue(t, sdk, th.ID); len(userTexts(s)) != n {
 		t.Fatalf("got %s", jsonOf(s))
 	}
 
@@ -404,7 +404,7 @@ func TestAQuestionIsntKeptOpenOnceTheUserSendsAMessageDuringItsTurn(t *testing.T
 	q = openRequest(t, sdk, th.ID, "question", "")
 	send(t, sdk, th.ID, "reply later")
 	sdk.Interrupt(ctx, th.ID)
-	s = settled(t, sdk, th.ID)
+	s = settledQueue(t, sdk, th.ID)
 	if r := resolutionOf(t, sdk, th.ID, q); len(protocol.OpenRequests(s)) != 0 || r == nil || jsonOf(r) != jsonOf(cancelled) {
 		t.Fatalf("got %s", jsonOf(s))
 	}
@@ -426,7 +426,7 @@ func TestDontAskDismissesQuestionsKeptOpenAfterTheirTurnsBeforeAndAfterARestart(
 		sdk := newMini(t, agentthreads.NewMemoryStoreOn(state), true)
 		mode(sdk, protocol.PermissionModeDefault)
 		q := interruptedQuestion(t, sdk, th.ID)
-		if s := settled(t, sdk, th.ID); len(protocol.OpenRequests(s)) != 1 || protocol.OpenRequests(s)[0].ID() != q.ID() {
+		if s := settledQueue(t, sdk, th.ID); len(protocol.OpenRequests(s)) != 1 || protocol.OpenRequests(s)[0].ID() != q.ID() {
 			t.Fatalf("got %s", jsonOf(s))
 		}
 		if restart {
@@ -446,7 +446,7 @@ func TestDontAskDismissesQuestionsKeptOpenAfterTheirTurnsBeforeAndAfterARestart(
 			return out
 		}())
 		mode(sdk, protocol.PermissionModeDontAsk)
-		s := settled(t, sdk, th.ID)
+		s := settledQueue(t, sdk, th.ID)
 		want := protocol.Resolution{Outcome: protocol.ResolutionOutcomeCancel, Message: agentthreads.DontAskDenial}
 		if r := resolutionOf(t, sdk, th.ID, q); len(protocol.OpenRequests(s)) != 0 || r == nil || jsonOf(r) != jsonOf(want) {
 			t.Fatalf("restart %v: got %s", restart, jsonOf(s))
@@ -502,7 +502,7 @@ func TestWithoutLateAnswersATurnThatEndsCancelsItsQuestions(t *testing.T) {
 	send(t, sdk, th.ID, "asking AskUserQuestion "+question)
 	openRequest(t, sdk, th.ID, "question", "")
 	sdk.Interrupt(ctx, th.ID)
-	if s := settled(t, sdk, th.ID); len(protocol.OpenRequests(s)) != 0 {
+	if s := settledQueue(t, sdk, th.ID); len(protocol.OpenRequests(s)) != 0 {
 		t.Fatalf("got %s", jsonOf(s))
 	}
 }

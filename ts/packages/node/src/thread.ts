@@ -7,6 +7,7 @@ import {
   type Attachment,
   type Item,
   type QuestionRequest,
+  type RateLimit,
   type Resolution,
   type Snapshot,
   type Thread,
@@ -15,7 +16,7 @@ import {
   type Usage,
   type UserMessage,
 } from "@dire-kiwi/agent-threads-protocol";
-import type { HarnessSession, LaunchOptions, Message, NewItem, NewRequest, ThreadConfig, ThreadContext, TurnEnd } from "./harness.js";
+import { ancestors, inBackground, type HarnessMessage, type HarnessSession, type LaunchOptions, type Message, type NewItem, type NewRequest, type ThreadConfig, type ThreadContext, type TurnEnd } from "./harness.js";
 import { newId } from "./ids.js";
 import { normalLaunch, sameLaunch, storedThread, type StoredThread } from "./launch.js";
 import { DONT_ASK_DENIAL, decide, modeDecision, permissionKey, standsFor, type PermissionDecision, type PermissionPolicy, type PermissionQuery, type StandingKey } from "./permissions.js";
@@ -77,7 +78,11 @@ export interface Outgoing {
 export interface RuntimeHost {
   store: Store;
   spawner: Spawner;
+  /** Fill in events' `raw` (the raw option). */
+  raw: boolean;
   publish(event: ThreadEvent): void;
+  /** A line from the thread's harness, for the app's onHarnessMessage. */
+  harnessMessage(message: HarnessMessage): void;
   error(error: unknown): void;
   /** AgentThreadsOptions.lateAnswers. */
   lateAnswers?: boolean;
@@ -119,6 +124,8 @@ export class ThreadRuntime implements ThreadContext {
   #streaming = new Set<string>();
   /** App tools' structured output, by tool call, until the harness gives the call its result. */
   #structured = new Map<string, unknown>();
+  /** The harness message being handled, which events made now have as their `raw` (with the raw option). */
+  #raw: unknown = undefined;
 
   constructor(host: RuntimeHost, state: Snapshot, config: ThreadConfig, launch: LaunchOptions, policy: PermissionPolicy) {
     this.#host = host;
@@ -154,6 +161,13 @@ export class ThreadRuntime implements ThreadContext {
   // ---------- events ----------
 
   emit(event: Unnumbered): void {
+    // An item or request has the harness message it came from, and its event doesn't as well.
+    const raw = this.#raw;
+    if (raw !== undefined) {
+      if (event.type === "item.added") event = { ...event, item: { ...event.item, raw } };
+      else if (event.type === "request.opened") event = { ...event, request: { ...event.request, raw } };
+      else event = { ...event, raw };
+    }
     const saved = event.type !== "delta";
     const e = { ...event, thread_id: this.threadId, seq: this.#state.seq + (saved ? 1 : 0) } as ThreadEvent;
     this.#state = applyEvent(this.#state, e);
@@ -436,6 +450,24 @@ export class ThreadRuntime implements ThreadContext {
     this.emit({ type: "thread.updated", thread: next as unknown as Thread });
   }
 
+  rateLimits(limits: RateLimit[]): void {
+    if (!limits.length) return;
+    const all = new Map((this.thread.rate_limits ?? []).map((l) => [l.id, l]));
+    for (const l of limits) all.set(l.id, l);
+    this.setThread({ rate_limits: [...all.values()].sort((a, b) => (a.id < b.id ? -1 : a.id > b.id ? 1 : 0)) });
+  }
+
+  fromHarness(runId: string, line: string, message: unknown, handle: () => void): void {
+    const before = this.#raw;
+    if (this.#host.raw && message !== undefined) this.#raw = message;
+    try {
+      handle();
+    } finally {
+      this.#raw = before;
+    }
+    this.#host.harnessMessage({ threadId: this.threadId, runId, harness: this.thread.harness, line, ...(message !== undefined ? { message } : {}) });
+  }
+
   // ---------- turns ----------
 
   /** Sends a message: starts a turn, or steers the running one. */
@@ -488,24 +520,27 @@ export class ThreadRuntime implements ThreadContext {
   endTurn(end: TurnEnd, { carry = true }: { carry?: boolean } = {}): void {
     const turn = this.turn;
     if (!turn) return;
+    // What a background subagent that's still running does carries on after the turn: its text
+    // still streaming, its calls (and their structured output, still to go with their results)
+    // and its requests.
+    const lookup = (id: string) => this.item(id);
     // Text streamed but never finished (its process went first) is kept as it was shown.
+    this.#finishText((id) => !inBackground(lookup, id));
+    for (const id of [...this.#structured.keys()]) if (!inBackground(lookup, id)) this.#structured.delete(id);
     for (const it of this.#state.items) {
-      if (it.type !== "assistant_message" && it.type !== "reasoning") continue;
-      const saved = this.item(it.id);
-      if (saved && "text" in saved && saved.text !== it.text) this.updateItem(it.id, { text: it.text });
-    }
-    this.#streaming.clear();
-    this.#structured.clear();
-    for (const it of this.#state.items) {
-      if (it.type === "tool_call" && it.turn_id === turn.id && (it.status === "running" || it.status === "pending")) {
-        this.updateItem(it.id, { status: "cancelled" });
+      if (it.type === "tool_call" && it.turn_id === turn.id && (it.status === "running" || it.status === "pending") && !inBackground(lookup, it.id)) {
+        // A subagent cut short (by an interrupt, or its process ending) is stopped with its call.
+        this.updateItem(it.id, { status: "cancelled", ...(it.subagent?.status === "running" ? { subagent: { ...it.subagent, status: "stopped" } } : {}) });
       }
     }
     // Questions are kept open after the turn (some may be already: see cancelRequest()), unless
     // messages are left queued, which a turn carries over or the next message sends: the
     // conversation has moved on.
     for (const [id, r] of this.#requests) {
-      const keep = r.late ? !this.#queue.length : r.request.turn_id !== undefined && r.request.turn_id !== turn.id;
+      // A background subagent's requests stay open, for it.
+      const keep = r.late
+        ? !this.#queue.length
+        : (r.request.turn_id !== undefined && r.request.turn_id !== turn.id) || (r.request.tool_call_id !== undefined && inBackground(lookup, r.request.tool_call_id));
       if (keep) continue;
       this.#requests.delete(id);
       if (r.late || !this.#keepLate(r.request, r.users)) this.emit({ type: "request.resolved", request_id: id, resolution: { outcome: "cancel" } });
@@ -545,7 +580,7 @@ export class ThreadRuntime implements ThreadContext {
       (retry && turn.interrupted) ||
       (carried > 0 && !ok && !(this.session?.live() ?? false));
     if (giveUp) {
-      this.setThread({ status: error ? "error" : "idle", error, usage });
+      this.setThread({ status: error ? "error" : this.#waiting() ? "waiting" : "idle", error, usage });
       if (left.length && carry && !this.closing) this.session?.release();
       if (left.length && !this.closing) this.#undelivered(left.length);
       void this.saveSnapshot();
@@ -557,6 +592,47 @@ export class ThreadRuntime implements ThreadContext {
     this.emit({ type: "turn.started", turn_id: this.turn.id });
     this.setThread({ status: "running", error: undefined, usage });
     this.session?.carryOver(left.map((m) => toMessage(m.id, m)));
+  }
+
+  /** Keeps text streamed into the items `which` picks, but never finished, as it was shown. */
+  #finishText(which: (id: string) => boolean): void {
+    for (const it of this.#state.items) {
+      if ((it.type !== "assistant_message" && it.type !== "reasoning") || !which(it.id)) continue;
+      const saved = this.item(it.id);
+      if (saved && "text" in saved && saved.text !== it.text) this.updateItem(it.id, { text: it.text });
+    }
+    for (const id of [...this.#streaming]) if (which(id)) this.#streaming.delete(id);
+  }
+
+  beginTurn(): void {
+    if (this.turn || this.closed || this.closing) return;
+    this.turn = { id: newId("turn"), interrupted: false };
+    this.emit({ type: "turn.started", turn_id: this.turn.id });
+    this.setThread({ status: "running", error: undefined });
+  }
+
+  stopSubagents(ids: Iterable<string>): void {
+    const stopped = new Set<string>();
+    for (const id of ids) {
+      const it = this.item(id);
+      if (it?.type !== "tool_call" || it.subagent?.status !== "running") continue;
+      stopped.add(id);
+      this.updateItem(id, { subagent: { ...it.subagent, status: "stopped" } });
+    }
+    if (!stopped.size) return;
+    const lookup = (id: string) => this.item(id);
+    const within = (id: string) => [...ancestors(lookup, id)].some((a) => stopped.has(a.id));
+    this.#finishText(within);
+    for (const id of [...this.#structured.keys()]) if (within(id)) this.#structured.delete(id);
+    for (const it of this.#state.items) {
+      if (it.type === "tool_call" && (it.status === "running" || it.status === "pending") && within(it.id)) this.updateItem(it.id, { status: "cancelled" });
+    }
+    for (const [id, r] of this.#requests) {
+      if (!r.request.tool_call_id || !within(r.request.tool_call_id)) continue;
+      this.#requests.delete(id);
+      this.emit({ type: "request.resolved", request_id: id, resolution: { outcome: "cancel" } });
+    }
+    if (!this.#waiting() && !this.turn && this.#state.thread.status === "waiting") this.setThread({ status: "idle" });
   }
 
   #undelivered(n: number): void {
@@ -644,7 +720,8 @@ export class ThreadRuntime implements ThreadContext {
     this.#requests.delete(requestId);
     // The answers to secret questions go only to the harness: what's sent and saved hides them.
     this.emit({ type: "request.resolved", request_id: requestId, resolution: redact(open.request, resolution) });
-    if (!this.#waiting() && this.turn) this.setThread({ status: "running" });
+    // A background subagent's request can be answered when no turn is running.
+    if (!this.#waiting() && (this.turn || this.#state.thread.status === "waiting")) this.setThread({ status: this.turn ? "running" : "idle" });
     const key = open.standing;
     const always = resolution.always && key && (resolution.outcome === "allow" || resolution.outcome === "deny");
     if (always) {
@@ -676,7 +753,7 @@ export class ThreadRuntime implements ThreadContext {
     if (!(this.interrupted && this.#keepLate(open.request, open.users))) {
       this.emit({ type: "request.resolved", request_id: id, resolution: { outcome: "cancel" } });
     }
-    if (!this.#waiting() && this.turn) this.setThread({ status: "running" });
+    if (!this.#waiting() && (this.turn || this.#state.thread.status === "waiting")) this.setThread({ status: this.turn ? "running" : "idle" });
   }
 
   /** Whether the turn waits on a request (one that isn't kept open after its turn). */

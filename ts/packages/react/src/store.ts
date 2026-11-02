@@ -140,10 +140,21 @@ export class ThreadStore {
       // source throws) is done with by the time it returns, and the next is asked for afresh.
       let done!: () => void;
       const paging = (this.paging = new Promise<void>((r) => (done = r)));
-      void this.page().finally(() => {
-        if (this.paging === paging) this.paging = null;
-        done();
-      });
+      void this.page()
+        .catch((e) => {
+          // It threw after the page came (putting it in, or a listener): it failed, so isn't stuck
+          // loading. Unless what threw had started the next load, which is under way.
+          if (this.paging !== paging && this.paging) return void console.error("agent-threads: loading earlier items failed", e);
+          try {
+            this.pageFailed(e);
+          } catch (e) {
+            console.error("agent-threads: a listener failed", e);
+          }
+        })
+        .finally(() => {
+          if (this.paging === paging) this.paging = null;
+          done();
+        });
       return paging;
     };
     if (to === undefined) {
@@ -172,11 +183,7 @@ export class ThreadStore {
       try {
         page = await this.source.loadEarlier!(before);
       } catch (e) {
-        this.recorded = null;
-        // Done before it says so, so what that sets off can load the next.
-        this.paging = null;
-        console.error("agent-threads: loading earlier items failed", e);
-        this.update({ ...this.state, loadingEarlier: false, earlierError: e instanceof Error ? e.message : String(e) });
+        this.pageFailed(e);
         return;
       }
       const recorded = this.recorded;
@@ -195,17 +202,31 @@ export class ThreadStore {
         theirs = applyEvent(theirs, e);
       }
       const snapshot = withPage(s, { ...page, items: theirs.items, requests: theirs.requests });
-      if (snapshot === s) console.warn(`agent-threads: the page of items before ${before} doesn't fit the thread's window any more; left out`);
+      // A page that doesn't end at the window's start (or is another thread's) is left out. It's a
+      // failure, not done, so loading back to an item doesn't ask for the same page forever.
+      if (snapshot === s) {
+        this.pageFailed(new Error(`the page of items before ${before} doesn't fit the thread's window`));
+        return;
+      }
       this.update({
         ...this.state,
         snapshot,
-        view: snapshot === s ? this.state.view : buildView(snapshot.items, snapshot.requests, this.state.view),
+        view: buildView(snapshot.items, snapshot.requests, this.state.view),
         loadingEarlier: false,
       });
       return;
     }
     this.paging = null;
     if (this.state.loadingEarlier) this.update({ ...this.state, loadingEarlier: false });
+  }
+
+  /** Notes that loading earlier items failed, and why. */
+  private pageFailed(e: unknown) {
+    this.recorded = null;
+    // Done before it says so, so what that sets off can load the next.
+    this.paging = null;
+    console.error("agent-threads: loading earlier items failed", e);
+    this.update({ ...this.state, loadingEarlier: false, earlierError: e instanceof Error ? e.message : String(e) });
   }
 
   /** Takes one of the thread's events (as the source's subscription does). */

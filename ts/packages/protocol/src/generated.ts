@@ -38,6 +38,10 @@ export type Item = UserMessage | AssistantMessage | Reasoning | ToolCall | Compa
  */
 export type ToolStatus = "pending" | "running" | "completed" | "failed" | "denied" | "cancelled";
 /**
+ * running: it's working. completed: it finished. failed: it ended with an error. stopped: it was stopped (killed, interrupted, or its harness process ended) before it finished.
+ */
+export type SubagentStatus = "running" | "completed" | "failed" | "stopped";
+/**
  * A request, told apart by type: open, or resolved (with its resolution).
  */
 export type ThreadRequest = PermissionRequest | QuestionRequest;
@@ -188,6 +192,10 @@ export interface Thread {
    */
   standing_answers?: StandingAnswer[];
   /**
+   * The usage limits of the account the harness runs on, as it last reported them in this thread, sorted by id. Absent until it reports one.
+   */
+  rate_limits?: RateLimit[];
+  /**
    * The app's own data, given when the thread was created. Backends store it and pass it to tools; they don't read it.
    */
   metadata?: {
@@ -226,6 +234,31 @@ export interface Run {
    * When a restarted backend last re-attached to the run. Absent if it never has.
    */
   reattached_at?: string;
+}
+/**
+ * A usage limit of the account the harness runs on (a subscription's session or weekly limit, say), as the harness last reported it.
+ */
+export interface RateLimit {
+  /**
+   * Which limit, by the harness's name for it: Claude Code's rateLimitType (five_hour, seven_day, seven_day_opus...), Codex's primary and secondary windows.
+   */
+  id: string;
+  /**
+   * allowed: there's room. warning: it's nearly used up, or used up with extra usage carrying on. rejected: the harness refuses turns until it resets.
+   */
+  status: "allowed" | "warning" | "rejected";
+  /**
+   * How much of it is used, from 0 to 100, when the harness says.
+   */
+  used_percent?: number;
+  /**
+   * When it resets, when the harness says.
+   */
+  resets_at?: string;
+  /**
+   * How long its window is, when the harness says.
+   */
+  window_minutes?: number;
 }
 /**
  * A turn started: the agent is working on a message.
@@ -397,6 +430,7 @@ export interface ToolCall {
    * todo: the whole list after the call.
    */
   todos?: Todo[];
+  subagent?: SubagentState;
   /**
    * The id of the subagent tool_call this item belongs to. Absent for the main conversation.
    */
@@ -447,6 +481,36 @@ export interface FileChange {
 export interface Todo {
   text: string;
   status: "pending" | "in_progress" | "completed";
+}
+/**
+ * A subagent, as its call (a tool_call of kind subagent) shows it: how it's getting on, and how it ended.
+ */
+export interface SubagentState {
+  status: SubagentStatus;
+  /**
+   * It runs in the background: its call returned as soon as it started, and it carries on (its items keep arriving, after its turn has ended too) until it ends.
+   */
+  background?: boolean;
+  /**
+   * What kind of agent it is (Claude's subagent_type, e.g. general-purpose).
+   */
+  agent_type?: string;
+  /**
+   * The model it runs on.
+   */
+  model?: string;
+  /**
+   * What it's doing, as of its latest progress report (e.g. Reading notes.txt).
+   */
+  activity?: string;
+  /**
+   * How many tool calls it has made.
+   */
+  tool_uses?: number;
+  /**
+   * A background subagent's final report, once it has ended. (A foreground one's is its call's result.)
+   */
+  summary?: string;
 }
 /**
  * The harness compacted the conversation's context.

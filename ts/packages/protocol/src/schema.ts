@@ -562,6 +562,9 @@ export const schema: { readonly $defs: { readonly [name: string]: unknown } } = 
             "$ref": "#/$defs/Todo"
           }
         },
+        "subagent": {
+          "$ref": "#/$defs/SubagentState"
+        },
         "parent_id": {
           "type": "string"
         },
@@ -619,6 +622,46 @@ export const schema: { readonly $defs: { readonly [name: string]: unknown } } = 
           "type": "integer"
         }
       }
+    },
+    "SubagentState": {
+      "type": "object",
+      "required": [
+        "status"
+      ],
+      "properties": {
+        "status": {
+          "$ref": "#/$defs/SubagentStatus"
+        },
+        "background": {
+          "type": "boolean",
+          "default": false
+        },
+        "agent_type": {
+          "type": "string"
+        },
+        "model": {
+          "type": "string"
+        },
+        "activity": {
+          "type": "string"
+        },
+        "tool_uses": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "summary": {
+          "type": "string"
+        }
+      }
+    },
+    "SubagentStatus": {
+      "type": "string",
+      "enum": [
+        "running",
+        "completed",
+        "failed",
+        "stopped"
+      ]
     },
     "FileChange": {
       "type": "object",
@@ -1142,6 +1185,12 @@ export const schema: { readonly $defs: { readonly [name: string]: unknown } } = 
             "$ref": "#/$defs/StandingAnswer"
           }
         },
+        "rate_limits": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/RateLimit"
+          }
+        },
         "metadata": {
           "type": "object",
           "additionalProperties": true
@@ -1225,6 +1274,38 @@ export const schema: { readonly $defs: { readonly [name: string]: unknown } } = 
         "reattached_at": {
           "type": "string",
           "format": "date-time"
+        }
+      }
+    },
+    "RateLimit": {
+      "type": "object",
+      "required": [
+        "id",
+        "status"
+      ],
+      "properties": {
+        "id": {
+          "type": "string"
+        },
+        "status": {
+          "type": "string",
+          "enum": [
+            "allowed",
+            "warning",
+            "rejected"
+          ]
+        },
+        "used_percent": {
+          "type": "number",
+          "minimum": 0
+        },
+        "resets_at": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "window_minutes": {
+          "type": "integer",
+          "minimum": 0
         }
       }
     },

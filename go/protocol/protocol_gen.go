@@ -1047,6 +1047,11 @@ type ToolCall struct {
 	// todo: the whole list after the call.
 	Todos []Todo `json:"todos,omitempty"`
 
+	// subagent: the subagent itself, once the harness says it has started. Its status is the
+	// subagent's, which a background subagent's call (completed as soon as it has started it) doesn't
+	// show.
+	Subagent *SubagentState `json:"subagent,omitempty"`
+
 	// The id of the subagent tool_call this item belongs to. Absent for the main conversation.
 	ParentID string `json:"parent_id,omitempty"`
 
@@ -1063,7 +1068,7 @@ type ToolCall struct {
 	Extra map[string]json.RawMessage `json:"-"`
 }
 
-var knownToolCall = fieldSet("type", "id", "name", "kind", "input", "status", "result", "title", "command", "path", "changes", "query", "url", "server", "todos", "parent_id", "turn_id", "created_at", "raw")
+var knownToolCall = fieldSet("type", "id", "name", "kind", "input", "status", "result", "title", "command", "path", "changes", "query", "url", "server", "todos", "subagent", "parent_id", "turn_id", "created_at", "raw")
 
 func (v ToolCall) MarshalJSON() ([]byte, error) {
 	type plain ToolCall
@@ -1179,6 +1184,77 @@ func (v *ToolResult) UnmarshalJSON(data []byte) error {
 	*v = ToolResult(p)
 	return nil
 }
+
+// SubagentState: A subagent, as its call (a tool_call of kind subagent) shows it: how it's getting
+// on, and how it ended.
+type SubagentState struct {
+	Status SubagentStatus `json:"status"`
+
+	// It runs in the background: its call returned as soon as it started, and it carries on (its items
+	// keep arriving, after its turn has ended too) until it ends.
+	Background bool `json:"background,omitempty"`
+
+	// What kind of agent it is (Claude's subagent_type, e.g. general-purpose).
+	AgentType string `json:"agent_type,omitempty"`
+
+	// The model it runs on.
+	Model string `json:"model,omitempty"`
+
+	// What it's doing, as of its latest progress report (e.g. Reading notes.txt).
+	Activity string `json:"activity,omitempty"`
+
+	// How many tool calls it has made.
+	ToolUses *int64 `json:"tool_uses,omitempty"`
+
+	// A background subagent's final report, once it has ended. (A foreground one's is its call's
+	// result.)
+	Summary string `json:"summary,omitempty"`
+
+	// Extra has the fields the spec doesn't name, as they came, so that they're written again
+	// unchanged (receivers ignore fields they don't know, and stores keep them).
+	Extra map[string]json.RawMessage `json:"-"`
+}
+
+var knownSubagentState = fieldSet("status", "background", "agent_type", "model", "activity", "tool_uses", "summary")
+
+func (v SubagentState) MarshalJSON() ([]byte, error) {
+	type plain SubagentState
+	p := plain(v)
+	data, err := json.Marshal(p)
+	if err != nil {
+		return nil, err
+	}
+	return withExtra(data, v.Extra, knownSubagentState)
+}
+
+func (v *SubagentState) UnmarshalJSON(data []byte) error {
+	if isNull(data) {
+		return nil
+	}
+	type plain SubagentState
+	var p plain
+	if err := json.Unmarshal(data, &p); err != nil {
+		return err
+	}
+	extra, err := extraFields(data, knownSubagentState)
+	if err != nil {
+		return err
+	}
+	p.Extra = extra
+	*v = SubagentState(p)
+	return nil
+}
+
+// SubagentStatus: running: it's working. completed: it finished. failed: it ended with an error.
+// stopped: it was stopped (killed, interrupted, or its harness process ended) before it finished.
+type SubagentStatus string
+
+const (
+	SubagentStatusRunning   SubagentStatus = "running"
+	SubagentStatusCompleted SubagentStatus = "completed"
+	SubagentStatusFailed    SubagentStatus = "failed"
+	SubagentStatusStopped   SubagentStatus = "stopped"
+)
 
 type FileChange struct {
 	Path string       `json:"path"`
@@ -2055,6 +2131,10 @@ type Thread struct {
 	// the thread, or with set_options).
 	StandingAnswers []StandingAnswer `json:"standing_answers,omitempty"`
 
+	// The usage limits of the account the harness runs on, as it last reported them in this thread,
+	// sorted by id. Absent until it reports one.
+	RateLimits []RateLimit `json:"rate_limits,omitempty"`
+
 	// The app's own data, given when the thread was created. Backends store it and pass it to tools;
 	// they don't read it.
 	Metadata  map[string]json.RawMessage `json:"metadata,omitempty"`
@@ -2066,7 +2146,7 @@ type Thread struct {
 	Extra map[string]json.RawMessage `json:"-"`
 }
 
-var knownThread = fieldSet("id", "harness", "status", "title", "model", "effort", "permission_mode", "cwd", "session_id", "usage", "error", "run", "standing_answers", "metadata", "created_at", "updated_at")
+var knownThread = fieldSet("id", "harness", "status", "title", "model", "effort", "permission_mode", "cwd", "session_id", "usage", "error", "run", "standing_answers", "rate_limits", "metadata", "created_at", "updated_at")
 
 func (v Thread) MarshalJSON() ([]byte, error) {
 	type plain Thread
@@ -2233,6 +2313,72 @@ type RunSpawner string
 const (
 	RunSpawnerDirect RunSpawner = "direct"
 	RunSpawnerShim   RunSpawner = "shim"
+)
+
+// RateLimit: A usage limit of the account the harness runs on (a subscription's session or weekly
+// limit, say), as the harness last reported it.
+type RateLimit struct {
+
+	// Which limit, by the harness's name for it: Claude Code's rateLimitType (five_hour, seven_day,
+	// seven_day_opus...), Codex's primary and secondary windows.
+	ID string `json:"id"`
+
+	// allowed: there's room. warning: it's nearly used up, or used up with extra usage carrying on.
+	// rejected: the harness refuses turns until it resets.
+	Status RateLimitStatus `json:"status"`
+
+	// How much of it is used, from 0 to 100, when the harness says.
+	UsedPercent *float64 `json:"used_percent,omitempty"`
+
+	// When it resets, when the harness says.
+	ResetsAt string `json:"resets_at,omitempty"`
+
+	// How long its window is, when the harness says.
+	WindowMinutes *int64 `json:"window_minutes,omitempty"`
+
+	// Extra has the fields the spec doesn't name, as they came, so that they're written again
+	// unchanged (receivers ignore fields they don't know, and stores keep them).
+	Extra map[string]json.RawMessage `json:"-"`
+}
+
+var knownRateLimit = fieldSet("id", "status", "used_percent", "resets_at", "window_minutes")
+
+func (v RateLimit) MarshalJSON() ([]byte, error) {
+	type plain RateLimit
+	p := plain(v)
+	data, err := json.Marshal(p)
+	if err != nil {
+		return nil, err
+	}
+	return withExtra(data, v.Extra, knownRateLimit)
+}
+
+func (v *RateLimit) UnmarshalJSON(data []byte) error {
+	if isNull(data) {
+		return nil
+	}
+	type plain RateLimit
+	var p plain
+	if err := json.Unmarshal(data, &p); err != nil {
+		return err
+	}
+	extra, err := extraFields(data, knownRateLimit)
+	if err != nil {
+		return err
+	}
+	p.Extra = extra
+	*v = RateLimit(p)
+	return nil
+}
+
+// RateLimitStatus: allowed: there's room. warning: it's nearly used up, or used up with extra usage
+// carrying on. rejected: the harness refuses turns until it resets.
+type RateLimitStatus string
+
+const (
+	RateLimitStatusAllowed  RateLimitStatus = "allowed"
+	RateLimitStatusWarning  RateLimitStatus = "warning"
+	RateLimitStatusRejected RateLimitStatus = "rejected"
 )
 
 // Usage: Token counts.

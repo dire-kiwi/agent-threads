@@ -12,12 +12,14 @@ use serde_json::{Map, Value, json};
 use tokio::sync::{Mutex, broadcast, oneshot};
 use tokio::task::JoinHandle;
 
-use crate::harness::{Harness, LaunchOptions, McpServer, Skill, ThreadConfig, TurnEnd};
+use crate::harness::{
+    ControlReply, Harness, HarnessMessageHandler, LaunchOptions, McpServer, Skill, ThreadConfig, TurnEnd,
+};
 use crate::ids::{new_id, now_iso};
 use crate::permissions::PermissionPolicy;
 use crate::protocol::{
-    Attachment, Command, Item, ItemPage, PermissionMode, Resolution, Snapshot, StandingAnswer, Thread, ThreadEvent,
-    ThreadStatus,
+    Attachment, Command, Item, ItemPage, PermissionMode, Resolution, Snapshot, StandingAnswer, SubagentStatus, Thread,
+    ThreadEvent, ThreadStatus,
 };
 use crate::reducer::{apply_event, initial_state, open_requests};
 use crate::spawner::{Spawner, direct};
@@ -35,6 +37,10 @@ pub enum Error {
     Command(String),
     /// The store failed.
     Store(StoreError),
+    /// A control request ([`AgentThreads::control`]) the harness refused, or didn't answer: its
+    /// process exited first, or the backend closed. `error` is the harness's own error, when it
+    /// gave one (Claude Code's error text, or Codex's JSON-RPC error object).
+    Control { message: String, error: Option<Value> },
     /// Something else: a harness that misbehaved, say (for `on_error`).
     Other(String),
 }
@@ -42,7 +48,7 @@ pub enum Error {
 impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Error::Command(m) | Error::Other(m) => f.write_str(m),
+            Error::Command(m) | Error::Other(m) | Error::Control { message: m, .. } => f.write_str(m),
             Error::Store(e) => write!(f, "the store failed: {e}"),
         }
     }
@@ -119,6 +125,14 @@ pub struct Options {
     /// conversation has moved on first (the user sent a message, or one was left queued). Secret
     /// ones are cancelled still, and dont_ask dismisses them.
     pub late_answers: bool,
+    /// Fill in `raw` on events, items and requests: the harness message each came from. Off by
+    /// default; it's saved with the events, so they take more room.
+    pub raw: bool,
+    /// Called with every line a thread's harness process writes, once its driver has dealt with it:
+    /// for what the protocol leaves out (Claude Code's system messages and rate limit events,
+    /// Codex's token usage...). It's called on the thread's task as the output is read, so it
+    /// should be quick, and mustn't wait on the backend.
+    pub on_harness_message: Option<HarnessMessageHandler>,
 }
 
 impl Default for Options {
@@ -131,6 +145,8 @@ impl Default for Options {
             on_error: None,
             event_capacity: 4096,
             late_answers: false,
+            raw: false,
+            on_harness_message: None,
         }
     }
 }
@@ -281,6 +297,8 @@ struct Inner {
     capabilities: Capabilities,
     on_error: Arc<dyn Fn(Error) + Send + Sync>,
     late_answers: bool,
+    raw: bool,
+    on_harness_message: Option<HarnessMessageHandler>,
     events: broadcast::Sender<ThreadEvent>,
     threads: StdMutex<Threads>,
     configs: StdMutex<HashMap<String, Capabilities>>,
@@ -324,6 +342,8 @@ impl AgentThreads {
                 capabilities: options.capabilities,
                 late_answers: options.late_answers,
                 on_error,
+                raw: options.raw,
+                on_harness_message: options.on_harness_message,
                 events,
                 threads: StdMutex::new(Threads::default()),
                 configs: StdMutex::new(HashMap::new()),
@@ -686,6 +706,31 @@ impl AgentThreads {
         abandon(&self.inner.spawner, &self.inner.store, &self.inner.on_error, run).await;
     }
 
+    /// Sends the thread's running harness process a request of the app's own, and returns its
+    /// answer: for Claude Code a control request's `request` (e.g. `{"subtype":
+    /// "get_context_usage"}`), answered with the control response's `response`; for Codex
+    /// `{"method", "params"?}`, answered with the JSON-RPC result. It's an `Error::Command` if the
+    /// thread has no running process or its harness takes no requests, and an `Error::Control` if
+    /// the harness refuses it, or its process exits (or the backend closes) before it answers. It
+    /// mustn't be used for what the driver does itself (starting turns, answering the harness's
+    /// requests...).
+    pub async fn control(&self, thread_id: &str, request: Value) -> Result<Value> {
+        let (tx, rx) = oneshot::channel();
+        let reply: ControlReply = Box::new(move |r| {
+            let _ = tx.send(r);
+        });
+        self.ready(thread_id)
+            .await?
+            .call(move |a| a.session.control(&mut a.core, request, reply))
+            .await?;
+        rx.await.unwrap_or_else(|_| {
+            Err(Error::Control {
+                message: "the harness didn't answer before the thread was closed".into(),
+                error: None,
+            })
+        })
+    }
+
     // ---------- commands ----------
 
     /// Carries out a command from a client. A command it can't carry out (an unknown thread, a
@@ -1009,6 +1054,8 @@ impl AgentThreads {
             events: i.events.clone(),
             on_error: i.on_error.clone(),
             late_answers: i.late_answers,
+            raw: i.raw,
+            on_harness_message: i.on_harness_message.clone(),
         })
     }
 
@@ -1182,22 +1229,26 @@ impl AgentThreads {
             // thread (no turn ended as lost), and the error is the caller's.
             Err(e) => return Err(Error::Store(e)),
         };
-        let saved_turn: Option<Turn> = record
+        // A run saved with no turn running (null) had none: it may be waiting only on a background
+        // subagent's request. A run saved before runs had their turn has the last one.
+        let saved_turn: Option<Option<Turn>> = record
             .data
             .as_ref()
             .and_then(|d| d.get("turn"))
-            .and_then(|t| serde_json::from_value(t.clone()).ok());
+            .map(|t| serde_json::from_value(t.clone()).ok());
         if matches!(
             actor.core.thread().status,
             ThreadStatus::Running | ThreadStatus::Waiting
         ) {
             let last = last_turn(actor.core.snapshot());
-            actor.core.turn = Some(saved_turn.unwrap_or_else(|| Turn {
-                id: last.unwrap_or_else(|| new_id("turn")),
-                interrupted: false,
-                carried: 0,
-                progressed: false,
-            }));
+            actor.core.turn = saved_turn.unwrap_or_else(|| {
+                Some(Turn {
+                    id: last.unwrap_or_else(|| new_id("turn")),
+                    interrupted: false,
+                    carried: 0,
+                    progressed: false,
+                })
+            });
         }
         actor.core.adopt_run(record.clone());
         // The configuration and policy as they are now, not as they were when the actor was made
@@ -1226,9 +1277,15 @@ impl AgentThreads {
         for id in stale {
             c.emit_resolved(&id, &cancel_resolution());
         }
-        // With none left (one answered before the restart is closed, say), the turn runs on.
-        if c.turn.is_some() && open.is_empty() && c.thread().status == ThreadStatus::Waiting {
-            c.set_thread(|t| t.status = ThreadStatus::Running);
+        // With none left (one answered before the restart is closed, say), the turn runs on, or
+        // the thread is idle if none was running.
+        if open.is_empty() && c.thread().status == ThreadStatus::Waiting {
+            let status = if c.turn.is_some() {
+                ThreadStatus::Running
+            } else {
+                ThreadStatus::Idle
+            };
+            c.set_thread(|t| t.status = status);
         }
         c.set_thread(|t| {
             if let Some(r) = &mut t.run {
@@ -1298,18 +1355,46 @@ fn last_turn(s: &Snapshot) -> Option<String> {
     s.items.iter().rev().find_map(Item::turn_id).map(String::from)
 }
 
-/// Ends a turn whose process was lost when the backend stopped.
+/// The turn a thread's items say is still running: its last, if it has no turn_result. (A thread
+/// waiting with none running is waiting on a background subagent's request.)
+fn open_turn(s: &Snapshot) -> Option<String> {
+    let last = last_turn(s)?;
+    let ended = s
+        .items
+        .iter()
+        .any(|i| matches!(i, Item::TurnResult(r) if r.turn_id.as_deref() == Some(last.as_str())));
+    (!ended).then_some(last)
+}
+
+/// Ends a turn whose process was lost when the backend stopped, and stops the subagents that went
+/// with it (a background one may be running with no turn).
 fn recover_lost(c: &mut ThreadContext) {
-    if matches!(c.thread().status, ThreadStatus::Running | ThreadStatus::Waiting) {
-        let id = last_turn(c.snapshot()).unwrap_or_else(|| new_id("turn"));
+    let status = c.thread().status;
+    let open = open_turn(c.snapshot());
+    let turn = status == ThreadStatus::Running || (status == ThreadStatus::Waiting && open.is_some());
+    if turn {
         c.turn = Some(Turn {
-            id,
+            id: open.unwrap_or_else(|| new_id("turn")),
             interrupted: false,
             carried: 0,
             progressed: false,
         });
-        // Its requests can't be answered (but for questions that can be answered late).
-        c.take_up_requests(true);
+    }
+    let running: Vec<String> = c
+        .snapshot()
+        .items
+        .iter()
+        .filter_map(|i| match i {
+            Item::ToolCall(t) if t.subagent.as_ref().is_some_and(|s| s.status == SubagentStatus::Running) => {
+                Some(t.id.clone())
+            }
+            _ => None,
+        })
+        .collect();
+    c.stop_subagents(&running);
+    // Its open requests can't be answered now (but for questions that can be answered late).
+    c.take_up_requests(true);
+    if turn {
         c.add_item(json!({
             "id": new_id("n"), "type": "notice", "level": "warning", "code": "run.lost",
             "text": "The backend stopped while this turn was running, and couldn't pick its run up again.",
@@ -1321,6 +1406,8 @@ fn recover_lost(c: &mut ThreadContext) {
             ..Default::default()
         };
         c.finish_turn(end, false, false);
+    } else if c.thread().status == ThreadStatus::Waiting {
+        c.set_thread(|t| t.status = ThreadStatus::Idle);
     }
     c.set_thread(|t| t.run = None);
 }

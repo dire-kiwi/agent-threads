@@ -11,6 +11,7 @@ import {
   validate,
   type Attachment,
   type Command,
+  type Item,
   type ItemPage,
   type PermissionMode,
   type StandingAnswer,
@@ -21,7 +22,8 @@ import {
 } from "@dire-kiwi/agent-threads-protocol";
 import { claudeCode } from "./claude/driver.js";
 import { codex } from "./codex/driver.js";
-import type { Harness, LaunchOptions, McpServer, Skill, ThreadConfig } from "./harness.js";
+import { CommandError } from "./errors.js";
+import type { Harness, HarnessMessage, LaunchOptions, McpServer, Skill, ThreadConfig } from "./harness.js";
 import { newId } from "./ids.js";
 import { splitStored, storedThread } from "./launch.js";
 import type { PermissionPolicy } from "./permissions.js";
@@ -57,10 +59,21 @@ export interface AgentThreadsOptions extends Capabilities {
   /**
    * Questions still open when their turn ends (it was interrupted, say) stay open, rather than
    * being cancelled: an answer is sent to the agent as the user's next message, unless the
-   * conversation has moved on first (a turn started, or a message was queued). Secret ones are
-   * cancelled still.
+   * conversation has moved on first (the user sent a message, or one was left queued). Secret ones
+   * are cancelled still, and dont_ask dismisses them.
    */
   lateAnswers?: boolean;
+  /**
+   * Fill in `raw` on events, items and requests: the harness message each came from. Off by
+   * default; it's saved with the events, so they take more room.
+   */
+  raw?: boolean;
+  /**
+   * Called with every line a thread's harness process writes, once its driver has dealt with it:
+   * for what the protocol leaves out (Claude Code's system messages and rate limit events, Codex's
+   * token usage...). It runs as the output is read, so it should be quick.
+   */
+  onHarnessMessage?: (message: HarnessMessage) => void;
 }
 
 export interface CreateOptions extends Capabilities {
@@ -112,16 +125,11 @@ export interface Recovered {
   lost: string[];
 }
 
+export { CommandError, ControlError } from "./errors.js";
+
 /** How often the shim spawner's finished runs are pruned. */
 const PRUNE_EVERY_MS = 3600_000;
 
-/** A command that can't be carried out: an unknown thread, or a malformed command. */
-export class CommandError extends Error {
-  constructor(message: string) {
-    super(message);
-    this.name = "CommandError";
-  }
-}
 
 export class AgentThreads {
   readonly store: Store;
@@ -301,6 +309,24 @@ export class AgentThreads {
     }
   }
 
+  /**
+   * Sends the thread's running harness process a request of the app's own, and resolves with its
+   * answer: for Claude Code a control request's `request` (e.g. `{subtype: "get_context_usage"}`),
+   * answered with the control response's `response`; for Codex `{method, params?}`, answered with the
+   * JSON-RPC result. Rejects with a CommandError if the thread has no running process or its harness
+   * takes no requests, and with a ControlError if the harness refuses it, or its process exits (or
+   * the backend closes) before it answers. It mustn't be used for what the driver does itself
+   * (starting turns, answering the harness's requests...).
+   */
+  async control(threadId: string, request: unknown): Promise<unknown> {
+    this.#open();
+    const rt = await this.#load(threadId);
+    this.#open();
+    const session = rt.session;
+    if (!session?.control) throw new CommandError(`thread ${threadId} runs on ${rt.thread.harness}, which doesn't take control requests`);
+    return session.control(request);
+  }
+
   // ---------- commands ----------
 
   /** Carries out a command from a client. Throws a CommandError for one it can't. */
@@ -461,10 +487,20 @@ export class AgentThreads {
 
   #runtime(state: Snapshot, launch: LaunchOptions): ThreadRuntime {
     const id = state.thread.id;
+    const onMessage = this.#options.onHarnessMessage;
     const host = {
       store: this.store,
       spawner: this.spawner,
+      raw: !!this.#options.raw,
       publish: (e: ThreadEvent) => this.#publish(e),
+      harnessMessage: (m: HarnessMessage) => {
+        if (!onMessage) return;
+        try {
+          onMessage(m);
+        } catch (e) {
+          this.#error(e);
+        }
+      },
       error: (e: unknown) => this.#error(e),
       lateAnswers: !!this.#options.lateAnswers,
     };
@@ -524,7 +560,9 @@ export class AgentThreads {
     const s = rt.thread.status;
     if (s === "running" || s === "waiting") {
       const last = [...rt.snapshot.items].reverse().find((i) => i.turn_id)?.turn_id;
-      rt.turn = data.turn ? { ...data.turn } : { id: last ?? newId("turn"), interrupted: false };
+      // A run saved with no turn running (null) had none: it may be waiting only on a background
+      // subagent's request. A run saved before runs had their turn has the last one.
+      rt.turn = data.turn ? { ...data.turn } : "turn" in data ? null : { id: last ?? newId("turn"), interrupted: false };
     }
     rt.adoptRun(record);
     const session = rt.session;
@@ -536,8 +574,9 @@ export class AgentThreads {
     // Requests the session didn't take up again can't be answered (questions kept open after their
     // turns were taken up before).
     for (const r of openRequests(rt.snapshot)) if (!rt.isOpen(r.id)) rt.emit({ type: "request.resolved", request_id: r.id, resolution: { outcome: "cancel" } });
-    // With none left (one answered before the restart is closed, say), the turn runs on.
-    if (rt.turn && !rt.openRequests.length && rt.thread.status === "waiting") rt.setThread({ status: "running" });
+    // With none left (one answered before the restart is closed, say), the turn runs on, or the
+    // thread is idle if none was running.
+    if (!rt.openRequests.length && rt.thread.status === "waiting") rt.setThread({ status: rt.turn ? "running" : "idle" });
     rt.setThread({ run: { ...run, reattached_at: new Date().toISOString() } });
     if (rt.turn) {
       rt.addItem({
@@ -567,15 +606,29 @@ export class AgentThreads {
   }
 }
 
-/** Ends a turn whose process was lost when the backend stopped. */
+/**
+ * The turn a thread's items say is still running: its last, if it has no turn_result. (A thread
+ * waiting with none running is waiting on a background subagent's request.)
+ */
+function openTurn(items: readonly Item[]): string | undefined {
+  const last = [...items].reverse().find((i) => i.turn_id)?.turn_id;
+  return last && !items.some((i) => i.type === "turn_result" && i.turn_id === last) ? last : undefined;
+}
+
+/**
+ * Ends a turn whose process was lost when the backend stopped, and stops the subagents that went
+ * with it (a background one may be running with no turn).
+ */
 function recoverLost(rt: ThreadRuntime): void {
   const s = rt.thread.status;
-  if (s === "running" || s === "waiting") {
-    const items = rt.snapshot.items;
-    const turnId = [...items].reverse().find((i) => i.turn_id)?.turn_id ?? newId("turn");
-    rt.turn = { id: turnId, interrupted: false };
-    // Its requests can't be answered (but for questions that can be answered late).
-    rt.takeUpRequests(true);
+  const items = rt.snapshot.items;
+  const open = openTurn(items);
+  const turn = s === "running" || (s === "waiting" && open !== undefined);
+  if (turn) rt.turn = { id: open ?? newId("turn"), interrupted: false };
+  rt.stopSubagents(items.filter((i) => i.type === "tool_call" && i.subagent?.status === "running").map((i) => i.id));
+  // Its open requests can't be answered now (but for questions that can be answered late).
+  rt.takeUpRequests(true);
+  if (turn) {
     rt.addItem({
       id: newId("n"),
       type: "notice",
@@ -585,6 +638,6 @@ function recoverLost(rt: ThreadRuntime): void {
     });
     // Not carried over: loading a thread starts no process. Its queued messages go with the next.
     rt.endTurn({ ok: false, error: "The backend stopped while this turn was running." }, { carry: false });
-  }
+  } else if (rt.thread.status === "waiting") rt.setThread({ status: "idle" });
   rt.setThread({ run: undefined });
 }
