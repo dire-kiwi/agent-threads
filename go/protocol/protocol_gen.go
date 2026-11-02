@@ -10,7 +10,8 @@ import (
 
 // Command: A command, told apart by type.
 //
-// Value is one of *SendCommand, *InterruptCommand, *RespondCommand, *SetOptionsCommand.
+// Value is one of *SendCommand, *InterruptCommand, *RespondCommand, *SetOptionsCommand,
+// *RewindCommand, *NewSessionCommand, *CompactCommand.
 type Command struct {
 	Value CommandValue
 }
@@ -30,6 +31,12 @@ func (*RespondCommand) Type() string    { return "respond" }
 func (*RespondCommand) isCommand()      {}
 func (*SetOptionsCommand) Type() string { return "set_options" }
 func (*SetOptionsCommand) isCommand()   {}
+func (*RewindCommand) Type() string     { return "rewind" }
+func (*RewindCommand) isCommand()       {}
+func (*NewSessionCommand) Type() string { return "new_session" }
+func (*NewSessionCommand) isCommand()   {}
+func (*CompactCommand) Type() string    { return "compact" }
+func (*CompactCommand) isCommand()      {}
 
 func (u Command) MarshalJSON() ([]byte, error) {
 	if u.Value == nil {
@@ -55,6 +62,12 @@ func (u *Command) UnmarshalJSON(data []byte) error {
 		v = new(RespondCommand)
 	case "set_options":
 		v = new(SetOptionsCommand)
+	case "rewind":
+		v = new(RewindCommand)
+	case "new_session":
+		v = new(NewSessionCommand)
+	case "compact":
+		v = new(CompactCommand)
 	default:
 		return fmt.Errorf("protocol: unknown Command type %q", t.Type)
 	}
@@ -253,11 +266,150 @@ func (v *SetOptionsCommand) UnmarshalJSON(data []byte) error {
 	return nil
 }
 
+// RewindCommand: Take the conversation back to before a turn: the harness forgets that turn and
+// every one after it, and their items are removed from the thread. Refused while a turn is running.
+//
+// It's the "rewind" variant of Command.
+type RewindCommand struct {
+	ThreadID string `json:"thread_id"`
+
+	// The turn to go back to before (a turn_id of the thread's items).
+	TurnID string `json:"turn_id"`
+
+	// Extra has the fields the spec doesn't name, as they came, so that they're written again
+	// unchanged (receivers ignore fields they don't know, and stores keep them).
+	Extra map[string]json.RawMessage `json:"-"`
+}
+
+var knownRewindCommand = fieldSet("type", "thread_id", "turn_id")
+
+func (v RewindCommand) MarshalJSON() ([]byte, error) {
+	type plain RewindCommand
+	p := plain(v)
+	data, err := json.Marshal(struct {
+		Type string `json:"type"`
+		plain
+	}{"rewind", p})
+	if err != nil {
+		return nil, err
+	}
+	return withExtra(data, v.Extra, knownRewindCommand)
+}
+
+func (v *RewindCommand) UnmarshalJSON(data []byte) error {
+	if isNull(data) {
+		return nil
+	}
+	type plain RewindCommand
+	var p plain
+	if err := json.Unmarshal(data, &p); err != nil {
+		return err
+	}
+	extra, err := extraFields(data, knownRewindCommand)
+	if err != nil {
+		return err
+	}
+	p.Extra = extra
+	*v = RewindCommand(p)
+	return nil
+}
+
+// NewSessionCommand: Start a new conversation with the harness at the next turn, in the same
+// thread: its session_id is cleared, so the agent doesn't remember the turns before. The items
+// stay. Refused while a turn is running.
+//
+// It's the "new_session" variant of Command.
+type NewSessionCommand struct {
+	ThreadID string `json:"thread_id"`
+
+	// Extra has the fields the spec doesn't name, as they came, so that they're written again
+	// unchanged (receivers ignore fields they don't know, and stores keep them).
+	Extra map[string]json.RawMessage `json:"-"`
+}
+
+var knownNewSessionCommand = fieldSet("type", "thread_id")
+
+func (v NewSessionCommand) MarshalJSON() ([]byte, error) {
+	type plain NewSessionCommand
+	p := plain(v)
+	data, err := json.Marshal(struct {
+		Type string `json:"type"`
+		plain
+	}{"new_session", p})
+	if err != nil {
+		return nil, err
+	}
+	return withExtra(data, v.Extra, knownNewSessionCommand)
+}
+
+func (v *NewSessionCommand) UnmarshalJSON(data []byte) error {
+	if isNull(data) {
+		return nil
+	}
+	type plain NewSessionCommand
+	var p plain
+	if err := json.Unmarshal(data, &p); err != nil {
+		return err
+	}
+	extra, err := extraFields(data, knownNewSessionCommand)
+	if err != nil {
+		return err
+	}
+	p.Extra = extra
+	*v = NewSessionCommand(p)
+	return nil
+}
+
+// CompactCommand: Compact the harness's context now: a turn of its own, with no user_message, that
+// adds a compaction item. Refused while a turn is running, or when the thread has no session yet.
+//
+// It's the "compact" variant of Command.
+type CompactCommand struct {
+	ThreadID string `json:"thread_id"`
+
+	// Extra has the fields the spec doesn't name, as they came, so that they're written again
+	// unchanged (receivers ignore fields they don't know, and stores keep them).
+	Extra map[string]json.RawMessage `json:"-"`
+}
+
+var knownCompactCommand = fieldSet("type", "thread_id")
+
+func (v CompactCommand) MarshalJSON() ([]byte, error) {
+	type plain CompactCommand
+	p := plain(v)
+	data, err := json.Marshal(struct {
+		Type string `json:"type"`
+		plain
+	}{"compact", p})
+	if err != nil {
+		return nil, err
+	}
+	return withExtra(data, v.Extra, knownCompactCommand)
+}
+
+func (v *CompactCommand) UnmarshalJSON(data []byte) error {
+	if isNull(data) {
+		return nil
+	}
+	type plain CompactCommand
+	var p plain
+	if err := json.Unmarshal(data, &p); err != nil {
+		return err
+	}
+	extra, err := extraFields(data, knownCompactCommand)
+	if err != nil {
+		return err
+	}
+	p.Extra = extra
+	*v = CompactCommand(p)
+	return nil
+}
+
 // ThreadEvent: An event, told apart by type. All but delta are saved, and each saved event's seq is
 // one more than the one before it in the thread.
 //
 // Value is one of *ThreadUpdatedEvent, *TurnStartedEvent, *TurnCompletedEvent, *ItemAddedEvent,
-// *ItemUpdatedEvent, *DeltaEvent, *RequestOpenedEvent, *RequestResolvedEvent.
+// *ItemUpdatedEvent, *ItemsRemovedEvent, *DeltaEvent, *RequestOpenedEvent, *RequestResolvedEvent.
 type ThreadEvent struct {
 	Value ThreadEventValue
 }
@@ -279,6 +431,8 @@ func (*ItemAddedEvent) Type() string         { return "item.added" }
 func (*ItemAddedEvent) isThreadEvent()       {}
 func (*ItemUpdatedEvent) Type() string       { return "item.updated" }
 func (*ItemUpdatedEvent) isThreadEvent()     {}
+func (*ItemsRemovedEvent) Type() string      { return "items.removed" }
+func (*ItemsRemovedEvent) isThreadEvent()    {}
 func (*DeltaEvent) Type() string             { return "delta" }
 func (*DeltaEvent) isThreadEvent()           {}
 func (*RequestOpenedEvent) Type() string     { return "request.opened" }
@@ -312,6 +466,8 @@ func (u *ThreadEvent) UnmarshalJSON(data []byte) error {
 		v = new(ItemAddedEvent)
 	case "item.updated":
 		v = new(ItemUpdatedEvent)
+	case "items.removed":
+		v = new(ItemsRemovedEvent)
 	case "delta":
 		v = new(DeltaEvent)
 	case "request.opened":
@@ -579,6 +735,59 @@ func (v *ItemUpdatedEvent) UnmarshalJSON(data []byte) error {
 	}
 	p.Extra = extra
 	*v = ItemUpdatedEvent(p)
+	return nil
+}
+
+// ItemsRemovedEvent: Items were removed from the thread (a rewind took the conversation back to
+// before them). Ids the thread doesn't have are skipped.
+//
+// It's the "items.removed" variant of ThreadEvent.
+type ItemsRemovedEvent struct {
+	ThreadID string   `json:"thread_id"`
+	Seq      int64    `json:"seq"`
+	ItemIDs  []string `json:"item_ids"`
+
+	// The harness's own payload, for debugging.
+	Raw json.RawMessage `json:"raw,omitempty"`
+
+	// Extra has the fields the spec doesn't name, as they came, so that they're written again
+	// unchanged (receivers ignore fields they don't know, and stores keep them).
+	Extra map[string]json.RawMessage `json:"-"`
+}
+
+var knownItemsRemovedEvent = fieldSet("type", "thread_id", "seq", "item_ids", "raw")
+
+func (v ItemsRemovedEvent) MarshalJSON() ([]byte, error) {
+	type plain ItemsRemovedEvent
+	p := plain(v)
+	if p.ItemIDs == nil {
+		p.ItemIDs = []string{}
+	}
+	data, err := json.Marshal(struct {
+		Type string `json:"type"`
+		plain
+	}{"items.removed", p})
+	if err != nil {
+		return nil, err
+	}
+	return withExtra(data, v.Extra, knownItemsRemovedEvent)
+}
+
+func (v *ItemsRemovedEvent) UnmarshalJSON(data []byte) error {
+	if isNull(data) {
+		return nil
+	}
+	type plain ItemsRemovedEvent
+	var p plain
+	if err := json.Unmarshal(data, &p); err != nil {
+		return err
+	}
+	extra, err := extraFields(data, knownItemsRemovedEvent)
+	if err != nil {
+		return err
+	}
+	p.Extra = extra
+	*v = ItemsRemovedEvent(p)
 	return nil
 }
 
@@ -1433,6 +1642,10 @@ type TurnResult struct {
 	Usage      *Usage `json:"usage,omitempty"`
 	DurationMs *int64 `json:"duration_ms,omitempty"`
 
+	// The harness session the turn ran in, when there was one: what a rewind to before it, or a later
+	// turn, goes back to.
+	Session *TurnSession `json:"session,omitempty"`
+
 	// The id of the subagent tool_call this item belongs to. Absent for the main conversation.
 	ParentID string `json:"parent_id,omitempty"`
 
@@ -1449,7 +1662,7 @@ type TurnResult struct {
 	Extra map[string]json.RawMessage `json:"-"`
 }
 
-var knownTurnResult = fieldSet("type", "id", "ok", "interrupted", "error", "usage", "duration_ms", "parent_id", "turn_id", "created_at", "raw")
+var knownTurnResult = fieldSet("type", "id", "ok", "interrupted", "error", "usage", "duration_ms", "session", "parent_id", "turn_id", "created_at", "raw")
 
 func (v TurnResult) MarshalJSON() ([]byte, error) {
 	type plain TurnResult
@@ -1479,6 +1692,54 @@ func (v *TurnResult) UnmarshalJSON(data []byte) error {
 	}
 	p.Extra = extra
 	*v = TurnResult(p)
+	return nil
+}
+
+// TurnSession: Where a turn left the harness's session.
+type TurnSession struct {
+
+	// The thread's session_id when the turn ended.
+	ID string `json:"id"`
+
+	// The harness's own mark for the turn: Claude Code's last message in it (its uuid), Codex's id for
+	// the turn. Absent if the harness gave none (the turn failed before it did anything).
+	At string `json:"at,omitempty"`
+
+	// The turn started the session: the thread had no session_id when it began.
+	Started bool `json:"started,omitempty"`
+
+	// Extra has the fields the spec doesn't name, as they came, so that they're written again
+	// unchanged (receivers ignore fields they don't know, and stores keep them).
+	Extra map[string]json.RawMessage `json:"-"`
+}
+
+var knownTurnSession = fieldSet("id", "at", "started")
+
+func (v TurnSession) MarshalJSON() ([]byte, error) {
+	type plain TurnSession
+	p := plain(v)
+	data, err := json.Marshal(p)
+	if err != nil {
+		return nil, err
+	}
+	return withExtra(data, v.Extra, knownTurnSession)
+}
+
+func (v *TurnSession) UnmarshalJSON(data []byte) error {
+	if isNull(data) {
+		return nil
+	}
+	type plain TurnSession
+	var p plain
+	if err := json.Unmarshal(data, &p); err != nil {
+		return err
+	}
+	extra, err := extraFields(data, knownTurnSession)
+	if err != nil {
+		return err
+	}
+	p.Extra = extra
+	*v = TurnSession(p)
 	return nil
 }
 
@@ -1947,6 +2208,11 @@ type Thread struct {
 	// The harness's own session or thread id, used to resume it.
 	SessionID string `json:"session_id,omitempty"`
 
+	// Where the next turn takes up session_id, after a rewind: Claude Code resumes it at this message
+	// (--resume-session-at), Codex reverts it to before this turn (thread/revert). Cleared once the
+	// harness has done it.
+	ResumeAt string `json:"resume_at,omitempty"`
+
 	// Tokens used by the thread so far, over all its turns.
 	Usage *Usage `json:"usage,omitempty"`
 
@@ -1967,7 +2233,7 @@ type Thread struct {
 	Extra map[string]json.RawMessage `json:"-"`
 }
 
-var knownThread = fieldSet("id", "harness", "status", "title", "model", "effort", "permission_mode", "cwd", "session_id", "usage", "error", "run", "metadata", "created_at", "updated_at")
+var knownThread = fieldSet("id", "harness", "status", "title", "model", "effort", "permission_mode", "cwd", "session_id", "resume_at", "usage", "error", "run", "metadata", "created_at", "updated_at")
 
 func (v Thread) MarshalJSON() ([]byte, error) {
 	type plain Thread

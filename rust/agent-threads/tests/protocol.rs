@@ -64,3 +64,24 @@ fn unions_are_tagged_by_type() {
         json!({"type": "interrupt", "thread_id": "th"})
     );
 }
+
+#[test]
+fn items_removed_removes_items_and_skips_ids_it_doesnt_have() {
+    use agent_threads::reducer::{apply_events, initial_state};
+    let event = |v: Value| serde_json::from_value::<ThreadEvent>(v).unwrap();
+    let thread = serde_json::from_value(
+        json!({"id": "th", "harness": "claude", "status": "idle", "created_at": "2026-11-01T00:00:00Z"}),
+    )
+    .unwrap();
+    let mut state = initial_state(thread);
+    let added = |seq: u64, id: &str| {
+        event(
+            json!({"type": "item.added", "thread_id": "th", "seq": seq, "item": {"id": id, "type": "notice", "level": "info", "text": id}}),
+        )
+    };
+    let removed = event(json!({"type": "items.removed", "thread_id": "th", "seq": 4, "item_ids": ["b", "nope"]}));
+    apply_events(&mut state, &[added(1, "a"), added(2, "b"), added(3, "c"), removed]);
+    let ids: Vec<&str> = state.items.iter().map(|i| i.id()).collect();
+    assert_eq!(ids, ["a", "c"]);
+    assert_eq!(state.seq, 4);
+}

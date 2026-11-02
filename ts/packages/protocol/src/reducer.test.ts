@@ -61,6 +61,17 @@ describe("applyEvent", () => {
     expect(next.seq).toBe(4);
   });
 
+  it("removes items, keeping the others and skipping ids it doesn't have", () => {
+    const s = started();
+    const next = applyEvent(s, { type: "items.removed", thread_id: "th", seq: 4, item_ids: ["tc1", "nope"] });
+    expect(next.items).toEqual([user, reply]);
+    expect(next.items[0]).toBe(s.items[0]);
+    expect(next.seq).toBe(4);
+    const none = applyEvent(next, { type: "items.removed", thread_id: "th", seq: 5, item_ids: ["nope"] });
+    expect(none.items).toBe(next.items);
+    expect(none.seq).toBe(5);
+  });
+
   it("counts an update to an item it doesn't have", () => {
     const s = started();
     const next = applyEvent(s, { type: "item.updated", thread_id: "th", seq: 4, item_id: "nope", patch: { text: "x" } });

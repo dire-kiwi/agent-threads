@@ -69,6 +69,11 @@ func TestApplyEventItems(t *testing.T) {
 	if n := protocol.ApplyEvent(s, event(t, `{"type":"item.updated","thread_id":"th","seq":4,"item_id":"nope","patch":{"text":"x"}}`)); n.Seq != 4 || len(n.Items) != 3 {
 		t.Fatal("an update to an unknown item")
 	}
+	// Removed, skipping ids it doesn't have; the state before stays as it was.
+	r := protocol.ApplyEvent(s, event(t, `{"type":"items.removed","thread_id":"th","seq":4,"item_ids":["tc1","nope"]}`))
+	if r.Seq != 4 || len(r.Items) != 2 || r.Items[0].ID() != "u1" || r.Items[1].ID() != "a1" || len(s.Items) != 3 || s.Items[1].ID() != "tc1" {
+		t.Fatalf("removed: got %s", asJSON(t, r.Items))
+	}
 	// Events it has, and other threads', change nothing.
 	if n := protocol.ApplyEvent(s, event(t, `{"type":"item.added","thread_id":"th","seq":3,"item":{"id":"x","type":"notice","level":"info","text":"x"}}`)); len(n.Items) != 3 || n.Seq != 3 {
 		t.Fatal("an event it has")

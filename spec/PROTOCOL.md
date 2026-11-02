@@ -9,7 +9,7 @@ source of truth for the shapes, and this document says what they mean. See
 | Schema | Defines |
 | --- | --- |
 | [thread.schema.json](schema/thread.schema.json) | `Thread`, `ThreadStatus`, `PermissionMode`, `Run`, `Usage` |
-| [item.schema.json](schema/item.schema.json) | `Item` and its variants, `ToolKind`, `ToolStatus`, `ToolResult`, `FileChange`, `Todo`, `Attachment` |
+| [item.schema.json](schema/item.schema.json) | `Item` and its variants, `ToolKind`, `ToolStatus`, `ToolResult`, `FileChange`, `Todo`, `TurnSession`, `Attachment` |
 | [request.schema.json](schema/request.schema.json) | `ThreadRequest` (`PermissionRequest`, `QuestionRequest`), `Question`, `Resolution` |
 | [event.schema.json](schema/event.schema.json) | `ThreadEvent` and its variants |
 | [command.schema.json](schema/command.schema.json) | `Command` and its variants |
@@ -47,14 +47,17 @@ A `Thread` is one conversation with one harness (`claude` or `codex`). Its `stat
 - `error`: the last turn failed or the harness couldn't start (`error` says why). The next `send`
   tries again.
 
-`session_id` is the harness's own session id, which the backend uses to resume the conversation
-in a new process. `run` is the process running the thread, when one is: a `direct` run is a child
+`session_id` is the harness's own session id (Claude Code's `session_id`, Codex's thread id), which
+the backend uses to resume the conversation in a new process; `resume_at` is set after a rewind,
+until the harness has gone back there (see [Sessions](#sessions)). `run` is the process running the thread, when one is: a `direct` run is a child
 of the backend and ends with it; a `shim` run is supervised by `agent-threads-shim` and survives a
 backend restart, and its `reattached_at` is set when a restarted backend picks it up again
 ([RUNDIR.md](RUNDIR.md) has how backends and the shim share a run).
 `usage` sums the thread's turns. `metadata` is the app's own, given when it created the thread.
 
-Threads are created, listed and deleted through each backend's API, not through commands.
+Threads are created, listed and deleted through each backend's API, not through commands. A thread
+can be created with a `session_id`, to adopt a conversation the harness already has: its first turn
+resumes it. The conversation so far isn't made into items; the thread starts empty.
 
 ## Items
 
@@ -69,7 +72,7 @@ and may have `parent_id`, `turn_id`, `created_at` and `raw`.
 | `tool_call` | A tool call and, once it has one, its `result`. See below. |
 | `compaction` | The harness compacted its context: `trigger` (`auto` or `manual`), `summary`, `tokens_before`. |
 | `notice` | Something to tell the user that isn't the agent talking: `level` (`info`, `warning`, `error`), `text`, `detail`, and a `code` such as `run.reattached`, `run.lost`, `retry`, `hook` or `stderr`. |
-| `turn_result` | How a turn ended; the last item of each turn. `ok`, `interrupted`, `error`, `usage`, `duration_ms`. |
+| `turn_result` | How a turn ended; the last item of each turn. `ok`, `interrupted`, `error`, `usage`, `duration_ms`, and `session`: where the turn left the harness's session (see [Sessions](#sessions)). |
 
 ### Tool calls
 
@@ -103,6 +106,38 @@ reasoning and tool calls) is an item whose `parent_id` is that call's id, in the
 the same item list. Requests from a subagent have its `parent_id` too. The call's `result` is what
 the subagent returned.
 
+## Sessions
+
+A thread's conversation with its harness is a **session**, whose id is the thread's `session_id`.
+The backend starts one at the thread's first turn (or adopts the one the thread was created with),
+resumes it in each new process, and can take it back, replace it, or compact it:
+
+- **Rewind** (the `rewind` command): back to before one of the thread's turns. The harness forgets
+  that turn and every turn after it: Claude Code resumes the session at the last message of the turn
+  before (`--resume <session_id> --resume-session-at <uuid>`), and Codex reverts its thread to before
+  the turn (`thread/revert`). The thread's items from that turn on are removed with an
+  `items.removed` event, and a `notice` with code `rewind` is added where they were.
+- **New session** (the `new_session` command): the next turn starts a new conversation, in the same
+  thread, with its items kept. A `notice` with code `session.new` marks where.
+- **Compaction** (the `compact` command): the harness compacts its context now, in a turn of its
+  own, which adds a `compaction` item (Claude Code's `/compact`, Codex's `thread/compact/start`).
+
+Each `turn_result` has the turn's `session` (when the thread had one at its end): its `id`, the
+harness's own mark for the turn as `at` (Claude Code's last message in it, Codex's id for the turn),
+and `started` if the turn started that session. That's what a rewind works from, so it can go back
+to a turn in an earlier session (before a `new_session`) too. To rewind to before turn T:
+
+- If T started its session, or there was none at its end, the next turn starts a new session.
+- Otherwise T continued session S (its `session.id`). **Claude Code** resumes S at the `at` of the
+  latest turn before T in S that has one. If there's none (T was the first turn in the thread of a
+  session it was created with, whose earlier messages it doesn't know), it can't rewind there.
+  **Codex** reverts S to before the `at` of the first turn from T on, in S, that has one; if none
+  has, S is as it was before T, and nothing is reverted.
+
+The thread's `session_id` becomes S (or is cleared), and its `resume_at` the message to resume at
+or the turn to revert to before. The harness goes back there at the start of the next turn, in a
+new process, and `resume_at` is cleared once it has.
+
 ## Requests
 
 A request is something the agent is waiting on the user for. It's open from `request.opened` until
@@ -134,6 +169,7 @@ Every event has `type`, `thread_id` and `seq`, and may have `raw`.
 | `turn.completed` | `turn_id` | A turn ended. Its `turn_result` item comes just before. |
 | `item.added` | `item` | An item was added at the end of the list. If the thread already has an item with its id, it replaces that one in place. |
 | `item.updated` | `item_id`, `patch` | Fields of an item changed: each of the patch's fields replaces the item's, and one set to `null` is removed. `id` and `type` never change. |
+| `items.removed` | `item_ids` | Items were removed from the list (a rewind took the conversation back to before them). |
 | `delta` | `item_id`, `kind`, `offset`, `text` | Streamed text to append to an `assistant_message` (`kind: text`) or `reasoning` (`kind: reasoning`) item's `text`, which was `offset` long before it. |
 | `request.opened` | `request` | A request was opened. |
 | `request.resolved` | `request_id`, `resolution` | A request was answered or cancelled. |
@@ -166,7 +202,7 @@ the same rules:
    events can be delivered more than once.
 3. Otherwise the event is applied as described above, and the state's `seq` becomes the event's.
    (`turn.*` events change nothing else.) An `item.updated` or `request.resolved` for an id the
-   state doesn't have only advances `seq`.
+   state doesn't have only advances `seq`, and `items.removed` skips ids it doesn't have.
 4. A `delta` is applied when the state has its item, the item is the delta's `kind`'s type, and
    the delta's `seq` isn't below the state's (one from before the last saved event the state has
    is already in it). Its `text` goes at `offset` in the item's text: what's already there (the
@@ -195,6 +231,12 @@ Every command has `type` and `thread_id`.
 | `interrupt` | | Stop the running turn. Its `turn_result` has `interrupted`. Does nothing if no turn is running. |
 | `respond` | `request_id`, `resolution` | Answer an open request. Answering one that isn't open does nothing. |
 | `set_options` | `model?`, `effort?`, `permission_mode?` | Change the thread's options; ones left out stay as they are. They apply from the next turn, or straight away where the harness allows, and a `thread.updated` follows. |
+| `rewind` | `turn_id` | Take the conversation back to before that turn: the harness forgets it and every turn after, and their items are removed. See [Sessions](#sessions). |
+| `new_session` | | The next turn starts a new conversation with the harness; the items stay. Does nothing if the thread has no session. |
+| `compact` | | Compact the harness's context now, in a turn of its own (with no `user_message`) that adds a `compaction` item. |
+
+`rewind`, `new_session` and `compact` are refused while a turn is running, and `compact` when the
+thread has no session yet: interrupt the turn, or wait for it, first.
 
 `permission_mode` is `default` (ask via the permission policy), `accept_edits` (file edits in the
 thread's `cwd` are allowed without asking), `plan` (the agent plans and changes nothing) or

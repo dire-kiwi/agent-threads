@@ -5,3 +5,6 @@
 {"type":"respond","thread_id":"th_1","request_id":"p2","resolution":{"outcome":"deny","message":"Don't touch the lockfile."}}
 {"type":"respond","thread_id":"th_1","request_id":"q1","resolution":{"outcome":"answer","answers":{"runner":["vitest"]}}}
 {"type":"set_options","thread_id":"th_1","model":"sonnet","effort":"high","permission_mode":"accept_edits"}
+{"type":"rewind","thread_id":"th_1","turn_id":"turn_2"}
+{"type":"new_session","thread_id":"th_1"}
+{"type":"compact","thread_id":"th_1"}

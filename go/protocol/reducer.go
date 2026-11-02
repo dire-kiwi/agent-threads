@@ -83,6 +83,14 @@ func apply(state Snapshot, event ThreadEvent) Snapshot {
 		}
 	case *ItemUpdatedEvent:
 		return withItem(state, e.ItemID, func(item Item) (Item, bool) { return Patched(item, e.Patch) })
+	case *ItemsRemovedEvent:
+		gone := make(map[string]bool, len(e.ItemIDs))
+		for _, id := range e.ItemIDs {
+			gone[id] = true
+		}
+		if slices.ContainsFunc(state.Items, func(i Item) bool { return gone[i.ID()] }) {
+			state.Items = slices.DeleteFunc(slices.Clone(state.Items), func(i Item) bool { return gone[i.ID()] })
+		}
 	case *RequestOpenedEvent:
 		if at := indexOfRequest(state.Requests, e.Request.ID()); at >= 0 {
 			state.Requests = replaced(state.Requests, at, e.Request)

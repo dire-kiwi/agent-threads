@@ -12,6 +12,7 @@
         { "$ref": "#/$defs/TurnCompletedEvent" },
         { "$ref": "#/$defs/ItemAddedEvent" },
         { "$ref": "#/$defs/ItemUpdatedEvent" },
+        { "$ref": "#/$defs/ItemsRemovedEvent" },
         { "$ref": "#/$defs/DeltaEvent" },
         { "$ref": "#/$defs/RequestOpenedEvent" },
         { "$ref": "#/$defs/RequestResolvedEvent" }
@@ -75,6 +76,18 @@
         "seq": { "type": "integer", "minimum": 1 },
         "item_id": { "type": "string" },
         "patch": { "type": "object", "additionalProperties": true, "description": "Top-level fields of the item to set, e.g. {\"status\": \"completed\", \"result\": {...}}." },
+        "raw": { "description": "The harness's own payload, for debugging." }
+      }
+    },
+    "ItemsRemovedEvent": {
+      "type": "object",
+      "description": "Items were removed from the thread (a rewind took the conversation back to before them). Ids the thread doesn't have are skipped.",
+      "required": ["type", "thread_id", "seq", "item_ids"],
+      "properties": {
+        "type": { "const": "items.removed" },
+        "thread_id": { "type": "string" },
+        "seq": { "type": "integer", "minimum": 1 },
+        "item_ids": { "type": "array", "items": { "type": "string" } },
         "raw": { "description": "The harness's own payload, for debugging." }
       }
     },

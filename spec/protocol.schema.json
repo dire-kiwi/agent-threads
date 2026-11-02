@@ -18,6 +18,15 @@
         },
         {
           "$ref": "#/$defs/SetOptionsCommand"
+        },
+        {
+          "$ref": "#/$defs/RewindCommand"
+        },
+        {
+          "$ref": "#/$defs/NewSessionCommand"
+        },
+        {
+          "$ref": "#/$defs/CompactCommand"
         }
       ]
     },
@@ -116,6 +125,59 @@
         }
       }
     },
+    "RewindCommand": {
+      "type": "object",
+      "description": "Take the conversation back to before a turn: the harness forgets that turn and every one after it, and their items are removed from the thread. Refused while a turn is running.",
+      "required": [
+        "type",
+        "thread_id",
+        "turn_id"
+      ],
+      "properties": {
+        "type": {
+          "const": "rewind"
+        },
+        "thread_id": {
+          "type": "string"
+        },
+        "turn_id": {
+          "type": "string",
+          "description": "The turn to go back to before (a turn_id of the thread's items)."
+        }
+      }
+    },
+    "NewSessionCommand": {
+      "type": "object",
+      "description": "Start a new conversation with the harness at the next turn, in the same thread: its session_id is cleared, so the agent doesn't remember the turns before. The items stay. Refused while a turn is running.",
+      "required": [
+        "type",
+        "thread_id"
+      ],
+      "properties": {
+        "type": {
+          "const": "new_session"
+        },
+        "thread_id": {
+          "type": "string"
+        }
+      }
+    },
+    "CompactCommand": {
+      "type": "object",
+      "description": "Compact the harness's context now: a turn of its own, with no user_message, that adds a compaction item. Refused while a turn is running, or when the thread has no session yet.",
+      "required": [
+        "type",
+        "thread_id"
+      ],
+      "properties": {
+        "type": {
+          "const": "compact"
+        },
+        "thread_id": {
+          "type": "string"
+        }
+      }
+    },
     "ThreadEvent": {
       "description": "An event, told apart by type. All but delta are saved, and each saved event's seq is one more than the one before it in the thread.",
       "oneOf": [
@@ -133,6 +195,9 @@
         },
         {
           "$ref": "#/$defs/ItemUpdatedEvent"
+        },
+        {
+          "$ref": "#/$defs/ItemsRemovedEvent"
         },
         {
           "$ref": "#/$defs/DeltaEvent"
@@ -285,6 +350,37 @@
           "type": "object",
           "additionalProperties": true,
           "description": "Top-level fields of the item to set, e.g. {\"status\": \"completed\", \"result\": {...}}."
+        },
+        "raw": {
+          "description": "The harness's own payload, for debugging."
+        }
+      }
+    },
+    "ItemsRemovedEvent": {
+      "type": "object",
+      "description": "Items were removed from the thread (a rewind took the conversation back to before them). Ids the thread doesn't have are skipped.",
+      "required": [
+        "type",
+        "thread_id",
+        "seq",
+        "item_ids"
+      ],
+      "properties": {
+        "type": {
+          "const": "items.removed"
+        },
+        "thread_id": {
+          "type": "string"
+        },
+        "seq": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "item_ids": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
         },
         "raw": {
           "description": "The harness's own payload, for debugging."
@@ -879,6 +975,10 @@
           "type": "integer",
           "minimum": 0
         },
+        "session": {
+          "$ref": "#/$defs/TurnSession",
+          "description": "The harness session the turn ran in, when there was one: what a rewind to before it, or a later turn, goes back to."
+        },
         "parent_id": {
           "type": "string",
           "description": "The id of the subagent tool_call this item belongs to. Absent for the main conversation."
@@ -893,6 +993,28 @@
         },
         "raw": {
           "description": "The harness's own payload this came from, for debugging. Backends can leave it out; clients mustn't depend on it."
+        }
+      }
+    },
+    "TurnSession": {
+      "type": "object",
+      "description": "Where a turn left the harness's session.",
+      "required": [
+        "id"
+      ],
+      "properties": {
+        "id": {
+          "type": "string",
+          "description": "The thread's session_id when the turn ended."
+        },
+        "at": {
+          "type": "string",
+          "description": "The harness's own mark for the turn: Claude Code's last message in it (its uuid), Codex's id for the turn. Absent if the harness gave none (the turn failed before it did anything)."
+        },
+        "started": {
+          "type": "boolean",
+          "default": false,
+          "description": "The turn started the session: the thread had no session_id when it began."
         }
       }
     },
@@ -1210,6 +1332,10 @@
         "session_id": {
           "type": "string",
           "description": "The harness's own session or thread id, used to resume it."
+        },
+        "resume_at": {
+          "type": "string",
+          "description": "Where the next turn takes up session_id, after a rewind: Claude Code resumes it at this message (--resume-session-at), Codex reverts it to before this turn (thread/revert). Cleared once the harness has done it."
         },
         "usage": {
           "$ref": "#/$defs/Usage",

@@ -667,6 +667,9 @@ impl AgentThreads {
                 };
                 self.set_options(&c.thread_id, o).await
             }
+            Command::Rewind(_) | Command::NewSession(_) | Command::Compact(_) => {
+                Err(Error::Command("this backend doesn't take that command yet".into()))
+            }
         }
     }
 

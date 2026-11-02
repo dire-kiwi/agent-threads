@@ -65,6 +65,11 @@ function apply(state: Snapshot, event: Exclude<ThreadEvent, { type: "delta" }>):
     }
     case "item.updated":
       return withItem(state, event.item_id, (item) => patched(item, event.patch));
+    case "items.removed": {
+      const gone = new Set(event.item_ids);
+      const items = state.items.filter((i) => !gone.has(i.id));
+      return items.length === state.items.length ? state : { ...state, items };
+    }
     case "request.opened": {
       const at = indexOf(state.requests, event.request.id);
       return {
