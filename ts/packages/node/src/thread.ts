@@ -3,7 +3,7 @@
 // subscribers, and saved to the store in order (deltas aren't saved).
 
 import { applyEvent, type Attachment, type Item, type Resolution, type Snapshot, type Thread, type ThreadEvent, type ThreadRequest, type Usage, type UserMessage } from "@dire-kiwi/agent-threads-protocol";
-import type { HarnessSession, Message, NewItem, NewRequest, ThreadConfig, ThreadContext, TurnEnd } from "./harness.js";
+import { ancestors, inBackground, type HarnessSession, type Message, type NewItem, type NewRequest, type ThreadConfig, type ThreadContext, type TurnEnd } from "./harness.js";
 import { newId } from "./ids.js";
 import { decide, permissionKey, type PermissionDecision, type PermissionPolicy, type PermissionQuery } from "./permissions.js";
 import type { Spawner } from "./spawner.js";
@@ -450,13 +450,18 @@ export class ThreadRuntime implements ThreadContext {
     }
     this.#streaming.clear();
     this.#structured.clear();
+    // What a background subagent that's still running does carries on after the turn: its calls
+    // and requests too.
+    const lookup = (id: string) => this.item(id);
     for (const it of this.#state.items) {
-      if (it.type === "tool_call" && it.turn_id === turn.id && (it.status === "running" || it.status === "pending")) {
-        this.updateItem(it.id, { status: "cancelled" });
+      if (it.type === "tool_call" && it.turn_id === turn.id && (it.status === "running" || it.status === "pending") && !inBackground(lookup, it.id)) {
+        // A subagent cut short (by an interrupt, or its process ending) is stopped with its call.
+        this.updateItem(it.id, { status: "cancelled", ...(it.subagent?.status === "running" ? { subagent: { ...it.subagent, status: "stopped" } } : {}) });
       }
     }
     for (const [id, r] of this.#requests) {
       if (r.request.turn_id !== undefined && r.request.turn_id !== turn.id) continue;
+      if (r.request.tool_call_id && inBackground(lookup, r.request.tool_call_id)) continue;
       this.#requests.delete(id);
       this.emit({ type: "request.resolved", request_id: id, resolution: { outcome: "cancel" } });
     }
@@ -495,7 +500,7 @@ export class ThreadRuntime implements ThreadContext {
       (retry && turn.interrupted) ||
       (carried > 0 && !ok && !(this.session?.live() ?? false));
     if (giveUp) {
-      this.setThread({ status: error ? "error" : "idle", error, usage });
+      this.setThread({ status: error ? "error" : this.#requests.size ? "waiting" : "idle", error, usage });
       if (left.length && carry && !this.closing) this.session?.release();
       if (left.length && !this.closing) this.#undelivered(left.length);
       void this.saveSnapshot();
@@ -507,6 +512,35 @@ export class ThreadRuntime implements ThreadContext {
     this.emit({ type: "turn.started", turn_id: this.turn.id });
     this.setThread({ status: "running", error: undefined, usage });
     this.session?.carryOver(left.map((m) => toMessage(m.id, m)));
+  }
+
+  beginTurn(): void {
+    if (this.turn || this.closed || this.closing) return;
+    this.turn = { id: newId("turn"), interrupted: false };
+    this.emit({ type: "turn.started", turn_id: this.turn.id });
+    this.setThread({ status: "running", error: undefined });
+  }
+
+  stopSubagents(ids: Iterable<string>): void {
+    const stopped = new Set<string>();
+    for (const id of ids) {
+      const it = this.item(id);
+      if (it?.type !== "tool_call" || it.subagent?.status !== "running") continue;
+      stopped.add(id);
+      this.updateItem(id, { subagent: { ...it.subagent, status: "stopped" } });
+    }
+    if (!stopped.size) return;
+    const lookup = (id: string) => this.item(id);
+    const within = (id: string) => [...ancestors(lookup, id)].some((a) => stopped.has(a.id));
+    for (const it of this.#state.items) {
+      if (it.type === "tool_call" && (it.status === "running" || it.status === "pending") && within(it.id)) this.updateItem(it.id, { status: "cancelled" });
+    }
+    for (const [id, r] of this.#requests) {
+      if (!r.request.tool_call_id || !within(r.request.tool_call_id)) continue;
+      this.#requests.delete(id);
+      this.emit({ type: "request.resolved", request_id: id, resolution: { outcome: "cancel" } });
+    }
+    if (!this.#requests.size && !this.turn && this.#state.thread.status === "waiting") this.setThread({ status: "idle" });
   }
 
   #undelivered(n: number): void {
@@ -556,7 +590,8 @@ export class ThreadRuntime implements ThreadContext {
     this.#requests.delete(requestId);
     // The answers to secret questions go only to the harness: what's sent and saved hides them.
     this.emit({ type: "request.resolved", request_id: requestId, resolution: redact(open.request, resolution) });
-    if (!this.#requests.size && this.turn) this.setThread({ status: "running" });
+    // A background subagent's request can be answered when no turn is running.
+    if (!this.#requests.size && (this.turn || this.#state.thread.status === "waiting")) this.setThread({ status: this.turn ? "running" : "idle" });
     if (resolution.always && open.standing && (resolution.outcome === "allow" || resolution.outcome === "deny")) {
       this.#always.set(open.standing, resolution.outcome);
     }

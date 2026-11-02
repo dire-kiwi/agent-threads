@@ -16,6 +16,10 @@
 //   sleepcrash <ms>       waits, then crashes
 //   streamcrash <text>    streams <text> (deltas, no final message), then crashes
 //   streamhang <text>     streams <text>, then waits for its input to close
+//   background <ms> <text>
+//                         starts a background subagent and ends the turn; the subagent calls Bash
+//                         (asking can_use_tool before the turn ends), runs it for <ms>, and
+//                         reports <text>; then, as Claude does, a turn of its own says so
 //
 // MINI_CLAUDE_LOG names a file each run appends its argv, every line it's sent and each result
 // it sends ({"result": ...}) to. With
@@ -185,6 +189,33 @@ async function step(text) {
     await new Promise((r) => setTimeout(r, Number(process.env.MINI_CLAUDE_RESULT_DELAY ?? 0)));
     out({ type: "user", message: { role: "user", content: [{ type: "tool_result", tool_use_id: id, content: res.content, is_error: !!res.isError }] }, parent_tool_use_id: null, session_id: session });
     say(`app said ${res.content[0].text}`);
+  } else if (cmd === "background") {
+    const [ms, ...words] = rest;
+    const agent = `toolu_${++ids}`;
+    const task = `task_${agent}`;
+    out({ type: "assistant", message: { id: `msg_${process.pid}_${++msgs}`, model: "mini", content: [{ type: "tool_use", id: agent, name: "Agent", input: { description: "bg", prompt: "p", subagent_type: "general-purpose", run_in_background: true } }] }, parent_tool_use_id: null, session_id: session });
+    out({ type: "system", subtype: "task_started", task_id: task, tool_use_id: agent, description: "bg", subagent_type: "general-purpose", is_backgrounded: true, task_type: "local_agent", session_id: session });
+    out({ type: "user", message: { role: "user", content: [{ type: "tool_result", tool_use_id: agent, content: [{ type: "text", text: "Async agent launched successfully." }] }] }, parent_tool_use_id: null, session_id: session, tool_use_result: { isAsync: true, status: "async_launched", resolvedModel: "mini-1" } });
+    const bash = `toolu_${++ids}`;
+    out({ type: "assistant", message: { id: `msg_${process.pid}_${++msgs}`, model: "mini", content: [{ type: "tool_use", id: bash, name: "Bash", input: { command: "true" } }] }, parent_tool_use_id: agent, session_id: session });
+    // Asked now, so it's open when the turn ends.
+    const answer = ask({ subtype: "can_use_tool", tool_name: "Bash", input: { command: "true" }, tool_use_id: bash });
+    void (async () => {
+      const r = await answer;
+      const allowed = r.response.behavior === "allow";
+      if (allowed) await sleep(Number(ms));
+      out({ type: "user", message: { role: "user", content: [{ type: "tool_result", tool_use_id: bash, content: allowed ? "done" : r.response.message, is_error: !allowed }] }, parent_tool_use_id: agent, session_id: session });
+      out({ type: "system", subtype: "task_progress", task_id: task, tool_use_id: agent, description: "Running true", usage: { tool_uses: 1 }, session_id: session });
+      out({ type: "system", subtype: "task_updated", task_id: task, patch: { status: "completed" }, session_id: session });
+      out({ type: "system", subtype: "task_notification", task_id: task, tool_use_id: agent, status: "completed", summary: words.join(" "), usage: { tool_uses: 1 }, session_id: session });
+      if (busy) return;
+      busy = true;
+      out({ type: "system", subtype: "init", session_id: session });
+      say(`the subagent said ${words.join(" ")}`);
+      result();
+      busy = false;
+      wake?.();
+    })();
   } else if (cmd === "slow" || cmd === "stubborn") {
     stubborn = cmd === "stubborn";
     // Running with nothing else to do once its stdin's closed.
