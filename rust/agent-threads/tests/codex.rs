@@ -9,8 +9,9 @@ use std::sync::{Arc, Mutex};
 
 use agent_threads::protocol::ToolKind;
 use agent_threads::{
-    AgentThreads, AppTools, Capabilities, CodexOptions, CreateOptions, McpServer, MemoryStore, Options,
-    PermissionDecision, PermissionPolicy, SendOptions, Skill, Store, ThreadEvent, ToolContext, codex, tool,
+    AgentThreads, AppTools, Capabilities, CodexOptions, CreateOptions, LaunchOptions, McpServer, MemoryStore, Options,
+    PermissionDecision, PermissionPolicy, SendOptions, Skill, Store, ThreadEvent, ThreadOptions, ToolContext, codex,
+    tool,
 };
 use common::{items, mini_runs, settle, texts, until};
 use serde_json::{Value, json};
@@ -773,4 +774,84 @@ async fn links_the_users_login_into_the_apps_home() {
     let link = env.home.join("auth.json");
     assert!(std::fs::symlink_metadata(&link).unwrap().file_type().is_symlink());
     assert_eq!(std::fs::read_link(&link).unwrap(), user.join("auth.json"));
+}
+
+/// A thread's launch options: its own CODEX_HOME (used as it is), arguments after the options',
+/// environment, and writable roots; stored with the thread, and changed by set_options.
+#[tokio::test(flavor = "multi_thread")]
+async fn starts_codex_with_the_threads_launch_options() {
+    let mut o = plain();
+    o.args = vec!["--own".into()];
+    o.config
+        .insert("sandbox_workspace_write.writable_roots".into(), json!(["/base"]));
+    let env = setup(
+        Capabilities::default(),
+        o,
+        &[("MINI_LOG_ENV", "AT_SET,AT_GONE"), ("AT_GONE", "instance")],
+    );
+    let (home, cwd) = (common::temp_dir(), common::temp_dir());
+    let t = env
+        .sdk
+        .create(CreateOptions {
+            cwd: Some(cwd.clone()),
+            launch: LaunchOptions {
+                args: vec!["-c".into(), "a=1".into()],
+                env: [
+                    ("AT_SET".to_string(), Some("x y".to_string())),
+                    ("AT_GONE".to_string(), None),
+                ]
+                .into(),
+                add_dirs: vec!["sub".into(), "/abs".into()],
+                config_dir: Some(home.clone()),
+            },
+            ..create()
+        })
+        .await
+        .unwrap();
+    env.sdk.send(&t.id, "reply one", SendOptions::default()).await.unwrap();
+    assert_eq!(texts(&settle(&env.sdk, &t.id).await), ["one"]);
+    let runs = mini_runs(&env.log);
+    assert_eq!(runs[0].argv, ["app-server", "--own", "-c", "a=1"]);
+    assert_eq!(runs[0].config_dir.as_deref(), Some(home.to_str().unwrap()));
+    assert_eq!(runs[0].env, json!({"AT_SET": "x y", "AT_GONE": null}));
+    assert_eq!(
+        env.sent("thread/start")[0]["params"]["config"]["sandbox_workspace_write.writable_roots"],
+        json!(["/base", cwd.join("sub"), "/abs"])
+    );
+    // Its own home, not the app's: no login was linked into it.
+    assert!(!home.join("auth.json").exists());
+    let stored = env.store.get_thread(&t.id).await.unwrap().unwrap();
+    assert_eq!(stored["launch"]["args"], json!(["-c", "a=1"]));
+    assert!(
+        serde_json::to_value(env.sdk.snapshot(&t.id).await.unwrap()).unwrap()["thread"]
+            .get("launch")
+            .is_none()
+    );
+
+    // New arguments: the next turn resumes the thread in a new process that has them.
+    env.sdk
+        .set_options(
+            &t.id,
+            ThreadOptions {
+                launch: Some(LaunchOptions {
+                    args: vec!["-c".into(), "a=2".into()],
+                    config_dir: Some(home.clone()),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    env.sdk.send(&t.id, "reply two", SendOptions::default()).await.unwrap();
+    assert_eq!(texts(&settle(&env.sdk, &t.id).await), ["one", "two"]);
+    let runs = mini_runs(&env.log);
+    assert_eq!(runs.len(), 2);
+    assert_eq!(runs[1].argv, ["app-server", "--own", "-c", "a=2"]);
+    assert_eq!(runs[1].env, json!({"AT_SET": null, "AT_GONE": "instance"}));
+    assert_eq!(env.sent("thread/resume").len(), 1);
+    assert_eq!(
+        env.sent("thread/resume")[0]["params"]["config"]["sandbox_workspace_write.writable_roots"],
+        json!(["/base"])
+    );
 }

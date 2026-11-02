@@ -24,7 +24,7 @@ use tokio::sync::{oneshot, watch};
 use crate::agent_threads::Error;
 use crate::attachments::{Part, message_parts, path_text};
 use crate::claude::{forward_events, last_chars, title};
-use crate::harness::{BoxFuture, Harness, HarnessSession, Message, RunCheckpoint, TurnEnd};
+use crate::harness::{BoxFuture, Harness, HarnessSession, LaunchOptions, Message, RunCheckpoint, TurnEnd};
 use crate::ids::{new_id, now_iso, now_ms, private_temp_dir};
 use crate::mcp_http::{LoopbackMcp, ToolServer, serve_tools};
 use crate::permissions::{Decided, PermissionDecision, PermissionQuery, permission_key};
@@ -184,6 +184,20 @@ struct Launched {
     effort: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     permission_mode: Option<String>,
+    #[serde(default, skip_serializing_if = "LaunchOptions::is_empty")]
+    launch: LaunchOptions,
+}
+
+impl Launched {
+    fn of(ctx: &ThreadContext) -> Self {
+        let t = ctx.thread();
+        Launched {
+            model: t.model.clone(),
+            effort: t.effort.clone(),
+            permission_mode: t.permission_mode.map(|m| m.to_string()),
+            launch: ctx.launch().clone(),
+        }
+    }
 }
 
 /// An MCP tool call running: for an elicitation (which only names its server) and the app's MCP
@@ -929,7 +943,11 @@ impl CodexSession {
             return self.set_ready(ctx, id, Err("the session is closed".into()));
         }
         let o = self.o.clone();
-        let home = if o.user_config {
+        let launch = ctx.launch().clone();
+        // The thread's own CODEX_HOME is used as it is.
+        let home = if let Some(h) = &launch.config_dir {
+            std::path::absolute(h)
+        } else if o.user_config {
             Ok(user_codex_home())
         } else {
             prepare_codex_home(&o.home.clone().unwrap_or_else(default_codex_home), o.login.as_deref())
@@ -945,6 +963,7 @@ impl CodexSession {
                 None => env.remove(k),
             };
         }
+        launch.apply_env(&mut env);
         env.insert("CODEX_HOME".into(), home.to_string_lossy().into());
         let options = SpawnOptions {
             command: o.bin.clone(),
@@ -954,6 +973,7 @@ impl CodexSession {
                 .cloned()
                 .chain(["app-server".to_string()])
                 .chain(o.args.iter().cloned())
+                .chain(launch.args.iter().cloned())
                 .collect(),
             cwd: ctx.thread().cwd.as_ref().map(PathBuf::from),
             env,
@@ -964,12 +984,7 @@ impl CodexSession {
             Ok(p) => p,
             Err(e) => return self.spawn_failed(ctx, id, e.to_string()),
         };
-        let t = ctx.thread();
-        let launched = Launched {
-            model: t.model.clone(),
-            effort: t.effort.clone(),
-            permission_mode: t.permission_mode.map(|m| m.to_string()),
-        };
+        let launched = Launched::of(ctx);
         let run = self.run(id).unwrap();
         run.proc = Some(proc);
         run.launched = Some(launched);
@@ -1294,6 +1309,22 @@ impl CodexSession {
         cfg.insert("suppress_unstable_features_warning".into(), json!(true));
         if !servers.is_empty() {
             cfg.insert("mcp_servers".into(), Value::Object(servers));
+        }
+        // The thread's other directories are writable as its working directory is (relative ones
+        // are in it), after any the options give.
+        let add_dirs = &ctx.launch().add_dirs;
+        if !add_dirs.is_empty() {
+            let key = "sandbox_workspace_write.writable_roots";
+            let mut roots = cfg.get(key).and_then(Value::as_array).cloned().unwrap_or_default();
+            let cwd = t.cwd.as_deref().map(Path::new);
+            for d in add_dirs {
+                let d = match cwd {
+                    Some(cwd) if d.is_relative() => cwd.join(d),
+                    _ => d.clone(),
+                };
+                roots.push(json!(d.to_string_lossy()));
+            }
+            cfg.insert(key.into(), Value::Array(roots));
         }
         if !r.hidden_skills.is_empty() {
             let skills: Vec<Value> = r
@@ -2812,12 +2843,7 @@ impl HarnessSession for CodexSession {
             }
         }
         // A process started with other options than the thread's now is replaced at the next turn.
-        let t = ctx.thread();
-        let now = Launched {
-            model: t.model.clone(),
-            effort: t.effort.clone(),
-            permission_mode: t.permission_mode.map(|m| m.to_string()),
-        };
+        let now = Launched::of(ctx);
         self.stale = st.stale || st.launched.as_ref() != Some(&now);
         // Codex's requests that were open: the user's questions are taken up again, an app tool
         // that was running is answered (not run again), and the rest are dealt with again.
