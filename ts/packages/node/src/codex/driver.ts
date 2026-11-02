@@ -41,6 +41,7 @@ import type {
   ToolRequestUserInputResponse,
   Turn,
   TurnPlanUpdatedNotification,
+  SandboxPolicy,
   TurnStartParams,
   TurnStartResponse,
   UserInput,
@@ -153,6 +154,7 @@ interface RunState {
   rpc: { next: number; pending: PendingRequest[] };
   launched?: Launched;
   model?: string;
+  workspace?: SandboxPolicy;
   collab?: "plan" | "default";
   proposed?: string;
   planned?: Planned;
@@ -227,6 +229,8 @@ class Run {
   launched: Launched | undefined;
   /** The model Codex says the thread runs, for a collaboration mode's settings when the thread has none of its own. */
   model: string | undefined;
+  /** The workspace-write sandbox Codex last said the thread had, with its settings. */
+  workspace: SandboxPolicy | undefined;
   /** The collaboration mode it was last given (none: it's in its default one). */
   collab: "plan" | "default" | undefined;
   /** The plan the running Codex turn proposed, in plan mode. */
@@ -276,6 +280,7 @@ class Run {
       rpc: this.rpc.state(),
       ...(this.launched ? { launched: this.launched } : {}),
       ...(this.model ? { model: this.model } : {}),
+      ...(this.workspace ? { workspace: this.workspace } : {}),
       ...(this.collab ? { collab: this.collab } : {}),
       ...(this.proposed !== undefined ? { proposed: this.proposed } : {}),
       ...(this.planned ? { planned: this.planned } : {}),
@@ -309,6 +314,7 @@ class Run {
     this.held = new Set(st.held);
     if (st.launched) this.launched = { ...st.launched };
     this.model = st.model;
+    this.workspace = st.workspace;
     this.collab = st.collab;
     this.proposed = st.proposed;
     if (st.planned) this.planned = { ...st.planned };
@@ -659,10 +665,9 @@ class CodexSession implements HarnessSession {
     if (t.model && t.model !== l.model) o.model = t.model;
     const before = codexPolicy(l.permission_mode as PermissionMode | undefined);
     const now = codexPolicy(t.permission_mode);
-    if (before.approvalPolicy !== now.approvalPolicy || before.sandbox !== now.sandbox) {
-      o.approvalPolicy = now.approvalPolicy;
-      o.sandboxPolicy = sandboxPolicy(now.sandbox);
-    }
+    if (before.approvalPolicy !== now.approvalPolicy) o.approvalPolicy = now.approvalPolicy;
+    // Only a new sandbox, since what's sent replaces all of it.
+    if (before.sandbox !== now.sandbox) o.sandboxPolicy = sandboxPolicy(now.sandbox, run.workspace, this.#o.config);
     const collab = t.permission_mode === "plan" ? "plan" : run.collab === "plan" ? "default" : undefined;
     if (collab) {
       const model = t.model ?? l.model ?? run.model ?? "";
@@ -816,6 +821,7 @@ class CodexSession implements HarnessSession {
       const r = await this.#startThread(run);
       run.threadId = r.thread.id;
       if (r.model) run.model = r.model;
+      if (r.sandbox?.type === "workspaceWrite") run.workspace = r.sandbox;
       if (ctx.thread.session_id !== run.threadId) ctx.setThread({ session_id: run.threadId });
       return run.threadId;
     } catch (e) {
@@ -1055,6 +1061,12 @@ class CodexSession implements HarnessSession {
       case "turn/completed":
         if (own) return this.#turnCompleted(run, p.turn as Turn);
         return this.#childDone(run, p.threadId, p.turn as Turn, parent_id!);
+      case "thread/settings/updated": {
+        // Its workspace-write sandbox, kept for when it's switched back to it.
+        const sandbox = p.threadSettings?.sandboxPolicy;
+        if (own && sandbox?.type === "workspaceWrite") run.workspace = sandbox;
+        return;
+      }
       case "thread/tokenUsage/updated":
         if (own && p.tokenUsage?.total) run.total = p.tokenUsage.total;
         return;

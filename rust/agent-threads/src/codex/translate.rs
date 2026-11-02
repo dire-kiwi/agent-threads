@@ -314,13 +314,36 @@ pub(crate) fn codex_policy(mode: Option<PermissionMode>) -> (&'static str, &'sta
     }
 }
 
-/// A sandbox mode as turn/start's sandboxPolicy has it.
-pub(crate) fn sandbox_policy(mode: &str) -> Value {
+/// A sandbox mode as turn/start's sandboxPolicy has it. A workspace-write one keeps its settings
+/// (Codex takes those left out as false): the ones Codex last said the thread had (`workspace`), or
+/// else those of the config's `sandbox_workspace_write` (a table, or dotted keys).
+pub(crate) fn sandbox_policy(mode: &str, workspace: Option<&Value>, config: &Map<String, Value>) -> Value {
     match mode {
-        "read-only" => json!({"type": "readOnly"}),
-        "danger-full-access" => json!({"type": "dangerFullAccess"}),
-        _ => json!({"type": "workspaceWrite"}),
+        "read-only" => return json!({"type": "readOnly"}),
+        "danger-full-access" => return json!({"type": "dangerFullAccess"}),
+        _ => {}
     }
+    if let Some(w) = workspace {
+        return w.clone();
+    }
+    let setting = |key: &str| match config.get("sandbox_workspace_write") {
+        Some(Value::Object(table)) => table.get(key).cloned(),
+        _ => config.get(&format!("sandbox_workspace_write.{key}")).cloned(),
+    };
+    let mut p = json!({"type": "workspaceWrite"});
+    if let Some(roots @ Value::Array(_)) = setting("writable_roots") {
+        p["writableRoots"] = roots;
+    }
+    for (key, field) in [
+        ("network_access", "networkAccess"),
+        ("exclude_tmpdir_env_var", "excludeTmpdirEnvVar"),
+        ("exclude_slash_tmp", "excludeSlashTmp"),
+    ] {
+        if let Some(v @ Value::Bool(_)) = setting(key) {
+            p[field] = v;
+        }
+    }
+    p
 }
 
 /// An MCP server as Codex's `mcp_servers` config has it, or why it can't be.

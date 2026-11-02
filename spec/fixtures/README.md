@@ -54,7 +54,7 @@ Each fixture is a directory `spec/fixtures/<harness>/<scenario>/`:
 | `compaction` | A turn, then `/compact` | sent as a message | sent as `thread/compact/start` |
 | `error` | A turn that fails (the model doesn't exist) | an error result | a failed turn, after a warning |
 | `plan` | Plan mode: a plan the user sends back with feedback, then one they approve in `accept_edits`, which the agent carries out without asking | `--permission-mode plan`, ExitPlanMode via `can_use_tool`, approved with `updatedPermissions` `setMode` | `collaborationMode` `plan`, the turn's `plan` item; the feedback and "Implement the plan." are `turn/start`s |
-| `set-options` | `set_options` between turns, changing the model and the permission mode (`accept_edits`), so the next turn's edit isn't asked about, in the same process | `set_model` and `set_permission_mode` control requests | `turn/start`'s `model`, `approvalPolicy` and `sandboxPolicy` |
+| `set-options` | `set_options` between turns, changing the model and the permission mode (`accept_edits`), so the next turn's edit isn't asked about, in the same process | `set_model` and `set_permission_mode` control requests | `turn/start`'s `model` and `approvalPolicy` (the sandbox is the same) |
 | `pass-through` | What the protocol leaves out ([PROTOCOL.md](../PROTOCOL.md#pass-through)): `raw`, the harness message handler and control requests, plus rate limits and notices | `api_retry` and `hook_response` notices, a rejected `rate_limit_event`, a line the driver doesn't know, and `get_context_usage` (and one Claude refuses) | `account/rateLimits/updated` windows, `account/rateLimits/read`, a method answered with a `null` result, and one Codex refuses |
 
 Some things the recordings show that a backend has to deal with: Claude Code echoes the backend's
@@ -148,7 +148,9 @@ backend drives each CLI:
   questions outside plan mode), the MCP servers in `mcp_servers`, and app tools as `dynamicTools`.
   A message is `turn/start` with the text and the thread's `effort`, and the options the process
   doesn't have yet: `model`, `approvalPolicy` and `sandboxPolicy` when they changed since
-  thread/start, and in permission mode `plan` a `collaborationMode` of `plan` (then `default`, on
+  thread/start (each on its own: a `sandboxPolicy` replaces all of the sandbox's settings, so a
+  workspace-write one has those Codex last reported for the thread, or else the config's
+  `sandbox_workspace_write`), and in permission mode `plan` a `collaborationMode` of `plan` (then `default`, on
   the first turn after it); one sent during a turn is
   `turn/steer`; `/compact` is `thread/compact/start`; an interrupt is `turn/interrupt`. It answers
   approvals with `accept` or `decline`, MCP elicitations with `accept`, `requestUserInput` with

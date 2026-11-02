@@ -42,6 +42,12 @@ type optRun struct {
 
 func newMini(t *testing.T, policy agentthreads.PermissionPolicy, env map[string]string) *optEnv {
 	t.Helper()
+	return newMiniConfig(t, policy, env, nil)
+}
+
+// newMiniConfig is newMini with more config for Codex's thread/start.
+func newMiniConfig(t *testing.T, policy agentthreads.PermissionPolicy, env map[string]string, config map[string]any) *optEnv {
+	t.Helper()
 	needNode(t)
 	m := &optEnv{t: t, log: filepath.Join(t.TempDir(), "log.jsonl"), cwd: t.TempDir()}
 	all := map[string]string{"MINI_CLAUDE_LOG": m.log, "MINI_CODEX_LOG": m.log, "HOME": t.TempDir()}
@@ -51,7 +57,7 @@ func newMini(t *testing.T, policy agentthreads.PermissionPolicy, env map[string]
 	m.sdk = agentthreads.New(agentthreads.Options{
 		Harnesses: map[string]agentthreads.Harness{
 			"claude": agentthreads.ClaudeCode(agentthreads.ClaudeOptions{Bin: filepath.Join(miniDir, "mini-claude.mjs"), Env: all}),
-			"codex":  agentthreads.Codex(agentthreads.CodexOptions{Bin: filepath.Join(miniDir, "mini-codex.mjs"), Env: all, Home: t.TempDir(), NoLogin: true, CloseGrace: time.Second}),
+			"codex":  agentthreads.Codex(agentthreads.CodexOptions{Bin: filepath.Join(miniDir, "mini-codex.mjs"), Env: all, Home: t.TempDir(), NoLogin: true, CloseGrace: time.Second, Config: config}),
 		},
 		Capabilities: agentthreads.Capabilities{Permissions: policy},
 		OnError:      func(err error) { t.Errorf("OnError: %v", err) },
@@ -217,6 +223,14 @@ func has(v any, pattern string) bool {
 	json.Unmarshal(mustMarshal(v), &x)
 	json.Unmarshal([]byte(pattern), &p)
 	return like(x, p)
+}
+
+// sameAs says whether v is the JSON value want, exactly.
+func sameAs(v any, want string) bool {
+	var x, w any
+	json.Unmarshal(mustMarshal(v), &x)
+	json.Unmarshal([]byte(want), &w)
+	return reflect.DeepEqual(x, w)
 }
 
 func like(v, pattern any) bool {
@@ -444,6 +458,31 @@ func TestCodexGivesTheProcessNewOptionsWithItsNextTurn(t *testing.T) {
 	}
 }
 
+func TestCodexChangesOnlyTheApprovalPolicyWhenTheSandboxStays(t *testing.T) {
+	// And switches back to the sandbox Codex had: it takes a sandboxPolicy's settings that are left
+	// out as false.
+	m := newMiniConfig(t, agentthreads.Allow, nil, map[string]any{"sandbox_workspace_write.network_access": true, "sandbox_workspace_write.exclude_slash_tmp": true})
+	id := m.create(agentthreads.CreateOptions{Harness: "codex"})
+	for _, mode := range []protocol.PermissionMode{"", protocol.PermissionModeAcceptEdits, protocol.PermissionModeBypass, protocol.PermissionModeAcceptEdits} {
+		if mode != "" {
+			m.setOptions(id, agentthreads.ThreadOptions{PermissionMode: ptr(mode)})
+		}
+		m.send(id, "reply ok")
+		m.settle(id)
+	}
+	turns := m.runs()[0].params("turn/start")
+	if !has(turns[1], `{"approvalPolicy":"on-request"}`) || turns[1]["sandboxPolicy"] != nil {
+		t.Fatalf("turn 1: %s", mustMarshal(turns[1]))
+	}
+	if !has(turns[2], `{"approvalPolicy":"never","sandboxPolicy":{"type":"dangerFullAccess"}}`) {
+		t.Fatalf("turn 2: %s", mustMarshal(turns[2]))
+	}
+	want := `{"type":"workspaceWrite","writableRoots":[],"networkAccess":true,"excludeTmpdirEnvVar":false,"excludeSlashTmp":true}`
+	if !sameAs(turns[3]["sandboxPolicy"], want) {
+		t.Fatalf("turn 3: %s", mustMarshal(turns[3]))
+	}
+}
+
 func TestCodexStartsANewProcessWhenTheModelOrEffortIsCleared(t *testing.T) {
 	// With Codex's own: turn/start can't clear one.
 	for _, option := range []string{"model", "effort"} {
@@ -542,7 +581,7 @@ func TestCodexInPlanMode(t *testing.T) {
 		if !has(turns[0], `{"collaborationMode":{"mode":"plan","settings":{"model":"m"}}}`) {
 			t.Fatalf("turn 0: %s", mustMarshal(turns[0]))
 		}
-		if !has(turns[1], `{"input":[{"type":"text","text":"Implement the plan."}],"collaborationMode":{"mode":"default"},"approvalPolicy":"untrusted","sandboxPolicy":{"type":"workspaceWrite"}}`) {
+		if !has(turns[1], `{"input":[{"type":"text","text":"Implement the plan."}],"collaborationMode":{"mode":"default"},"sandboxPolicy":{"type":"workspaceWrite"}}`) || turns[1]["approvalPolicy"] != nil {
 			t.Fatalf("turn 1: %s", mustMarshal(turns[1]))
 		}
 		// One turn, of both Codex turns.
@@ -583,6 +622,21 @@ func TestCodexInPlanMode(t *testing.T) {
 		turns := m.runs()[0].params("turn/start")
 		if len(turns) != 2 || !has(turns[1], `{"input":[{"type":"text","text":"propose Two."}],"collaborationMode":{"mode":"plan"}}`) || turns[1]["approvalPolicy"] != nil {
 			t.Fatalf("turns %s", mustMarshal(turns))
+		}
+	})
+
+	t.Run("keeps the config's workspace-write settings when a plan's approved out of the read-only sandbox", func(t *testing.T) {
+		t.Parallel()
+		sandbox := map[string]any{"network_access": true, "exclude_tmpdir_env_var": true, "exclude_slash_tmp": true}
+		m := newMiniConfig(t, agentthreads.Allow, nil, map[string]any{"sandbox_workspace_write": sandbox})
+		id := m.create(agentthreads.CreateOptions{Harness: "codex", PermissionMode: *plan})
+		m.send(id, "propose One.")
+		r := m.request(id)
+		m.respond(id, r.ID(), protocol.Resolution{Outcome: protocol.ResolutionOutcomeAllow, PermissionMode: protocol.PermissionModeAcceptEdits})
+		m.settle(id)
+		want := `{"type":"workspaceWrite","networkAccess":true,"excludeTmpdirEnvVar":true,"excludeSlashTmp":true}`
+		if turn := m.runs()[0].params("turn/start")[1]; !sameAs(turn["sandboxPolicy"], want) {
+			t.Fatalf("turn 1: %s", mustMarshal(turn))
 		}
 	})
 

@@ -231,14 +231,39 @@ func codexPolicy(mode protocol.PermissionMode) (approval, sandbox string) {
 }
 
 // sandboxPolicy is a sandbox mode as turn/start's sandboxPolicy has it.
-func sandboxPolicy(mode string) map[string]any {
+//
+// A workspace-write one keeps its settings (Codex takes those left out as false): the ones Codex last
+// said the thread had (workspace), or else those of the config's sandbox_workspace_write (a table,
+// or dotted keys).
+func sandboxPolicy(mode string, workspace json.RawMessage, config map[string]any) any {
 	switch mode {
 	case "read-only":
 		return map[string]any{"type": "readOnly"}
 	case "danger-full-access":
 		return map[string]any{"type": "dangerFullAccess"}
 	}
-	return map[string]any{"type": "workspaceWrite"}
+	if workspace != nil {
+		return workspace
+	}
+	table, _ := config["sandbox_workspace_write"].(map[string]any)
+	setting := func(key string) any {
+		if table != nil {
+			return table[key]
+		}
+		return config["sandbox_workspace_write."+key]
+	}
+	p := map[string]any{"type": "workspaceWrite"}
+	if roots, ok := setting("writable_roots").([]string); ok {
+		p["writableRoots"] = roots
+	} else if roots, ok := setting("writable_roots").([]any); ok {
+		p["writableRoots"] = roots
+	}
+	for key, field := range map[string]string{"network_access": "networkAccess", "exclude_tmpdir_env_var": "excludeTmpdirEnvVar", "exclude_slash_tmp": "excludeSlashTmp"} {
+		if v, ok := setting(key).(bool); ok {
+			p[field] = v
+		}
+	}
+	return p
 }
 
 // mcpServerConfig is an MCP server as Codex's mcp_servers config has it, or why it can't be.

@@ -328,6 +328,15 @@ async function step(line) {
   }
 }
 
+/** The sandbox policy thread/start's sandbox and config make, as Codex reports it. */
+function sandboxOf(p) {
+  if (p.sandbox === "read-only") return { type: "readOnly", networkAccess: false };
+  if (p.sandbox === "danger-full-access") return { type: "dangerFullAccess" };
+  const c = p.config ?? {};
+  const set = (k) => (c.sandbox_workspace_write ?? {})[k] ?? c[`sandbox_workspace_write.${k}`] ?? false;
+  return { type: "workspaceWrite", writableRoots: [], networkAccess: set("network_access"), excludeTmpdirEnvVar: set("exclude_tmpdir_env_var"), excludeSlashTmp: set("exclude_slash_tmp") };
+}
+
 async function runTurn(input, id0 = uid("turn")) {
   turn = { id: id0, interrupted: false, wake: null, heard: [] };
   const id = turn.id;
@@ -389,14 +398,14 @@ createInterface({ input: process.stdin })
         if (p.dynamicTools?.length && process.env.MINI_CODEX_NO_DYNAMIC) return fail("dynamicTools isn't supported by this version");
         thread = { id: uid("thread"), totals: { totalTokens: 0, inputTokens: 0, cachedInputTokens: 0, cacheWriteInputTokens: 0, outputTokens: 0 }, params: p, dynamicTools: p.dynamicTools ?? [] };
         save();
-        return reply({ thread: { id: thread.id } });
+        return reply({ thread: { id: thread.id }, sandbox: sandboxOf(p) });
       case "thread/resume": {
         const file = sessions && join(sessions, `${p.threadId}.json`);
         if (!file || !existsSync(file)) return fail(`no rollout found for thread id ${p.threadId}`);
         // As Codex does, it keeps the dynamic tools the session started with (resuming can't change them).
         const saved = JSON.parse(readFileSync(file, "utf8"));
         thread = { id: p.threadId, totals: saved.totals, params: p, dynamicTools: saved.dynamicTools ?? [] };
-        return reply({ thread: { id: thread.id } });
+        return reply({ thread: { id: thread.id }, sandbox: sandboxOf(p) });
       }
       case "turn/start":
         if (turn) return fail("a turn is already running");

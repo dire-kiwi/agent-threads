@@ -848,9 +848,10 @@ async fn in_plan_mode_asks_the_user_about_a_proposed_plan_and_implements_it_in_t
     assert_eq!(turns[0]["collaborationMode"]["settings"]["model"], "m");
     assert_eq!(turns[1]["input"][0]["text"], "Implement the plan.");
     assert_eq!(turns[1]["collaborationMode"]["mode"], "default");
+    // Its approval policy's the same.
     assert_eq!(
-        (turns[1]["approvalPolicy"].clone(), turns[1]["sandboxPolicy"].clone()),
-        (json!("untrusted"), json!({"type": "workspaceWrite"}))
+        (turns[1].get("approvalPolicy"), turns[1]["sandboxPolicy"].clone()),
+        (None, json!({"type": "workspaceWrite"}))
     );
     // One turn, of both Codex turns.
     let r = results(&s);
@@ -911,6 +912,63 @@ async fn in_plan_mode_sends_the_users_feedback_and_plans_again_denied_without_an
         (json!("propose Two."), json!("plan"))
     );
     assert!(turns[1].get("approvalPolicy").is_none());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn in_plan_mode_keeps_the_configs_workspace_write_settings_when_a_plans_approved_out_of_the_read_only_sandbox() {
+    let sandbox = json!({"network_access": true, "exclude_tmpdir_env_var": true, "exclude_slash_tmp": true});
+    let config = [("sandbox_workspace_write".to_string(), sandbox)].into_iter().collect();
+    let env = setup(Capabilities::default(), CodexOptions { config, ..plain() }, &[]);
+    let t = planning(&env).await;
+    env.sdk.send(&t, "propose One.", SendOptions::default()).await.unwrap();
+    let r = env.request(&t).await;
+    env.sdk
+        .handle_json(respond(
+            &t,
+            &r,
+            json!({"outcome": "allow", "permission_mode": "accept_edits"}),
+        ))
+        .await
+        .unwrap();
+    settle(&env.sdk, &t).await;
+    assert_eq!(
+        turn_starts(&env)[1]["sandboxPolicy"],
+        json!({"type": "workspaceWrite", "networkAccess": true, "excludeTmpdirEnvVar": true, "excludeSlashTmp": true})
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn changes_only_the_approval_policy_when_the_sandbox_stays_and_switches_back_to_the_sandbox_codex_had() {
+    // Codex takes a sandboxPolicy's settings that are left out as false.
+    let config = [
+        ("sandbox_workspace_write.network_access".to_string(), json!(true)),
+        ("sandbox_workspace_write.exclude_slash_tmp".to_string(), json!(true)),
+    ]
+    .into_iter()
+    .collect();
+    let env = setup(Capabilities::default(), CodexOptions { config, ..plain() }, &[]);
+    let t = env.sdk.create(create()).await.unwrap();
+    for mode in [None, Some("accept_edits"), Some("bypass"), Some("accept_edits")] {
+        if let Some(mode) = mode {
+            let cmd = json!({"type": "set_options", "thread_id": t.id, "permission_mode": mode});
+            env.sdk.handle_json(cmd).await.unwrap();
+        }
+        env.sdk.send(&t.id, "reply ok", SendOptions::default()).await.unwrap();
+        settle(&env.sdk, &t.id).await;
+    }
+    let turns = turn_starts(&env);
+    assert_eq!(
+        (turns[1]["approvalPolicy"].clone(), turns[1].get("sandboxPolicy")),
+        (json!("on-request"), None)
+    );
+    assert_eq!(
+        (turns[2]["approvalPolicy"].clone(), turns[2]["sandboxPolicy"].clone()),
+        (json!("never"), json!({"type": "dangerFullAccess"}))
+    );
+    assert_eq!(
+        turns[3]["sandboxPolicy"],
+        json!({"type": "workspaceWrite", "writableRoots": [], "networkAccess": true, "excludeTmpdirEnvVar": false, "excludeSlashTmp": true})
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]

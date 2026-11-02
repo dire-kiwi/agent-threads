@@ -294,6 +294,8 @@ struct RunState {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     model: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    workspace: Option<Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     collab: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     proposed: Option<String>,
@@ -369,6 +371,8 @@ struct Run {
     /// The model Codex says the thread runs, for a collaboration mode's settings when the thread
     /// has none of its own.
     model: Option<String>,
+    /// The workspace-write sandbox Codex last said the thread had, with its settings.
+    workspace: Option<Value>,
     /// The collaboration mode it was last given, `plan` or `default` (none: it's in its default
     /// one).
     collab: Option<String>,
@@ -421,6 +425,7 @@ impl Run {
             held: HashSet::new(),
             launched: None,
             model: None,
+            workspace: None,
             collab: None,
             proposed: None,
             planned: None,
@@ -517,6 +522,7 @@ impl Run {
             },
             launched: self.launched.clone(),
             model: self.model.clone(),
+            workspace: self.workspace.clone(),
             collab: self.collab.clone(),
             proposed: self.proposed.clone(),
             planned: self.planned.clone(),
@@ -553,6 +559,7 @@ impl Run {
         self.held = st.held.iter().cloned().collect();
         self.launched = st.launched.clone();
         self.model = st.model.clone();
+        self.workspace = st.workspace.clone();
         self.collab = st.collab.clone();
         self.proposed = st.proposed.clone();
         self.planned = st.planned.clone();
@@ -926,9 +933,16 @@ impl CodexSession {
             o.insert("model".into(), json!(m));
         }
         let (approval, sandbox) = codex_policy(t.permission_mode);
-        if codex_policy(l.permission_mode) != (approval, sandbox) {
+        let (approval_before, sandbox_before) = codex_policy(l.permission_mode);
+        if approval != approval_before {
             o.insert("approvalPolicy".into(), json!(approval));
-            o.insert("sandboxPolicy".into(), sandbox_policy(sandbox));
+        }
+        // Only a new sandbox, since what's sent replaces all of it.
+        if sandbox != sandbox_before {
+            o.insert(
+                "sandboxPolicy".into(),
+                sandbox_policy(sandbox, r.workspace.as_ref(), &self.o.config),
+            );
         }
         let collab = if t.permission_mode == Some(PermissionMode::Plan) {
             Some("plan")
@@ -1383,6 +1397,9 @@ impl CodexSession {
         if let Some(m) = r["model"].as_str() {
             rs.model = Some(m.to_string());
         }
+        if r["sandbox"]["type"] == "workspaceWrite" {
+            rs.workspace = Some(r["sandbox"].clone());
+        }
         if ctx.thread().session_id.as_deref() != Some(thread_id.as_str()) {
             let sid = thread_id.clone();
             ctx.set_thread(|t| t.session_id = Some(sid));
@@ -1760,6 +1777,13 @@ impl CodexSession {
             "account/rateLimits/updated" => {
                 if p["rateLimits"].is_object() {
                     ctx.rate_limits(codex_rate_limits(&p["rateLimits"]));
+                }
+            }
+            "thread/settings/updated" => {
+                // Its workspace-write sandbox, kept for when it's switched back to it.
+                let sandbox = &p["threadSettings"]["sandboxPolicy"];
+                if own && sandbox["type"] == "workspaceWrite" {
+                    self.run(run).unwrap().workspace = Some(sandbox.clone());
                 }
             }
             "thread/tokenUsage/updated" => {

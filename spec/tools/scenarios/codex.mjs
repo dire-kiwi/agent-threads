@@ -264,7 +264,7 @@ export const scenarios = {
 
   "set-options": {
     description:
-      "Options changed between turns while the process runs: the next turn/start overrides the model and the policy (accept_edits), so its edit isn't asked about.",
+      "Options changed between turns while the process runs: the next turn/start overrides the model and the approval policy (accept_edits), so its edit isn't asked about.",
     async run(ctx) {
       const { p, rpc } = await start(ctx);
       const { thread } = await rpc.request("thread/start", threadParams(ctx));
@@ -272,8 +272,8 @@ export const scenarios = {
       await p.next(turnCompleted(thread.id), "the first turn to complete");
       await turn(rpc, thread.id, "Edit notes.txt with apply_patch to change the line apple to apricot. Then reply with just: done", {
         model: "gpt-6-luna",
+        // The sandbox stays as it is (workspace-write): only the approval policy changes.
         approvalPolicy: "on-request",
-        sandboxPolicy: { type: "workspaceWrite" },
       });
       await p.next(turnCompleted(thread.id), "the second turn to complete");
       p.close();

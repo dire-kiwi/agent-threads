@@ -153,16 +153,34 @@ export function codexPolicy(mode: PermissionMode | undefined): { approvalPolicy:
   }
 }
 
-/** A sandbox mode as turn/start's sandboxPolicy has it. */
-export function sandboxPolicy(mode: SandboxMode): SandboxPolicy {
+/**
+ * A sandbox mode as turn/start's sandboxPolicy has it. A workspace-write one keeps its settings
+ * (Codex takes those left out as false): the ones Codex last said the thread had (`workspace`), or
+ * else those of the config's `sandbox_workspace_write` (a table, or dotted keys).
+ */
+export function sandboxPolicy(mode: SandboxMode, workspace: SandboxPolicy | undefined, config: { [k: string]: unknown } | undefined): SandboxPolicy {
   switch (mode) {
     case "read-only":
       return { type: "readOnly" };
     case "danger-full-access":
       return { type: "dangerFullAccess" };
-    default:
-      return { type: "workspaceWrite" };
   }
+  if (workspace?.type === "workspaceWrite") return workspace;
+  const table = config?.sandbox_workspace_write;
+  const setting = (key: string): unknown =>
+    table && typeof table === "object" && !Array.isArray(table) ? (table as { [k: string]: unknown })[key] : config?.[`sandbox_workspace_write.${key}`];
+  const p: SandboxPolicy = { type: "workspaceWrite" };
+  const roots = setting("writable_roots");
+  if (Array.isArray(roots) && roots.every((r) => typeof r === "string")) p.writableRoots = roots;
+  for (const [key, field] of [
+    ["network_access", "networkAccess"],
+    ["exclude_tmpdir_env_var", "excludeTmpdirEnvVar"],
+    ["exclude_slash_tmp", "excludeSlashTmp"],
+  ] as const) {
+    const v = setting(key);
+    if (typeof v === "boolean") p[field] = v;
+  }
+  return p;
 }
 
 /** An MCP server as Codex's `mcp_servers` config has it, or why it can't be. */

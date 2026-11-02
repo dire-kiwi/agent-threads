@@ -523,6 +523,23 @@ describe("the Codex driver", () => {
     expect(turns.map((p) => p.collaborationMode)).toEqual([undefined, undefined, undefined]);
   });
 
+  it("changes only the approval policy when the sandbox stays, and switches back to the sandbox Codex had", async () => {
+    // Codex takes a sandboxPolicy's settings that are left out as false.
+    const config = { "sandbox_workspace_write.network_access": true, "sandbox_workspace_write.exclude_slash_tmp": true };
+    const { sdk, sent } = setup({ codex: { config } });
+    const t = await sdk.create({ harness: "codex", cwd: tempDir() });
+    for (const mode of [undefined, "accept_edits", "bypass", "accept_edits"] as const) {
+      if (mode) await sdk.setOptions(t.id, { permission_mode: mode });
+      await sdk.send(t.id, "reply ok");
+      await settle(sdk, t.id);
+    }
+    const turns = sent("turn/start").map((m) => m.params);
+    expect(turns[1]).toMatchObject({ approvalPolicy: "on-request" });
+    expect(turns[1]).not.toHaveProperty("sandboxPolicy");
+    expect(turns[2]).toMatchObject({ approvalPolicy: "never", sandboxPolicy: { type: "dangerFullAccess" } });
+    expect(turns[3]!.sandboxPolicy).toEqual({ type: "workspaceWrite", writableRoots: [], networkAccess: true, excludeTmpdirEnvVar: false, excludeSlashTmp: true });
+  });
+
   it.each(["model", "effort"] as const)("starts a new process, with Codex's own %s, when the thread's is cleared", async (option) => {
     const { sdk, sent, runs } = setup();
     const t = await sdk.create({ harness: "codex", model: "a", effort: "high", cwd: tempDir() });
@@ -573,9 +590,10 @@ describe("the Codex driver", () => {
       expect(turns[1]).toMatchObject({
         input: [{ type: "text", text: "Implement the plan." }],
         collaborationMode: { mode: "default" },
-        approvalPolicy: "untrusted",
         sandboxPolicy: { type: "workspaceWrite" },
       });
+      // Its approval policy's the same.
+      expect(turns[1]).not.toHaveProperty("approvalPolicy");
       // One turn, of both Codex turns.
       expect(results(s.items)).toHaveLength(1);
       expect(results(s.items)[0]).toMatchObject({ ok: true, duration_ms: 14, usage: { input_tokens: 120, cache_read_tokens: 80, output_tokens: 20 } });
@@ -603,6 +621,17 @@ describe("the Codex driver", () => {
       expect(turns).toHaveLength(2);
       expect(turns[1]).toMatchObject({ input: [{ type: "text", text: "propose Two." }], collaborationMode: { mode: "plan" } });
       expect(turns[1]).not.toHaveProperty("approvalPolicy");
+    });
+
+    it("keeps the config's workspace-write settings when a plan's approved out of the read-only sandbox", async () => {
+      const sandbox = { network_access: true, exclude_tmpdir_env_var: true, exclude_slash_tmp: true };
+      const { sdk, sent } = setup({ codex: { config: { sandbox_workspace_write: sandbox } } });
+      const t = await sdk.create({ harness: "codex", permission_mode: "plan", cwd: tempDir() });
+      await sdk.send(t.id, "propose One.");
+      const r = await request(sdk, t.id);
+      await sdk.respond(t.id, r.id, { outcome: "allow", permission_mode: "accept_edits" });
+      await settle(sdk, t.id);
+      expect(planTurns(sent)[1]!.sandboxPolicy).toEqual({ type: "workspaceWrite", networkAccess: true, excludeTmpdirEnvVar: true, excludeSlashTmp: true });
     });
 
     it("carries on in the mode the user approves the plan in", async () => {
