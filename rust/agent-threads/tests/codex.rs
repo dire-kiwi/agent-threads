@@ -8,6 +8,7 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 use agent_threads::protocol::ToolKind;
+use agent_threads::reducer::open_requests;
 use agent_threads::{
     AgentThreads, AppTools, Capabilities, CodexOptions, CreateOptions, McpServer, MemoryStore, Options,
     PermissionDecision, PermissionPolicy, SendOptions, Skill, Store, ThreadEvent, ToolContext, codex, tool,
@@ -90,12 +91,8 @@ impl Env {
 
     async fn request(&self, id: &str) -> Value {
         until(5, || async {
-            self.sdk
-                .snapshot(id)
-                .await
-                .unwrap()
-                .requests
-                .first()
+            open_requests(&self.sdk.snapshot(id).await.unwrap())
+                .next()
                 .map(|r| serde_json::to_value(r).unwrap())
         })
         .await
