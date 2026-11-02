@@ -922,6 +922,9 @@ func (rt *threadRuntime) Ask(request protocol.ThreadRequestValue, toolCallID str
 	case *protocol.QuestionRequest:
 		id = NewID("q")
 		r.ID, r.TurnID, r.ToolCallID, r.ParentID = id, turnID, toolCallID, parent
+	case *protocol.PlanRequest:
+		id = NewID("plan")
+		r.ID, r.TurnID, r.ToolCallID, r.ParentID = id, turnID, toolCallID, parent
 	}
 	req := protocol.ThreadRequest{Value: request}
 	rt.addRequest(id, &openRequest{request: req, answered: answered, standing: standing})

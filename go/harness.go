@@ -152,8 +152,12 @@ type Session interface {
 	// Release says the core gave up carrying the queued messages over: make sure nothing acts on
 	// them (stop a process that has them). They're sent again with the next turn's Start.
 	Release()
-	// OptionsChanged says the thread's options (model, effort, permission mode) or config changed.
+	// OptionsChanged says the thread's options (model, effort, permission mode) changed: they go to
+	// the running process where the harness takes them, and otherwise apply from the next turn.
 	OptionsChanged()
+	// ConfigChanged says the thread's config (tools, MCP servers, skills, system prompt) changed: the
+	// next turn needs a new process.
+	ConfigChanged()
 	// Close stops the harness process, if it's running, and calls done once it has.
 	Close(done func())
 }

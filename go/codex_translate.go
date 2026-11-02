@@ -229,6 +229,17 @@ func codexPolicy(mode protocol.PermissionMode) (approval, sandbox string) {
 	return "untrusted", "workspace-write"
 }
 
+// sandboxPolicy is a sandbox mode as turn/start's sandboxPolicy has it.
+func sandboxPolicy(mode string) map[string]any {
+	switch mode {
+	case "read-only":
+		return map[string]any{"type": "readOnly"}
+	case "danger-full-access":
+		return map[string]any{"type": "dangerFullAccess"}
+	}
+	return map[string]any{"type": "workspaceWrite"}
+}
+
 // mcpServerConfig is an MCP server as Codex's mcp_servers config has it, or why it can't be.
 func mcpServerConfig(s MCPServer) (map[string]any, string) {
 	if s.URL != "" {

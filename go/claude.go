@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"slices"
 	"sort"
 	"strings"
 	"syscall"
@@ -75,15 +76,24 @@ type sentMessage struct {
 	Echo string   `json:"echo"`
 }
 
-// launched is the thread's options a process is started with: a different one needs another.
+// launched is the thread's options a process has: it's started with them, and Claude takes a new
+// model and permission mode as it runs, and Codex all three with a turn (a new effort needs another
+// Claude process). Bypass (Claude's) says it was started in bypass mode, so it can be switched to it
+// (Claude Code refuses otherwise).
 type launched struct {
 	Model          string `json:"model,omitempty"`
 	Effort         string `json:"effort,omitempty"`
 	PermissionMode string `json:"permission_mode,omitempty"`
+	Bypass         bool   `json:"bypass,omitempty"`
 }
 
 func launchedOf(t protocol.Thread) *launched {
 	return &launched{Model: t.Model, Effort: t.Effort, PermissionMode: string(t.PermissionMode)}
+}
+
+// has says whether a process has the thread's options.
+func (l *launched) has(t protocol.Thread) bool {
+	return l != nil && l.Model == t.Model && l.Effort == t.Effort && l.PermissionMode == string(t.PermissionMode)
 }
 
 // claudeRunState is what a run's checkpoint holds (see DurableSession.Checkpoint): what's needed to
@@ -148,7 +158,9 @@ type claudeRun struct {
 	sent []sentMessage
 	// pluginDir is the generated plugin with the thread's skills, for this run only.
 	pluginDir string
-	launched  *launched
+	// launched is the thread's options it has: those it was started with, and the model and
+	// permission mode since.
+	launched *launched
 }
 
 func newClaudeRun(id string) *claudeRun {
@@ -184,13 +196,29 @@ func (r *claudeRun) send(ids []string, msg map[string]any) {
 	}
 }
 
-func (r *claudeRun) control(request map[string]any, resolve func(jmap)) {
+// control sends a control request (queue: once Claude is ready); resolve gets its response, or nil
+// if it failed.
+func (r *claudeRun) control(request map[string]any, queue bool, resolve func(jmap)) {
 	id := fmt.Sprintf("req_%d", r.nextRequest)
 	r.nextRequest++
 	subtype, _ := request["subtype"].(string)
 	r.pending[id] = &pendingControl{subtype: subtype, resolve: resolve}
 	r.pendingOrder = append(r.pendingOrder, id)
-	r.write(map[string]any{"type": "control_request", "request_id": id, "request": request})
+	msg := map[string]any{"type": "control_request", "request_id": id, "request": request}
+	if queue && !r.ready {
+		// Ahead of the messages waiting (after the requests already queued), so they run with it.
+		at := len(r.waiting)
+		for i, line := range r.waiting {
+			var w struct{ Type string }
+			if json.Unmarshal([]byte(line), &w) == nil && w.Type != "control_request" {
+				at = i
+				break
+			}
+		}
+		r.waiting = slices.Insert(r.waiting, at, string(mustJSON(msg)))
+		return
+	}
+	r.write(msg)
 }
 
 func (r *claudeRun) takePending(id string) *pendingControl {
@@ -434,7 +462,8 @@ type claudeSession struct {
 	// last is the run before, once it has exited (for its last checkpoint).
 	last     *claudeRun
 	stopping stopper
-	// stale says the options changed since the run started: the next turn starts a new one.
+	// stale says the run hasn't the thread's options or config as they are now (a new effort, or a
+	// mode Claude can't switch it to): the next turn starts a new one.
 	stale      bool
 	steerTimer *loopTimer
 	stopTimer  *loopTimer
@@ -469,7 +498,7 @@ func (s *claudeSession) Steer(m Message) {
 func (s *claudeSession) CarryOver(messages []Message) {
 	run := s.live()
 	if run == nil || s.stale {
-		// The next turn runs with the options as they are now, so in a new process if they changed.
+		// The next turn runs with the options as they are now, so in a new process if this one can't.
 		// The old one has the messages on its stdin, and mustn't act on them: it's stopped at once.
 		if run != nil {
 			s.stop(run, true, true, nil)
@@ -504,7 +533,7 @@ func (s *claudeSession) Interrupt() {
 	turn := s.ctx.TurnID()
 	send := func(error) {
 		if s.live() == run && !run.detached && s.ctx.TurnID() == turn {
-			run.control(map[string]any{"subtype": "interrupt"}, func(jmap) {})
+			run.control(map[string]any{"subtype": "interrupt"}, false, func(jmap) {})
 		}
 	}
 	// A run that outlives the backend is saved first, its turn interrupted and when it's stopped if
@@ -533,7 +562,52 @@ func (s *claudeSession) clearStop() {
 	s.stopTimer = nil
 }
 
-func (s *claudeSession) OptionsChanged() { s.stale = true }
+func (s *claudeSession) OptionsChanged() {
+	run := s.live()
+	// A process yet to start is started with them.
+	if run == nil || run.launched == nil {
+		return
+	}
+	l := run.launched
+	t := s.ctx.Thread()
+	// Claude takes a new model and permission mode as it runs, even during a turn; a new effort needs
+	// a new process, at the next turn.
+	if l.Effort != t.Effort {
+		s.stale = true
+	}
+	// Set as they're asked for, so a restart before the answer doesn't ask again; one Claude refuses
+	// is the next process's.
+	refused := func(r jmap) {
+		if r == nil && s.run == run {
+			s.stale = true
+		}
+	}
+	if l.Model != t.Model {
+		l.Model = t.Model
+		model := t.Model
+		if model == "" {
+			model = "default"
+		}
+		run.control(map[string]any{"subtype": "set_model", "model": model}, true, refused)
+	}
+	if l.PermissionMode != string(t.PermissionMode) {
+		l.PermissionMode = string(t.PermissionMode)
+		run.control(map[string]any{"subtype": "set_permission_mode", "mode": s.liveMode(run, t.PermissionMode)}, true, refused)
+	}
+}
+
+func (s *claudeSession) ConfigChanged() { s.stale = true }
+
+// liveMode is Claude's name for a permission mode the running process is switched to. One not
+// started in bypass mode can't be switched to it: it goes to acceptEdits, the driver allows what it
+// asks about (see canUseTool), and the next turn has a new process, in bypass mode.
+func (s *claudeSession) liveMode(run *claudeRun, mode protocol.PermissionMode) string {
+	if mode == protocol.PermissionModeBypass && (run.launched == nil || !run.launched.Bypass) {
+		s.stale = true
+		return "acceptEdits"
+	}
+	return claudeMode(mode)
+}
 
 func (s *claudeSession) Live() bool { return s.live() != nil }
 
@@ -612,9 +686,7 @@ func (s *claudeSession) Reattach(record RunRecord) bool {
 	}
 	run.proc = proc
 	// A process started with other options than the thread's now is replaced at the next turn.
-	t := s.ctx.Thread()
-	l := st.Launched
-	s.stale = st.Stale || l == nil || *l != *launchedOf(t)
+	s.stale = st.Stale || !st.Launched.has(s.ctx.Thread())
 	// Claude's requests that were open: the user's questions are taken up again, and the rest (a
 	// policy that hadn't decided, a tool that was running) are dealt with again. One answered before
 	// the restart, though that wasn't saved, is closed: Claude has its answer.
@@ -732,7 +804,7 @@ func (s *claudeSession) live() *claudeRun {
 	return nil
 }
 
-// ensure is the running process, or a new one. A new turn (fresh) restarts it if the options changed.
+// ensure is the running process, or a new one. A new turn (fresh) restarts it if it's stale.
 func (s *claudeSession) ensure(fresh bool) *claudeRun {
 	live := s.live()
 	if live != nil && !(fresh && s.stale) {
@@ -838,6 +910,7 @@ func (s *claudeSession) spawn(run *claudeRun) {
 	}
 	run.proc = proc
 	run.launched = launchedOf(thread)
+	run.launched.Bypass = thread.PermissionMode == protocol.PermissionModeBypass
 	ctx.SetThread(func(t *protocol.Thread) {
 		t.Run = &protocol.Run{ID: run.id, Spawner: protocol.RunSpawner(ctx.Spawner().Name()), StartedAt: now()}
 	})
@@ -845,7 +918,7 @@ func (s *claudeSession) spawn(run *claudeRun) {
 	if len(cfg.Tools) > 0 {
 		init["sdkMcpServers"] = []string{appServer}
 	}
-	run.control(init, func(r jmap) { s.initialized(run, r) })
+	run.control(init, false, func(r jmap) { s.initialized(run, r) })
 }
 
 // mergeEnv is env with vars set (replacing any already there).
@@ -1300,9 +1373,15 @@ func (s *claudeSession) canUseTool(run *claudeRun, requestID string, req jmap, e
 		_, open := run.open[requestID]
 		return open && !run.exited && !run.retired && !run.detached && s.run == run && ctx.TurnID() == turn
 	}
-	allow := func(updated json.RawMessage) {
+	allow := func(updated json.RawMessage, more ...map[string]any) {
 		if wanted() {
-			run.respond(requestID, map[string]any{"behavior": "allow", "updatedInput": updated})
+			response := map[string]any{"behavior": "allow", "updatedInput": updated}
+			for _, m := range more {
+				for k, v := range m {
+					response[k] = v
+				}
+			}
+			run.respond(requestID, response)
 		}
 	}
 	deny := func(message string) {
@@ -1347,6 +1426,42 @@ func (s *claudeSession) canUseTool(run *claudeRun, requestID string, req jmap, e
 			}
 		}, "")
 		run.asked[requestID] = id
+		return
+	}
+
+	if req.str("tool_name") == "ExitPlanMode" {
+		// A plan, which only the user approves. Approved, Claude leaves plan mode for the mode the
+		// thread carries on in (setMode), as does the thread; sent back, it plans again.
+		id := ask(&protocol.PlanRequest{Plan: orObj(parseObj(input)).str("plan")}, toolUseID, func(res protocol.Resolution) {
+			if !wanted() {
+				return
+			}
+			if res.Outcome == protocol.ResolutionOutcomeAllow {
+				mode := modeAfterPlan(ctx.Thread().PermissionMode, res.PermissionMode)
+				allow(input, map[string]any{"updatedPermissions": []any{map[string]any{"type": "setMode", "mode": s.liveMode(run, mode), "destination": "session"}}})
+				if run.launched != nil {
+					run.launched.PermissionMode = string(mode)
+				}
+				ctx.SetThread(func(t *protocol.Thread) { t.PermissionMode = mode })
+				if toolUseID != "" {
+					ctx.UpdateItem(toolUseID, Patch{"status": protocol.ToolStatusRunning})
+				}
+			} else {
+				msg := res.Message
+				if msg == "" {
+					msg = "The user wants you to keep planning rather than start on this plan."
+				}
+				deny(msg)
+				denied()
+			}
+		}, "")
+		run.asked[requestID] = id
+		return
+	}
+
+	// The thread is in bypass mode, which its process couldn't be switched to: nothing is asked.
+	if ctx.Thread().PermissionMode == protocol.PermissionModeBypass && existing == "" {
+		allow(input)
 		return
 	}
 

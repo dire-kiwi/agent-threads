@@ -62,6 +62,7 @@ func (s *echoSession) Interrupt()                          { s.ctx.EndTurn(agent
 func (s *echoSession) Live() bool                          { return false }
 func (s *echoSession) Release()                            {}
 func (s *echoSession) OptionsChanged()                     {}
+func (s *echoSession) ConfigChanged()                      {}
 func (s *echoSession) Close(done func())                   { s.closed = true; done() }
 
 func newEcho(t *testing.T, store agentthreads.Store, policy agentthreads.PermissionPolicy) *agentthreads.AgentThreads {

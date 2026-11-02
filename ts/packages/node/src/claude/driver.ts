@@ -151,8 +151,11 @@ class Run {
     const request_id = `req_${this.#nextRequest++}`;
     const p = new Promise<Json | null>((resolve) => this.pending.set(request_id, { subtype: String(request.subtype), resolve }));
     const msg = { type: "control_request", request_id, request };
-    if (queue && !this.ready) this.waiting.push(JSON.stringify(msg));
-    else this.write(msg);
+    if (queue && !this.ready) {
+      // Ahead of the messages waiting (after the requests already queued), so they run with it.
+      const at = this.waiting.findIndex((l) => JSON.parse(l).type !== "control_request");
+      this.waiting.splice(at < 0 ? this.waiting.length : at, 0, JSON.stringify(msg));
+    } else this.write(msg);
     return p;
   }
 

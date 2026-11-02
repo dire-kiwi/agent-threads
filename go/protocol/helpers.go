@@ -193,6 +193,8 @@ func (u ThreadRequest) ID() string {
 		return r.ID
 	case *QuestionRequest:
 		return r.ID
+	case *PlanRequest:
+		return r.ID
 	}
 	return ""
 }
@@ -203,6 +205,8 @@ func (u ThreadRequest) TurnID() string {
 	case *PermissionRequest:
 		return r.TurnID
 	case *QuestionRequest:
+		return r.TurnID
+	case *PlanRequest:
 		return r.TurnID
 	}
 	return ""
