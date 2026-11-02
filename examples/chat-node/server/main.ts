@@ -142,7 +142,13 @@ const methods: { [name: string]: (params: any) => unknown } = {
       cwd: workspace,
     });
   },
-  snapshot: (p: { thread_id: string }) => sdk.snapshot(p.thread_id),
+  // With a limit, a window of its latest items; the client loads earlier ones with items_before.
+  snapshot: (p: { thread_id: string; limit?: number }) =>
+    sdk.snapshot(p.thread_id, typeof p.limit === "number" ? { limit: Math.max(0, p.limit) } : undefined),
+  items_before: (p: { thread_id: string; before: number; limit: number }) => {
+    if (typeof p.before !== "number" || typeof p.limit !== "number") throw new CommandError("items_before needs a before and a limit");
+    return sdk.itemsBefore(p.thread_id, p.before, p.limit);
+  },
   events_since: (p: { thread_id: string; seq: number }) => sdk.eventsSince(p.thread_id, p.seq),
   // Commands in: send, interrupt, respond and set_options, checked and carried out by the backend.
   command: async (p: { command: unknown }) => {

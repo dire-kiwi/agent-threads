@@ -17,7 +17,8 @@ source of truth for the shapes, and this document says what they mean. See
 
 `protocol.schema.json` bundles them into one schema, and the TS, Go and Rust types are generated
 from it: run `make gen` after changing a schema. [examples/](examples/) has a whole thread's events,
-the snapshot they fold into, and one of each command; every language's tests read them.
+the snapshot they fold into, a window of it and a page before that window, and one of each command;
+every language's tests read them.
 [fixtures/](fixtures/README.md) has recorded Claude and Codex sessions with the events a backend
 must make of them, which is where the translation from each harness is pinned down.
 
@@ -219,7 +220,9 @@ the context items of both, ordered by index (the page's version of one they shar
 the page's own items include dropped, then the page's items from its `start`, then its own from its
 old `start`. Its `start` becomes the page's, and `context` the indices of the context items it kept
 (left out once `start` is 0). The page's requests go in front of its own, a page's version of one
-it has replacing it in place.
+it has replacing it in place. (So a window with pages put in it may not have its requests in the
+state's order: a resolved request from a page can come before an open one the window had. A UI
+places resolved requests by their anchor.)
 
 A page may be taken from a later state than the client's (its `seq` is higher), and that's fine:
 events the client applies after it set what they set again. One taken from an earlier state can't

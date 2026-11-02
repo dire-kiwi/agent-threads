@@ -1,4 +1,4 @@
-import { applyEvents, initialState, type Item, type Snapshot, type ThreadEvent } from "@dire-kiwi/agent-threads-protocol";
+import { applyEvent, applyEvents, initialState, itemPage, snapshotWindow, type Item, type ItemPage, type Snapshot, type ThreadEvent } from "@dire-kiwi/agent-threads-protocol";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { ThreadStore } from "./store.js";
 import { fixtureEvents, fixtureNames, fixtureThread, testSource, thread } from "./test/helpers.js";
@@ -292,6 +292,132 @@ describe("ThreadStore", () => {
       await flush();
       expect(ids()).toEqual(["a"]);
       expect(store.getState().resyncing).toBe(true);
+    });
+  });
+
+  describe("loading earlier items", () => {
+    const agent = (id: string): Item => ({ id, type: "tool_call", name: "Agent", kind: "subagent", input: {}, status: "running" });
+    /** A thread of m0..m9, with a subagent (s3) whose last item (b8) is in the window of 4 its store starts from. */
+    function paged(limit = 4) {
+      const items: Item[] = Array.from({ length: 10 }, (_, i) => (i === 3 ? agent("s3") : i === 8 ? { ...msg("b8"), parent_id: "s3" } : msg(`m${i}`, `m${i}`)));
+      let whole = applyEvents(initialState(thread), items.map((item, i) => added(i + 1, item)));
+      const pages: { before: number; resolve: (p: ItemPage) => void; reject: (e: Error) => void }[] = [];
+      const t = testSource(snapshotWindow(whole, limit));
+      t.source.loadEarlier = (before) => new Promise((resolve, reject) => void pages.push({ before, resolve, reject }));
+      const store = new ThreadStore(t.source);
+      store.connect();
+      /** Answers the page asked for from the thread as it is now. */
+      const answer = (n = 3) => pages.shift()!.resolve(itemPage(whole, store.getState().snapshot.start!, n));
+      const change = (e: ThreadEvent) => {
+        whole = applyEvent(whole, e);
+        t.emit(e);
+      };
+      return { ...t, store, pages, answer, change, whole: () => whole, ids: () => store.getState().snapshot.items.map((i) => i.id) };
+    }
+
+    it("puts a page in front of the window, and notes while it's loading", async () => {
+      const { store, pages, answer, ids } = paged();
+      expect(ids()).toEqual(["s3", "m6", "m7", "b8", "m9"]);
+      expect(store.hasEarlier()).toBe(true);
+      expect(store.isLoaded("s3")).toBe(false);
+      const done = store.loadEarlier();
+      expect(store.getState().loadingEarlier).toBe(true);
+      expect(pages.map((p) => p.before)).toEqual([6]);
+      answer(2);
+      await done;
+      expect(store.getState().loadingEarlier).toBe(false);
+      expect(ids()).toEqual(["s3", "m4", "m5", "m6", "m7", "b8", "m9"]);
+      expect(store.getState().snapshot).toMatchObject({ start: 4, context: [3] });
+      expect(store.getState().view.children.get("")!.map((i) => i.id)).toEqual(["s3", "m4", "m5", "m6", "m7", "m9"]);
+      // The rest, and then there's nothing more to load.
+      const rest = store.loadEarlier();
+      answer(10);
+      await rest;
+      expect(ids()).toEqual(["m0", "m1", "m2", "s3", "m4", "m5", "m6", "m7", "b8", "m9"]);
+      expect(store.hasEarlier()).toBe(false);
+      expect(store.isLoaded("s3")).toBe(true);
+      await store.loadEarlier();
+      expect(pages).toEqual([]);
+    });
+
+    it("joins a load under way, and with `to` loads back to that item", async () => {
+      const { store, pages, answer, ids } = paged();
+      const a = store.loadEarlier();
+      const b = store.loadEarlier();
+      const c = store.loadEarlier({ to: "s3" });
+      expect(pages).toHaveLength(1);
+      answer(1);
+      await a;
+      await b;
+      expect(ids()).toContain("m5");
+      await flush();
+      expect(pages).toHaveLength(1);
+      answer(1);
+      await flush();
+      answer(1);
+      await c;
+      expect(store.isLoaded("s3")).toBe(true);
+      expect(store.getState().snapshot.start).toBe(3);
+      // Already in: nothing to load.
+      await store.loadEarlier({ to: "m4" });
+      expect(pages).toHaveLength(0);
+    });
+
+    it("notes why a page failed, and tries again when asked", async () => {
+      const { store, pages, answer, ids } = paged();
+      const err = vi.spyOn(console, "error").mockImplementation(() => {});
+      const first = store.loadEarlier({ to: "m0" });
+      pages.shift()!.reject(new Error("offline"));
+      await first;
+      expect(store.getState()).toMatchObject({ loadingEarlier: false, earlierError: "offline" });
+      expect(err).toHaveBeenCalled();
+      const again = store.loadEarlier();
+      expect(store.getState().earlierError).toBeNull();
+      answer();
+      await again;
+      expect(ids()).toContain("m5");
+    });
+
+    it("applies the events that come while a page loads to the page's items too", async () => {
+      const { store, pages, change, whole, ids } = paged();
+      const done = store.loadEarlier();
+      // The page is taken now, before these.
+      const page = itemPage(whole(), 6, 3);
+      change(updated(11, "m5", { text: "m5 changed" }));
+      change(updated(12, "s3", { status: "completed" }));
+      change(added(13, msg("m10", "m10")));
+      change({ type: "request.opened", thread_id: "th", seq: 14, request: { id: "p1", type: "permission", name: "Bash", kind: "shell", input: {}, tool_call_id: "m10" } });
+      pages.shift()!.resolve(page);
+      await done;
+      const s = store.getState().snapshot;
+      expect(ids()).toEqual(["s3", "m4", "m5", "m6", "m7", "b8", "m9", "m10"]);
+      expect(s.items.find((i) => i.id === "m5")).toMatchObject({ text: "m5 changed" });
+      expect(s.items.find((i) => i.id === "s3")).toMatchObject({ status: "completed" });
+      expect(s.requests.map((r) => r.id)).toEqual(["p1"]);
+      expect(s.seq).toBe(14);
+      expect(s).toEqual(snapshotWindow(whole(), 8));
+    });
+
+    it("leaves out a page that doesn't fit the window any more", async () => {
+      const { store, pages, whole } = paged();
+      const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+      const done = store.loadEarlier();
+      const page = itemPage(whole(), 6, 3);
+      // A resync brings a new window meanwhile.
+      (store as unknown as { caughtUp(r: Snapshot): void }).caughtUp(snapshotWindow(whole(), 2));
+      pages.shift()!.resolve(page);
+      await done;
+      expect(store.getState().snapshot.start).toBe(8);
+      expect(warn).toHaveBeenCalled();
+    });
+
+    it("has nothing to load without the source's loadEarlier", async () => {
+      const items = Array.from({ length: 5 }, (_, i) => msg(`m${i}`));
+      const whole = applyEvents(initialState(thread), items.map((item, i) => added(i + 1, item)));
+      const { store } = connected(snapshotWindow(whole, 2));
+      expect(store.hasEarlier()).toBe(false);
+      await store.loadEarlier();
+      expect(store.getState().snapshot.start).toBe(3);
     });
   });
 

@@ -2,7 +2,7 @@
 // applyEvent, what's being streamed, and the view the components draw from. It catches up when
 // events go missing, by asking the source for a resync.
 
-import { applyEvent, type Snapshot, type ThreadEvent } from "@dire-kiwi/agent-threads-protocol";
+import { applyEvent, withPage, type ItemPage, type Snapshot, type ThreadEvent } from "@dire-kiwi/agent-threads-protocol";
 import { buildView, type ThreadView } from "./view.js";
 
 /**
@@ -25,6 +25,17 @@ export interface ThreadSource {
    * Without it, a gap is ignored and the event applied anyway.
    */
   resync?(seq: number): Promise<Snapshot | ThreadEvent[] | void> | void;
+  /**
+   * For a snapshot that's a window of the thread (the backend's snapshot taken with a limit):
+   * resolves with the page of items before index `before` (the backend's itemsBefore, with as many
+   * as the app likes to load at a time). Without it, a window's earlier items aren't loaded.
+   */
+  loadEarlier?(before: number): Promise<ItemPage>;
+}
+
+export interface LoadEarlierOptions {
+  /** Load pages until this item (a subagent's call, say) and everything after it is in. */
+  to?: string;
 }
 
 export interface ThreadState {
@@ -36,6 +47,10 @@ export interface ThreadState {
   resyncing: boolean;
   /** The items arranged for drawing (see buildView). */
   view: ThreadView;
+  /** Earlier items are being loaded (see ThreadStore.loadEarlier). */
+  loadingEarlier: boolean;
+  /** Why loading earlier items last failed, until it's tried again. */
+  earlierError: string | null;
 }
 
 const NO_IDS: ReadonlySet<string> = new Set();
@@ -57,10 +72,21 @@ export class ThreadStore {
    */
   private asked: "none" | "answer" | "events" = "none";
   private connected = false;
+  /** The page of earlier items being loaded, if one is. */
+  private paging: Promise<void> | null = null;
+  /** The saved events applied while a page loads, to apply to its items too (see loadEarlier). */
+  private recorded: ThreadEvent[] | null = null;
 
   constructor(readonly source: ThreadSource) {
     const snapshot = source.snapshot;
-    this.state = { snapshot, streaming: NO_IDS, resyncing: false, view: buildView(snapshot.items, snapshot.requests) };
+    this.state = {
+      snapshot,
+      streaming: NO_IDS,
+      resyncing: false,
+      view: buildView(snapshot.items, snapshot.requests),
+      loadingEarlier: false,
+      earlierError: null,
+    };
   }
 
   getState = (): ThreadState => this.state;
@@ -85,6 +111,75 @@ export class ThreadStore {
       this.asked = "none";
       off();
     };
+  }
+
+  /** Whether the snapshot is a window with items before it to load (with the source's loadEarlier). */
+  hasEarlier(): boolean {
+    return !!this.state.snapshot.start && !!this.source.loadEarlier;
+  }
+
+  /**
+   * Whether item `id` is loaded with everything after it: it's in the window, not one of the items
+   * from before it the window has for context (a subagent's call, whose earlier items aren't in).
+   */
+  isLoaded(id: string): boolean {
+    return isLoaded(this.state.snapshot, id);
+  }
+
+  /**
+   * Loads the page of items before the window's start (from the source's loadEarlier), and puts it
+   * in front; with `to`, pages until that item is loaded with everything after it. Resolves once
+   * it's done, or failed (`earlierError` says why). A load under way is joined, not repeated.
+   */
+  async loadEarlier({ to }: LoadEarlierOptions = {}): Promise<void> {
+    const next = () => (this.paging ??= this.page());
+    if (to === undefined) {
+      if (this.hasEarlier()) await next();
+      return;
+    }
+    while (this.hasEarlier() && !this.isLoaded(to)) {
+      await next();
+      if (this.state.earlierError) return;
+    }
+  }
+
+  private async page(): Promise<void> {
+    const before = this.state.snapshot.start!;
+    this.recorded = [];
+    this.update({ ...this.state, loadingEarlier: true, earlierError: null });
+    let page: ItemPage;
+    try {
+      page = await this.source.loadEarlier!(before);
+    } catch (e) {
+      this.recorded = null;
+      // Done before it says so, so what that sets off can load the next.
+      this.paging = null;
+      console.error("agent-threads: loading earlier items failed", e);
+      this.update({ ...this.state, loadingEarlier: false, earlierError: e instanceof Error ? e.message : String(e) });
+      return;
+    }
+    const recorded = this.recorded;
+    this.recorded = null;
+    this.paging = null;
+    const s = this.state.snapshot;
+    // The page is from when the backend got the request, so it has every event applied before
+    // then; events applied since that it doesn't have apply to its items too. Those that would add
+    // an item or request it doesn't have are for the window (they're in it already).
+    let theirs: Snapshot = { thread: s.thread, items: page.items, requests: page.requests, seq: page.seq };
+    for (const e of recorded) {
+      if (e.seq <= theirs.seq) continue;
+      if (e.type === "item.added" && !theirs.items.some((i) => i.id === e.item.id)) continue;
+      if (e.type === "request.opened" && !theirs.requests.some((r) => r.id === e.request.id)) continue;
+      theirs = applyEvent(theirs, e);
+    }
+    const snapshot = withPage(s, { ...page, items: theirs.items, requests: theirs.requests });
+    if (snapshot === s) console.warn(`agent-threads: the page of items before ${before} doesn't fit the thread's window any more; left out`);
+    this.update({
+      ...this.state,
+      snapshot,
+      view: snapshot === s ? this.state.view : buildView(snapshot.items, snapshot.requests, this.state.view),
+      loadingEarlier: false,
+    });
   }
 
   /** Takes one of the thread's events (as the source's subscription does). */
@@ -184,6 +279,7 @@ export class ThreadStore {
   /** `state` with `event` applied: the snapshot, what's streaming, and the view. */
   private apply(state: ThreadState, event: ThreadEvent): ThreadState {
     const snapshot = applyEvent(state.snapshot, event);
+    if (this.recorded && event.type !== "delta" && snapshot.seq !== state.snapshot.seq) this.recorded.push(event);
     const streaming = streamingAfter(state.streaming, event, snapshot);
     if (snapshot === state.snapshot && streaming === state.streaming) return state;
     const view =
@@ -198,6 +294,16 @@ export class ThreadStore {
     this.state = next;
     for (const l of this.listeners) l();
   }
+}
+
+/**
+ * Whether item `id` is in `snapshot` with everything after it: it's in its window, not one of the
+ * items from before it the window has for context (a subagent's call, whose earlier items aren't in).
+ */
+export function isLoaded(snapshot: Snapshot, id: string): boolean {
+  const ctx = snapshot.start ? (snapshot.context?.length ?? 0) : 0;
+  for (let i = snapshot.items.length - 1; i >= 0; i--) if (snapshot.items[i]!.id === id) return i >= ctx;
+  return false;
 }
 
 /** What's streaming after `event`: a delta's item is, until an event gives it its final text. */
