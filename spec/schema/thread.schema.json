@@ -19,6 +19,7 @@
         "cwd": { "type": "string", "description": "The working directory the harness runs in." },
         "session_id": { "type": "string", "description": "The harness's own session or thread id, used to resume it." },
         "resume_at": { "type": "string", "description": "Where the next turn takes up session_id, after a rewind: Claude Code resumes it at this message (--resume-session-at), Codex reverts it to before this turn (thread/revert). Cleared once the harness has done it." },
+        "turn_at": { "type": "string", "description": "The running turn's mark so far, as the harness gives it (its turn_result's session.at to be): kept so that a turn lost when the backend stops still has it. Absent with no turn running, or until the harness gives one." },
         "usage": { "$ref": "#/$defs/Usage", "description": "Tokens used by the thread so far, over all its turns." },
         "error": { "type": "string", "description": "What went wrong, when status is error." },
         "run": { "$ref": "#/$defs/Run", "description": "The harness process running the thread, if one is. Absent when it's idle with no process." },

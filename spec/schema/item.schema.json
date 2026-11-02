@@ -205,8 +205,9 @@
       "required": ["id"],
       "properties": {
         "id": { "type": "string", "description": "The thread's session_id when the turn ended." },
-        "at": { "type": "string", "description": "The harness's own mark for the turn: Claude Code's last message in it (its uuid), Codex's id for the turn. Absent if the harness gave none (the turn failed before it did anything)." },
-        "started": { "type": "boolean", "default": false, "description": "The turn started the session: the thread had no session_id when it began." }
+        "at": { "type": "string", "description": "The harness's own mark for the turn: Claude Code's last message in it (its uuid), Codex's id for the turn (its first, for a turn that went on after a plan). Absent if the harness gave none (the turn failed before it did anything)." },
+        "started": { "type": "boolean", "default": false, "description": "The turn started the session: the thread had no session_id when it began." },
+        "lost": { "type": "boolean", "default": false, "description": "The turn was lost (the backend stopped while it ran) before the harness gave its mark, so what it left in the session isn't known: a rewind that would need to know is refused." }
       }
     },
     "Attachment": {

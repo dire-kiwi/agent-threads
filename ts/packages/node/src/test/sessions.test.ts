@@ -290,7 +290,7 @@ describe("a turn the backend lost", () => {
 
   it("records that it started the session it got", async () => {
     const { next, id, s } = await lost({});
-    expect(sessions(s.items)).toEqual([{ id: "S-new", started: true }]);
+    expect(sessions(s.items)).toEqual([{ id: "S-new", started: true, lost: true }]);
     await next.rewind(id, turnIds(s.items)[0]!);
     expect((await next.snapshot(id)).thread.session_id).toBeUndefined();
   });
@@ -302,7 +302,7 @@ describe("a turn the backend lost", () => {
       h.ctx!.endTurn({ ok: true, session_at: "m1" });
       await sdk.newSession(id);
     });
-    expect(sessions(s.items)).toEqual([{ id: "S-old", at: "m1", started: true }, { id: "S-new", started: true }]);
+    expect(sessions(s.items)).toEqual([{ id: "S-old", at: "m1", started: true }, { id: "S-new", started: true, lost: true }]);
   });
 
   it("is a compaction that had no items yet, not the turn before it", async () => {
@@ -321,14 +321,63 @@ describe("a turn the backend lost", () => {
     const started = events.flatMap((e) => (e.type === "turn.started" ? [e.turn_id] : []));
     expect(events.flatMap((e) => (e.type === "turn.completed" ? [e.turn_id] : []))).toEqual(started);
     expect(turnIds(s.items)).toEqual(started);
-    expect(sessions(s.items)).toEqual([{ id: "S", at: "m1", started: true }, { id: "S" }]);
+    expect(sessions(s.items)).toEqual([{ id: "S", at: "m1", started: true }, { id: "S", lost: true }]);
     await next.rewind(thread.id, started[1]!);
     expect((await next.snapshot(thread.id)).thread).toMatchObject({ session_id: "S", resume_at: "m1" });
   });
 
   it("records that it continued a session the thread adopted", async () => {
     const { next, id, s } = await lost({ session_id: "S0" });
-    expect(sessions(s.items)).toEqual([{ id: "S0" }]);
+    expect(sessions(s.items)).toEqual([{ id: "S0", lost: true }]);
     await expect(next.rewind(id, turnIds(s.items)[0]!)).rejects.toThrow(CommandError);
+  });
+
+  /** Turn one in S (marked m1), then a turn the backend lost after the harness gave `mark`, if any; then turn three, in S. */
+  async function lostBetween(point: typeof resumeAtPoint, mark?: string) {
+    const store = new MemoryStore();
+    const first = fake(point);
+    const sdk = new AgentThreads({ store, harnesses: { fake: first.harness }, permissions: "allow" });
+    const { id } = await sdk.create();
+    await sdk.send(id, "one");
+    first.h.ctx!.setThread({ session_id: "S" });
+    first.h.ctx!.endTurn({ ok: true, session_at: "m1" });
+    await sdk.send(id, "two");
+    if (mark) first.h.ctx!.mark(mark);
+    await sdk.eventsSince(id, 0);
+    const second = fake(point);
+    const next = new AgentThreads({ store, harnesses: { fake: second.harness }, permissions: "allow" });
+    await next.snapshot(id);
+    await next.send(id, "three");
+    second.h.ctx!.endTurn({ ok: true, session_at: "m3" });
+    const s = await next.snapshot(id);
+    return { next, id, s, turns: turnIds(s.items) };
+  }
+
+  it("keeps the mark the harness gave before it was lost, for a rewind to after it", async () => {
+    const { next, id, s, turns } = await lostBetween(resumeAtPoint, "m2");
+    expect(sessions(s.items)).toEqual([{ id: "S", at: "m1", started: true }, { id: "S", at: "m2" }, { id: "S", at: "m3" }]);
+    expect(s.thread.turn_at).toBeUndefined();
+    await next.rewind(id, turns[2]!);
+    expect((await next.snapshot(id)).thread).toMatchObject({ session_id: "S", resume_at: "m2" });
+  });
+
+  it("refuses a rewind past a lost turn with no mark, which may have added to the session", async () => {
+    const { next, id, s, turns } = await lostBetween(resumeAtPoint);
+    expect(sessions(s.items)[1]).toEqual({ id: "S", lost: true });
+    await expect(next.rewind(id, turns[2]!)).rejects.toThrow(/lost/);
+    // To before it is still known.
+    await next.rewind(id, turns[1]!);
+    expect((await next.snapshot(id)).thread).toMatchObject({ session_id: "S", resume_at: "m1" });
+  });
+
+  it("reverts to before a lost turn by its mark (Codex), and refuses to with none", async () => {
+    const marked = await lostBetween(revertPoint, "c2");
+    await marked.next.rewind(marked.id, marked.turns[1]!);
+    expect((await marked.next.snapshot(marked.id)).thread).toMatchObject({ session_id: "S", resume_at: "c2" });
+    const unmarked = await lostBetween(revertPoint);
+    await expect(unmarked.next.rewind(unmarked.id, unmarked.turns[1]!)).rejects.toThrow(/lost/);
+    // To before turn one, which started S, is a new session.
+    await unmarked.next.rewind(unmarked.id, unmarked.turns[0]!);
+    expect((await unmarked.next.snapshot(unmarked.id)).thread.session_id).toBeUndefined();
   });
 });

@@ -247,7 +247,11 @@ class Draft {
 
   /** The harness's mark for the running turn (Claude's last message, Codex's turn id). */
   mark(at) {
-    if (this.turn && at) this.turn.at = at;
+    if (!this.turn || !at) return;
+    this.turn.at = at;
+    // Kept in the thread as it goes, for a turn the backend loses: once the harness has its
+    // message, for one that waits for that (see draftClaude's echoes).
+    if (this.turn.marks !== false && this.thread.turn_at !== at) this.setThread({ turn_at: at });
   }
 
   /** A command the app sent that the recording noted (see Proc.note). */
@@ -388,7 +392,7 @@ class Draft {
     this.emit({ type: "turn.completed", turn_id: this.turn.id });
     const total = addUsage(this.thread.usage, usage);
     this.turn = null;
-    this.setThread({ status: tr.ok || tr.interrupted ? "idle" : "error", error: tr.error, usage: total });
+    this.setThread({ status: tr.ok || tr.interrupted ? "idle" : "error", error: tr.error, usage: total, turn_at: undefined });
   }
 
   /** A new process: the backend restarted, unless a rewind or new_session made it start one. */
@@ -494,6 +498,10 @@ function pattern(e) {
 
 function draftClaude(d, runs) {
   let first = true;
+  // A turn of a message is marked as it goes (the thread's turn_at) once Claude has echoed the
+  // message back: what it says before then may be from before the turn (set_model's reply, say).
+  // A turn Claude starts by itself, or a compaction (/compact isn't echoed), is from its start.
+  const echoes = [];
   for (const [, entries] of runs) {
     if (!first) d.newRun();
     first = false;
@@ -510,8 +518,14 @@ function draftClaude(d, runs) {
     const opener = entries.find((e) => e.dir === "in" && e.msg.type === "user");
     // set_model and set_permission_mode requests in a row are one set_options command.
     let options = null;
+    const send = (text) => {
+      const started = !d.turn;
+      d.send(text);
+      echoes.push(text);
+      if (started) d.turn.marks = false;
+    };
     for (const e of entries) {
-      if (e.dir === "spawn" && opener) d.send(userText(opener.msg));
+      if (e.dir === "spawn" && opener) send(userText(opener.msg));
       if (e.dir === "command") d.note(e.command);
       if (e.dir === "command" && e.command.type !== "compact") d.restartless = true;
       const m = e.msg;
@@ -531,7 +545,7 @@ function draftClaude(d, runs) {
         if (m.type === "user") {
           // The compact command's /compact is its turn's, not a message.
           if (d.compacting && userText(m) === "/compact") d.compacting = false;
-          else if (e !== opener) d.send(userText(m));
+          else if (e !== opener) send(userText(m));
         } else if (m.type === "control_request" && m.request.subtype === "interrupt") {
           d.interrupt();
           interrupted = true;
@@ -567,7 +581,14 @@ function draftClaude(d, runs) {
       if (e.dir !== "out") continue;
       const parent = m.parent_tool_use_id ?? undefined;
       // The main conversation's messages: the last of a turn's is where a rewind can resume.
-      if ((m.type === "user" || m.type === "assistant") && !parent) d.mark(m.uuid);
+      if ((m.type === "user" || m.type === "assistant") && !parent) {
+        const echo = m.type === "user" && m.isReplay ? echoes.indexOf(replayText(m.message.content)) : -1;
+        if (echo >= 0) {
+          echoes.splice(echo, 1);
+          if (d.turn) d.turn.marks = true;
+        }
+        d.mark(m.uuid);
+      }
       // A message refused for the usage limit says which limit, before anything else it leads to.
       if (["assistant", "user", "result"].includes(m.type) && m.api_error === "usage_limit_reached" && m.api_error_params?.rate_limit_info) {
         d.rateLimits(claudeLimits(m.api_error_params.rate_limit_info));
@@ -659,8 +680,7 @@ function draftClaude(d, runs) {
         }
         case "user": {
           if (m.isReplay) {
-            const c = m.message.content;
-            d.tookIn(typeof c === "string" ? c : c.filter((b) => b.type === "text").map((b) => b.text).join("\n"));
+            d.tookIn(replayText(m.message.content));
             break;
           }
           const content = m.message.content;
@@ -808,10 +828,10 @@ function hookNotice(m) {
   return output ? { level: "info", text: `Hook ${m.hook_name} ran`, detail: output } : null;
 }
 
-const userText = (m) => {
-  const c = m.message.content;
-  return typeof c === "string" ? c : c.filter((b) => b.type === "text").map((b) => b.text).join("\n");
-};
+const userText = (m) => replayText(m.message.content);
+
+/** A user message's text, from its content. */
+const replayText = (c) => (typeof c === "string" ? c : c.filter((b) => b.type === "text").map((b) => b.text).join("\n"));
 
 /** A permission's title: what it's about, in a few words. */
 function title(t) {
@@ -1055,6 +1075,8 @@ function draftCodex(d, runs) {
         case "turn/started":
           // The thread turn's usage is from its first Codex turn on (the next, in plan mode, goes on with it).
           if (!child) used ??= { input_tokens: 0, output_tokens: 0, cache_read_tokens: 0, cache_write_tokens: 0 };
+          // A thread turn's mark is its first Codex turn: reverting to before it takes back all of them.
+          if (!child && planned === null) d.mark(p.turn.id);
           break;
         case "thread/tokenUsage/updated":
           if (child) break;
@@ -1070,8 +1092,6 @@ function draftCodex(d, runs) {
             break;
           }
           const turn = p.turn;
-          // A thread turn's mark is its first Codex turn: reverting to before it takes back all of them.
-          if (planned === null) d.mark(turn.id);
           const plan = proposed;
           proposed = null;
           if (plan !== null && turn.status === "completed" && d.thread.permission_mode === "plan" && !d.turn?.interrupted) {

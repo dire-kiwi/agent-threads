@@ -274,6 +274,12 @@ class ClaudeSession implements HarnessSession {
   #stopping: Promise<void> | null = null;
   /** The options changed since the run started: the next turn starts a new one. */
   #stale = false;
+  /**
+   * The turn whose marks go to the thread as they come (ThreadContext.mark): one of a message once
+   * Claude has echoed a message of it back (what it says before then may be from before the turn:
+   * set_model's reply, say), and a compaction or a turn Claude started by itself from its start.
+   */
+  #marking: string | undefined;
   #steerTimer: NodeJS.Timeout | undefined;
   #stopTimer: NodeJS.Timeout | undefined;
   /** When those go off, for a checkpoint. */
@@ -335,6 +341,7 @@ class ClaudeSession implements HarnessSession {
   compact(): void {
     // Claude Code compacts when it's sent /compact, which is its turn.
     this.#ensure(true).send([], this.#userMessage([{ id: "", text: "/compact" }]));
+    this.#marking = this.#ctx.turnId;
   }
 
   rewindPoint(sessions: (TurnSession | undefined)[], index: number): RewindPoint {
@@ -798,7 +805,12 @@ class ClaudeSession implements HarnessSession {
     const parent: string | undefined = m.parent_tool_use_id ?? undefined;
     // The main conversation's messages (replayed ones too): the turn's last is where a rewind to
     // after it resumes the session.
-    if ((m.type === "user" || m.type === "assistant") && !parent && typeof m.uuid === "string") run.at = m.uuid;
+    if ((m.type === "user" || m.type === "assistant") && !parent && typeof m.uuid === "string") {
+      run.at = m.uuid;
+      if (m.type === "user" && m.isReplay && run.sent.some((s) => s.echo === echoKey(m.message?.content))) this.#marking = ctx.turnId;
+      // A turn that has a mark already (re-attached after a restart, say) was being marked.
+      if (ctx.turnId && (this.#marking === ctx.turnId || ctx.thread.turn_at !== undefined)) ctx.mark(m.uuid);
+    }
     // A message refused for the usage limit says which limit, before anything else it leads to.
     if ((m.type === "assistant" || m.type === "user" || m.type === "result") && m.api_error === "usage_limit_reached") {
       const info = m.api_error_params?.rate_limit_info;
@@ -813,6 +825,7 @@ class ClaudeSession implements HarnessSession {
         if (m.subtype === "init" && !ctx.turnId) {
           ctx.beginTurn();
           run.autoTurn = ctx.turnId;
+          this.#marking = ctx.turnId;
         }
         if (m.subtype === "init") {
           // The session it runs in; and a rewind's resume_at is done with once it has resumed there.

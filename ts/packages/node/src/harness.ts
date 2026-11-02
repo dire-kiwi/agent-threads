@@ -78,7 +78,7 @@ export interface TurnEnd {
   duration_ms?: number;
   /**
    * The harness's own mark for the turn, in its session: Claude Code's last message in it, Codex's
-   * id for the turn (the turn_result's `session.at`).
+   * id for the turn (the turn_result's `session.at`). Without it, the last mark() given in the turn.
    */
   session_at?: string;
 }
@@ -158,6 +158,12 @@ export interface ThreadContext {
   fromHarness(runId: string, line: string, message: unknown, handle: () => void): void;
   /** The harness took in the queued message with this id. Whether it was queued. */
   tookIn(id: string): boolean;
+  /**
+   * The running turn's mark (TurnEnd's session_at) so far, as soon as the harness gives it: kept
+   * in the thread (turn_at), so a turn lost when the backend stops still has it. Does nothing with
+   * no turn running.
+   */
+  mark(at: string): void;
   /**
    * An app tool returned structured output for the tool call `toolCallId`: it goes in the call's
    * `result.structured` when the harness gives the call its result (harnesses pass on only the text).

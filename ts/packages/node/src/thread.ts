@@ -567,7 +567,11 @@ export class ThreadRuntime implements ThreadContext {
    * The running turn ended. Its queued messages are carried over to a new turn unless `carry` is
    * false (shutting down, or recovering a turn the backend lost), or they've been tried enough.
    */
-  endTurn(end: TurnEnd, { carry = true }: { carry?: boolean } = {}): void {
+  /**
+   * Ends the running turn. A `lost` one (its process was lost when the backend stopped) with no
+   * mark is noted as such in its session: what it left there isn't known.
+   */
+  endTurn(end: TurnEnd, { carry = true, lost = false }: { carry?: boolean; lost?: boolean } = {}): void {
     const turn = this.turn;
     if (!turn) return;
     // What a background subagent that's still running does carries on after the turn: its text
@@ -592,6 +596,7 @@ export class ThreadRuntime implements ThreadContext {
     const ok = end.ok && !turn.interrupted;
     const error = !ok && !turn.interrupted ? end.error || "The turn failed." : undefined;
     const sessionId = this.#state.thread.session_id;
+    const at = end.session_at ?? this.#state.thread.turn_at;
     this.addItem({
       id: newId("tr"),
       type: "turn_result",
@@ -600,7 +605,9 @@ export class ThreadRuntime implements ThreadContext {
       ...(error ? { error } : {}),
       ...(end.usage ? { usage: end.usage } : {}),
       ...(end.duration_ms !== undefined ? { duration_ms: end.duration_ms } : {}),
-      ...(sessionId ? { session: { id: sessionId, ...(end.session_at ? { at: end.session_at } : {}), ...(!turn.session ? { started: true } : {}) } } : {}),
+      ...(sessionId
+        ? { session: { id: sessionId, ...(at ? { at } : {}), ...(!turn.session ? { started: true } : {}), ...(lost && !at ? { lost: true } : {}) } }
+        : {}),
     });
     this.emit({ type: "turn.completed", turn_id: turn.id });
     this.turn = null;
@@ -626,7 +633,7 @@ export class ThreadRuntime implements ThreadContext {
       (retry && turn.interrupted) ||
       (carried > 0 && !ok && !(this.session?.live() ?? false));
     if (giveUp) {
-      this.setThread({ status: error ? "error" : this.#requests.size ? "waiting" : "idle", error, usage });
+      this.setThread({ status: error ? "error" : this.#requests.size ? "waiting" : "idle", error, usage, turn_at: undefined });
       if (left.length && carry && !this.closing) this.session?.release();
       if (left.length && !this.closing) this.#undelivered(left.length);
       void this.saveSnapshot();
@@ -636,7 +643,7 @@ export class ThreadRuntime implements ThreadContext {
     this.turn = { id: newId("turn"), interrupted: false, ...this.#sessionNow(), carried: carried + 1 };
     for (const m of left) this.updateItem(m.id, { turn_id: this.turn.id });
     this.emit({ type: "turn.started", turn_id: this.turn.id });
-    this.setThread({ status: "running", error: undefined, usage });
+    this.setThread({ status: "running", error: undefined, usage, turn_at: undefined });
     this.session?.carryOver(left.map((m) => toMessage(m.id, m)));
   }
 
@@ -648,6 +655,10 @@ export class ThreadRuntime implements ThreadContext {
       if (saved && "text" in saved && saved.text !== it.text) this.updateItem(it.id, { text: it.text });
     }
     for (const id of [...this.#streaming]) if (which(id)) this.#streaming.delete(id);
+  }
+
+  mark(at: string): void {
+    if (this.turn && this.#state.thread.turn_at !== at) this.setThread({ turn_at: at });
   }
 
   beginTurn(): void {

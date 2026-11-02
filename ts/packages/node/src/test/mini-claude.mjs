@@ -52,7 +52,12 @@ const note = (v) => log && appendFileSync(log, JSON.stringify(v) + "\n");
 const loggedEnv = Object.fromEntries((process.env.MINI_LOG_ENV ?? "").split(",").filter(Boolean).map((k) => [k, process.env[k] ?? null]));
 note({ argv: process.argv.slice(2), configDir: process.env.CLAUDE_CONFIG_DIR, env: loggedEnv });
 
-const out = (m) => process.stdout.write(JSON.stringify(m) + "\n");
+let uuids = 0;
+// As Claude does, the main conversation's messages have uuids (where a session can be resumed at).
+const out = (m) => {
+  if ((m.type === "user" || m.type === "assistant") && !m.parent_tool_use_id && !m.uuid) m = { ...m, uuid: `${process.pid}-${++uuids}` };
+  process.stdout.write(JSON.stringify(m) + "\n");
+};
 const args = process.argv.slice(2);
 const resume = args.includes("--resume") ? args[args.indexOf("--resume") + 1] : undefined;
 const session = resume ?? `sess-${process.pid}`;

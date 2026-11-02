@@ -1107,6 +1107,8 @@ class CodexSession implements HarnessSession {
           run.error = null;
           run.setTurn(p.turn.id);
           run.used = { input_tokens: 0, output_tokens: 0, cache_read_tokens: 0, cache_write_tokens: 0 };
+          // The turn's mark is its first Codex turn (one that goes on after a plan has it already).
+          if (!run.planned) this.#ctx.mark(p.turn.id);
         }
         return;
       case "turn/completed":

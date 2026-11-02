@@ -947,6 +947,10 @@ export const schema: { readonly $defs: { readonly [name: string]: unknown } } = 
         "started": {
           "type": "boolean",
           "default": false
+        },
+        "lost": {
+          "type": "boolean",
+          "default": false
         }
       }
     },
@@ -1322,6 +1326,9 @@ export const schema: { readonly $defs: { readonly [name: string]: unknown } } = 
           "type": "string"
         },
         "resume_at": {
+          "type": "string"
+        },
+        "turn_at": {
           "type": "string"
         },
         "usage": {

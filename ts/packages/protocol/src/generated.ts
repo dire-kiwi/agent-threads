@@ -200,6 +200,10 @@ export interface Thread {
    * Where the next turn takes up session_id, after a rewind: Claude Code resumes it at this message (--resume-session-at), Codex reverts it to before this turn (thread/revert). Cleared once the harness has done it.
    */
   resume_at?: string;
+  /**
+   * The running turn's mark so far, as the harness gives it (its turn_result's session.at to be): kept so that a turn lost when the backend stops still has it. Absent with no turn running, or until the harness gives one.
+   */
+  turn_at?: string;
   usage?: Usage;
   /**
    * What went wrong, when status is error.
@@ -621,13 +625,17 @@ export interface TurnSession {
    */
   id: string;
   /**
-   * The harness's own mark for the turn: Claude Code's last message in it (its uuid), Codex's id for the turn. Absent if the harness gave none (the turn failed before it did anything).
+   * The harness's own mark for the turn: Claude Code's last message in it (its uuid), Codex's id for the turn (its first, for a turn that went on after a plan). Absent if the harness gave none (the turn failed before it did anything).
    */
   at?: string;
   /**
    * The turn started the session: the thread had no session_id when it began.
    */
   started?: boolean;
+  /**
+   * The turn was lost (the backend stopped while it ran) before the harness gave its mark, so what it left in the session isn't known: a rewind that would need to know is refused.
+   */
+  lost?: boolean;
 }
 /**
  * An item changed: patch's fields replace the item's, and a field set to null is removed. id and type never change.

@@ -706,7 +706,8 @@ function recoverLost(rt: ThreadRuntime, lost: LostTurn): void {
       text: "The backend stopped while this turn was running, and couldn't pick its run up again.",
     });
     // Not carried over: loading a thread starts no process. Its queued messages go with the next.
-    rt.endTurn({ ok: false, error: "The backend stopped while this turn was running." }, { carry: false });
+    // Its mark is the last the harness gave (turn_at); with none, it's lost.
+    rt.endTurn({ ok: false, error: "The backend stopped while this turn was running." }, { carry: false, lost: true });
   } else if (rt.thread.status === "waiting") rt.setThread({ status: "idle" });
   rt.setThread({ run: undefined });
 }

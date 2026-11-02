@@ -1786,18 +1786,23 @@ type TurnSession struct {
 	ID string `json:"id"`
 
 	// The harness's own mark for the turn: Claude Code's last message in it (its uuid), Codex's id for
-	// the turn. Absent if the harness gave none (the turn failed before it did anything).
+	// the turn (its first, for a turn that went on after a plan). Absent if the harness gave none (the
+	// turn failed before it did anything).
 	At string `json:"at,omitempty"`
 
 	// The turn started the session: the thread had no session_id when it began.
 	Started bool `json:"started,omitempty"`
+
+	// The turn was lost (the backend stopped while it ran) before the harness gave its mark, so what it
+	// left in the session isn't known: a rewind that would need to know is refused.
+	Lost bool `json:"lost,omitempty"`
 
 	// Extra has the fields the spec doesn't name, as they came, so that they're written again
 	// unchanged (receivers ignore fields they don't know, and stores keep them).
 	Extra map[string]json.RawMessage `json:"-"`
 }
 
-var knownTurnSession = fieldSet("id", "at", "started")
+var knownTurnSession = fieldSet("id", "at", "started", "lost")
 
 func (v TurnSession) MarshalJSON() ([]byte, error) {
 	type plain TurnSession
@@ -2458,6 +2463,11 @@ type Thread struct {
 	// harness has done it.
 	ResumeAt string `json:"resume_at,omitempty"`
 
+	// The running turn's mark so far, as the harness gives it (its turn_result's session.at to be):
+	// kept so that a turn lost when the backend stops still has it. Absent with no turn running, or
+	// until the harness gives one.
+	TurnAt string `json:"turn_at,omitempty"`
+
 	// Tokens used by the thread so far, over all its turns.
 	Usage *Usage `json:"usage,omitempty"`
 
@@ -2482,7 +2492,7 @@ type Thread struct {
 	Extra map[string]json.RawMessage `json:"-"`
 }
 
-var knownThread = fieldSet("id", "harness", "status", "title", "model", "effort", "permission_mode", "cwd", "session_id", "resume_at", "usage", "error", "run", "rate_limits", "metadata", "created_at", "updated_at")
+var knownThread = fieldSet("id", "harness", "status", "title", "model", "effort", "permission_mode", "cwd", "session_id", "resume_at", "turn_at", "usage", "error", "run", "rate_limits", "metadata", "created_at", "updated_at")
 
 func (v Thread) MarshalJSON() ([]byte, error) {
 	type plain Thread

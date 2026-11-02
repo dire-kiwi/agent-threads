@@ -16,7 +16,7 @@ import { FileStore } from "../stores/file.js";
 import { MemoryStore } from "../stores/memory.js";
 import { SqliteStore } from "../stores/sqlite.js";
 import { defineTool, type ToolContext } from "../tools.js";
-import { shimPath, tempDir } from "./spec.js";
+import { crashed, shimPath, tempDir } from "./spec.js";
 
 const mini = fileURLToPath(new URL("./mini-claude.mjs", import.meta.url));
 
@@ -409,6 +409,33 @@ describe("the Claude driver", () => {
     await sdk.close();
     open = open.filter((x) => x !== sdk);
     expect(texts((await make(store).snapshot(t.id)).items)).toEqual(["half a thought "]);
+  });
+
+  it("keeps the mark Claude gave a turn the backend lost, so a rewind past it resumes after it", async () => {
+    const store = new MemoryStore();
+    const { sdk, make, runs } = setup({ store });
+    const t = await sdk.create();
+    await sdk.send(t.id, "reply one");
+    let s = await settle(sdk, t.id);
+    const first = results(s.items)[0]!.session!.at;
+    await sdk.send(t.id, "streamhang cut short");
+    // It has the message (its echo is the turn's mark so far), and is answering.
+    const at = await until(async () => {
+      const x = await sdk.snapshot(t.id);
+      return texts(x.items).includes("cut short ") && x.thread.turn_at;
+    });
+    expect(at).not.toBe(first);
+    const next = make(crashed(store));
+    s = await next.snapshot(t.id);
+    expect(results(s.items)[1]).toMatchObject({ ok: false, session: { id: s.thread.session_id, at } });
+    await next.send(t.id, "reply three");
+    s = await settle(next, t.id);
+    await next.rewind(t.id, results(s.items)[2]!.turn_id!);
+    expect((await next.snapshot(t.id)).thread).toMatchObject({ session_id: s.thread.session_id, resume_at: at });
+    await next.send(t.id, "reply four");
+    await settle(next, t.id);
+    const argv = runs().at(-1)!.argv;
+    expect(argv.slice(argv.indexOf("--resume-session-at"))[1]).toBe(at);
   });
 
   it("keeps the text streamed so far when the backend shuts down mid-message", async () => {

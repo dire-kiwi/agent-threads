@@ -157,7 +157,15 @@ resumes it in each new process, and can take it back, replace it, or compact it:
 Each `turn_result` has the turn's `session` (when the thread had one at its end): its `id`, the
 harness's own mark for the turn as `at` (Claude Code's last message in it, Codex's id for the turn:
 its first, for a turn that went on after a plan), and `started` if the turn started that session. That's what a rewind works from, so it can go back
-to a turn in an earlier session (before a `new_session`) too. To rewind to before turn T:
+to a turn in an earlier session (before a `new_session`) too.
+
+While a turn runs, the thread's `turn_at` is its mark so far, set (with a `thread.updated`) as the
+harness gives it: Claude Code's latest message, Codex's turn once it starts. A turn the backend
+lost while it ran (it stopped, and couldn't pick the run up again) ends with that mark as its
+`at`; with none, its session has `lost: true` instead, as the harness may have taken in some of
+it without saying so.
+
+To rewind to before turn T:
 
 - If T started its session, or there was none at its end, the next turn starts a new session.
 - Otherwise T continued session S (its `session.id`). **Claude Code** resumes S at the `at` of the
@@ -166,6 +174,8 @@ to a turn in an earlier session (before a `new_session`) too. To rewind to befor
   **Codex** reverts S to before the `at` of the first turn from T on, in S, that has one; if none
   has, S is as it was before T, and nothing is reverted, except what an earlier rewind in S not
   yet made (the thread's `resume_at`) still has to: it stays.
+- Either way, a `lost` turn passed over on the way to that `at` (or, for Codex, with none found)
+  may have left more in S: the rewind is refused.
 
 The thread's `session_id` becomes S (or is cleared), and its `resume_at` the message to resume at
 or the turn to revert to before. The harness goes back there at the start of the next turn, in a

@@ -1,8 +1,8 @@
 #!/usr/bin/env node
 // A tiny scriptable `codex app-server` for the driver's tests of what the recorded fixtures don't
 // cover. It speaks the app server's JSON-RPC over stdio: initialize, thread/start and
-// thread/resume (its sessions are files in $CODEX_HOME/mini-sessions), turn/start, turn/steer,
-// turn/interrupt and thread/compact/start. A turn does what each line of its message's text says:
+// thread/resume (its sessions are files in $CODEX_HOME/mini-sessions), thread/revert (which it
+// only answers), turn/start, turn/steer, turn/interrupt and thread/compact/start. A turn does what each line of its message's text says:
 //
 //   reply <text>        an agent message, streamed a word at a time
 //   reason <text>       a reasoning item with two summary parts, streamed
@@ -452,6 +452,9 @@ createInterface({ input: process.stdin })
       case "thread/compact/start":
         reply({});
         return void compact();
+      case "thread/revert":
+        // Taken back: its turns aren't kept, so there's nothing to take back but to say so.
+        return reply({ thread: { id: p.threadId } });
       default:
         return fail(`unknown method ${m.method}`);
     }
