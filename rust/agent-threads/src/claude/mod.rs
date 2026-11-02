@@ -22,7 +22,7 @@ use crate::harness::{
     BoxFuture, ControlReply, Harness, HarnessSession, LaunchOptions, Message, RunCheckpoint, TurnEnd,
 };
 use crate::ids::{new_id, now_iso, now_ms, private_temp_dir};
-use crate::permissions::{Decided, PermissionDecision, PermissionQuery, mode_after_plan, permission_key};
+use crate::permissions::{Decided, PermissionDecision, PermissionQuery, StandingKey, mode_after_plan, permission_key};
 use crate::protocol::{
     DeltaEventKind, Item, PermissionMode, Resolution, ResolutionOutcome, ToolKind, ToolStatus, Usage,
 };
@@ -437,7 +437,7 @@ struct CanUse {
     kind: ToolKind,
     title: String,
     reason: Option<String>,
-    standing: String,
+    standing: StandingKey,
     existing: Option<String>,
 }
 

@@ -135,7 +135,9 @@ again to finish saving. The file store undoes a write that fails partway, so a r
 - **Permissions**: `--permission-prompt-tool stdio`, so Claude asks over `can_use_tool` and the
   policy answers. `ask` opens a `permission` request for the user; answering it with `always` keeps
   that answer for that tool (the same name on the same MCP server, of the same kind) for the rest
-  of the thread. AskUserQuestion is always a `question`.
+  of the thread, in the thread's `standing_answers` (which `create` and `setOptions` can set).
+  AskUserQuestion is always a `question`; with `lateAnswers`, one left open when its turn ends can
+  still be answered, and the answer is sent as the next message.
 - **App tools** are an in-process MCP server, `app`, answered over the control channel. Tool
   handlers get `ctx` with the thread's id and metadata, and the tool call's id.
 - **Isolated config**: threads run with `--setting-sources ""` and `--strict-mcp-config`, so they

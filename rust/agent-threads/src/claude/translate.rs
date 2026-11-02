@@ -291,7 +291,9 @@ pub(crate) fn claude_permission_mode(mode: Option<crate::protocol::PermissionMod
         AcceptEdits => Some("acceptEdits"),
         Plan => Some("plan"),
         Bypass => Some("bypassPermissions"),
-        Default => None,
+        // dont_ask: Claude asks, and agent-threads denies what it asks about (so the policy still
+        // allows what it allows).
+        Default | DontAsk => None,
     }
 }
 

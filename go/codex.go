@@ -702,7 +702,7 @@ func (s *codexSession) Reattach(record RunRecord) bool {
 		s.stopAfter(run, time.Duration(max(0, *st.StopAt-time.Now().UnixMilli()))*time.Millisecond)
 	}
 	// A plan the user was asked about is still asked; if it's no longer open, its turn ends.
-	if plan := run.planned; plan != nil && plan.Request != "" && !ctx.Reopen(plan.Request, func(res protocol.Resolution) { s.planAnswered(run, res) }, "") {
+	if plan := run.planned; plan != nil && plan.Request != "" && !ctx.Reopen(plan.Request, func(res protocol.Resolution) { s.planAnswered(run, res) }, nil) {
 		ctx.Post(func() { s.endPlanned(run) })
 	}
 	return true
@@ -1817,7 +1817,7 @@ func (s *codexSession) turnCompleted(run *codexRun, turn jmap) {
 	if plan != nil && ok && ctx.Thread().PermissionMode == protocol.PermissionModePlan && !ctx.Interrupted() {
 		// A plan: the turn goes on while the user decides whether to start on it.
 		run.planned = &sum
-		run.planned.Request = ctx.Ask(&protocol.PlanRequest{Plan: *plan}, "", func(res protocol.Resolution) { s.planAnswered(run, res) }, "")
+		run.planned.Request = ctx.Ask(&protocol.PlanRequest{Plan: *plan}, "", func(res protocol.Resolution) { s.planAnswered(run, res) }, nil)
 		return
 	}
 	run.planned = nil
@@ -2220,8 +2220,8 @@ func (s *codexSession) userInput(run *codexRun, key string, p jmap, answer func(
 		ctx.UpdateItem(itemID, Patch{"status": protocol.ToolStatusCompleted, "result": protocol.ToolResult{Content: strings.Join(lines, "\n")}})
 	}
 	rid := existing
-	if existing == "" || !ctx.Reopen(existing, answered, "") {
-		rid = ctx.Ask(&protocol.QuestionRequest{Questions: qs}, itemID, answered, "")
+	if existing == "" || !ctx.Reopen(existing, answered, nil) {
+		rid = ctx.Ask(&protocol.QuestionRequest{Questions: qs}, itemID, answered, nil)
 	}
 	run.asked[key] = rid
 }

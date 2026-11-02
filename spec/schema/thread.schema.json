@@ -21,6 +21,7 @@
         "usage": { "$ref": "#/$defs/Usage", "description": "Tokens used by the thread so far, over all its turns." },
         "error": { "type": "string", "description": "What went wrong, when status is error." },
         "run": { "$ref": "#/$defs/Run", "description": "The harness process running the thread, if one is. Absent when it's idle with no process." },
+        "standing_answers": { "type": "array", "items": { "$ref": "#/$defs/StandingAnswer" }, "description": "Answers that stand for the rest of the thread: a permission request for a tool one matches gets its outcome without asking. Added by a respond with always, and set by the app (when it creates the thread, or with set_options)." },
         "rate_limits": { "type": "array", "items": { "$ref": "#/$defs/RateLimit" }, "description": "The usage limits of the account the harness runs on, as it last reported them in this thread, sorted by id. Absent until it reports one." },
         "metadata": { "type": "object", "additionalProperties": true, "description": "The app's own data, given when the thread was created. Backends store it and pass it to tools; they don't read it." },
         "created_at": { "type": "string", "format": "date-time" },
@@ -34,8 +35,19 @@
     },
     "PermissionMode": {
       "type": "string",
-      "description": "default: ask (via the permission policy) for anything the harness would ask about. accept_edits: file edits in cwd are allowed without asking. plan: the agent plans and doesn't change anything. bypass: nothing is asked.",
-      "enum": ["default", "accept_edits", "plan", "bypass"]
+      "description": "default: ask (via the permission policy) for anything the harness would ask about. accept_edits: file edits in cwd are allowed without asking. plan: the agent plans and doesn't change anything. bypass: nothing is asked, and what would be is allowed. dont_ask: nothing is asked, and what would be (a question included) is denied.",
+      "enum": ["default", "accept_edits", "plan", "bypass", "dont_ask"]
+    },
+    "StandingAnswer": {
+      "type": "object",
+      "description": "An answer that stands for a tool: its kind, its MCP server (for an mcp tool) and its name, as in a PermissionRequest.",
+      "required": ["kind", "name", "outcome"],
+      "properties": {
+        "kind": { "$ref": "item.schema.json#/$defs/ToolKind" },
+        "server": { "type": "string", "description": "The MCP server, for a tool of kind mcp." },
+        "name": { "type": "string", "description": "The tool's name, as in PermissionRequest.name." },
+        "outcome": { "type": "string", "enum": ["allow", "deny"] }
+      }
     },
     "Run": {
       "type": "object",

@@ -18,10 +18,10 @@ use crate::harness::{
 use crate::ids::{new_id, now_iso};
 use crate::permissions::PermissionPolicy;
 use crate::protocol::{
-    Attachment, Command, Item, ItemPage, PermissionMode, Resolution, Snapshot, SubagentStatus, Thread, ThreadEvent,
-    ThreadStatus,
+    Attachment, Command, Item, ItemPage, PermissionMode, Resolution, Snapshot, StandingAnswer, SubagentStatus, Thread,
+    ThreadEvent, ThreadStatus,
 };
-use crate::reducer::{apply_event, initial_state, open_requests};
+use crate::reducer::{apply_event, initial_state};
 use crate::spawner::{Spawner, direct};
 use crate::store::{RunRecord, Store, StoreError};
 use crate::stores::memory::MemoryStore;
@@ -120,6 +120,11 @@ pub struct Options {
     /// How many events a subscriber may fall behind by before it misses some (and gets
     /// `RecvError::Lagged`, after which it catches up with `events_since`). 4096 by default.
     pub event_capacity: usize,
+    /// Questions still open when their turn ends (it was interrupted, say) stay open, rather than
+    /// being cancelled: an answer is sent to the agent as the user's next message, unless the
+    /// conversation has moved on first (the user sent a message, or one was left queued). Secret
+    /// ones are cancelled still, and dont_ask dismisses them.
+    pub late_answers: bool,
     /// Fill in `raw` on events, items and requests: the harness message each came from. Off by
     /// default; it's saved with the events, so they take more room.
     pub raw: bool,
@@ -139,6 +144,7 @@ impl Default for Options {
             capabilities: Capabilities::default(),
             on_error: None,
             event_capacity: 4096,
+            late_answers: false,
             raw: false,
             on_harness_message: None,
         }
@@ -158,6 +164,9 @@ pub struct CreateOptions {
     pub title: Option<String>,
     /// The app's own data about the thread (e.g. the user it's for); tools and the policy get it.
     pub metadata: Map<String, Value>,
+    /// Answers that stand from the start (from the app's own rules, say), as answers given with
+    /// `always` do.
+    pub standing_answers: Vec<StandingAnswer>,
     /// The thread's id; a new one by default.
     pub id: Option<String>,
     /// The thread's own tools, MCP servers, skills, policy and system prompt, on top of the
@@ -184,6 +193,8 @@ pub struct ThreadOptions {
     /// `Some("")` clears it.
     pub effort: Option<String>,
     pub permission_mode: Option<PermissionMode>,
+    /// Replaces the thread's standing answers; `Some(vec![])` clears them.
+    pub standing_answers: Option<Vec<StandingAnswer>>,
     /// Replaces how the thread's harness process is started, in full. Only the app sets it: the
     /// `set_options` command doesn't.
     pub launch: Option<LaunchOptions>,
@@ -285,6 +296,7 @@ struct Inner {
     spawner: Arc<dyn Spawner>,
     capabilities: Capabilities,
     on_error: Arc<dyn Fn(Error) + Send + Sync>,
+    late_answers: bool,
     raw: bool,
     on_harness_message: Option<HarnessMessageHandler>,
     events: broadcast::Sender<ThreadEvent>,
@@ -328,6 +340,7 @@ impl AgentThreads {
                 harnesses,
                 spawner: options.spawner.unwrap_or_else(direct),
                 capabilities: options.capabilities,
+                late_answers: options.late_answers,
                 on_error,
                 raw: options.raw,
                 on_harness_message: options.on_harness_message,
@@ -389,6 +402,9 @@ impl AgentThreads {
         }
         if !options.metadata.is_empty() {
             thread["metadata"] = Value::Object(options.metadata);
+        }
+        if !options.standing_answers.is_empty() {
+            thread["standing_answers"] = json!(options.standing_answers);
         }
         let typed: Thread = serde_json::from_value(thread.clone()).map_err(|e| Error::Command(e.to_string()))?;
         i.configs.lock().unwrap().insert(typed.id.clone(), options.capabilities);
@@ -739,6 +755,7 @@ impl AgentThreads {
                     model: c.model,
                     effort: c.effort,
                     permission_mode: c.permission_mode,
+                    standing_answers: c.standing_answers,
                     launch: None,
                 };
                 self.set_options(&c.thread_id, o).await
@@ -789,15 +806,20 @@ impl AgentThreads {
             .await
     }
 
-    /// Changes the thread's model, effort, permission mode or launch options: the model and
-    /// permission mode straight away where the harness takes them in its running process, and
-    /// otherwise from the next turn.
+    /// Changes the thread's model, effort, permission mode or launch options, or its standing
+    /// answers: the model and permission mode straight away where the harness takes them in its
+    /// running process, and otherwise from the next turn. Open permission requests the new mode or
+    /// standing answers answer (bypass allows them, dont_ask denies them) are answered at once.
     pub async fn set_options(&self, thread_id: &str, options: ThreadOptions) -> Result<()> {
         self.ready(thread_id)
             .await?
             .call(move |a| {
-                let before = serde_json::to_value(a.core.thread()).ok();
+                let options_of = |t: &Thread| (t.model.clone(), t.effort.clone(), t.permission_mode);
+                let before = options_of(a.core.thread());
                 a.core.set_thread(|t| {
+                    if let Some(s) = options.standing_answers {
+                        t.standing_answers = s;
+                    }
                     if let Some(m) = options.model {
                         t.model = Some(m).filter(|m| !m.is_empty());
                     }
@@ -808,12 +830,13 @@ impl AgentThreads {
                         t.permission_mode = Some(p);
                     }
                 });
-                if serde_json::to_value(a.core.thread()).ok() != before {
+                if options_of(a.core.thread()) != before {
                     a.core.options_changed();
                 }
                 if let Some(l) = options.launch {
                     a.core.set_launch(l);
                 }
+                a.settle();
             })
             .await
     }
@@ -1031,6 +1054,7 @@ impl AgentThreads {
             spawner: i.spawner.clone(),
             events: i.events.clone(),
             on_error: i.on_error.clone(),
+            late_answers: i.late_answers,
             raw: i.raw,
             on_harness_message: i.on_harness_message.clone(),
         })
@@ -1179,6 +1203,10 @@ impl AgentThreads {
             if matches!(t.status, ThreadStatus::Running | ThreadStatus::Waiting) || t.run.is_some() {
                 actor.core.lost_run = t.run.as_ref().map(|r| r.id.clone());
                 recover_lost(&mut actor.core);
+            } else {
+                // Questions kept open after their turns ended are taken up again (or cancelled,
+                // if they can't be any more).
+                actor.core.take_up_requests(false);
             }
         }
         self.run(&handle, actor, rx);
@@ -1242,15 +1270,11 @@ impl AgentThreads {
             return Ok(false);
         }
         let c = &mut actor.core;
-        // Requests the session didn't take up again can't be answered.
+        // Requests the session didn't take up again can't be answered by the harness: questions
+        // kept open after their turns (or given up by an interrupted one) stay open, the others
+        // are cancelled.
+        c.take_up_requests(false);
         let open = c.open_request_ids();
-        let stale: Vec<String> = open_requests(c.snapshot())
-            .map(|r| r.id().to_string())
-            .filter(|id| !open.contains(id))
-            .collect();
-        for id in stale {
-            c.emit_resolved(&id, &cancel_resolution());
-        }
         // With none left (one answered before the restart is closed, say), the turn runs on, or
         // the thread is idle if none was running.
         if open.is_empty() && c.thread().status == ThreadStatus::Waiting {
@@ -1320,10 +1344,6 @@ fn is_base64(s: &str) -> bool {
             .all(|c| c.is_ascii_alphanumeric() || *c == b'+' || *c == b'/')
 }
 
-fn cancel_resolution() -> Resolution {
-    serde_json::from_value(json!({"outcome": "cancel"})).unwrap()
-}
-
 /// The last turn the thread's items were made in.
 fn last_turn(s: &Snapshot) -> Option<String> {
     s.items.iter().rev().find_map(Item::turn_id).map(String::from)
@@ -1366,11 +1386,8 @@ fn recover_lost(c: &mut ThreadContext) {
         })
         .collect();
     c.stop_subagents(&running);
-    // Its open requests can't be answered now.
-    let requests: Vec<String> = open_requests(c.snapshot()).map(|r| r.id().to_string()).collect();
-    for id in requests {
-        c.emit_resolved(&id, &cancel_resolution());
-    }
+    // Its open requests can't be answered now (but for questions that can be answered late).
+    c.take_up_requests(true);
     if turn {
         c.add_item(json!({
             "id": new_id("n"), "type": "notice", "level": "warning", "code": "run.lost",

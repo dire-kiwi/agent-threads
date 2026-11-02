@@ -113,6 +113,13 @@
         },
         "permission_mode": {
           "$ref": "#/$defs/PermissionMode"
+        },
+        "standing_answers": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/StandingAnswer"
+          },
+          "description": "Replaces the thread's standing answers ([] clears them)."
         }
       }
     },
@@ -1022,6 +1029,10 @@
         "kind": {
           "$ref": "#/$defs/ToolKind"
         },
+        "server": {
+          "type": "string",
+          "description": "The MCP server, for a tool of kind mcp, as in ToolCall.server."
+        },
         "input": {
           "description": "The tool's arguments, as in ToolCall.input."
         },
@@ -1089,6 +1100,11 @@
         },
         "turn_id": {
           "type": "string"
+        },
+        "user_messages": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "How many user_message items the thread had when it was asked: the conversation has moved on since once it has more (see keeping questions open after their turn)."
         },
         "created_at": {
           "type": "string",
@@ -1219,7 +1235,7 @@
         "always": {
           "type": "boolean",
           "default": false,
-          "description": "allow, deny, for a permission: apply the same answer to matching calls for the rest of the thread, without asking."
+          "description": "allow, deny, for a permission: apply the same answer to matching calls for the rest of the thread, without asking. It's kept in the thread's standing_answers."
         },
         "message": {
           "type": "string",
@@ -1395,6 +1411,13 @@
           "$ref": "#/$defs/Run",
           "description": "The harness process running the thread, if one is. Absent when it's idle with no process."
         },
+        "standing_answers": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/StandingAnswer"
+          },
+          "description": "Answers that stand for the rest of the thread: a permission request for a tool one matches gets its outcome without asking. Added by a respond with always, and set by the app (when it creates the thread, or with set_options)."
+        },
         "rate_limits": {
           "type": "array",
           "items": {
@@ -1429,13 +1452,43 @@
     },
     "PermissionMode": {
       "type": "string",
-      "description": "default: ask (via the permission policy) for anything the harness would ask about. accept_edits: file edits in cwd are allowed without asking. plan: the agent plans and doesn't change anything. bypass: nothing is asked.",
+      "description": "default: ask (via the permission policy) for anything the harness would ask about. accept_edits: file edits in cwd are allowed without asking. plan: the agent plans and doesn't change anything. bypass: nothing is asked, and what would be is allowed. dont_ask: nothing is asked, and what would be (a question included) is denied.",
       "enum": [
         "default",
         "accept_edits",
         "plan",
-        "bypass"
+        "bypass",
+        "dont_ask"
       ]
+    },
+    "StandingAnswer": {
+      "type": "object",
+      "description": "An answer that stands for a tool: its kind, its MCP server (for an mcp tool) and its name, as in a PermissionRequest.",
+      "required": [
+        "kind",
+        "name",
+        "outcome"
+      ],
+      "properties": {
+        "kind": {
+          "$ref": "#/$defs/ToolKind"
+        },
+        "server": {
+          "type": "string",
+          "description": "The MCP server, for a tool of kind mcp."
+        },
+        "name": {
+          "type": "string",
+          "description": "The tool's name, as in PermissionRequest.name."
+        },
+        "outcome": {
+          "type": "string",
+          "enum": [
+            "allow",
+            "deny"
+          ]
+        }
+      }
     },
     "Run": {
       "type": "object",

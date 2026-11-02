@@ -155,6 +155,7 @@ fn make(s: &Setup) -> AgentThreads {
         raw: fixture["raw"] == true,
         on_harness_message: (fixture["raw"] == true)
             .then(|| Arc::new(move |m: &HarnessMessage| messages.lock().unwrap().push(m.clone())) as _),
+        late_answers: false,
     })
 }
 

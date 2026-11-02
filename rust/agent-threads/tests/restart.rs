@@ -698,6 +698,7 @@ async fn backend() {
         },
         on_error: Some(Arc::new(|e| eprintln!("backend error: {e}"))),
         event_capacity: 1 << 16,
+        late_answers: env("LATE_ANSWERS").is_some(),
         ..Default::default()
     });
     let out = Arc::new(Mutex::new(std::io::stdout()));
@@ -1112,10 +1113,27 @@ async fn stops_a_background_subagent_waiting_on_its_request_whose_run_was_lost()
     stops_a_lost_runs_background_subagent(true).await;
 }
 
+const QUESTION: &str = r#"{"questions":[{"question":"Colour?","options":[{"label":"Blue"},{"label":"Red"}]}]}"#;
+
 #[tokio::test(flavor = "multi_thread")]
-async fn takes_up_a_background_subagents_request_after_a_restart_with_no_turn_running() {
+async fn takes_up_a_background_subagents_permission_request_after_a_restart_with_no_turn_running() {
+    takes_up_a_background_subagents_request(false).await;
+}
+
+/// With late answers on too: it's the subagent's still, not a question kept open after its turn.
+#[tokio::test(flavor = "multi_thread")]
+async fn takes_up_a_background_subagents_question_after_a_restart_with_no_turn_running() {
+    takes_up_a_background_subagents_request(true).await;
+}
+
+/// The request is taken up again as it was (the same one), and the answer goes to the subagent.
+async fn takes_up_a_background_subagents_request(question: bool) {
     let _one = serial().await;
-    let s = mini_scene(&[("POLICY", "ask")]);
+    let mut extra = vec![("POLICY", "ask")];
+    if question {
+        extra.extend([("MINI_CLAUDE_BACKGROUND_ASK", QUESTION), ("LATE_ANSWERS", "1")]);
+    }
+    let s = mini_scene(&extra);
     let mut a = s.start();
     let thread = a.call("create", json!({"harness": "claude", "cwd": s.cwd})).await;
     let id = thread["id"].as_str().unwrap().to_string();
@@ -1124,10 +1142,11 @@ async fn takes_up_a_background_subagents_request_after_a_restart_with_no_turn_ru
         json!({"type": "send", "thread_id": id, "text": "background 200 apple"}),
     )
     .await;
-    snapshot_until(&mut a, &id, |s| {
+    let snap = snapshot_until(&mut a, &id, |s| {
         of_type(s, "turn_result").len() == 1 && s["thread"]["status"] == "waiting"
     })
     .await;
+    let before: Vec<Value> = open_requests(&snap).into_iter().cloned().collect();
     a.call("saved", json!(id)).await;
     a.call("close", json!({"stop": false})).await;
     a.exited().await;
@@ -1141,9 +1160,20 @@ async fn takes_up_a_background_subagents_request_after_a_restart_with_no_turn_ru
     assert_eq!(snap["thread"]["status"], "waiting");
     let open = open_requests(&snap);
     assert_eq!(open.len(), 1, "{snap}");
+    assert_eq!(open[0]["id"], before[0]["id"]);
+    assert_eq!(open[0]["type"], if question { "question" } else { "permission" });
+    assert!(
+        !b.events.lock().unwrap().iter().any(|e| e["type"] == "request.resolved"),
+        "{}",
+        b.show()
+    );
     let from = b.events.lock().unwrap().len();
-    let respond =
-        json!({"type": "respond", "thread_id": id, "request_id": open[0]["id"], "resolution": {"outcome": "allow"}});
+    let resolution = if question {
+        json!({"outcome": "answer", "answers": {"Colour?": ["Blue"]}})
+    } else {
+        json!({"outcome": "allow"})
+    };
+    let respond = json!({"type": "respond", "thread_id": id, "request_id": open[0]["id"], "resolution": resolution});
     b.call("handle", respond).await;
     // Answered with no turn running, the thread is idle; then Claude's report is a turn of its own.
     let events = b.events.clone();
@@ -1167,4 +1197,57 @@ async fn takes_up_a_background_subagents_request_after_a_restart_with_no_turn_ru
     let results = of_type(&snap, "turn_result");
     assert_eq!(results.len(), 2);
     assert_ne!(results[0]["turn_id"], results[1]["turn_id"]);
+    // Answered to the subagent, not sent as a message.
+    assert_eq!(of_type(&snap, "user_message").len(), 1);
+}
+
+/// A question the harness gave up when the user interrupted its turn is kept open for a late
+/// answer, though the backend restarted before the turn ended.
+#[tokio::test(flavor = "multi_thread")]
+async fn keeps_a_question_its_interrupted_turn_gave_up_open_across_a_restart() {
+    let _one = serial().await;
+    let s = mini_scene(&[
+        ("POLICY", "ask"),
+        ("LATE_ANSWERS", "1"),
+        ("MINI_CLAUDE_INTERRUPT_DELAY", "1500"),
+    ]);
+    let mut a = s.start();
+    let thread = a.call("create", json!({"harness": "claude", "cwd": s.cwd})).await;
+    let id = thread["id"].as_str().unwrap().to_string();
+    let text = format!("asking AskUserQuestion {QUESTION}");
+    a.call("handle", json!({"type": "send", "thread_id": id, "text": text}))
+        .await;
+    let snap = snapshot_until(&mut a, &id, |s| open_requests(s).len() == 1).await;
+    let q = open_requests(&snap)[0].clone();
+    a.call("handle", json!({"type": "interrupt", "thread_id": id})).await;
+    // The harness gave it up; the turn hasn't ended yet.
+    snapshot_until(&mut a, &id, |s| {
+        s["thread"]["status"] == "running" && of_type(s, "turn_result").is_empty()
+    })
+    .await;
+    a.call("saved", json!(id)).await;
+    a.call("close", json!({"stop": false})).await;
+    a.exited().await;
+
+    let mut b = s.start();
+    assert_eq!(
+        b.call("recover", json!(null)).await,
+        json!({"reattached": [id], "lost": []})
+    );
+    let snap = snapshot_until(&mut b, &id, |s| of_type(s, "turn_result").len() == 1).await;
+    assert_eq!(snap["thread"]["status"], "idle");
+    let open = open_requests(&snap);
+    assert_eq!(open.len(), 1, "{snap}");
+    assert_eq!(open[0]["id"], q["id"]);
+    let respond = json!({"type": "respond", "thread_id": id, "request_id": q["id"],
+        "resolution": {"outcome": "answer", "answers": {"Colour?": ["Red"]}}});
+    b.call("handle", respond).await;
+    let snap = snapshot_until(&mut b, &id, |s| of_type(s, "turn_result").len() == 2).await;
+    b.call("close", json!({"stop": true})).await;
+    b.exited().await;
+    let messages = of_type(&snap, "user_message");
+    assert_eq!(
+        messages.last().unwrap()["text"],
+        "My answer to the question you asked:\n\n- Colour?\n  Red"
+    );
 }

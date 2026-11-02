@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strings"
 	"sync"
 	"time"
 
@@ -43,7 +44,10 @@ type openRequest struct {
 	request  protocol.ThreadRequest
 	answered func(protocol.Resolution)
 	// standing is the tool it's about (permissionKey), for an answer given "always".
-	standing string
+	standing *StandingKey
+	// late says it's a question kept open after its turn ended (Options.LateAnswers): its answer is
+	// sent as the next message, unless the user sends one first.
+	late bool
 }
 
 // outgoing is a message as sent: its text and attachments, and the client's id for it.
@@ -94,7 +98,6 @@ type threadRuntime struct {
 	queue         []string // ids of queued user messages, oldest first
 	requests      map[string]*openRequest
 	requestOrder  []string
-	always        map[string]Decision // permissionKey -> the user's standing answer
 	unsaved       []protocol.ThreadEvent
 	threadChanged bool
 	flushQueued   bool
@@ -138,7 +141,6 @@ func newRuntime(sdk *AgentThreads, state protocol.Snapshot, config ThreadConfig,
 		launch:     launch,
 		policy:     policy,
 		requests:   map[string]*openRequest{},
-		always:     map[string]Decision{},
 		streaming:  map[string]bool{},
 		structured: map[string]json.RawMessage{},
 		changed:    make(chan struct{}),
@@ -782,6 +784,8 @@ func sameJSONValue(a, b any) bool {
 // send sends a message: it starts a turn, or steers the running one.
 func (rt *threadRuntime) send(m outgoing) {
 	id := NewID("um")
+	// The conversation moves on: questions kept open after their turns can't be answered.
+	rt.cancelLate()
 	if rt.turn == nil {
 		// Messages still queued from before weren't delivered: they go first, in this turn, and stay
 		// queued until the harness takes them in. Such a turn is a retry for them.
@@ -900,9 +904,19 @@ func (rt *threadRuntime) endTurn(end TurnEnd, carry bool) {
 			rt.UpdateItem(c.ID, patch)
 		}
 	}
+	// Questions are kept open after the turn (some may be already: see CancelRequest), unless
+	// messages are left queued, which a turn carries over or the next message sends: the
+	// conversation has moved on.
 	for _, id := range append([]string(nil), rt.requestOrder...) {
 		r := rt.requests[id]
 		if r == nil {
+			continue
+		}
+		if r.late {
+			if len(rt.queue) > 0 {
+				rt.dropRequest(id)
+				rt.emit(&protocol.RequestResolvedEvent{RequestID: id, Resolution: cancelled("")})
+			}
 			continue
 		}
 		if t := r.request.TurnID(); t != "" && t != turn.ID {
@@ -912,7 +926,9 @@ func (rt *threadRuntime) endTurn(end TurnEnd, carry bool) {
 			continue
 		}
 		rt.dropRequest(id)
-		rt.emit(&protocol.RequestResolvedEvent{RequestID: id, Resolution: protocol.Resolution{Outcome: protocol.ResolutionOutcomeCancel}})
+		if !rt.keepLate(id, r.request) {
+			rt.emit(&protocol.RequestResolvedEvent{RequestID: id, Resolution: cancelled("")})
+		}
 	}
 	ok := end.OK && !turn.Interrupted
 	errText := ""
@@ -948,7 +964,7 @@ func (rt *threadRuntime) endTurn(end TurnEnd, carry bool) {
 		status := protocol.ThreadStatusIdle
 		if errText != "" {
 			status = protocol.ThreadStatusError
-		} else if len(rt.requests) > 0 {
+		} else if rt.waiting() {
 			status = protocol.ThreadStatusWaiting
 		}
 		rt.SetThread(func(t *protocol.Thread) { t.Status = status; t.Error = errText; t.Usage = usage })
@@ -1144,15 +1160,79 @@ func (rt *threadRuntime) undelivered(n int) {
 
 // ---------- requests ----------
 
+// standingDenial is what the agent is told when a standing answer denies a call.
+const standingDenial = "The user has denied this tool for the rest of the thread."
+
 func (rt *threadRuntime) Decide(q PermissionQuery) Decision {
-	if d, ok := rt.always[permissionKey(q.Kind, q.Server, q.Name)]; ok {
-		return d
+	if r := rt.standing(permissionKey(q.Kind, q.Server, q.Name)); r != nil {
+		if r.Outcome == protocol.ResolutionOutcomeAllow {
+			return Allow
+		}
+		return DenyWith(r.Message)
 	}
 	t := rt.state.Thread
-	return decide(background, rt.policy, q, PermissionContext{ThreadID: rt.id, Thread: t, Metadata: metadataOf(t)})
+	d := decide(background, rt.policy, q, PermissionContext{ThreadID: rt.id, Thread: t, Metadata: metadataOf(t)})
+	return modeDecision(t.PermissionMode, d)
 }
 
-func (rt *threadRuntime) Ask(request protocol.ThreadRequestValue, toolCallID string, answered func(protocol.Resolution), standing string) string {
+// standing is the thread's standing answer for a tool, if it has one.
+func (rt *threadRuntime) standing(key *StandingKey) *protocol.Resolution {
+	if key == nil {
+		return nil
+	}
+	answers := rt.state.Thread.StandingAnswers
+	for i := len(answers) - 1; i >= 0; i-- {
+		if key.Matches(answers[i]) {
+			if answers[i].Outcome == protocol.StandingAnswerOutcomeAllow {
+				return &protocol.Resolution{Outcome: protocol.ResolutionOutcomeAllow}
+			}
+			return &protocol.Resolution{Outcome: protocol.ResolutionOutcomeDeny, Message: standingDenial}
+		}
+	}
+	return nil
+}
+
+// settled is how a request is answered without asking the user, if it is: a permission request by
+// the thread's standing answer for its tool, or else by its permission mode (bypass allows it,
+// dont_ask denies it); a question by dont_ask, which dismisses it.
+func (rt *threadRuntime) settled(question bool, standing *StandingKey) *protocol.Resolution {
+	if !question {
+		if r := rt.standing(standing); r != nil {
+			return r
+		}
+	}
+	switch rt.state.Thread.PermissionMode {
+	case protocol.PermissionModeBypass:
+		if !question {
+			return &protocol.Resolution{Outcome: protocol.ResolutionOutcomeAllow}
+		}
+	case protocol.PermissionModeDontAsk:
+		if !question {
+			return &protocol.Resolution{Outcome: protocol.ResolutionOutcomeDeny, Message: DontAskDenial}
+		}
+		r := cancelled(DontAskDenial)
+		return &r
+	}
+	return nil
+}
+
+func cancelled(message string) protocol.Resolution {
+	return protocol.Resolution{Outcome: protocol.ResolutionOutcomeCancel, Message: message}
+}
+
+func (rt *threadRuntime) Ask(request protocol.ThreadRequestValue, toolCallID string, answered func(protocol.Resolution), standing *StandingKey) string {
+	_, question := request.(*protocol.QuestionRequest)
+	if r := rt.settled(question, standing); r != nil {
+		res := *r
+		rt.loop.post(func() { answered(res) })
+		switch request.(type) {
+		case *protocol.QuestionRequest:
+			return NewID("q")
+		case *protocol.PlanRequest:
+			return NewID("plan")
+		}
+		return NewID("perm")
+	}
 	turnID := rt.TurnID()
 	var id string
 	// A request about a call is from the subagent the call is (or the thread itself); one about
@@ -1168,9 +1248,14 @@ func (rt *threadRuntime) Ask(request protocol.ThreadRequestValue, toolCallID str
 	case *protocol.PermissionRequest:
 		id = NewID("perm")
 		r.ID, r.TurnID, r.ToolCallID, r.ParentID = id, turnID, toolCallID, parent
+		if r.Server == "" && standing != nil {
+			r.Server = standing.Server
+		}
 	case *protocol.QuestionRequest:
 		id = NewID("q")
 		r.ID, r.TurnID, r.ToolCallID, r.ParentID = id, turnID, toolCallID, parent
+		users := int64(rt.userMessages())
+		r.UserMessages = &users
 	case *protocol.PlanRequest:
 		id = NewID("plan")
 		r.ID, r.TurnID, r.ToolCallID, r.ParentID = id, turnID, toolCallID, parent
@@ -1199,7 +1284,7 @@ func (rt *threadRuntime) dropRequest(id string) {
 	}
 }
 
-func (rt *threadRuntime) Reopen(requestID string, answered func(protocol.Resolution), standing string) bool {
+func (rt *threadRuntime) Reopen(requestID string, answered func(protocol.Resolution), standing *StandingKey) bool {
 	if _, ok := rt.requests[requestID]; ok {
 		return false
 	}
@@ -1222,30 +1307,78 @@ func (rt *threadRuntime) respond(requestID string, res protocol.Resolution) {
 	// The answers to secret questions go only to the harness: what's sent and saved hides them.
 	rt.emit(&protocol.RequestResolvedEvent{RequestID: requestID, Resolution: redact(open.request, res)})
 	rt.requestsDone()
-	if res.Always && open.standing != "" {
+	var standing *protocol.StandingAnswer
+	if res.Always && open.standing != nil {
 		switch res.Outcome {
 		case protocol.ResolutionOutcomeAllow:
-			rt.always[open.standing] = Allow
+			a := open.standing.Answer(protocol.StandingAnswerOutcomeAllow)
+			standing = &a
 		case protocol.ResolutionOutcomeDeny:
-			rt.always[open.standing] = Deny
+			a := open.standing.Answer(protocol.StandingAnswerOutcomeDeny)
+			standing = &a
 		}
 	}
+	if standing != nil {
+		rt.SetThread(func(t *protocol.Thread) {
+			var kept []protocol.StandingAnswer
+			for _, a := range t.StandingAnswers {
+				if !open.standing.Matches(a) {
+					kept = append(kept, a)
+				}
+			}
+			t.StandingAnswers = append(kept, *standing)
+		})
+	}
 	open.answered(res)
+	// It stands for the requests open for the same tool too.
+	if standing != nil {
+		rt.settle()
+	}
 }
 
+// settle answers the open requests the thread's standing answers or permission mode now answer
+// (see settled), after either changed: questions kept open after their turns included, which
+// dont_ask dismisses (and which then send nothing).
+func (rt *threadRuntime) settle() {
+	type answer struct {
+		id  string
+		res protocol.Resolution
+	}
+	var answers []answer
+	for _, id := range rt.requestOrder {
+		o := rt.requests[id]
+		if o == nil {
+			continue
+		}
+		_, question := o.request.Value.(*protocol.QuestionRequest)
+		if r := rt.settled(question, o.standing); r != nil {
+			answers = append(answers, answer{id, *r})
+		}
+	}
+	for _, a := range answers {
+		rt.respond(a.id, a.res)
+	}
+}
+
+// CancelRequest closes a request the harness no longer wants answered. (A question kept open after
+// its turn isn't the harness's any more, and stays open; so does one the harness gives up on
+// because the user interrupted its turn, with LateAnswers.)
 func (rt *threadRuntime) CancelRequest(id string) {
-	if rt.requests[id] == nil {
+	open := rt.requests[id]
+	if open == nil || open.late {
 		return
 	}
 	rt.dropRequest(id)
-	rt.emit(&protocol.RequestResolvedEvent{RequestID: id, Resolution: protocol.Resolution{Outcome: protocol.ResolutionOutcomeCancel}})
+	if !(rt.Interrupted() && rt.keepLate(id, open.request)) {
+		rt.emit(&protocol.RequestResolvedEvent{RequestID: id, Resolution: cancelled("")})
+	}
 	rt.requestsDone()
 }
 
-// requestsDone sets the thread running again once it has no open requests, or idle if no turn is
+// requestsDone sets the thread running again once it waits on no request, or idle if no turn is
 // running (a background subagent's request can be answered after its turn).
 func (rt *threadRuntime) requestsDone() {
-	if len(rt.requests) > 0 {
+	if rt.waiting() {
 		return
 	}
 	if rt.turn != nil {
@@ -1255,12 +1388,131 @@ func (rt *threadRuntime) requestsDone() {
 	}
 }
 
+// waiting says whether the thread waits on a request (one that isn't kept open after its turn).
+func (rt *threadRuntime) waiting() bool {
+	for _, o := range rt.requests {
+		if !o.late {
+			return true
+		}
+	}
+	return false
+}
+
+// openRequestIDs is the open requests, but for questions kept open after their turns.
 func (rt *threadRuntime) openRequestIDs() map[string]bool {
 	out := map[string]bool{}
-	for id := range rt.requests {
-		out[id] = true
+	for id, o := range rt.requests {
+		if !o.late {
+			out[id] = true
+		}
 	}
 	return out
+}
+
+// keepLate keeps a question open after its turn ended, with LateAnswers, if it can be: not a secret
+// one (its answer would be shown, as a message), not under dont_ask (which dismisses questions),
+// and not when the conversation has moved on (see movedOn). It says whether it did.
+func (rt *threadRuntime) keepLate(id string, request protocol.ThreadRequest) bool {
+	q, ok := request.Value.(*protocol.QuestionRequest)
+	if !ok || !rt.sdk.options.LateAnswers || rt.movedOn(q) || rt.state.Thread.PermissionMode == protocol.PermissionModeDontAsk {
+		return false
+	}
+	for _, x := range q.Questions {
+		if x.Secret {
+			return false
+		}
+	}
+	rt.addRequest(id, &openRequest{request: request, answered: rt.lateAnswered(q), late: true})
+	return true
+}
+
+// movedOn says whether the conversation has moved on since a question was asked: messages are
+// queued, or the user sent one since (there are more than its UserMessages, which is saved with it,
+// so it's known after a restart too; one without is taken to have been passed by).
+func (rt *threadRuntime) movedOn(q *protocol.QuestionRequest) bool {
+	return len(rt.queue) > 0 || q.UserMessages == nil || int64(rt.userMessages()) > *q.UserMessages
+}
+
+// userMessages is how many messages the user has sent (user_message items).
+func (rt *threadRuntime) userMessages() int {
+	n := 0
+	for _, it := range rt.state.Items {
+		if it.Type() == "user_message" {
+			n++
+		}
+	}
+	return n
+}
+
+// cancelLate cancels the questions kept open after their turns.
+func (rt *threadRuntime) cancelLate() {
+	for _, id := range append([]string(nil), rt.requestOrder...) {
+		if o := rt.requests[id]; o != nil && o.late {
+			rt.dropRequest(id)
+			rt.emit(&protocol.RequestResolvedEvent{RequestID: id, Resolution: cancelled("")})
+		}
+	}
+}
+
+// takeUpRequests takes up, as a thread is loaded, the requests open in its state that its session
+// didn't take up again (after it re-attached to its run, if it did), which nothing will answer. A
+// question whose turn is over (it has a result, or it's the turn running and was interrupted, so
+// the harness gave the question up), or any with all (the turn was lost), is kept open as endTurn
+// and CancelRequest keep it, if it can be; the others are cancelled.
+func (rt *threadRuntime) takeUpRequests(all bool) {
+	ended := map[string]bool{}
+	for _, it := range rt.state.Items {
+		if it.Type() == "turn_result" && it.TurnID() != "" {
+			ended[it.TurnID()] = true
+		}
+	}
+	interrupted := ""
+	if rt.turn != nil && rt.turn.Interrupted {
+		interrupted = rt.turn.ID
+	}
+	for _, r := range protocol.OpenRequests(rt.state) {
+		if rt.requests[r.ID()] != nil {
+			continue
+		}
+		t := r.TurnID()
+		over := all || t != "" && (ended[t] || t == interrupted)
+		if !over || !rt.keepLate(r.ID(), r) {
+			rt.emit(&protocol.RequestResolvedEvent{RequestID: r.ID(), Resolution: cancelled("")})
+		}
+	}
+}
+
+// lateAnswered is what's done with the answer to a question kept open after its turn: it's sent as
+// the next message (a dismissal sends nothing).
+func (rt *threadRuntime) lateAnswered(q *protocol.QuestionRequest) func(protocol.Resolution) {
+	return func(res protocol.Resolution) {
+		if res.Outcome != protocol.ResolutionOutcomeAnswer {
+			return
+		}
+		rt.send(outgoing{text: lateAnswerText(q, res)})
+	}
+}
+
+// lateAnswerText is the message a late answer is sent as: each question, with its answers (and the
+// note with them).
+func lateAnswerText(q *protocol.QuestionRequest, res protocol.Resolution) string {
+	lines := make([]string, 0, len(q.Questions))
+	for _, x := range q.Questions {
+		answer := "(no answer)"
+		if a := res.Answers[x.ID]; len(a) > 0 {
+			answer = strings.Join(a, ", ")
+		}
+		lines = append(lines, "- "+x.Question+"\n  "+answer)
+	}
+	what := "answers to the questions"
+	if len(lines) == 1 {
+		what = "answer to the question"
+	}
+	text := "My " + what + " you asked:\n\n" + strings.Join(lines, "\n")
+	if res.Message != "" {
+		text += "\n\n" + res.Message
+	}
+	return text
 }
 
 // secretText is what a secret answer is shown as.

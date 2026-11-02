@@ -7,9 +7,9 @@ use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::pin::Pin;
 use std::sync::Arc;
 
-use serde_json::{Map, Value, json};
+use serde_json::{Map, Value};
 
-use crate::protocol::{PermissionMode, Thread, ToolKind};
+use crate::protocol::{PermissionMode, StandingAnswer, StandingAnswerOutcome, Thread, ToolKind};
 
 /// A tool call the agent wants to make.
 #[derive(Clone, Debug)]
@@ -150,8 +150,52 @@ pub(crate) fn decide(policy: &PermissionPolicy, query: PermissionQuery, ctx: Per
 
 /// Which tool a query is about, for a standing answer: its kind, its MCP server and its name, since
 /// two servers (or an app tool and a built-in) can have tools of the same name.
-pub(crate) fn permission_key(kind: ToolKind, server: Option<&str>, name: &str) -> String {
-    json!([kind, server, name]).to_string()
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct StandingKey {
+    pub kind: ToolKind,
+    pub server: Option<String>,
+    pub name: String,
+}
+
+impl StandingKey {
+    /// Whether a standing answer is for this tool.
+    pub fn matches(&self, answer: &StandingAnswer) -> bool {
+        answer.kind == self.kind
+            && answer.name == self.name
+            && answer.server.as_deref().filter(|s| !s.is_empty()) == self.server.as_deref().filter(|s| !s.is_empty())
+    }
+
+    /// The standing answer for this tool with `outcome`.
+    pub fn answer(&self, outcome: StandingAnswerOutcome) -> StandingAnswer {
+        StandingAnswer {
+            kind: self.kind,
+            server: self.server.clone().filter(|s| !s.is_empty()),
+            name: self.name.clone(),
+            outcome,
+        }
+    }
+}
+
+pub(crate) fn permission_key(kind: ToolKind, server: Option<&str>, name: &str) -> StandingKey {
+    StandingKey {
+        kind,
+        server: server.filter(|s| !s.is_empty()).map(String::from),
+        name: name.to_string(),
+    }
+}
+
+/// What the agent is told when the thread's mode (dont_ask) denies what it would have asked.
+pub const DONT_ASK_DENIAL: &str =
+    "Denied automatically: this thread's permission mode is dont_ask, so the user isn't asked.";
+
+/// What the thread's permission mode makes of a call the policy would ask the user about: bypass
+/// allows it, dont_ask denies it.
+pub(crate) fn mode_decision(mode: Option<PermissionMode>, d: PermissionDecision) -> PermissionDecision {
+    match (mode, d) {
+        (Some(PermissionMode::Bypass), PermissionDecision::Ask) => PermissionDecision::Allow,
+        (Some(PermissionMode::DontAsk), PermissionDecision::Ask) => PermissionDecision::deny(DONT_ASK_DENIAL),
+        (_, d) => d,
+    }
 }
 
 /// The permission mode a thread carries on in once its plan is approved: the one the user picked,

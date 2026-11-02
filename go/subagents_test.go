@@ -276,13 +276,26 @@ func TestALostRunStopsItsBackgroundSubagents(t *testing.T) {
 }
 
 func TestARestartTakesUpABackgroundSubagentsRequestWithNoTurnRunning(t *testing.T) {
-	s := miniScene(t, "POLICY=ask")
+	t.Run("permission", func(t *testing.T) { takesUpABackgroundSubagentsRequest(t, false) })
+	// With late answers on too: it's the subagent's still, not a question kept open after its turn.
+	t.Run("question", func(t *testing.T) { takesUpABackgroundSubagentsRequest(t, true) })
+}
+
+// takesUpABackgroundSubagentsRequest: the request is taken up again as it was (the same one), and
+// the answer goes to the subagent.
+func takesUpABackgroundSubagentsRequest(t *testing.T, asks bool) {
+	extra := []string{"POLICY=ask"}
+	if asks {
+		extra = append(extra, "MINI_CLAUDE_BACKGROUND_ASK="+question, "LATE_ANSWERS=1")
+	}
+	s := miniScene(t, extra...)
 	a := s.start()
 	id := s.create(a, "claude")
 	a.call("handle", map[string]any{"type": "send", "thread_id": id, "text": "background 200 apple"})
+	var before protocol.Snapshot
 	until(t, func() bool {
-		snap := snapshotOf(t, a, id)
-		return len(turnResults(snap)) == 1 && snap.Thread.Status == protocol.ThreadStatusWaiting
+		before = snapshotOf(t, a, id)
+		return len(turnResults(before)) == 1 && before.Thread.Status == protocol.ThreadStatusWaiting
 	})
 	a.call("saved", id)
 	a.call("close")
@@ -291,11 +304,25 @@ func TestARestartTakesUpABackgroundSubagentsRequestWithNoTurnRunning(t *testing.
 	b := s.start()
 	expectRecovered(t, b, id)
 	snap := snapshotOf(t, b, id)
-	if snap.Thread.Status != protocol.ThreadStatusWaiting || len(protocol.OpenRequests(snap)) != 1 {
+	open := protocol.OpenRequests(snap)
+	if snap.Thread.Status != protocol.ThreadStatusWaiting || len(open) != 1 {
 		t.Fatalf("after the restart: %s", mustMarshal(snap))
 	}
+	_, isQuestion := open[0].Value.(*protocol.QuestionRequest)
+	if open[0].ID() != protocol.OpenRequests(before)[0].ID() || isQuestion != asks {
+		t.Fatalf("the request was %s, and is %s", mustMarshal(protocol.OpenRequests(before)[0]), mustMarshal(open[0]))
+	}
+	for _, e := range b.events.all() {
+		if _, ok := e.Value.(*protocol.RequestResolvedEvent); ok {
+			t.Fatalf("a request was resolved: %s", mustMarshal(e))
+		}
+	}
 	from := len(b.events.all())
-	b.call("handle", map[string]any{"type": "respond", "thread_id": id, "request_id": protocol.OpenRequests(snap)[0].ID(), "resolution": map[string]any{"outcome": "allow"}})
+	resolution := map[string]any{"outcome": "allow"}
+	if asks {
+		resolution = map[string]any{"outcome": "answer", "answers": map[string]any{"Colour?": []string{"Blue"}}}
+	}
+	b.call("handle", map[string]any{"type": "respond", "thread_id": id, "request_id": open[0].ID(), "resolution": resolution})
 	// Answered with no turn running, the thread is idle; then Claude's report is a turn of its own.
 	completed := func() (started, done int, statuses []protocol.ThreadStatus) {
 		for _, e := range b.events.all()[from:] {
@@ -318,6 +345,63 @@ func TestARestartTakesUpABackgroundSubagentsRequestWithNoTurnRunning(t *testing.
 	results := turnResults(snap)
 	if started != 1 || len(statuses) == 0 || statuses[0] != protocol.ThreadStatusIdle || len(results) != 2 || results[0].TurnID == results[1].TurnID {
 		t.Fatalf("started %d, statuses %v, results %s", started, statuses, mustMarshal(results))
+	}
+	// Answered to the subagent, not sent as a message.
+	if n := userMessages(snap); n != 1 {
+		t.Fatalf("%d user messages: %s", n, mustMarshal(snap.Items))
+	}
+}
+
+func userMessages(snap protocol.Snapshot) int {
+	n := 0
+	for _, it := range snap.Items {
+		if it.Type() == "user_message" {
+			n++
+		}
+	}
+	return n
+}
+
+// A question the harness gave up when the user interrupted its turn is kept open for a late answer,
+// though the backend restarted before the turn ended.
+func TestARestartKeepsAQuestionItsInterruptedTurnGaveUpOpen(t *testing.T) {
+	s := miniScene(t, "POLICY=ask", "LATE_ANSWERS=1", "MINI_CLAUDE_INTERRUPT_DELAY=1500")
+	a := s.start()
+	id := s.create(a, "claude")
+	a.call("handle", map[string]any{"type": "send", "thread_id": id, "text": "asking AskUserQuestion " + question})
+	var snap protocol.Snapshot
+	until(t, func() bool { snap = snapshotOf(t, a, id); return len(protocol.OpenRequests(snap)) == 1 })
+	q := protocol.OpenRequests(snap)[0]
+	a.call("handle", map[string]any{"type": "interrupt", "thread_id": id})
+	// The harness gave it up; the turn hasn't ended yet.
+	until(t, func() bool {
+		snap = snapshotOf(t, a, id)
+		return snap.Thread.Status == protocol.ThreadStatusRunning && len(turnResults(snap)) == 0
+	})
+	a.call("saved", id)
+	a.call("close")
+	<-a.exited
+
+	b := s.start()
+	expectRecovered(t, b, id)
+	until(t, func() bool { snap = snapshotOf(t, b, id); return len(turnResults(snap)) == 1 })
+	open := protocol.OpenRequests(snap)
+	if snap.Thread.Status != protocol.ThreadStatusIdle || len(open) != 1 || open[0].ID() != q.ID() {
+		t.Fatalf("after the restart: %s", mustMarshal(snap))
+	}
+	b.call("handle", map[string]any{"type": "respond", "thread_id": id, "request_id": q.ID(),
+		"resolution": map[string]any{"outcome": "answer", "answers": map[string]any{"Colour?": []string{"Red"}}}})
+	until(t, func() bool { snap = snapshotOf(t, b, id); return len(turnResults(snap)) == 2 })
+	b.call("stop")
+	<-b.exited
+	var last *protocol.UserMessage
+	for _, it := range snap.Items {
+		if m, ok := it.Value.(*protocol.UserMessage); ok {
+			last = m
+		}
+	}
+	if want := "My answer to the question you asked:\n\n- Colour?\n  Red"; last == nil || last.Text != want {
+		t.Fatalf("the last message is %s", mustMarshal(last))
 	}
 }
 

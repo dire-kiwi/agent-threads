@@ -88,6 +88,7 @@ func runBackend() {
 		Capabilities: agentthreads.Capabilities{Permissions: policy},
 		Spawner:      spawner,
 		OnError:      func(err error) { fmt.Fprintf(os.Stderr, "backend error: %v\n", err) },
+		LateAnswers:  env("LATE_ANSWERS") != "",
 	})
 	sdk.Subscribe(func(e protocol.ThreadEvent) { out(map[string]any{"event": e}) })
 	ctx := context.Background()

@@ -215,12 +215,15 @@ type SetOptionsCommand struct {
 	Effort         string         `json:"effort,omitempty"`
 	PermissionMode PermissionMode `json:"permission_mode,omitempty"`
 
+	// Replaces the thread's standing answers ([] clears them).
+	StandingAnswers *[]StandingAnswer `json:"standing_answers,omitempty"`
+
 	// Extra has the fields the spec doesn't name, as they came, so that they're written again
 	// unchanged (receivers ignore fields they don't know, and stores keep them).
 	Extra map[string]json.RawMessage `json:"-"`
 }
 
-var knownSetOptionsCommand = fieldSet("type", "thread_id", "model", "effort", "permission_mode")
+var knownSetOptionsCommand = fieldSet("type", "thread_id", "model", "effort", "permission_mode", "standing_answers")
 
 func (v SetOptionsCommand) MarshalJSON() ([]byte, error) {
 	type plain SetOptionsCommand
@@ -1676,6 +1679,9 @@ type PermissionRequest struct {
 	Name string   `json:"name"`
 	Kind ToolKind `json:"kind"`
 
+	// The MCP server, for a tool of kind mcp, as in ToolCall.server.
+	Server string `json:"server,omitempty"`
+
 	// The tool's arguments, as in ToolCall.input.
 	Input json.RawMessage `json:"input"`
 
@@ -1702,7 +1708,7 @@ type PermissionRequest struct {
 	Extra map[string]json.RawMessage `json:"-"`
 }
 
-var knownPermissionRequest = fieldSet("type", "id", "tool_call_id", "name", "kind", "input", "title", "reason", "parent_id", "resolution", "turn_id", "created_at", "raw")
+var knownPermissionRequest = fieldSet("type", "id", "tool_call_id", "name", "kind", "server", "input", "title", "reason", "parent_id", "resolution", "turn_id", "created_at", "raw")
 
 func (v PermissionRequest) MarshalJSON() ([]byte, error) {
 	type plain PermissionRequest
@@ -1753,7 +1759,11 @@ type QuestionRequest struct {
 	// set. Absent while it's open.
 	Resolution *Resolution `json:"resolution,omitempty"`
 	TurnID     string      `json:"turn_id,omitempty"`
-	CreatedAt  string      `json:"created_at,omitempty"`
+
+	// How many user_message items the thread had when it was asked: the conversation has moved on since
+	// once it has more (see keeping questions open after their turn).
+	UserMessages *int64 `json:"user_messages,omitempty"`
+	CreatedAt    string `json:"created_at,omitempty"`
 
 	// The harness's own payload, for debugging.
 	Raw json.RawMessage `json:"raw,omitempty"`
@@ -1763,7 +1773,7 @@ type QuestionRequest struct {
 	Extra map[string]json.RawMessage `json:"-"`
 }
 
-var knownQuestionRequest = fieldSet("type", "id", "questions", "tool_call_id", "parent_id", "resolution", "turn_id", "created_at", "raw")
+var knownQuestionRequest = fieldSet("type", "id", "questions", "tool_call_id", "parent_id", "resolution", "turn_id", "user_messages", "created_at", "raw")
 
 func (v QuestionRequest) MarshalJSON() ([]byte, error) {
 	type plain QuestionRequest
@@ -1968,7 +1978,7 @@ type Resolution struct {
 	Outcome ResolutionOutcome `json:"outcome"`
 
 	// allow, deny, for a permission: apply the same answer to matching calls for the rest of the
-	// thread, without asking.
+	// thread, without asking. It's kept in the thread's standing_answers.
 	Always bool `json:"always,omitempty"`
 
 	// deny: why, which the agent is told (for a plan, the user's feedback on it). answer: a note with
@@ -2193,6 +2203,11 @@ type Thread struct {
 	// The harness process running the thread, if one is. Absent when it's idle with no process.
 	Run *Run `json:"run,omitempty"`
 
+	// Answers that stand for the rest of the thread: a permission request for a tool one matches gets
+	// its outcome without asking. Added by a respond with always, and set by the app (when it creates
+	// the thread, or with set_options).
+	StandingAnswers []StandingAnswer `json:"standing_answers,omitempty"`
+
 	// The usage limits of the account the harness runs on, as it last reported them in this thread,
 	// sorted by id. Absent until it reports one.
 	RateLimits []RateLimit `json:"rate_limits,omitempty"`
@@ -2208,7 +2223,7 @@ type Thread struct {
 	Extra map[string]json.RawMessage `json:"-"`
 }
 
-var knownThread = fieldSet("id", "harness", "status", "title", "model", "effort", "permission_mode", "cwd", "session_id", "usage", "error", "run", "rate_limits", "metadata", "created_at", "updated_at")
+var knownThread = fieldSet("id", "harness", "status", "title", "model", "effort", "permission_mode", "cwd", "session_id", "usage", "error", "run", "standing_answers", "rate_limits", "metadata", "created_at", "updated_at")
 
 func (v Thread) MarshalJSON() ([]byte, error) {
 	type plain Thread
@@ -2252,7 +2267,8 @@ const (
 
 // PermissionMode: default: ask (via the permission policy) for anything the harness would ask
 // about. accept_edits: file edits in cwd are allowed without asking. plan: the agent plans and
-// doesn't change anything. bypass: nothing is asked.
+// doesn't change anything. bypass: nothing is asked, and what would be is allowed. dont_ask:
+// nothing is asked, and what would be (a question included) is denied.
 type PermissionMode string
 
 const (
@@ -2260,6 +2276,61 @@ const (
 	PermissionModeAcceptEdits PermissionMode = "accept_edits"
 	PermissionModePlan        PermissionMode = "plan"
 	PermissionModeBypass      PermissionMode = "bypass"
+	PermissionModeDontAsk     PermissionMode = "dont_ask"
+)
+
+// StandingAnswer: An answer that stands for a tool: its kind, its MCP server (for an mcp tool) and
+// its name, as in a PermissionRequest.
+type StandingAnswer struct {
+	Kind ToolKind `json:"kind"`
+
+	// The MCP server, for a tool of kind mcp.
+	Server string `json:"server,omitempty"`
+
+	// The tool's name, as in PermissionRequest.name.
+	Name    string                `json:"name"`
+	Outcome StandingAnswerOutcome `json:"outcome"`
+
+	// Extra has the fields the spec doesn't name, as they came, so that they're written again
+	// unchanged (receivers ignore fields they don't know, and stores keep them).
+	Extra map[string]json.RawMessage `json:"-"`
+}
+
+var knownStandingAnswer = fieldSet("kind", "server", "name", "outcome")
+
+func (v StandingAnswer) MarshalJSON() ([]byte, error) {
+	type plain StandingAnswer
+	p := plain(v)
+	data, err := json.Marshal(p)
+	if err != nil {
+		return nil, err
+	}
+	return withExtra(data, v.Extra, knownStandingAnswer)
+}
+
+func (v *StandingAnswer) UnmarshalJSON(data []byte) error {
+	if isNull(data) {
+		return nil
+	}
+	type plain StandingAnswer
+	var p plain
+	if err := json.Unmarshal(data, &p); err != nil {
+		return err
+	}
+	extra, err := extraFields(data, knownStandingAnswer)
+	if err != nil {
+		return err
+	}
+	p.Extra = extra
+	*v = StandingAnswer(p)
+	return nil
+}
+
+type StandingAnswerOutcome string
+
+const (
+	StandingAnswerOutcomeAllow StandingAnswerOutcome = "allow"
+	StandingAnswerOutcomeDeny  StandingAnswerOutcome = "deny"
 )
 
 // Run: A harness process. A run started under the shim can outlive the backend: after a restart the

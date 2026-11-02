@@ -22,6 +22,7 @@
         "tool_call_id": { "type": "string", "description": "The tool_call item it's for, when there is one." },
         "name": { "type": "string", "description": "The tool's name, as in ToolCall.name." },
         "kind": { "$ref": "item.schema.json#/$defs/ToolKind" },
+        "server": { "type": "string", "description": "The MCP server, for a tool of kind mcp, as in ToolCall.server." },
         "input": { "description": "The tool's arguments, as in ToolCall.input." },
         "title": { "type": "string", "description": "A short summary of what's asked, e.g. the command line." },
         "reason": { "type": "string", "description": "Why the harness asks, when it says." },
@@ -44,6 +45,7 @@
         "parent_id": { "type": "string", "description": "The subagent tool_call that's asking, if one is." },
         "resolution": { "$ref": "#/$defs/Resolution", "description": "How it was resolved, once it is (request.resolved): the state keeps resolved requests with this set. Absent while it's open." },
         "turn_id": { "type": "string" },
+        "user_messages": { "type": "integer", "minimum": 0, "description": "How many user_message items the thread had when it was asked: the conversation has moved on since once it has more (see keeping questions open after their turn)." },
         "created_at": { "type": "string", "format": "date-time" },
         "raw": { "description": "The harness's own payload, for debugging." }
       }
@@ -91,7 +93,7 @@
       "required": ["outcome"],
       "properties": {
         "outcome": { "type": "string", "enum": ["allow", "deny", "answer", "cancel"], "description": "allow, deny: for a permission or a plan. answer: for a question. cancel: for any, when the user dismisses it or the turn ends first." },
-        "always": { "type": "boolean", "default": false, "description": "allow, deny, for a permission: apply the same answer to matching calls for the rest of the thread, without asking." },
+        "always": { "type": "boolean", "default": false, "description": "allow, deny, for a permission: apply the same answer to matching calls for the rest of the thread, without asking. It's kept in the thread's standing_answers." },
         "message": { "type": "string", "description": "deny: why, which the agent is told (for a plan, the user's feedback on it). answer: a note with the answers." },
         "permission_mode": { "$ref": "thread.schema.json#/$defs/PermissionMode", "description": "allow, for a plan: the permission mode the thread carries on in, which it's set to. Left out (or plan), it's the thread's mode, or default if that's plan." },
         "answers": {
