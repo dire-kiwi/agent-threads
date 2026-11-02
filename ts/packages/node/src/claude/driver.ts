@@ -7,11 +7,12 @@
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import type { Resolution } from "@dire-kiwi/agent-threads-protocol";
+import type { Resolution, TurnSession } from "@dire-kiwi/agent-threads-protocol";
 import { messageParts, pathText } from "../attachments.js";
 import type { Harness, HarnessSession, Message, RunCheckpoint, Skill, ThreadContext } from "../harness.js";
 import { newId } from "../ids.js";
 import { permissionKey, type PermissionDecision } from "../permissions.js";
+import { resumeAtPoint, type RewindPoint } from "../sessions.js";
 import { writeSkills } from "../skills.js";
 import type { ExitStatus, HarnessProcess, ProcessHandlers } from "../spawner.js";
 import type { RunRecord } from "../store.js";
@@ -80,6 +81,10 @@ interface RunState {
   open: [string, OpenRequest][];
   sent: { ids: string[]; echo: string }[];
   pluginDir?: string;
+  /** The running turn's mark: the main conversation's last message in it. */
+  at?: string;
+  /** The message it was started to resume its session at (the thread's resume_at then). */
+  resumeAt?: string;
   /** The thread's options it was started with. */
   launched?: Launched;
   /** The thread's options or config have changed since, so the next turn starts a new process. */
@@ -121,6 +126,10 @@ class Run {
   sent: { ids: string[]; echo: string }[] = [];
   /** The generated plugin with the thread's skills, for this run only. */
   pluginDir: string | undefined;
+  /** The running turn's mark: the uuid of the main conversation's last message in it. */
+  at: string | undefined;
+  /** The message it was started to resume its session at (--resume-session-at). */
+  resumeAt: string | undefined;
   launched: Launched | undefined;
 
   /** Left running when the backend shut down: nothing more is read or written. */
@@ -164,6 +173,8 @@ class Run {
       open: [...this.open],
       sent: this.sent,
       ...(this.pluginDir ? { pluginDir: this.pluginDir } : {}),
+      ...(this.at ? { at: this.at } : {}),
+      ...(this.resumeAt ? { resumeAt: this.resumeAt } : {}),
       ...(this.launched ? { launched: this.launched } : {}),
     };
   }
@@ -182,6 +193,8 @@ class Run {
     this.open = new Map(st.open);
     this.sent = st.sent.map((x) => ({ ids: [...x.ids], echo: x.echo }));
     if (st.pluginDir) this.pluginDir = st.pluginDir;
+    this.at = st.at;
+    this.resumeAt = st.resumeAt;
     if (st.launched) this.launched = { ...st.launched };
   }
 
@@ -261,6 +274,15 @@ class ClaudeSession implements HarnessSession {
   #clearSteer(): void {
     clearTimeout(this.#steerTimer);
     this.#steerAt = undefined;
+  }
+
+  compact(): void {
+    // Claude Code compacts when it's sent /compact, which is its turn.
+    this.#ensure(true).send([], this.#userMessage([{ id: "", text: "/compact" }]));
+  }
+
+  rewindPoint(sessions: (TurnSession | undefined)[], index: number): RewindPoint {
+    return resumeAtPoint(sessions, index);
   }
 
   interrupt(): void {
@@ -555,6 +577,9 @@ class ClaudeSession implements HarnessSession {
     const mode = claudePermissionMode(t.permission_mode);
     if (mode) args.push("--permission-mode", mode);
     if (t.session_id) args.push("--resume", t.session_id);
+    // After a rewind: the session as it was at the end of the turn it went back to.
+    run.resumeAt = t.session_id ? t.resume_at : undefined;
+    if (run.resumeAt) args.push("--resume-session-at", run.resumeAt);
     const servers: Json = {};
     if (tools.length) servers[APP_SERVER] = { type: "sdk", name: APP_SERVER };
     for (const [name, s] of Object.entries(mcpServers)) {
@@ -592,7 +617,7 @@ class ClaudeSession implements HarnessSession {
     if (!run.retired && ctx.turnId) {
       this.#clearStop();
       this.#clearSteer();
-      ctx.endTurn({ ok: false, error: exitError(status, run.stderr) });
+      ctx.endTurn({ ok: false, error: exitError(status, run.stderr), ...(run.at ? { session_at: run.at } : {}) });
     }
     run.finish();
   }
@@ -628,9 +653,18 @@ class ClaudeSession implements HarnessSession {
   #message(run: Run, m: Json): void {
     const ctx = this.#ctx;
     const parent: string | undefined = m.parent_tool_use_id ?? undefined;
+    // The main conversation's messages (replayed ones too): the turn's last is where a rewind to
+    // after it resumes the session.
+    if ((m.type === "user" || m.type === "assistant") && !parent && typeof m.uuid === "string") run.at = m.uuid;
     switch (m.type) {
       case "system":
-        if (m.subtype === "init" && m.session_id && m.session_id !== ctx.thread.session_id) ctx.setThread({ session_id: m.session_id });
+        if (m.subtype === "init") {
+          // The session it runs in; and a rewind's resume_at is done with once it has resumed there.
+          const patch: { session_id?: string; resume_at?: undefined } = {};
+          if (m.session_id && m.session_id !== ctx.thread.session_id) patch.session_id = m.session_id;
+          if (run.resumeAt && ctx.thread.resume_at === run.resumeAt) patch.resume_at = undefined;
+          if (Object.keys(patch).length) ctx.setThread(patch);
+        }
         if (m.subtype === "compact_boundary") {
           const meta = m.compact_metadata ?? {};
           ctx.addItem({
@@ -699,6 +733,8 @@ class ClaudeSession implements HarnessSession {
         run.msgOfParent.clear();
         run.blockCount.clear();
         run.streamed.clear();
+        const at = run.at;
+        run.at = undefined;
         if (!ctx.turnId) break;
         this.#clearStop();
         const failed = !!m.is_error;
@@ -707,6 +743,7 @@ class ClaudeSession implements HarnessSession {
           ...(failed ? { error: m.result || (Array.isArray(m.errors) ? m.errors.join("\n") : "") || m.subtype } : {}),
           usage: claudeUsage(m),
           ...(typeof m.duration_ms === "number" ? { duration_ms: m.duration_ms } : {}),
+          ...(at ? { session_at: at } : {}),
         });
         break;
       }

@@ -2,10 +2,11 @@
 // steering queue and open requests. Every change is an event, numbered, applied, sent to the
 // subscribers, and saved to the store in order (deltas aren't saved).
 
-import { applyEvent, type Attachment, type Item, type Resolution, type Snapshot, type Thread, type ThreadEvent, type ThreadRequest, type Usage, type UserMessage } from "@dire-kiwi/agent-threads-protocol";
+import { applyEvent, type Attachment, type Item, type Resolution, type Snapshot, type Thread, type ThreadEvent, type ThreadRequest, type TurnResult, type TurnSession, type Usage, type UserMessage } from "@dire-kiwi/agent-threads-protocol";
 import type { HarnessSession, Message, NewItem, NewRequest, ThreadConfig, ThreadContext, TurnEnd } from "./harness.js";
 import { newId } from "./ids.js";
 import { decide, permissionKey, type PermissionDecision, type PermissionPolicy, type PermissionQuery } from "./permissions.js";
+import { RewindError } from "./sessions.js";
 import type { Spawner } from "./spawner.js";
 import { StoreError, type RunRecord, type Store } from "./store.js";
 
@@ -15,6 +16,8 @@ type Unnumbered = ThreadEvent extends infer E ? (E extends ThreadEvent ? Omit<E,
 export interface Turn {
   id: string;
   interrupted: boolean;
+  /** The thread's session_id when it started (none: it starts a new session). */
+  session?: string;
   /**
    * How many turns in a row (this one included) are retries for messages left queued that took
    * none in: carried over from the turn before, or sent again with an explicit message.
@@ -401,7 +404,7 @@ export class ThreadRuntime implements ThreadContext {
       // Messages still queued from before weren't delivered: they go first, in this turn, and stay
       // queued until the harness takes them in. Such a turn is a retry for them.
       const left = this.queued();
-      this.turn = { id: newId("turn"), interrupted: false, ...(left.length ? { carried: 1 } : {}) };
+      this.turn = { id: newId("turn"), interrupted: false, ...this.#sessionNow(), ...(left.length ? { carried: 1 } : {}) };
       for (const m of left) this.updateItem(m.id, { turn_id: this.turn.id });
       this.addItem({ id, type: "user_message", ...userFields(message) });
       this.emit({ type: "turn.started", turn_id: this.turn.id });
@@ -412,6 +415,56 @@ export class ThreadRuntime implements ThreadContext {
     this.addItem({ id, type: "user_message", ...userFields(message), steered: true, queued: true });
     this.#queue.push(id);
     this.session!.steer(toMessage(id, message));
+  }
+
+  /** The session a turn starting now starts in, for its Turn. */
+  #sessionNow(): { session?: string } {
+    const s = this.#state.thread.session_id;
+    return s ? { session: s } : {};
+  }
+
+  /** Compacts the harness's context: a turn with no message. The caller checks one can start. */
+  compact(): void {
+    this.turn = { id: newId("turn"), interrupted: false, ...this.#sessionNow() };
+    this.emit({ type: "turn.started", turn_id: this.turn.id });
+    this.setThread({ status: "running", error: undefined });
+    this.session!.compact!();
+  }
+
+  /** The next turn starts a new session. The caller checks no turn is running. */
+  newSession(): void {
+    if (!this.#state.thread.session_id) return;
+    this.setThread({ session_id: undefined, resume_at: undefined });
+    this.addItem({ id: newId("n"), type: "notice", level: "info", code: "session.new", text: NEW_SESSION_TEXT });
+    this.session?.optionsChanged();
+  }
+
+  /**
+   * Takes the conversation back to before the turn `turnId`: its items and every later turn's go,
+   * and the session goes where the harness says (see sessions.ts). Throws for a turn the thread
+   * hasn't, or one the harness can't rewind to. The caller checks no turn is running.
+   */
+  rewind(turnId: string): void {
+    const items = this.#saved.items;
+    const order: string[] = [];
+    for (const it of items) if (it.turn_id && !order.includes(it.turn_id)) order.push(it.turn_id);
+    const results = items.filter((it): it is TurnResult => it.type === "turn_result" && !it.parent_id);
+    const index = results.findIndex((r) => r.turn_id === turnId);
+    if (index < 0) throw new RewindError(`there's no turn ${turnId} in the thread`);
+    if (!this.session?.rewindPoint) throw new RewindError(`${this.thread.harness} threads can't be rewound`);
+    const point = this.session.rewindPoint(
+      results.map((r): TurnSession | undefined => r.session),
+      index,
+    );
+    const dropped = new Set(order.slice(order.indexOf(turnId)));
+    const first = items.findIndex((it) => it.turn_id !== undefined && dropped.has(it.turn_id));
+    const gone = items.filter((it, i) => (it.turn_id !== undefined ? dropped.has(it.turn_id) : i > first)).map((it) => it.id);
+    const goneSet = new Set(gone);
+    this.#queue = this.#queue.filter((id) => !goneSet.has(id));
+    this.emit({ type: "items.removed", item_ids: gone });
+    this.setThread({ session_id: point.session_id, resume_at: point.resume_at });
+    this.addItem({ id: newId("n"), type: "notice", level: "info", code: "rewind", text: REWIND_TEXT });
+    this.session.optionsChanged();
   }
 
   queued(): UserMessage[] {
@@ -462,6 +515,7 @@ export class ThreadRuntime implements ThreadContext {
     }
     const ok = end.ok && !turn.interrupted;
     const error = !ok && !turn.interrupted ? end.error || "The turn failed." : undefined;
+    const sessionId = this.#state.thread.session_id;
     this.addItem({
       id: newId("tr"),
       type: "turn_result",
@@ -470,6 +524,7 @@ export class ThreadRuntime implements ThreadContext {
       ...(error ? { error } : {}),
       ...(end.usage ? { usage: end.usage } : {}),
       ...(end.duration_ms !== undefined ? { duration_ms: end.duration_ms } : {}),
+      ...(sessionId ? { session: { id: sessionId, ...(end.session_at ? { at: end.session_at } : {}), ...(!turn.session ? { started: true } : {}) } } : {}),
     });
     this.emit({ type: "turn.completed", turn_id: turn.id });
     this.turn = null;
@@ -502,7 +557,7 @@ export class ThreadRuntime implements ThreadContext {
       return;
     }
     // The next turn starts straight away, so the thread doesn't go idle in between.
-    this.turn = { id: newId("turn"), interrupted: false, carried: carried + 1 };
+    this.turn = { id: newId("turn"), interrupted: false, ...this.#sessionNow(), carried: carried + 1 };
     for (const m of left) this.updateItem(m.id, { turn_id: this.turn.id });
     this.emit({ type: "turn.started", turn_id: this.turn.id });
     this.setThread({ status: "running", error: undefined, usage });
@@ -578,6 +633,10 @@ export class ThreadRuntime implements ThreadContext {
     this.#host.error(error);
   }
 }
+
+/** The notices a rewind and a new session add. */
+const REWIND_TEXT = "The conversation was rewound to here: the agent doesn't remember what came after.";
+const NEW_SESSION_TEXT = "A new conversation starts here: the agent doesn't remember what came before.";
 
 /** What a secret answer is shown as. */
 export const SECRET = "[secret]";

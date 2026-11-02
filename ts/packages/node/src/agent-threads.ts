@@ -19,6 +19,7 @@ import { codex } from "./codex/driver.js";
 import type { Harness, McpServer, Skill, ThreadConfig } from "./harness.js";
 import { newId } from "./ids.js";
 import type { PermissionPolicy } from "./permissions.js";
+import { RewindError } from "./sessions.js";
 import { direct, type Spawner } from "./spawner.js";
 import type { RunRecord, Store } from "./store.js";
 import { MemoryStore } from "./stores/memory.js";
@@ -63,6 +64,11 @@ export interface CreateOptions extends Capabilities {
   metadata?: { [k: string]: unknown };
   /** The thread's id; a new one by default. */
   id?: string;
+  /**
+   * The harness's own session to adopt (Claude Code's session id, Codex's thread id): the thread's
+   * first turn resumes it. Its messages so far aren't made into items.
+   */
+  session_id?: string;
 }
 
 /** What recover() did. */
@@ -117,6 +123,7 @@ export class AgentThreads {
       ...(options.title ? { title: options.title } : {}),
       ...(options.model ? { model: options.model } : {}),
       ...(options.effort ? { effort: options.effort } : {}),
+      ...(options.session_id ? { session_id: options.session_id } : {}),
       permission_mode: options.permission_mode ?? "default",
       cwd: options.cwd ?? process.cwd(),
       ...(options.metadata ? { metadata: options.metadata } : {}),
@@ -264,6 +271,12 @@ export class AgentThreads {
         const { type: _t, thread_id, ...options } = command;
         return this.setOptions(thread_id, options);
       }
+      case "rewind":
+        return this.rewind(command.thread_id, command.turn_id);
+      case "new_session":
+        return this.newSession(command.thread_id);
+      case "compact":
+        return this.compact(command.thread_id);
     }
   }
 
@@ -293,6 +306,42 @@ export class AgentThreads {
     const before = JSON.stringify(rt.thread);
     rt.setThread(patch);
     if (JSON.stringify(rt.thread) !== before) rt.session?.optionsChanged();
+  }
+
+  /**
+   * Takes the conversation back to before the turn `turnId`: the harness forgets it and every turn
+   * after it (from the next turn, which resumes the session there), and their items are removed.
+   * Refused while a turn is running, for a turn the thread hasn't, and where the harness can't go
+   * back (a Claude Code session the thread adopted, to before its first turn in it).
+   */
+  async rewind(threadId: string, turnId: string): Promise<void> {
+    const rt = await this.#ready({ type: "rewind", thread_id: threadId, turn_id: turnId });
+    idle(rt, "rewound");
+    try {
+      rt.rewind(turnId);
+    } catch (e) {
+      if (e instanceof RewindError) throw new CommandError(`the thread can't be rewound to before that turn: ${e.message}`);
+      throw e;
+    }
+  }
+
+  /** The next turn starts a new conversation with the harness; the thread's items stay. */
+  async newSession(threadId: string): Promise<void> {
+    const rt = await this.#ready({ type: "new_session", thread_id: threadId });
+    idle(rt, "given a new session");
+    rt.newSession();
+  }
+
+  /**
+   * Compacts the harness's context now, in a turn of its own. Refused while a turn is running, and
+   * when the thread has no session yet.
+   */
+  async compact(threadId: string): Promise<void> {
+    const rt = await this.#ready({ type: "compact", thread_id: threadId });
+    idle(rt, "compacted");
+    if (!rt.thread.session_id) throw new CommandError("the thread has no conversation to compact yet");
+    if (!rt.session?.compact) throw new CommandError(`${rt.thread.harness} threads can't be compacted`);
+    rt.compact();
   }
 
   /**
@@ -446,7 +495,8 @@ export class AgentThreads {
     const s = rt.thread.status;
     if (s === "running" || s === "waiting") {
       const last = [...rt.snapshot.items].reverse().find((i) => i.turn_id)?.turn_id;
-      rt.turn = data.turn ? { ...data.turn } : { id: last ?? newId("turn"), interrupted: false };
+      const session = rt.thread.session_id ? { session: rt.thread.session_id } : {};
+      rt.turn = data.turn ? { ...data.turn } : { id: last ?? newId("turn"), interrupted: false, ...session };
     }
     rt.adoptRun(record);
     const session = rt.session;
@@ -489,13 +539,19 @@ export class AgentThreads {
   }
 }
 
+/** Refuses a command that needs the thread idle: one that's running a turn. */
+function idle(rt: ThreadRuntime, what: string): void {
+  if (rt.turn) throw new CommandError(`a turn is running: the thread can't be ${what} until it ends (interrupt it first)`);
+}
+
 /** Ends a turn whose process was lost when the backend stopped. */
 function recoverLost(rt: ThreadRuntime): void {
   const s = rt.thread.status;
   if (s === "running" || s === "waiting") {
     const items = rt.snapshot.items;
     const turnId = [...items].reverse().find((i) => i.turn_id)?.turn_id ?? newId("turn");
-    rt.turn = { id: turnId, interrupted: false };
+    // Its session as it is now, which is as it was when it started unless the turn started it.
+    rt.turn = { id: turnId, interrupted: false, ...(rt.thread.session_id ? { session: rt.thread.session_id } : {}) };
     for (const r of rt.snapshot.requests) {
       rt.emit({ type: "request.resolved", request_id: r.id, resolution: { outcome: "cancel" } });
     }

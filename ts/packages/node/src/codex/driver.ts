@@ -10,13 +10,14 @@
 import { mkdtempSync, realpathSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve, sep } from "node:path";
-import type { Resolution, ToolCall, Usage } from "@dire-kiwi/agent-threads-protocol";
+import type { Resolution, ToolCall, TurnSession, Usage } from "@dire-kiwi/agent-threads-protocol";
 import { messageParts } from "../attachments.js";
 import { title } from "../claude/translate.js";
 import type { Harness, HarnessSession, Message, RunCheckpoint, ThreadContext } from "../harness.js";
 import { newId } from "../ids.js";
 import { serveTools, type LoopbackMcp } from "../mcp-http.js";
 import { permissionKey, type PermissionDecision, type PermissionQuery } from "../permissions.js";
+import { revertPoint, type RewindPoint } from "../sessions.js";
 import { writeSkills } from "../skills.js";
 import type { ExitStatus, HarnessProcess, ProcessHandlers } from "../spawner.js";
 import type { RunRecord } from "../store.js";
@@ -327,16 +328,21 @@ class CodexSession implements HarnessSession {
   // ---------- the core's side ----------
 
   start(messages: Message[]): void {
+    if (messages.length === 1 && messages[0]!.text.trim() === "/compact" && !messages[0]!.attachments?.length) return this.compact();
+    this.#turnStart(this.#ensure(true), messages);
+  }
+
+  compact(): void {
     const run = this.#ensure(true);
-    if (messages.length === 1 && messages[0]!.text.trim() === "/compact" && !messages[0]!.attachments?.length) {
-      run.starting = true;
-      run.compacting = true;
-      void run.ready
-        .then((threadId) => run.rpc.request("thread/compact/start", { threadId }))
-        .catch((e) => this.#turnFailed(run, e));
-      return;
-    }
-    this.#turnStart(run, messages);
+    run.starting = true;
+    run.compacting = true;
+    void run.ready
+      .then((threadId) => run.rpc.request("thread/compact/start", { threadId }))
+      .catch((e) => this.#turnFailed(run, e));
+  }
+
+  rewindPoint(sessions: (TurnSession | undefined)[], index: number): RewindPoint {
+    return revertPoint(sessions, index);
   }
 
   steer(message: Message): void {
@@ -572,8 +578,9 @@ class CodexSession implements HarnessSession {
   /** A turn couldn't be started: it ends with the error. */
   #turnFailed(run: Run, e: unknown): void {
     if (run.exited || run.retired || run !== this.#run) return;
+    const at = run.turnId;
     run.turnEnded();
-    if (this.#ctx.turnId) this.#ctx.endTurn({ ok: false, error: e instanceof Error ? e.message : String(e) });
+    if (this.#ctx.turnId) this.#ctx.endTurn({ ok: false, error: e instanceof Error ? e.message : String(e), ...(at ? { session_at: at } : {}) });
   }
 
   // ---------- the process ----------
@@ -688,7 +695,8 @@ class CodexSession implements HarnessSession {
       if (!o.userConfig) run.hiddenSkills = await this.#ambientSkills(run);
       const r = await this.#startThread(run);
       run.threadId = r.thread.id;
-      if (ctx.thread.session_id !== run.threadId) ctx.setThread({ session_id: run.threadId });
+      // A rewind's resume_at was for the session it had, which this isn't if it couldn't be resumed.
+      if (ctx.thread.session_id !== run.threadId) ctx.setThread({ session_id: run.threadId, resume_at: undefined });
       return run.threadId;
     } catch (e) {
       // The thread can't run: the process is stopped (and its end ends nothing), and the turn ends
@@ -729,11 +737,21 @@ class CodexSession implements HarnessSession {
       const state = readSessionState(run.home, session);
       run.dynamic = state ? new Map(state.dynamicTools.map((t) => [t.name, t])) : null;
       run.baseline = state?.totals ?? null;
+      let r: ThreadStartResponse | undefined;
       try {
-        return await run.rpc.request<ThreadStartResponse>("thread/resume", { threadId: session, ...(await this.#threadParams(run, false)), excludeTurns: true });
+        r = await run.rpc.request<ThreadStartResponse>("thread/resume", { threadId: session, ...(await this.#threadParams(run, false)), excludeTurns: true });
       } catch (e) {
         if (!(e instanceof RpcError) || !/not found|no rollout|unknown thread|does not exist/i.test(e.message)) throw e;
         this.#notice(`Codex couldn't resume its session (${e.message}), so this is a new one: it doesn't remember the thread so far.`);
+      }
+      if (r) {
+        // After a rewind: the session as it was before the turn it went back to before.
+        const at = this.#ctx.thread.resume_at;
+        if (at) {
+          await run.rpc.request("thread/revert", { threadId: session, beforeTurnId: at });
+          if (this.#ctx.thread.resume_at === at) this.#ctx.setThread({ resume_at: undefined });
+        }
+        return r;
       }
     }
     return this.#newThread(run);
@@ -835,6 +853,7 @@ class CodexSession implements HarnessSession {
     run.exited = true;
     run.abort.abort();
     run.rpc?.close(new Error(exitError(status, run.stderr, false)));
+    const at = run.turnId;
     run.turnEnded();
     void run.mcp?.close();
     if (run.skillsDir) rmSync(run.skillsDir, { recursive: true, force: true });
@@ -847,7 +866,7 @@ class CodexSession implements HarnessSession {
     // A run that ends while its turn is running ends the turn (as interrupted, if it was).
     if (!run.retired && ctx.turnId) {
       this.#clearStop();
-      ctx.endTurn({ ok: false, error: exitError(status, run.stderr, true) });
+      ctx.endTurn({ ok: false, error: exitError(status, run.stderr, true), ...(at ? { session_at: at } : {}) });
     }
     run.finish();
   }
@@ -1037,6 +1056,7 @@ class CodexSession implements HarnessSession {
   #turnCompleted(run: Run, turn: Turn): void {
     const ctx = this.#ctx;
     const error = run.error;
+    const at = turn?.id ?? run.turnId;
     run.turnEnded();
     run.error = null;
     // The turn's requests are moot now; its open ones are cancelled with it.
@@ -1056,6 +1076,7 @@ class CodexSession implements HarnessSession {
       ...(turn?.status === "failed" ? { error: turn.error?.message ?? error ?? "The turn failed." } : {}),
       ...(usage ? { usage } : {}),
       ...(typeof turn?.durationMs === "number" ? { duration_ms: turn.durationMs } : {}),
+      ...(at ? { session_at: at } : {}),
     });
   }
 

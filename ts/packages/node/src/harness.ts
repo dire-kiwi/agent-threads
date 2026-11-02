@@ -9,10 +9,12 @@ import type {
   QuestionRequest,
   Resolution,
   Thread,
+  TurnSession,
   Usage,
   UserMessage,
 } from "@dire-kiwi/agent-threads-protocol";
 import type { PermissionDecision, PermissionQuery } from "./permissions.js";
+import type { RewindPoint } from "./sessions.js";
 import type { Spawner } from "./spawner.js";
 import type { RunRecord } from "./store.js";
 import type { Tool } from "./tools.js";
@@ -46,6 +48,11 @@ export interface TurnEnd {
   error?: string;
   usage?: Usage;
   duration_ms?: number;
+  /**
+   * The harness's own mark for the turn, in its session: Claude Code's last message in it, Codex's
+   * id for the turn (the turn_result's `session.at`).
+   */
+  session_at?: string;
 }
 
 /** A request to open, without the fields the core fills in. */
@@ -140,6 +147,14 @@ export interface HarnessSession {
   carryOver(messages: Message[]): void;
   /** Stop the running turn. */
   interrupt(): void;
+  /** A turn started (with no messages) to compact the harness's context. */
+  compact?(): void;
+  /**
+   * Where a rewind to before turn `index` of `sessions` (each turn's session, in order) takes the
+   * session (see sessions.ts). Throws a RewindError if it can't be rewound there. The core then
+   * sets the thread's session_id and resume_at, and calls optionsChanged().
+   */
+  rewindPoint?(sessions: (TurnSession | undefined)[], index: number): RewindPoint;
   /** Whether a harness process is running that has the queued messages (it was sent them). */
   live(): boolean;
   /**

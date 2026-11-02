@@ -31,7 +31,7 @@ const sdk = new AgentThreads({
 const thread = await sdk.create({ model: "sonnet", cwd: "/srv/work", metadata: { user: "u1" } });
 // broadcast and onCommandFromClient are the app's transport: docs/transport.md has real ones.
 const off = sdk.subscribe((event) => broadcast(event)); // every thread's events, deltas included
-onCommandFromClient((command) => sdk.handle(command)); // send / interrupt / respond / set_options
+onCommandFromClient((command) => sdk.handle(command)); // send / interrupt / respond / set_options / rewind / new_session / compact
 await sdk.snapshot(thread.id); // for a client that just connected
 await sdk.eventsSince(thread.id, seq); // for one catching up
 await sdk.close(); // on shutdown: stops the harness processes (or with the shim, leaves them going) and saves everything
@@ -42,11 +42,18 @@ await sdk.close(); // on shutdown: stops the harness processes (or with the shim
 - `create(options)` makes a thread (`harness`, `model`, `effort`, `permission_mode`, `cwd`,
   `title`, `metadata`) and sends its first `thread.updated`. It runs on the first harness unless
   it names one (`harness: "codex"`). It can have its own `tools`,
-  `mcpServers`, `skills`, `permissions` and `systemPrompt`, on top of the instance's.
+  `mcpServers`, `skills`, `permissions` and `systemPrompt`, on top of the instance's. With
+  `session_id` (Claude Code's session id, or Codex's thread id) it adopts a conversation the
+  harness already has: its first turn resumes it.
 - `handle(command)` carries out a command from a client ([spec/PROTOCOL.md](../../../spec/PROTOCOL.md#commands)),
   and throws a `CommandError` for one it can't (an unknown thread, or a command that isn't valid by
-  the protocol's schema, which is checked before anything changes). `send`, `interrupt`, `respond`
-  and `setOptions` do the same from code. After `close()`, they're all refused.
+  the protocol's schema, which is checked before anything changes). `send`, `interrupt`, `respond`,
+  `setOptions`, `rewind`, `newSession` and `compact` do the same from code. After `close()`, they're
+  all refused.
+- `rewind(id, turnId)` takes the conversation back to before a turn (the harness forgets it and the
+  turns after, whose items are removed), `newSession(id)` has the next turn start a new
+  conversation, and `compact(id)` compacts the harness's context in a turn of its own
+  ([spec/PROTOCOL.md](../../../spec/PROTOCOL.md#sessions)). They're refused while a turn runs.
 - `get`, `list` and `delete` look threads up and remove them.
 - `snapshot(id)` is the thread's state now; `eventsSince(id, seq, limit?)` its saved events after
   `seq`; `subscribe(fn)` calls `fn` with every thread's events as they happen, and returns how to

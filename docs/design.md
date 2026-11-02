@@ -139,7 +139,8 @@ details.
 - **Requests**: `permission` and `question`.
 - **Events**: `thread.updated`, `turn.started`, `turn.completed`, `item.added`, `item.updated`,
   `delta` (not saved), `request.opened` and `request.resolved`. Each has `thread_id` and `seq`.
-- **Commands**: `send` (which steers if a turn is running), `interrupt`, `respond` and `set_options`.
+- **Commands**: `send` (which steers if a turn is running), `interrupt`, `respond`, `set_options`,
+  and for the harness's session `rewind`, `new_session` and `compact`.
 - **Snapshot**: `{thread, items, requests, seq}`. A client that reconnects asks for the events after
   its `seq`, or takes a fresh snapshot.
 
@@ -179,6 +180,8 @@ Tool handlers get a `ctx` with the thread id and metadata, so an app can scope t
 | Messages and steering | stream-json on stdin with `--replay-user-messages`. A steered message counts as delivered once it's echoed back; anything not taken in by the end of the turn starts the next one. | `turn/start`, `turn/steer` |
 | Interrupt | stream-json `control_request` interrupt | `turn/interrupt` |
 | Resume | `--resume <session_id>` | `thread/resume` |
+| Rewind to before a turn | `--resume <session_id> --resume-session-at <uuid>` | `thread/revert` |
+| Compact | `/compact` | `thread/compact/start` |
 | App tools (in process) | An in-process ("sdk") MCP server answered over the stream-json control channel, as the official Agent SDK does. | `dynamicTools` on `thread/start`, answered via `item/tool/call` (experimental). Fallback: a loopback streamable-HTTP MCP server with a random token. |
 | External MCP servers | `--mcp-config` + `--strict-mcp-config` | `mcp_servers` in `thread/start` config overrides |
 | Permissions | `--permission-prompt-tool stdio` → `can_use_tool` control requests | Approval server requests (`commandExecution`, `fileChange`, MCP elicitation) |

@@ -210,6 +210,8 @@ function streamingAfter(streaming: ReadonlySet<string>, event: ThreadEvent, snap
       return "text" in event.patch ? without(streaming, event.item_id) : streaming;
     case "item.added":
       return without(streaming, event.item.id);
+    case "items.removed":
+      return event.item_ids.reduce(without, streaming);
     case "turn.completed":
       return streaming.size ? NO_IDS : streaming;
     default:
