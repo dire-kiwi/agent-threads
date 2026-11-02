@@ -6,6 +6,7 @@ package agentthreads_test
 
 import (
 	"context"
+	"encoding/json"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -14,14 +15,14 @@ import (
 	"github.com/dire-kiwi/agent-threads/go/protocol"
 )
 
-func miniClaude(t *testing.T, policy agentthreads.PermissionPolicy) (*agentthreads.AgentThreads, *recorder) {
+func miniClaude(t *testing.T, policy agentthreads.PermissionPolicy, env map[string]string, tools ...agentthreads.Tool) (*agentthreads.AgentThreads, *recorder) {
 	needNode(t)
 	mini := filepath.Join(specDir, "..", "ts", "packages", "node", "src", "test", "mini-claude.mjs")
 	rec := &recorder{}
 	sdk := agentthreads.New(agentthreads.Options{
 		Store:        agentthreads.NewMemoryStore(),
-		Harnesses:    map[string]agentthreads.Harness{"claude": agentthreads.ClaudeCode(agentthreads.ClaudeOptions{Bin: mini})},
-		Capabilities: agentthreads.Capabilities{Permissions: policy},
+		Harnesses:    map[string]agentthreads.Harness{"claude": agentthreads.ClaudeCode(agentthreads.ClaudeOptions{Bin: mini, Env: env})},
+		Capabilities: agentthreads.Capabilities{Permissions: policy, Tools: tools},
 		Spawner:      agentthreads.Direct(),
 		OnError:      func(err error) { t.Errorf("OnError: %v", err) },
 	})
@@ -48,7 +49,7 @@ func TestABackgroundSubagentOutlivesItsTurn(t *testing.T) {
 		}
 		return agentthreads.Allow
 	})
-	sdk, rec := miniClaude(t, shell)
+	sdk, rec := miniClaude(t, shell, nil)
 	th, err := sdk.Create(ctx, agentthreads.CreateOptions{Model: "mini", Cwd: t.TempDir()})
 	if err != nil {
 		t.Fatal(err)
@@ -113,7 +114,7 @@ func TestABackgroundSubagentOutlivesItsTurn(t *testing.T) {
 
 func TestARunsSubagentsStopWithIt(t *testing.T) {
 	ctx := context.Background()
-	sdk, rec := miniClaude(t, agentthreads.Allow)
+	sdk, rec := miniClaude(t, agentthreads.Allow, nil)
 	th, _ := sdk.Create(ctx, agentthreads.CreateOptions{Model: "mini", Cwd: t.TempDir()})
 	sdk.Send(ctx, th.ID, "background 60000 apple", agentthreads.SendOptions{})
 	until(t, func() bool {
@@ -137,5 +138,167 @@ func TestARunsSubagentsStopWithIt(t *testing.T) {
 	}
 	if !strings.Contains(subagent, `"status":"stopped"`) || bash == "" {
 		t.Fatalf("after closing:\n%s", show(rec.all()))
+	}
+}
+
+func turnResults(snap protocol.Snapshot) []*protocol.TurnResult {
+	var out []*protocol.TurnResult
+	for _, it := range snap.Items {
+		if r, ok := it.Value.(*protocol.TurnResult); ok {
+			out = append(out, r)
+		}
+	}
+	return out
+}
+
+func TestAUsersTurnOutlastsATurnClaudeMakesBeforeTakingItsMessageIn(t *testing.T) {
+	ctx := context.Background()
+	sdk, rec := miniClaude(t, agentthreads.Allow, map[string]string{"MINI_CLAUDE_NOTIFY_FIRST": "1"})
+	th, _ := sdk.Create(ctx, agentthreads.CreateOptions{Model: "mini", Cwd: t.TempDir()})
+	sdk.Send(ctx, th.ID, "background 300 apple", agentthreads.SendOptions{})
+	if rec.waitFor(0, []byte(`{"type":"turn.completed"}`), waitFor) < 0 {
+		t.Fatal("the turn didn't end")
+	}
+	// Sent before the subagent is done: Claude reports the subagent first, then takes this in.
+	sdk.Send(ctx, th.ID, "reply hi", agentthreads.SendOptions{})
+	var snap protocol.Snapshot
+	until(t, func() bool {
+		snap, _ = sdk.Snapshot(ctx, th.ID)
+		last := ""
+		for _, it := range snap.Items {
+			if m, ok := it.Value.(*protocol.AssistantMessage); ok {
+				last = m.Text
+			}
+		}
+		return last == "hi" && snap.Thread.Status == protocol.ThreadStatusIdle
+	})
+	results := turnResults(snap)
+	if len(results) != 2 {
+		t.Fatalf("turns:\n%s", show(rec.all()))
+	}
+	// The user's turn has its message, both replies, and both results' usage.
+	var in []string
+	for _, it := range snap.Items {
+		if it.TurnID() != results[1].TurnID {
+			continue
+		}
+		switch v := it.Value.(type) {
+		case *protocol.UserMessage:
+			in = append(in, v.Text)
+		case *protocol.AssistantMessage:
+			in = append(in, v.Text)
+		}
+	}
+	if strings.Join(in, "|") != "reply hi|the subagent said apple|hi" || results[1].Usage == nil || results[1].Usage.InputTokens != 2 {
+		t.Fatalf("the user's turn has %q, used %s:\n%s", in, mustMarshal(results[1].Usage), show(rec.all()))
+	}
+}
+
+func TestABackgroundSubagentsAppToolKeepsItsStructuredOutputPastItsTurn(t *testing.T) {
+	ctx := context.Background()
+	lookup := agentthreads.ToolFunc("lookup", "Looks it up.", json.RawMessage(`{"type":"object"}`), func(context.Context, json.RawMessage, agentthreads.ToolContext) (agentthreads.ToolOutput, error) {
+		return agentthreads.ToolOutput{Text: "42", Structured: map[string]any{"answer": 42}}, nil
+	})
+	sdk, rec := miniClaude(t, agentthreads.Allow, map[string]string{"MINI_CLAUDE_BACKGROUND_APP": "lookup"}, lookup)
+	th, _ := sdk.Create(ctx, agentthreads.CreateOptions{Model: "mini", Cwd: t.TempDir()})
+	sdk.Send(ctx, th.ID, "background 200 apple", agentthreads.SendOptions{})
+	var snap protocol.Snapshot
+	until(t, func() bool {
+		snap, _ = sdk.Snapshot(ctx, th.ID)
+		return len(turnResults(snap)) == 2 && snap.Thread.Status == protocol.ThreadStatusIdle
+	})
+	for _, c := range toolCalls(snap) {
+		if c.Name == "lookup" {
+			if c.Result == nil || string(mustMarshal(c.Result.Structured)) != `{"answer":42}` {
+				t.Fatalf("the call: %s\n%s", mustMarshal(c), show(rec.all()))
+			}
+			return
+		}
+	}
+	t.Fatalf("no lookup call:\n%s", show(rec.all()))
+}
+
+func TestALostRunStopsItsBackgroundSubagents(t *testing.T) {
+	for _, how := range []string{"running", "waiting"} {
+		t.Run(how, func(t *testing.T) {
+			t.Parallel()
+			// The direct spawner's runs go with the backend: the next can't pick them up.
+			extra := []string{"SPAWNER=direct"}
+			want := protocol.ThreadStatusIdle
+			if how == "waiting" {
+				extra = append(extra, "POLICY=ask")
+				want = protocol.ThreadStatusWaiting
+			}
+			s := miniScene(t, extra...)
+			a := s.start()
+			id := s.create(a, "claude")
+			a.call("handle", map[string]any{"type": "send", "thread_id": id, "text": "background 60000 apple"})
+			until(t, func() bool {
+				snap := snapshotOf(t, a, id)
+				calls := toolCalls(snap)
+				return len(turnResults(snap)) == 1 && snap.Thread.Status == want && len(calls) == 2
+			})
+			a.call("saved", id)
+			a.crash()
+
+			b := s.start()
+			snap := snapshotOf(t, b, id)
+			b.call("stop")
+			<-b.exited
+			calls := toolCalls(snap)
+			if len(calls) != 2 || calls[0].Subagent == nil || calls[0].Subagent.Status != protocol.SubagentStatusStopped || calls[1].Status != protocol.ToolStatusCancelled {
+				t.Fatalf("the calls: %s", mustMarshal(calls))
+			}
+			// Its one turn had ended: it isn't ended again.
+			if snap.Thread.Status != protocol.ThreadStatusIdle || snap.Thread.Run != nil || len(snap.Requests) != 0 || len(turnResults(snap)) != 1 {
+				t.Fatalf("after: %s", mustMarshal(snap))
+			}
+		})
+	}
+}
+
+func TestARestartTakesUpABackgroundSubagentsRequestWithNoTurnRunning(t *testing.T) {
+	s := miniScene(t, "POLICY=ask")
+	a := s.start()
+	id := s.create(a, "claude")
+	a.call("handle", map[string]any{"type": "send", "thread_id": id, "text": "background 200 apple"})
+	until(t, func() bool {
+		snap := snapshotOf(t, a, id)
+		return len(turnResults(snap)) == 1 && snap.Thread.Status == protocol.ThreadStatusWaiting
+	})
+	a.call("saved", id)
+	a.call("close")
+	<-a.exited
+
+	b := s.start()
+	expectRecovered(t, b, id)
+	snap := snapshotOf(t, b, id)
+	if snap.Thread.Status != protocol.ThreadStatusWaiting || len(snap.Requests) != 1 {
+		t.Fatalf("after the restart: %s", mustMarshal(snap))
+	}
+	from := len(b.events.all())
+	b.call("handle", map[string]any{"type": "respond", "thread_id": id, "request_id": snap.Requests[0].ID(), "resolution": map[string]any{"outcome": "allow"}})
+	// Answered with no turn running, the thread is idle; then Claude's report is a turn of its own.
+	completed := func() (started, done int, statuses []protocol.ThreadStatus) {
+		for _, e := range b.events.all()[from:] {
+			switch v := e.Value.(type) {
+			case *protocol.TurnStartedEvent:
+				started++
+			case *protocol.TurnCompletedEvent:
+				done++
+			case *protocol.ThreadUpdatedEvent:
+				statuses = append(statuses, v.Thread.Status)
+			}
+		}
+		return
+	}
+	until(t, func() bool { _, done, _ := completed(); return done == 1 })
+	snap = snapshotOf(t, b, id)
+	b.call("stop")
+	<-b.exited
+	started, _, statuses := completed()
+	results := turnResults(snap)
+	if started != 1 || len(statuses) == 0 || statuses[0] != protocol.ThreadStatusIdle || len(results) != 2 || results[0].TurnID == results[1].TurnID {
+		t.Fatalf("started %d, statuses %v, results %s", started, statuses, mustMarshal(results))
 	}
 }

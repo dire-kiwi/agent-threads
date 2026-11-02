@@ -67,6 +67,11 @@ func runBackend() {
 	if env("POLICY") == "ask" {
 		policy = agentthreads.Ask
 	}
+	// SPAWNER=direct runs the harnesses as its own children instead of under the shim.
+	var spawner agentthreads.Spawner = agentthreads.Shim(env("SHIM"), agentthreads.ShimOptions{RunsDir: env("RUNS"), Poll: 50 * time.Millisecond})
+	if env("SPAWNER") == "direct" {
+		spawner = agentthreads.Direct()
+	}
 	var mu sync.Mutex
 	out := func(msg any) {
 		mu.Lock()
@@ -80,7 +85,7 @@ func runBackend() {
 			"codex":  agentthreads.Codex(agentthreads.CodexOptions{Bin: or("CODEX_BIN", env("FAKE_CLI")), Env: fake, Home: env("CODEX_HOME_DIR"), NoLogin: true, StopGrace: ms("STOP_GRACE_MS"), CloseGrace: ms("CLOSE_GRACE_MS")}),
 		},
 		Capabilities: agentthreads.Capabilities{Permissions: policy},
-		Spawner:      agentthreads.Shim(env("SHIM"), agentthreads.ShimOptions{RunsDir: env("RUNS"), Poll: 50 * time.Millisecond}),
+		Spawner:      spawner,
 		OnError:      func(err error) { fmt.Fprintf(os.Stderr, "backend error: %v\n", err) },
 	})
 	sdk.Subscribe(func(e protocol.ThreadEvent) { out(map[string]any{"event": e}) })

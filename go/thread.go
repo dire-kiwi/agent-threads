@@ -798,22 +798,17 @@ func (rt *threadRuntime) endTurn(end TurnEnd, carry bool) {
 	if turn == nil {
 		return
 	}
+	// What a background subagent that's still running does carries on after the turn: its text
+	// still streaming, its calls (and their structured output, still to go with their results)
+	// and its requests.
+	ending := func(id string) bool { return !inBackground(rt.Item, id) }
 	// Text streamed but never finished (its process went first) is kept as it was shown.
-	for _, it := range rt.state.Items {
-		text, ok := it.Text()
-		if !ok {
-			continue
-		}
-		if saved, ok := rt.Item(it.ID()); ok {
-			if st, _ := saved.Text(); st != text {
-				rt.UpdateItem(it.ID(), Patch{"text": text})
-			}
+	rt.finishText(ending)
+	for id := range rt.structured {
+		if ending(id) {
+			delete(rt.structured, id)
 		}
 	}
-	clear(rt.streaming)
-	clear(rt.structured)
-	// What a background subagent that's still running does carries on after the turn: its calls
-	// and requests too.
 	for _, it := range rt.state.Items {
 		if c, ok := it.Value.(*protocol.ToolCall); ok && c.TurnID == turn.ID && (c.Status == protocol.ToolStatusRunning || c.Status == protocol.ToolStatusPending) && !inBackground(rt.Item, c.ID) {
 			patch := Patch{"status": protocol.ToolStatusCancelled}
@@ -903,6 +898,26 @@ func (rt *threadRuntime) endTurn(end TurnEnd, carry bool) {
 	rt.session.CarryOver(msgs)
 }
 
+// finishText keeps text streamed into the items which picks, but never finished, as it was shown.
+func (rt *threadRuntime) finishText(which func(id string) bool) {
+	for _, it := range rt.state.Items {
+		text, ok := it.Text()
+		if !ok || !which(it.ID()) {
+			continue
+		}
+		if saved, ok := rt.Item(it.ID()); ok {
+			if st, _ := saved.Text(); st != text {
+				rt.UpdateItem(it.ID(), Patch{"text": text})
+			}
+		}
+	}
+	for id := range rt.streaming {
+		if which(id) {
+			delete(rt.streaming, id)
+		}
+	}
+}
+
 func (rt *threadRuntime) BeginTurn() {
 	if rt.turn != nil || rt.closing || rt.disposed {
 		return
@@ -935,6 +950,12 @@ func (rt *threadRuntime) StopSubagents(ids []string) {
 			}
 		}
 		return false
+	}
+	rt.finishText(within)
+	for id := range rt.structured {
+		if within(id) {
+			delete(rt.structured, id)
+		}
 	}
 	for _, it := range rt.state.Items {
 		if c, ok := it.Value.(*protocol.ToolCall); ok && (c.Status == protocol.ToolStatusRunning || c.Status == protocol.ToolStatusPending) && within(c.ID) {

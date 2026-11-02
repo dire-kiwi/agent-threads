@@ -104,6 +104,8 @@ type claudeRunState struct {
 	Sent        []sentMessage   `json:"sent"`
 	Tasks       [][2]string     `json:"tasks,omitempty"`  // [a subagent's task id, its call's id]
 	Agents      []string        `json:"agents,omitempty"` // the calls whose subagents it ran
+	AutoTurn    string          `json:"autoTurn,omitempty"`
+	HeldUsage   *protocol.Usage `json:"heldUsage,omitempty"`
 	PluginDir   string          `json:"pluginDir,omitempty"`
 	Launched    *launched       `json:"launched,omitempty"`
 	Stale       bool            `json:"stale,omitempty"`
@@ -152,6 +154,10 @@ type claudeRun struct {
 	// ids, and agents the calls whose subagents it ran, which are stopped when it ends.
 	tasks  map[string]string
 	agents []string
+	// autoTurn is the turn it started by itself (BeginTurn), and heldUsage the usage of turns
+	// Claude made by itself while one of the user's waited, for that turn's.
+	autoTurn  string
+	heldUsage *protocol.Usage
 	// pluginDir is the generated plugin with the thread's skills, for this run only.
 	pluginDir string
 	launched  *launched
@@ -281,6 +287,7 @@ func (r *claudeRun) state() claudeRunState {
 		st.Tasks = append(st.Tasks, [2]string{k, r.tasks[k]})
 	}
 	st.Agents = append([]string(nil), r.agents...)
+	st.AutoTurn, st.HeldUsage = r.autoTurn, r.heldUsage
 	return st
 }
 
@@ -328,6 +335,7 @@ func (r *claudeRun) restore(st claudeRunState, answered func(subtype string) fun
 		r.tasks[kv[0]] = kv[1]
 	}
 	r.agents = append([]string(nil), st.Agents...)
+	r.autoTurn, r.heldUsage = st.AutoTurn, st.HeldUsage
 	r.pluginDir = st.PluginDir
 	r.launched = st.Launched
 }
@@ -1078,8 +1086,9 @@ func (s *claudeSession) message(run *claudeRun, m jmap) {
 	switch m.str("type") {
 	case "system":
 		// Claude starts a turn by itself to tell the agent that a background subagent has ended.
-		if m.str("subtype") == "init" {
+		if m.str("subtype") == "init" && ctx.TurnID() == "" {
 			ctx.BeginTurn()
+			run.autoTurn = ctx.TurnID()
 		}
 		sid := m.str("session_id")
 		if m.str("subtype") == "init" && sid != "" && sid != ctx.Thread().SessionID {
@@ -1210,9 +1219,17 @@ func (s *claudeSession) message(run *claudeRun, m jmap) {
 		if ctx.TurnID() == "" {
 			return
 		}
+		// The end of a turn Claude made by itself (to tell the agent a background subagent ended)
+		// while a turn of the user's waited for it: the user's goes on to its own result, which gets
+		// this one's usage too.
+		if m.obj("origin").str("kind") == "task-notification" && ctx.TurnID() != run.autoTurn {
+			run.heldUsage = addUsage(run.heldUsage, claudeUsage(m))
+			return
+		}
 		s.clearStop()
 		failed := m.bool("is_error")
-		end := TurnEnd{OK: !failed, Usage: claudeUsage(m)}
+		end := TurnEnd{OK: !failed, Usage: addUsage(run.heldUsage, claudeUsage(m))}
+		run.heldUsage = nil
 		if failed {
 			end.Error = m.str("result")
 			if end.Error == "" {
