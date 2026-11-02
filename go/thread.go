@@ -868,11 +868,13 @@ func (rt *threadRuntime) interrupt() {
 	}
 }
 
-func (rt *threadRuntime) EndTurn(end TurnEnd) { rt.endTurn(end, true) }
+func (rt *threadRuntime) EndTurn(end TurnEnd) { rt.endTurn(end, true, false) }
 
 // endTurn ends the running turn. Its queued messages are carried over to a new turn unless carry
-// is false (shutting down, or recovering a turn the backend lost), or they've been tried enough.
-func (rt *threadRuntime) endTurn(end TurnEnd, carry bool) {
+// is false (shutting down, or recovering a turn the backend lost), or they've been tried enough. A
+// lost one (its process was lost when the backend stopped) with no mark is noted as such in its
+// session: what it left there isn't known.
+func (rt *threadRuntime) endTurn(end TurnEnd, carry, lost bool) {
 	turn := rt.turn
 	if turn == nil {
 		return
@@ -925,8 +927,12 @@ func (rt *threadRuntime) endTurn(end TurnEnd, carry bool) {
 		}
 	}
 	var session *protocol.TurnSession
+	at := end.SessionAt
+	if at == "" {
+		at = rt.state.Thread.TurnAt
+	}
 	if id := rt.state.Thread.SessionID; id != "" {
-		session = &protocol.TurnSession{ID: id, At: end.SessionAt, Started: turn.Session == ""}
+		session = &protocol.TurnSession{ID: id, At: at, Started: turn.Session == "", Lost: lost && at == ""}
 	}
 	rt.AddItem(&protocol.TurnResult{ID: NewID("tr"), OK: ok, Interrupted: turn.Interrupted, Error: errText, Usage: end.Usage, DurationMs: end.DurationMs, Session: session})
 	rt.emit(&protocol.TurnCompletedEvent{TurnID: turn.ID})
@@ -957,7 +963,7 @@ func (rt *threadRuntime) endTurn(end TurnEnd, carry bool) {
 		} else if len(rt.requests) > 0 {
 			status = protocol.ThreadStatusWaiting
 		}
-		rt.SetThread(func(t *protocol.Thread) { t.Status = status; t.Error = errText; t.Usage = usage })
+		rt.SetThread(func(t *protocol.Thread) { t.Status = status; t.Error = errText; t.Usage = usage; t.TurnAt = "" })
 		if len(left) > 0 && carry && !rt.closing && rt.session != nil {
 			rt.session.Release()
 		}
@@ -973,7 +979,12 @@ func (rt *threadRuntime) endTurn(end TurnEnd, carry bool) {
 		rt.UpdateItem(q.ID, Patch{"turn_id": rt.turn.ID})
 	}
 	rt.emit(&protocol.TurnStartedEvent{TurnID: rt.turn.ID})
-	rt.SetThread(func(t *protocol.Thread) { t.Status = protocol.ThreadStatusRunning; t.Error = ""; t.Usage = usage })
+	rt.SetThread(func(t *protocol.Thread) {
+		t.Status = protocol.ThreadStatusRunning
+		t.Error = ""
+		t.Usage = usage
+		t.TurnAt = ""
+	})
 	msgs := make([]Message, 0, len(left))
 	for _, q := range left {
 		msgs = append(msgs, toMessage(q))
@@ -1125,6 +1136,12 @@ func (rt *threadRuntime) finishText(which func(id string) bool) {
 		if which(id) {
 			delete(rt.streaming, id)
 		}
+	}
+}
+
+func (rt *threadRuntime) Mark(at string) {
+	if rt.turn != nil && rt.state.Thread.TurnAt != at {
+		rt.SetThread(func(t *protocol.Thread) { t.TurnAt = at })
 	}
 }
 

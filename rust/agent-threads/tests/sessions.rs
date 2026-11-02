@@ -361,7 +361,7 @@ async fn rewind_is_refused_for_a_claude_session_the_thread_adopted_to_before_its
 
 #[tokio::test]
 async fn rewind_reverts_a_codex_session_to_before_the_first_turn_from_there_that_has_a_mark() {
-    let env = setup(|s, i| Ok(revert_point(s, i)), Some("S0")).await;
+    let env = setup(revert_point, Some("S0")).await;
     env.turn("one", None, Some("c1")).await;
     env.turn("two", None, None).await; // no mark
     env.turn("three", None, Some("c3")).await;
@@ -376,7 +376,7 @@ async fn rewind_reverts_a_codex_session_to_before_the_first_turn_from_there_that
 
 #[tokio::test]
 async fn rewind_keeps_a_codex_revert_not_yet_made_when_a_second_rewind_to_before_turns_with_no_mark_needs_it() {
-    let env = setup(|s, i| Ok(revert_point(s, i)), None).await;
+    let env = setup(revert_point, None).await;
     env.turn("one", Some("S"), Some("c1")).await;
     env.turn("two", None, None).await; // failed before Codex marked it
     env.turn("three", None, Some("c3")).await;
@@ -582,13 +582,13 @@ fn the_rewind_points_revert_to_before_the_first_mark_from_the_turn_on_in_its_ses
     let a = |at: Option<&str>, started| s("A", at, started);
     assert_eq!(
         revert_point(&[a(Some("a1"), true), a(None, false), a(Some("a3"), false)], 1),
-        point(Some("A"), Some("a3"))
+        Ok(point(Some("A"), Some("a3")))
     );
     assert_eq!(
         revert_point(&[a(Some("a1"), true), a(None, false), s("B", Some("b1"), true)], 1),
-        point(Some("A"), None)
+        Ok(point(Some("A"), None))
     );
-    assert_eq!(revert_point(&[a(Some("a1"), true)], 0), point(None, None));
+    assert_eq!(revert_point(&[a(Some("a1"), true)], 0), Ok(point(None, None)));
 }
 
 // ---------- a turn the backend lost ----------
@@ -619,7 +619,10 @@ async fn a_turn_the_backend_lost_records_that_it_started_the_session_it_got() {
     let (env, store) = to_lose(None).await;
     let id = env.id.clone();
     let (next, s) = lose(env, store, "S-new").await;
-    assert_eq!(sessions(&s), vec![json!({"id": "S-new", "started": true})]);
+    assert_eq!(
+        sessions(&s),
+        vec![json!({"id": "S-new", "started": true, "lost": true})]
+    );
     next.rewind(&id, &turn_ids(&s)[0]).await.unwrap();
     let s = serde_json::to_value(next.snapshot(&id).await.unwrap()).unwrap();
     assert!(s["thread"].get("session_id").is_none());
@@ -635,7 +638,7 @@ async fn a_turn_the_backend_lost_records_that_it_started_the_one_it_got_after_a_
         sessions(&s),
         vec![
             json!({"id": "S-old", "at": "m1", "started": true}),
-            json!({"id": "S-new", "started": true})
+            json!({"id": "S-new", "started": true, "lost": true})
         ]
     );
 }
@@ -676,7 +679,10 @@ async fn a_turn_the_backend_lost_is_a_compaction_that_had_no_items_yet_not_the_t
     assert_eq!(turn_ids(&s), started);
     assert_eq!(
         sessions(&s),
-        vec![json!({"id": "S", "at": "m1", "started": true}), json!({"id": "S"})]
+        vec![
+            json!({"id": "S", "at": "m1", "started": true}),
+            json!({"id": "S", "lost": true})
+        ]
     );
     next.rewind(&id, &started[1]).await.unwrap();
     let t = serde_json::to_value(next.snapshot(&id).await.unwrap()).unwrap()["thread"].clone();
@@ -688,6 +694,83 @@ async fn a_turn_the_backend_lost_records_that_it_continued_a_session_the_thread_
     let (env, store) = to_lose(Some("S0")).await;
     let id = env.id.clone();
     let (next, s) = lose(env, store, "S0").await;
-    assert_eq!(sessions(&s), vec![json!({"id": "S0"})]);
+    assert_eq!(sessions(&s), vec![json!({"id": "S0", "lost": true})]);
     refused(next.rewind(&id, &turn_ids(&s)[0]).await, "can't be rewound");
+}
+
+/// Turn one in S (marked m1), then a turn the backend lost after the harness gave `mark`, if any;
+/// then turn three, in S: the backend that has the thread then, the thread's id, the thread as it
+/// has it, and its turns' ids.
+async fn lost_between(point: Point, mark: Option<&str>) -> (AgentThreads, String, Value, Vec<String>) {
+    let store = Arc::new(MemoryStore::new());
+    let env = setup_in(point, None, store.clone()).await;
+    let id = env.id.clone();
+    env.turn("one", Some("S"), Some("m1")).await;
+    env.sdk.send(&id, "two", SendOptions::default()).await.unwrap();
+    if let Some(mark) = mark.map(String::from) {
+        env.harness(move |ctx| ctx.mark(&mark));
+    }
+    env.sdk.events_since(&id, 0, None).await.unwrap();
+    let (next, _, poster) = backend(point, store);
+    next.snapshot(&id).await.unwrap();
+    next.send(&id, "three", SendOptions::default()).await.unwrap();
+    let end = |_: &mut Fake, ctx: &mut ThreadContext| {
+        ctx.end_turn(
+            TurnEnd {
+                ok: true,
+                session_at: Some("m3".into()),
+                ..Default::default()
+            },
+            false,
+        )
+    };
+    assert!((poster.lock().unwrap().as_ref().unwrap())(Box::new(end)));
+    let s = serde_json::to_value(next.snapshot(&id).await.unwrap()).unwrap();
+    let turns = turn_ids(&s);
+    (next, id, s, turns)
+}
+
+async fn thread_of(sdk: &AgentThreads, id: &str) -> Value {
+    serde_json::to_value(sdk.snapshot(id).await.unwrap()).unwrap()["thread"].clone()
+}
+
+#[tokio::test]
+async fn a_turn_the_backend_lost_keeps_the_mark_the_harness_gave_before_it_was_lost_for_a_rewind_to_after_it() {
+    let (next, id, s, turns) = lost_between(resume_at_point, Some("m2")).await;
+    assert_eq!(
+        sessions(&s),
+        vec![
+            json!({"id": "S", "at": "m1", "started": true}),
+            json!({"id": "S", "at": "m2"}),
+            json!({"id": "S", "at": "m3"})
+        ]
+    );
+    assert!(s["thread"].get("turn_at").is_none());
+    next.rewind(&id, &turns[2]).await.unwrap();
+    let t = thread_of(&next, &id).await;
+    assert_eq!((&t["session_id"], &t["resume_at"]), (&json!("S"), &json!("m2")));
+}
+
+#[tokio::test]
+async fn a_turn_the_backend_lost_refuses_a_rewind_past_it_with_no_mark_which_may_have_added_to_the_session() {
+    let (next, id, s, turns) = lost_between(resume_at_point, None).await;
+    assert_eq!(sessions(&s)[1], json!({"id": "S", "lost": true}));
+    refused(next.rewind(&id, &turns[2]).await, "lost");
+    // To before it is still known.
+    next.rewind(&id, &turns[1]).await.unwrap();
+    let t = thread_of(&next, &id).await;
+    assert_eq!((&t["session_id"], &t["resume_at"]), (&json!("S"), &json!("m1")));
+}
+
+#[tokio::test]
+async fn a_turn_the_backend_lost_is_reverted_to_before_by_its_mark_codex_and_refuses_to_be_with_none() {
+    let (next, id, _, turns) = lost_between(revert_point, Some("c2")).await;
+    next.rewind(&id, &turns[1]).await.unwrap();
+    let t = thread_of(&next, &id).await;
+    assert_eq!((&t["session_id"], &t["resume_at"]), (&json!("S"), &json!("c2")));
+    let (next, id, _, turns) = lost_between(revert_point, None).await;
+    refused(next.rewind(&id, &turns[1]).await, "lost");
+    // To before turn one, which started S, is a new session.
+    next.rewind(&id, &turns[0]).await.unwrap();
+    assert!(thread_of(&next, &id).await.get("session_id").is_none());
 }

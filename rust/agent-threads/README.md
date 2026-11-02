@@ -82,7 +82,9 @@ conversation, and `compact(id)` compacts the harness's context in a turn of its 
 ([spec/PROTOCOL.md](../../spec/PROTOCOL.md#sessions)). They're refused while a turn runs. Each
 `turn_result` records the session the turn ended in (`session`), which is what a rewind works from;
 a custom `HarnessSession` takes part with `rewind_point` (`resume_at_point` or `revert_point`, or its
-own) and `can_compact`/`compact`, and without them refuses both.
+own) and `can_compact`/`compact`, and without them refuses both. It gives each turn's mark with
+`ctx.mark()` as it goes (or at least in `TurnEnd::session_at`): a turn lost when the backend stops
+keeps the last one given, and one lost with none can't be rewound past.
 
 `subscribe()` is a `tokio::sync::broadcast` receiver of every thread's events. One that falls more
 than `Options::event_capacity` (4096) events behind gets `RecvError::Lagged`: it should catch up with

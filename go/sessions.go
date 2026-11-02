@@ -17,9 +17,13 @@ type RewindError struct{ Message string }
 
 func (e *RewindError) Error() string { return e.Message }
 
+// lostText is where a turn lost with no mark (TurnSession.Lost) leaves a rewind that would need it.
+const lostText = "a turn the backend lost while it ran is in the way: where it left the conversation isn't known"
+
 // ResumeAtPoint is, for a harness that resumes a session at a message (Claude Code), where a rewind
 // to before turn i of sessions (each turn's, in order; nil for a turn that ended with none) goes: the
-// session it continued, at the mark of the latest turn before it in that session.
+// session it continued, at the mark of the latest turn before it in that session. A lost turn in
+// between, with no mark, may have added to the session after that: it can't be rewound there.
 func ResumeAtPoint(sessions []*protocol.TurnSession, i int) (RewindPoint, error) {
 	t := sessions[i]
 	if t == nil || t.Started {
@@ -33,6 +37,9 @@ func ResumeAtPoint(sessions []*protocol.TurnSession, i int) (RewindPoint, error)
 		if u.At != "" {
 			return RewindPoint{SessionID: t.ID, ResumeAt: u.At}, nil
 		}
+		if u.Lost {
+			return RewindPoint{}, &RewindError{Message: lostText}
+		}
 		if u.Started {
 			break
 		}
@@ -42,7 +49,8 @@ func ResumeAtPoint(sessions []*protocol.TurnSession, i int) (RewindPoint, error)
 
 // RevertPoint is, for a harness that reverts a session to before a turn (Codex), where a rewind to
 // before turn i of sessions goes: the session it continued, reverted to before the first turn from
-// it on, in that session, that has a mark. With none, the session is as it was before the turn.
+// it on, in that session, that has a mark. With none, the session is as it was before the turn. A
+// lost turn before that, with no mark, may have added to the session: it can't be rewound there.
 func RevertPoint(sessions []*protocol.TurnSession, i int) (RewindPoint, error) {
 	t := sessions[i]
 	if t == nil || t.Started {
@@ -55,6 +63,9 @@ func RevertPoint(sessions []*protocol.TurnSession, i int) (RewindPoint, error) {
 		}
 		if u.At != "" {
 			return RewindPoint{SessionID: t.ID, ResumeAt: u.At}, nil
+		}
+		if u.Lost {
+			return RewindPoint{}, &RewindError{Message: lostText}
 		}
 	}
 	return RewindPoint{SessionID: t.ID}, nil

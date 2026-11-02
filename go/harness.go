@@ -148,7 +148,8 @@ type TurnEnd struct {
 	Usage      *protocol.Usage
 	DurationMs *int64
 	// SessionAt is the harness's own mark for the turn, in its session: Claude Code's last message in
-	// it, Codex's id for the turn (the turn_result's session.at).
+	// it, Codex's id for the turn (the turn_result's session.at). Without it, the last Mark given in
+	// the turn.
 	SessionAt string
 }
 
@@ -192,6 +193,10 @@ type ThreadContext interface {
 	FromHarness(runID, line string, handle func())
 	// TookIn says the harness took in the queued message with this id, and whether it was queued.
 	TookIn(id string) bool
+	// Mark is the running turn's mark (TurnEnd's SessionAt) so far, as soon as the harness gives it:
+	// kept in the thread (turn_at), so a turn lost when the backend stops still has it. It does
+	// nothing with no turn running.
+	Mark(at string)
 	// ToolOutput says an app tool returned structured output for the tool call toolCallID: it goes
 	// in the call's result.structured when the harness gives the call its result (harnesses pass on
 	// only the text).

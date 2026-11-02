@@ -25,6 +25,8 @@ struct Env {
     user_home: PathBuf,
     store: Arc<MemoryStore>,
     rx: tokio::sync::broadcast::Receiver<ThreadEvent>,
+    /// How its backend was made, for another on a store of its own.
+    made: (CodexOptions, Capabilities),
 }
 
 fn setup(capabilities: Capabilities, o: CodexOptions, env: &[(&str, &str)]) -> Env {
@@ -48,14 +50,7 @@ fn setup(capabilities: Capabilities, o: CodexOptions, env: &[(&str, &str)]) -> E
         capabilities.permissions = Some(PermissionPolicy::allow());
     }
     let store = Arc::new(MemoryStore::new());
-    let sdk = AgentThreads::new(Options {
-        store: Some(store.clone()),
-        harnesses: vec![codex(o)],
-        capabilities,
-        on_error: Some(Arc::new(|e| panic!("{e}"))),
-        event_capacity: 1 << 16,
-        ..Default::default()
-    });
+    let sdk = backend(o.clone(), capabilities.clone(), store.clone());
     let rx = sdk.subscribe();
     Env {
         sdk,
@@ -64,7 +59,19 @@ fn setup(capabilities: Capabilities, o: CodexOptions, env: &[(&str, &str)]) -> E
         user_home,
         store,
         rx,
+        made: (o, capabilities),
     }
+}
+
+fn backend(o: CodexOptions, capabilities: Capabilities, store: Arc<dyn Store>) -> AgentThreads {
+    AgentThreads::new(Options {
+        store: Some(store),
+        harnesses: vec![codex(o)],
+        capabilities,
+        on_error: Some(Arc::new(|e| panic!("{e}"))),
+        event_capacity: 1 << 16,
+        ..Default::default()
+    })
 }
 
 fn plain() -> CodexOptions {
@@ -75,6 +82,11 @@ fn plain() -> CodexOptions {
 }
 
 impl Env {
+    /// Another backend like this one, on `store`.
+    fn make(&self, store: Arc<dyn Store>) -> AgentThreads {
+        backend(self.made.0.clone(), self.made.1.clone(), store)
+    }
+
     /// The requests the last run (or `run`) sent, by method.
     fn sent(&self, method: &str) -> Vec<Value> {
         mini_runs(&self.log)
@@ -1344,5 +1356,45 @@ async fn starts_codex_with_the_threads_launch_options() {
     assert_eq!(
         env.sent("thread/resume")[0]["params"]["config"]["sandbox_workspace_write.writable_roots"],
         json!(["/base"])
+    );
+}
+
+// ---------- a turn the backend lost ----------
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_turn_the_backend_lost_is_reverted_by_the_codex_turn_it_started_once_codex_said_for_a_rewind_to_before_it() {
+    let env = setup(Capabilities::default(), plain(), &[]);
+    let t = env.sdk.create(create()).await.unwrap();
+    env.sdk.send(&t.id, "reply one", SendOptions::default()).await.unwrap();
+    settle(&env.sdk, &t.id).await;
+    env.sdk
+        .send(&t.id, "reply two\nslow", SendOptions::default())
+        .await
+        .unwrap();
+    let at = until(5, || async {
+        let s = serde_json::to_value(env.sdk.snapshot(&t.id).await.unwrap()).unwrap();
+        let at = s["thread"].get("turn_at").cloned();
+        texts(&s).iter().any(|t| t == "two").then_some(at).flatten()
+    })
+    .await;
+    env.sdk.events_since(&t.id, 0, None).await.unwrap(); // saved
+    let crashed = common::crashed(env.store.as_ref(), &t.id).await;
+    env.sdk.close(false).await.unwrap();
+
+    let next = env.make(Arc::new(crashed));
+    let s = serde_json::to_value(next.snapshot(&t.id).await.unwrap()).unwrap();
+    let lost = results(&s)[1];
+    assert_eq!(lost["ok"], false);
+    assert_eq!(lost["session"], json!({"id": s["thread"]["session_id"], "at": at}));
+    next.rewind(&t.id, lost["turn_id"].as_str().unwrap()).await.unwrap();
+    let thread = serde_json::to_value(next.snapshot(&t.id).await.unwrap()).unwrap()["thread"].clone();
+    assert_eq!(thread["resume_at"], at);
+    next.send(&t.id, "reply again", SendOptions::default()).await.unwrap();
+    let s = settle(&next, &t.id).await;
+    assert_eq!(texts(&s).last().unwrap(), "again");
+    let reverts: Vec<Value> = env.sent("thread/revert").iter().map(|m| m["params"].clone()).collect();
+    assert_eq!(
+        reverts,
+        [json!({"threadId": s["thread"]["session_id"], "beforeTurnId": at})]
     );
 }

@@ -180,7 +180,7 @@ pub struct TurnEnd {
     pub usage: Option<Usage>,
     pub duration_ms: Option<u64>,
     /// The harness's own mark for the turn, in its session: Claude Code's last message in it, Codex's
-    /// id for the turn (the turn_result's `session.at`).
+    /// id for the turn (the turn_result's `session.at`). Without it, the last mark() given in the turn.
     pub session_at: Option<String>,
 }
 

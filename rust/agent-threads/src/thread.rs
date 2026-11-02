@@ -606,12 +606,14 @@ impl ThreadContext {
     /// The running turn ended. `live`: whether the session has a process running that has the
     /// queued messages (HarnessSession::live).
     pub fn end_turn(&mut self, end: TurnEnd, live: bool) {
-        self.finish_turn(end, live, true);
+        self.finish_turn(end, live, true, false);
     }
 
     /// Ends the running turn. Its queued messages are carried over to a new turn unless `carry` is
     /// false (shutting down, or recovering a turn the backend lost), or they've been tried enough.
-    pub(crate) fn finish_turn(&mut self, end: TurnEnd, live: bool, carry: bool) {
+    /// A `lost` one (its process was lost when the backend stopped) with no mark is noted as such in
+    /// its session: what it left there isn't known.
+    pub(crate) fn finish_turn(&mut self, end: TurnEnd, live: bool, carry: bool, lost: bool) {
         let Some(turn) = self.turn.clone() else { return };
         // What a background subagent that's still running does carries on after the turn: its
         // text still streaming, its calls (and their structured output, still to go with their
@@ -690,11 +692,19 @@ impl ThreadContext {
         }
         if let Some(id) = &self.state.thread.session_id {
             let mut session = json!({"id": id});
-            if let Some(at) = end.session_at.as_ref().filter(|a| !a.is_empty()) {
+            let at = end
+                .session_at
+                .as_ref()
+                .filter(|a| !a.is_empty())
+                .or(self.state.thread.turn_at.as_ref());
+            if let Some(at) = at {
                 session["at"] = json!(at);
             }
             if turn.session.is_none() {
                 session["started"] = json!(true);
+            }
+            if lost && at.is_none() {
+                session["lost"] = json!(true);
             }
             result["session"] = session;
         }
@@ -732,6 +742,7 @@ impl ThreadContext {
                 };
                 t.error = error.clone();
                 t.usage = usage.clone();
+                t.turn_at = None;
             });
             if !left.is_empty() && carry && !self.closing {
                 self.effects.push_back(Effect::Release);
@@ -760,6 +771,7 @@ impl ThreadContext {
             t.status = crate::protocol::ThreadStatus::Running;
             t.error = None;
             t.usage = usage;
+            t.turn_at = None;
         });
         self.effects
             .push_back(Effect::CarryOver(left.iter().map(queued_message).collect()));
@@ -783,6 +795,15 @@ impl ThreadContext {
         }
         let done: Vec<String> = self.streaming.iter().filter(|id| which(self, id)).cloned().collect();
         self.streaming.retain(|id| !done.contains(id));
+    }
+
+    /// The running turn's mark (TurnEnd's session_at) so far, as soon as the harness gives it: kept
+    /// in the thread (turn_at), so a turn lost when the backend stops still has it. Does nothing with
+    /// no turn running.
+    pub fn mark(&mut self, at: &str) {
+        if self.turn.is_some() && self.state.thread.turn_at.as_deref() != Some(at) {
+            self.set_thread(|t| t.turn_at = Some(at.to_string()));
+        }
     }
 
     /// The harness started a turn by itself, with no message (Claude does, to tell the agent that a

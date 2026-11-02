@@ -922,7 +922,7 @@ func (a *AgentThreads) stopAll(ctx context.Context, stop bool) {
 			a.closeSession(ctx, rt)
 			rt.loop.call(func() {
 				if rt.turn != nil {
-					rt.endTurn(TurnEnd{}, false)
+					rt.endTurn(TurnEnd{}, false, false)
 				}
 			})
 		}()
@@ -1313,7 +1313,8 @@ func recoverLost(rt *threadRuntime, lost lostTurn) {
 			Text: "The backend stopped while this turn was running, and couldn't pick its run up again.",
 		})
 		// Not carried over: loading a thread starts no process. Its queued messages go with the next.
-		rt.endTurn(TurnEnd{Error: "The backend stopped while this turn was running."}, false)
+		// Its mark is the last the harness gave (turn_at); with none, it's lost.
+		rt.endTurn(TurnEnd{Error: "The backend stopped while this turn was running."}, false, true)
 	} else if rt.state.Thread.Status == protocol.ThreadStatusWaiting {
 		rt.SetThread(func(t *protocol.Thread) { t.Status = protocol.ThreadStatusIdle })
 	}

@@ -232,6 +232,17 @@ func (r *claudeRun) write(msg any) {
 	r.proc.Write(string(mustJSON(msg)))
 }
 
+// sentLike says whether a message sent and not yet echoed back has this content, as Claude echoes it.
+func (r *claudeRun) sentLike(content json.RawMessage) bool {
+	echo := echoKey(content)
+	for _, sent := range r.sent {
+		if sent.Echo == echo {
+			return true
+		}
+	}
+	return false
+}
+
 // send writes a user message (of the items ids), once Claude is ready for one.
 func (r *claudeRun) send(ids []string, msg map[string]any) {
 	content, _ := msg["message"].(map[string]any)["content"].([]map[string]any)
@@ -528,6 +539,11 @@ type claudeSession struct {
 	stale      bool
 	steerTimer *loopTimer
 	stopTimer  *loopTimer
+	// marking is the turn whose marks go to the thread as they come (ThreadContext.Mark): one of a
+	// message once Claude has echoed a message of it back (what it says before then may be from
+	// before the turn: set_model's reply, say), and a compaction or a turn Claude started by itself
+	// from its start.
+	marking string
 	// tmp is a directory for the thread's generated files (skills, attached files), made when needed.
 	tmp    string
 	closed bool
@@ -592,6 +608,7 @@ func (s *claudeSession) clearSteer() {
 func (s *claudeSession) Compact() {
 	// Claude Code compacts when it's sent /compact, which is its turn.
 	s.ensure(true).send([]string{}, s.userMessage([]Message{{Text: "/compact"}}))
+	s.marking = s.ctx.TurnID()
 }
 
 func (s *claudeSession) RewindPoint(sessions []*protocol.TurnSession, index int) (RewindPoint, error) {
@@ -1315,16 +1332,23 @@ func (s *claudeSession) line(run *claudeRun, line string) {
 func (s *claudeSession) message(run *claudeRun, m jmap) {
 	ctx := s.ctx
 	parent := m.str("parent_tool_use_id")
+	// The main conversation's messages (replayed ones too): the turn's last is where a rewind to after
+	// it resumes the session.
+	if typ := m.str("type"); (typ == "user" || typ == "assistant") && parent == "" && m.str("uuid") != "" {
+		run.at = m.str("uuid")
+		if typ == "user" && m.bool("isReplay") && run.sentLike(m.obj("message").raw("content")) {
+			s.marking = ctx.TurnID()
+		}
+		// A turn that has a mark already (re-attached after a restart, say) was being marked.
+		if id := ctx.TurnID(); id != "" && (s.marking == id || ctx.Thread().TurnAt != "") {
+			ctx.Mark(run.at)
+		}
+	}
 	// A message refused for the usage limit says which limit, before anything else it leads to.
 	if t := m.str("type"); (t == "assistant" || t == "user" || t == "result") && m.str("api_error") == "usage_limit_reached" {
 		if info := m.obj("api_error_params").obj("rate_limit_info"); info != nil {
 			ctx.RateLimits(claudeRateLimits(info))
 		}
-	}
-	// The main conversation's messages (replayed ones too): the turn's last is where a rewind to after
-	// it resumes the session.
-	if typ := m.str("type"); (typ == "user" || typ == "assistant") && parent == "" && m.str("uuid") != "" {
-		run.at = m.str("uuid")
 	}
 	switch m.str("type") {
 	case "rate_limit_event":
@@ -1336,6 +1360,7 @@ func (s *claudeSession) message(run *claudeRun, m jmap) {
 		if m.str("subtype") == "init" && ctx.TurnID() == "" {
 			ctx.BeginTurn()
 			run.autoTurn = ctx.TurnID()
+			s.marking = ctx.TurnID()
 		}
 		if m.str("subtype") == "init" {
 			// The session it runs in; and a rewind's resume_at is done with once it has resumed there.

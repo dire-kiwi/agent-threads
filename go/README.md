@@ -73,7 +73,9 @@ sdk.Close(ctx) // on shutdown: stops the harness processes (or with the shim, le
   conversation, and `Compact(ctx, id)` compacts the harness's context in a turn of its own
   ([spec/PROTOCOL.md](../spec/PROTOCOL.md#sessions)). They're refused while a turn runs. A harness
   of the app's own supports them by implementing `RewindingSession` and `CompactingSession`, and
-  can stop its old session's process at once on a rewind or new session with `RetiringSession`.
+  can stop its old session's process at once on a rewind or new session with `RetiringSession`. It
+  gives each turn's mark with `ctx.Mark` as it goes (or at least in `TurnEnd.SessionAt`): a turn
+  lost when the backend stops keeps the last one given, and one lost with none can't be rewound past.
 - `Subscribe(func(protocol.ThreadEvent))` calls the function with every thread's events, in order,
   one at a time, on a goroutine of the SDK's own (so it may call the SDK); `Events(ctx)` is the same
   as a channel. `Snapshot` is the thread's state now, text streamed so far included, and

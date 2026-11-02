@@ -1811,6 +1811,10 @@ impl CodexSession {
                     r.error = None;
                     r.used = Some(no_usage());
                     self.set_turn(ctx, run, t.to_string());
+                    // The turn's mark is its first Codex turn (one that goes on after a plan has it already).
+                    if self.run(run).is_some_and(|r| r.planned.is_none()) {
+                        ctx.mark(t);
+                    }
                 }
             }
             "turn/completed" => {
@@ -2959,7 +2963,7 @@ impl HarnessSession for CodexSession {
     }
 
     fn rewind_point(&self, sessions: &[Option<TurnSession>], index: usize) -> Option<Result<RewindPoint, RewindError>> {
-        Some(Ok(revert_point(sessions, index)))
+        Some(revert_point(sessions, index))
     }
 
     fn steer(&mut self, ctx: &mut ThreadContext, message: Message) {

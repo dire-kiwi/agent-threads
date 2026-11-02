@@ -468,6 +468,11 @@ pub(crate) struct ClaudeSession {
     /// The options or config changed since the run started, in a way it can't take as it runs: the
     /// next turn starts a new one.
     stale: bool,
+    /// The turn whose marks go to the thread as they come (ThreadContext::mark): one of a message
+    /// once Claude has echoed a message of it back (what it says before then may be from before the
+    /// turn: set_model's reply, say), and a compaction or a turn Claude started by itself from its
+    /// start.
+    marking: Option<String>,
     steer_timer: Option<Timer>,
     stop_timer: Option<Timer>,
     /// When those go off (ms since the epoch), for a checkpoint.
@@ -486,6 +491,7 @@ impl ClaudeSession {
             current: None,
             last: None,
             stale: false,
+            marking: None,
             steer_timer: None,
             stop_timer: None,
             steer_at: None,
@@ -1026,7 +1032,20 @@ impl ClaudeSession {
             && parent.is_none()
             && let Some(uuid) = m["uuid"].as_str()
         {
-            self.run(id).unwrap().at = Some(uuid.to_string());
+            let run = self.run(id).unwrap();
+            run.at = Some(uuid.to_string());
+            if m["type"] == "user"
+                && m["isReplay"].as_bool().unwrap_or(false)
+                && run.sent.iter().any(|s| s.echo == echo_key(&m["message"]["content"]))
+            {
+                self.marking = ctx.turn_id().map(String::from);
+            }
+            // A turn that has a mark already (re-attached after a restart, say) was being marked.
+            if let Some(turn) = ctx.turn_id()
+                && (self.marking.as_deref() == Some(turn) || ctx.thread().turn_at.is_some())
+            {
+                ctx.mark(uuid);
+            }
         }
         // A message refused for the usage limit says which limit, before anything else it leads to.
         if matches!(m["type"].as_str(), Some("assistant" | "user" | "result"))
@@ -1047,7 +1066,8 @@ impl ClaudeSession {
                 if m["subtype"] == "init" && ctx.turn_id().is_none() {
                     ctx.begin_turn();
                     let turn = ctx.turn_id().map(String::from);
-                    self.run(id).unwrap().auto_turn = turn;
+                    self.run(id).unwrap().auto_turn = turn.clone();
+                    self.marking = turn;
                 }
                 if m["subtype"] == "init" {
                     // The session it runs in; and a rewind's resume_at is done with once it has
@@ -1842,6 +1862,7 @@ impl HarnessSession for ClaudeSession {
         };
         let msg = self.user_message(ctx, &[message]);
         self.run(&id).unwrap().send(Vec::new(), msg);
+        self.marking = ctx.turn_id().map(String::from);
     }
 
     fn rewind_point(&self, sessions: &[Option<TurnSession>], index: usize) -> Option<Result<RewindPoint, RewindError>> {

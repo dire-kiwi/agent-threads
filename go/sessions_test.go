@@ -648,7 +648,7 @@ func TestLostTurnSession(t *testing.T) {
 	ctx := context.Background()
 	t.Run("records that it started the session it got", func(t *testing.T) {
 		next, id, snap := lostTurn(t, "", nil)
-		expectSame(t, "sessions", turnSessions(snap.Items), []*protocol.TurnSession{{ID: "S-new", Started: true}})
+		expectSame(t, "sessions", turnSessions(snap.Items), []*protocol.TurnSession{{ID: "S-new", Started: true, Lost: true}})
 		if err := next.Rewind(ctx, id, turnIDs(snap.Items)[0]); err != nil {
 			t.Fatal(err)
 		}
@@ -663,7 +663,7 @@ func TestLostTurnSession(t *testing.T) {
 				t.Fatal(err)
 			}
 		})
-		expectSame(t, "sessions", turnSessions(snap.Items), []*protocol.TurnSession{{ID: "S-old", At: "m1", Started: true}, {ID: "S-new", Started: true}})
+		expectSame(t, "sessions", turnSessions(snap.Items), []*protocol.TurnSession{{ID: "S-old", At: "m1", Started: true}, {ID: "S-new", Started: true, Lost: true}})
 	})
 	t.Run("is a compaction that had no items yet, not the turn before it", func(t *testing.T) {
 		store := agentthreads.NewMemoryStore()
@@ -718,7 +718,7 @@ func TestLostTurnSession(t *testing.T) {
 		}
 		expectSame(t, "turns completed", completed, started)
 		expectSame(t, "turns", turnIDs(snap.Items), started)
-		expectSame(t, "sessions", turnSessions(snap.Items), []*protocol.TurnSession{{ID: "S", At: "m1", Started: true}, {ID: "S"}})
+		expectSame(t, "sessions", turnSessions(snap.Items), []*protocol.TurnSession{{ID: "S", At: "m1", Started: true}, {ID: "S", Lost: true}})
 		if err := next.Rewind(ctx, th.ID, started[1]); err != nil {
 			t.Fatal(err)
 		}
@@ -728,7 +728,100 @@ func TestLostTurnSession(t *testing.T) {
 	})
 	t.Run("records that it continued a session the thread adopted", func(t *testing.T) {
 		next, id, snap := lostTurn(t, "S0", nil)
-		expectSame(t, "sessions", turnSessions(snap.Items), []*protocol.TurnSession{{ID: "S0"}})
+		expectSame(t, "sessions", turnSessions(snap.Items), []*protocol.TurnSession{{ID: "S0", Lost: true}})
 		refused(t, next.Rewind(ctx, id, turnIDs(snap.Items)[0]), "can't be rewound to before that turn")
 	})
+	t.Run("keeps the mark the harness gave before it was lost, for a rewind to after it", func(t *testing.T) {
+		next, id, snap := lostBetween(t, agentthreads.ResumeAtPoint, "m2")
+		expectSame(t, "sessions", turnSessions(snap.Items), []*protocol.TurnSession{{ID: "S", At: "m1", Started: true}, {ID: "S", At: "m2"}, {ID: "S", At: "m3"}})
+		if snap.Thread.TurnAt != "" {
+			t.Fatalf("turn_at: %q", snap.Thread.TurnAt)
+		}
+		if err := next.Rewind(ctx, id, turnIDs(snap.Items)[2]); err != nil {
+			t.Fatal(err)
+		}
+		if after, _ := next.Snapshot(ctx, id); after.Thread.SessionID != "S" || after.Thread.ResumeAt != "m2" {
+			t.Fatalf("got %s", mustMarshal(after.Thread))
+		}
+	})
+	t.Run("refuses a rewind past a lost turn with no mark, which may have added to the session", func(t *testing.T) {
+		next, id, snap := lostBetween(t, agentthreads.ResumeAtPoint, "")
+		expectSame(t, "the lost one's session", turnSessions(snap.Items)[1], &protocol.TurnSession{ID: "S", Lost: true})
+		turns := turnIDs(snap.Items)
+		refused(t, next.Rewind(ctx, id, turns[2]), "lost")
+		// To before it is still known.
+		if err := next.Rewind(ctx, id, turns[1]); err != nil {
+			t.Fatal(err)
+		}
+		if after, _ := next.Snapshot(ctx, id); after.Thread.SessionID != "S" || after.Thread.ResumeAt != "m1" {
+			t.Fatalf("got %s", mustMarshal(after.Thread))
+		}
+	})
+	t.Run("reverts to before a lost turn by its mark (Codex), and refuses to with none", func(t *testing.T) {
+		next, id, snap := lostBetween(t, agentthreads.RevertPoint, "c2")
+		if err := next.Rewind(ctx, id, turnIDs(snap.Items)[1]); err != nil {
+			t.Fatal(err)
+		}
+		if after, _ := next.Snapshot(ctx, id); after.Thread.SessionID != "S" || after.Thread.ResumeAt != "c2" {
+			t.Fatalf("got %s", mustMarshal(after.Thread))
+		}
+		next, id, snap = lostBetween(t, agentthreads.RevertPoint, "")
+		turns := turnIDs(snap.Items)
+		refused(t, next.Rewind(ctx, id, turns[1]), "lost")
+		// To before turn one, which started S, is a new session.
+		if err := next.Rewind(ctx, id, turns[0]); err != nil {
+			t.Fatal(err)
+		}
+		if after, _ := next.Snapshot(ctx, id); after.Thread.SessionID != "" {
+			t.Fatalf("got %s", mustMarshal(after.Thread))
+		}
+	})
+}
+
+// lostBetween is a thread with turn one in session S (marked m1), then a turn the backend lost after
+// the harness gave it mark (if not ""), then turn three in S (marked m3), run by a second backend.
+// It returns that backend, the thread, and its snapshot.
+func lostBetween(t *testing.T, point rewindFunc, mark string) (*agentthreads.AgentThreads, string, protocol.Snapshot) {
+	t.Helper()
+	ctx := context.Background()
+	store := agentthreads.NewMemoryStore()
+	h := &sessionHarness{point: point}
+	// Never closed: it goes as a backend that stopped would.
+	first := agentthreads.New(agentthreads.Options{
+		Store:        store,
+		Harnesses:    map[string]agentthreads.Harness{"fake": h},
+		Capabilities: agentthreads.Capabilities{Permissions: agentthreads.Allow},
+		OnError:      func(error) {},
+	})
+	th, err := first.Create(ctx, agentthreads.CreateOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	(&sessionsScene{t: t, sdk: first, h: h, id: th.ID}).turn("one", "S", "m1")
+	if err := first.Send(ctx, th.ID, "two", agentthreads.SendOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	if mark != "" {
+		h.on(func(c agentthreads.ThreadContext) { c.Mark(mark) })
+	}
+	if _, err := first.EventsSince(ctx, th.ID, 0, 0); err != nil {
+		t.Fatal(err)
+	}
+	h2 := &sessionHarness{point: point}
+	next := agentthreads.New(agentthreads.Options{
+		Store:        store,
+		Harnesses:    map[string]agentthreads.Harness{"fake": h2},
+		Capabilities: agentthreads.Capabilities{Permissions: agentthreads.Allow},
+		OnError:      func(err error) { t.Errorf("OnError: %v", err) },
+	})
+	t.Cleanup(func() { next.Stop(context.Background()) })
+	if _, err := next.Snapshot(ctx, th.ID); err != nil {
+		t.Fatal(err)
+	}
+	(&sessionsScene{t: t, sdk: next, h: h2, id: th.ID}).turn("three", "", "m3")
+	snap, err := next.Snapshot(ctx, th.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return next, th.ID, snap
 }

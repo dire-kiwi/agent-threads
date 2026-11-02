@@ -1363,8 +1363,7 @@ async fn ends_a_turn_that_was_running_when_the_backend_stopped() {
     .await;
     env.sdk.events_since(&t.id, 0, None).await.unwrap(); // saved
     // As if the backend died: nothing is closed, and the thread is left running in the store.
-    let crashed = MemoryStore::new();
-    copy_store(&MemoryStore::with_state(state), &crashed, &t.id).await;
+    let crashed = common::crashed(&MemoryStore::with_state(state), &t.id).await;
     env.sdk.close(false).await.unwrap();
 
     let again = env.make(Arc::new(crashed));
@@ -1377,12 +1376,51 @@ async fn ends_a_turn_that_was_running_when_the_backend_stopped() {
     assert_eq!(r[0]["ok"], false);
 }
 
-async fn copy_store(from: &MemoryStore, to: &MemoryStore, id: &str) {
-    to.create_thread(&from.get_thread(id).await.unwrap().unwrap())
+#[tokio::test(flavor = "multi_thread")]
+async fn keeps_the_mark_claude_gave_a_turn_the_backend_lost_so_a_rewind_past_it_resumes_after_it() {
+    let store = Arc::new(MemoryStore::new());
+    let env = setup(Setup {
+        store: Some(store.clone()),
+        ..Default::default()
+    });
+    let t = env.sdk.create(create()).await.unwrap();
+    env.sdk.send(&t.id, "reply one", SendOptions::default()).await.unwrap();
+    let s = settle(&env.sdk, &t.id).await;
+    let first = results(&s)[0]["session"]["at"].clone();
+    env.sdk
+        .send(&t.id, "streamhang cut short", SendOptions::default())
         .await
         .unwrap();
-    let events = from.read_events(id, 0, None).await.unwrap();
-    to.append_events(id, &events, &[]).await.unwrap();
+    // It has the message (its echo is the turn's mark so far), and is answering.
+    let at = until(5, || async {
+        let x = serde_json::to_value(env.sdk.snapshot(&t.id).await.unwrap()).unwrap();
+        let at = x["thread"].get("turn_at").cloned();
+        texts(&x).iter().any(|t| t == "cut short ").then_some(at).flatten()
+    })
+    .await;
+    assert_ne!(at, first);
+    env.sdk.events_since(&t.id, 0, None).await.unwrap(); // saved
+    let crashed = common::crashed(store.as_ref(), &t.id).await;
+    env.sdk.close(false).await.unwrap();
+
+    let next = env.make(Arc::new(crashed));
+    let s = serde_json::to_value(next.snapshot(&t.id).await.unwrap()).unwrap();
+    let lost = results(&s)[1];
+    assert_eq!(lost["ok"], false);
+    assert_eq!(lost["session"], json!({"id": s["thread"]["session_id"], "at": at}));
+    next.send(&t.id, "reply three", SendOptions::default()).await.unwrap();
+    let s = settle(&next, &t.id).await;
+    let third = results(&s)[2]["turn_id"].as_str().unwrap().to_string();
+    next.rewind(&t.id, &third).await.unwrap();
+    let thread = serde_json::to_value(next.snapshot(&t.id).await.unwrap()).unwrap()["thread"].clone();
+    assert_eq!(
+        (&thread["session_id"], &thread["resume_at"]),
+        (&s["thread"]["session_id"], &at)
+    );
+    next.send(&t.id, "reply four", SendOptions::default()).await.unwrap();
+    settle(&next, &t.id).await;
+    let argv = env.runs().last().unwrap().argv.clone();
+    assert!(has(&argv, "--resume-session-at", at.as_str().unwrap()), "{argv:?}");
 }
 
 /// A store whose appends fail when it's told to.

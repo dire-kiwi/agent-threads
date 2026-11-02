@@ -959,7 +959,7 @@ impl AgentThreads {
                     let _ = h
                         .call(|a| {
                             if a.core.turn.is_some() {
-                                a.core.finish_turn(TurnEnd::default(), false, false);
+                                a.core.finish_turn(TurnEnd::default(), false, false, false);
                             }
                         })
                         .await;
@@ -1493,12 +1493,13 @@ fn recover_lost(c: &mut ThreadContext, lost: LostTurn) {
             "text": "The backend stopped while this turn was running, and couldn't pick its run up again.",
         }));
         // Not carried over: loading a thread starts no process. Its queued messages go with the next.
+        // Its mark is the last the harness gave (turn_at); with none, it's lost.
         let end = TurnEnd {
             ok: false,
             error: Some("The backend stopped while this turn was running.".into()),
             ..Default::default()
         };
-        c.finish_turn(end, false, false);
+        c.finish_turn(end, false, false, true);
     } else if c.thread().status == ThreadStatus::Waiting {
         c.set_thread(|t| t.status = ThreadStatus::Idle);
     }

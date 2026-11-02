@@ -868,3 +868,95 @@ func TestRestartStillAsksAboutCodexsPlan(t *testing.T) {
 		t.Fatalf("no turn to implement the plan:\n%s", data)
 	}
 }
+
+// settledOn waits for the thread to be idle (or in error) on b, and is its snapshot.
+func settledOn(t *testing.T, b *backend, id string) protocol.Snapshot {
+	t.Helper()
+	var snap protocol.Snapshot
+	until(t, func() bool {
+		snap = snapshotOf(t, b, id)
+		return snap.Thread.Status == protocol.ThreadStatusIdle || snap.Thread.Status == protocol.ThreadStatusError
+	})
+	return snap
+}
+
+// lostMark runs a turn, then text, in a thread of harness's, until its turn has a mark and what it
+// says includes said; then the backend crashes (with the direct spawner, the run goes with it), and
+// the next loads the thread. It returns the next backend, the thread, the mark, and the snapshot.
+func lostMark(t *testing.T, s *scene, harness, text, said string) (*backend, string, string, protocol.Snapshot) {
+	t.Helper()
+	a := s.start()
+	id := s.create(a, harness)
+	a.call("handle", map[string]any{"type": "send", "thread_id": id, "text": "reply one"})
+	first := settledOn(t, a, id)
+	a.call("handle", map[string]any{"type": "send", "thread_id": id, "text": text})
+	at := ""
+	until(t, func() bool {
+		snap := snapshotOf(t, a, id)
+		at = snap.Thread.TurnAt
+		return slices.Contains(texts(snap), said) && at != ""
+	})
+	if r := turnResults(first.Items); len(r) != 1 || r[0].Session == nil || r[0].Session.At == at {
+		t.Fatalf("the first turn's session %s, the second's mark %q", mustMarshal(r), at)
+	}
+	a.call("saved", id)
+	a.crash()
+	b := s.start()
+	snap := snapshotOf(t, b, id)
+	r := turnResults(snap.Items)
+	if len(r) != 2 || r[1].OK || snap.Thread.TurnAt != "" {
+		t.Fatalf("the lost turn: %s", mustMarshal(snap))
+	}
+	same(t, "the lost turn's session", mustMarshal(r[1].Session), mustMarshal(protocol.TurnSession{ID: snap.Thread.SessionID, At: at}))
+	return b, id, at, snap
+}
+
+// A turn the backend lost keeps the Codex turn it started, once Codex said: a rewind to before it
+// reverts the session to before that turn.
+func TestALostCodexTurnIsRevertedByItsMark(t *testing.T) {
+	needNode(t)
+	t.Parallel()
+	log := filepath.Join(t.TempDir(), "log.jsonl")
+	s := miniScene(t, "SPAWNER=direct", "MINI_CODEX_LOG="+log)
+	b, id, at, snap := lostMark(t, s, "codex", "reply two\nslow", "two")
+	b.call("handle", map[string]any{"type": "rewind", "thread_id": id, "turn_id": turnResults(snap.Items)[1].TurnID})
+	if got := snapshotOf(t, b, id).Thread; got.ResumeAt != at {
+		t.Fatalf("after the rewind: %s", mustMarshal(got))
+	}
+	b.call("handle", map[string]any{"type": "send", "thread_id": id, "text": "reply again"})
+	snap = settledOn(t, b, id)
+	b.call("stop")
+	<-b.exited
+	if got := texts(snap); got[len(got)-1] != "again" {
+		t.Fatalf("texts %q", got)
+	}
+	var reverts []any
+	for _, r := range miniRuns(t, log) {
+		for _, m := range r.sent("thread/revert") {
+			reverts = append(reverts, m["params"])
+		}
+	}
+	same(t, "thread/revert", reverts, []any{map[string]any{"threadId": snap.Thread.SessionID, "beforeTurnId": at}})
+}
+
+// A turn the backend lost keeps the mark Claude gave it (its message's echo): a rewind to before
+// the turn after it resumes the session there.
+func TestALostClaudeTurnKeepsItsMark(t *testing.T) {
+	needNode(t)
+	t.Parallel()
+	log := filepath.Join(t.TempDir(), "log.jsonl")
+	s := miniScene(t, "SPAWNER=direct", "MINI_CLAUDE_LOG="+log)
+	b, id, at, _ := lostMark(t, s, "claude", "streamhang cut short", "cut short ")
+	b.call("handle", map[string]any{"type": "send", "thread_id": id, "text": "reply three"})
+	snap := settledOn(t, b, id)
+	b.call("handle", map[string]any{"type": "rewind", "thread_id": id, "turn_id": turnResults(snap.Items)[2].TurnID})
+	if got := snapshotOf(t, b, id).Thread; got.SessionID != snap.Thread.SessionID || got.ResumeAt != at {
+		t.Fatalf("after the rewind: %s", mustMarshal(got))
+	}
+	b.call("handle", map[string]any{"type": "send", "thread_id": id, "text": "reply four"})
+	settledOn(t, b, id)
+	b.call("stop")
+	<-b.exited
+	runs := miniRuns(t, log)
+	same(t, "--resume-session-at", flagValues(runs[len(runs)-1].Argv, "--resume-session-at"), []string{at})
+}

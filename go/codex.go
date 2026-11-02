@@ -1540,6 +1540,10 @@ func (s *codexSession) notification(run *codexRun, m jmap) {
 			run.errText = nil
 			run.setTurn(id)
 			run.used = zeroUsage()
+			// The turn's mark is its first Codex turn (one that goes on after a plan has it already).
+			if run.planned == nil {
+				s.ctx.Mark(id)
+			}
 		}
 	case "turn/completed":
 		if own {
