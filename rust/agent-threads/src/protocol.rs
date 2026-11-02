@@ -1001,6 +1001,9 @@ pub struct Thread {
     pub status: ThreadStatus,
     #[serde(skip_serializing_if = "::std::option::Option::is_none")]
     pub title: ::std::option::Option<::std::string::String>,
+    ///The running turn's mark so far, as the harness gives it (its turn_result's session.at to be): kept so that a turn lost when the backend stops still has it. Absent with no turn running, or until the harness gives one.
+    #[serde(skip_serializing_if = "::std::option::Option::is_none")]
+    pub turn_at: ::std::option::Option<::std::string::String>,
     #[serde(skip_serializing_if = "::std::option::Option::is_none")]
     pub updated_at: ::std::option::Option<::std::string::String>,
     ///Tokens used by the thread so far, over all its turns.
@@ -1440,11 +1443,14 @@ pub struct TurnResult {
 ///Where a turn left the harness's session.
 #[derive(::serde::Deserialize, ::serde::Serialize, Clone, Debug)]
 pub struct TurnSession {
-    ///The harness's own mark for the turn: Claude Code's last message in it (its uuid), Codex's id for the turn. Absent if the harness gave none (the turn failed before it did anything).
+    ///The harness's own mark for the turn: Claude Code's last message in it (its uuid), Codex's id for the turn (its first, for a turn that went on after a plan). Absent if the harness gave none (the turn failed before it did anything).
     #[serde(skip_serializing_if = "::std::option::Option::is_none")]
     pub at: ::std::option::Option<::std::string::String>,
     ///The thread's session_id when the turn ended.
     pub id: ::std::string::String,
+    ///The turn was lost (the backend stopped while it ran) before the harness gave its mark, so what it left in the session isn't known: a rewind that would need to know is refused.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub lost: bool,
     ///The turn started the session: the thread had no session_id when it began.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub started: bool,
