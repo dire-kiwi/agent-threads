@@ -7,7 +7,7 @@
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import type { Resolution } from "@dire-kiwi/agent-threads-protocol";
+import type { Resolution, Usage } from "@dire-kiwi/agent-threads-protocol";
 import { messageParts, pathText } from "../attachments.js";
 import { inBackground, runningInBackground, type Harness, type HarnessSession, type Message, type RunCheckpoint, type Skill, type ThreadContext } from "../harness.js";
 import { newId } from "../ids.js";
@@ -28,6 +28,7 @@ import {
   subagentResult,
   subagentStarted,
   subagentTask,
+  sumUsage,
   title,
 } from "./translate.js";
 
@@ -96,6 +97,9 @@ interface RunState {
   tasks?: [string, string][];
   /** The calls whose subagents it ran. */
   agents?: string[];
+  /** The turn Claude started by itself, and the usage of its turns held for the user's. */
+  autoTurn?: string;
+  heldUsage?: Usage;
   pluginDir?: string;
   /** The thread's options it was started with. */
   launched?: Launched;
@@ -140,6 +144,10 @@ class Run {
   tasks = new Map<string, string>();
   /** The calls whose subagents it ran, which are stopped when it ends. */
   agents = new Set<string>();
+  /** The turn it started by itself (beginTurn), if it has. */
+  autoTurn: string | undefined;
+  /** The usage of turns Claude made by itself while one of the user's waited, for that turn's. */
+  heldUsage: Usage | undefined;
   /** The generated plugin with the thread's skills, for this run only. */
   pluginDir: string | undefined;
   launched: Launched | undefined;
@@ -186,6 +194,8 @@ class Run {
       sent: this.sent,
       ...(this.tasks.size ? { tasks: [...this.tasks] } : {}),
       ...(this.agents.size ? { agents: [...this.agents] } : {}),
+      ...(this.autoTurn ? { autoTurn: this.autoTurn } : {}),
+      ...(this.heldUsage ? { heldUsage: this.heldUsage } : {}),
       ...(this.pluginDir ? { pluginDir: this.pluginDir } : {}),
       ...(this.launched ? { launched: this.launched } : {}),
     };
@@ -206,6 +216,8 @@ class Run {
     this.sent = st.sent.map((x) => ({ ids: [...x.ids], echo: x.echo }));
     this.tasks = new Map(st.tasks ?? []);
     this.agents = new Set(st.agents ?? []);
+    this.autoTurn = st.autoTurn;
+    this.heldUsage = st.heldUsage;
     if (st.pluginDir) this.pluginDir = st.pluginDir;
     if (st.launched) this.launched = { ...st.launched };
   }
@@ -658,7 +670,10 @@ class ClaudeSession implements HarnessSession {
     switch (m.type) {
       case "system":
         // Claude starts a turn by itself to tell the agent that a background subagent has ended.
-        if (m.subtype === "init") ctx.beginTurn();
+        if (m.subtype === "init" && !ctx.turnId) {
+          ctx.beginTurn();
+          run.autoTurn = ctx.turnId;
+        }
         if (m.subtype === "init" && m.session_id && m.session_id !== ctx.thread.session_id) ctx.setThread({ session_id: m.session_id });
         if (typeof m.subtype === "string" && m.subtype.startsWith("task_")) this.#task(run, m);
         if (m.subtype === "compact_boundary") {
@@ -738,12 +753,21 @@ class ClaudeSession implements HarnessSession {
           run.streamed.clear();
         }
         if (!ctx.turnId) break;
+        // The end of a turn Claude made by itself (to tell the agent a background subagent ended)
+        // while a turn of the user's waited for it: the user's goes on to its own result, which
+        // gets this one's usage too.
+        if (m.origin?.kind === "task-notification" && ctx.turnId !== run.autoTurn) {
+          run.heldUsage = sumUsage(run.heldUsage, claudeUsage(m));
+          break;
+        }
         this.#clearStop();
         const failed = !!m.is_error;
+        const usage = sumUsage(run.heldUsage, claudeUsage(m));
+        run.heldUsage = undefined;
         ctx.endTurn({
           ok: !failed,
           ...(failed ? { error: m.result || (Array.isArray(m.errors) ? m.errors.join("\n") : "") || m.subtype } : {}),
-          usage: claudeUsage(m),
+          usage,
           ...(typeof m.duration_ms === "number" ? { duration_ms: m.duration_ms } : {}),
         });
         break;

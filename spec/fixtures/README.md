@@ -200,8 +200,12 @@ backend drives each CLI:
 - **Background subagents**: at the end of a turn, the calls and requests of a background subagent
   still running aren't cancelled. A call cancelled at a turn's end stops its running subagent. When
   no turn is running, an `init` system message starts one (Claude telling the agent a background
-  subagent has ended), with no `user_message`. When the process ends, its subagents still running
-  are `stopped`, and their calls still running `cancelled`.
+  subagent has ended), with no `user_message`. If a turn of the user's started first (Claude hadn't
+  taken its message in yet), Claude's own turn's items go in it, and its result (`origin.kind:
+  task-notification`) doesn't end it: the user's turn ends with its own result, with both results'
+  usage. When the process ends, or the backend restarts and can't pick it up again, its subagents
+  still running are `stopped`, and their calls still running `cancelled`; a turn is ended as lost
+  only if one was running (a thread can be `waiting` on a background subagent's request with none).
 - **Questions**: AskUserQuestion's `can_use_tool` is always a question (whatever the policy). Each
   question's `id` is its text, and `allow_other` is set (Claude Code always offers "Other").
 - **Left out**: `assistant` messages from the `<synthetic>` model (the error is in the turn's

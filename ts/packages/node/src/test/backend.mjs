@@ -9,11 +9,12 @@
 // fake CLI. With TOOL_MARKER, there's an app
 // tool `lookup`, which appends a line to that file each time it runs, and then (with TOOL_HANG)
 // doesn't return. STOP_GRACE_MS and CLOSE_GRACE_MS are the drivers' stopGraceMs and closeGraceMs.
-// With SAVE_DELAY_MS, each save (appendEvents) takes that long.
+// With SAVE_DELAY_MS, each save (appendEvents) takes that long. SPAWNER=direct runs the harnesses
+// as its own children instead of under the shim.
 
 import { appendFileSync } from "node:fs";
 import { createInterface } from "node:readline";
-import { AgentThreads, FileStore, claudeCode, codex, defineTool, shim } from "../../dist/index.js";
+import { AgentThreads, FileStore, claudeCode, codex, defineTool, direct, shim } from "../../dist/index.js";
 
 const env = process.env;
 const fakeEnv = Object.fromEntries(Object.entries(env).filter(([k]) => k.startsWith("AGENT_THREADS_FIXTURE")));
@@ -50,7 +51,7 @@ const sdk = new AgentThreads({
         }),
       ]
     : [],
-  spawner: shim(env.SHIM, { runsDir: env.RUNS, pollMs: 50 }),
+  spawner: env.SPAWNER === "direct" ? direct() : shim(env.SHIM, { runsDir: env.RUNS, pollMs: 50 }),
   onError: (e) => process.stderr.write(`backend error: ${e?.stack ?? e}\n`),
 });
 const out = (msg) => process.stdout.write(JSON.stringify(msg) + "\n");

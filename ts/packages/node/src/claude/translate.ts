@@ -153,6 +153,18 @@ export function subagentResult(call: ToolCall, isError: boolean, interrupted: bo
   return s;
 }
 
+/** Two turns' usage together. */
+export function sumUsage(a: Usage | undefined, b: Usage): Usage {
+  if (!a) return b;
+  return {
+    input_tokens: (a.input_tokens ?? 0) + (b.input_tokens ?? 0),
+    output_tokens: (a.output_tokens ?? 0) + (b.output_tokens ?? 0),
+    cache_read_tokens: (a.cache_read_tokens ?? 0) + (b.cache_read_tokens ?? 0),
+    cache_write_tokens: (a.cache_write_tokens ?? 0) + (b.cache_write_tokens ?? 0),
+    cost_usd: Math.round(((a.cost_usd ?? 0) + (b.cost_usd ?? 0)) * 1e12) / 1e12,
+  };
+}
+
 /** A permission's title: what it's about, in a few words. */
 export function title(t: ToolFields): string {
   if (t.command) return t.command;

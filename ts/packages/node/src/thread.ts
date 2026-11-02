@@ -442,17 +442,13 @@ export class ThreadRuntime implements ThreadContext {
   endTurn(end: TurnEnd, { carry = true }: { carry?: boolean } = {}): void {
     const turn = this.turn;
     if (!turn) return;
-    // Text streamed but never finished (its process went first) is kept as it was shown.
-    for (const it of this.#state.items) {
-      if (it.type !== "assistant_message" && it.type !== "reasoning") continue;
-      const saved = this.item(it.id);
-      if (saved && "text" in saved && saved.text !== it.text) this.updateItem(it.id, { text: it.text });
-    }
-    this.#streaming.clear();
-    this.#structured.clear();
-    // What a background subagent that's still running does carries on after the turn: its calls
-    // and requests too.
+    // What a background subagent that's still running does carries on after the turn: its text
+    // still streaming, its calls (and their structured output, still to go with their results)
+    // and its requests.
     const lookup = (id: string) => this.item(id);
+    // Text streamed but never finished (its process went first) is kept as it was shown.
+    this.#finishText((id) => !inBackground(lookup, id));
+    for (const id of [...this.#structured.keys()]) if (!inBackground(lookup, id)) this.#structured.delete(id);
     for (const it of this.#state.items) {
       if (it.type === "tool_call" && it.turn_id === turn.id && (it.status === "running" || it.status === "pending") && !inBackground(lookup, it.id)) {
         // A subagent cut short (by an interrupt, or its process ending) is stopped with its call.
@@ -514,6 +510,16 @@ export class ThreadRuntime implements ThreadContext {
     this.session?.carryOver(left.map((m) => toMessage(m.id, m)));
   }
 
+  /** Keeps text streamed into the items `which` picks, but never finished, as it was shown. */
+  #finishText(which: (id: string) => boolean): void {
+    for (const it of this.#state.items) {
+      if ((it.type !== "assistant_message" && it.type !== "reasoning") || !which(it.id)) continue;
+      const saved = this.item(it.id);
+      if (saved && "text" in saved && saved.text !== it.text) this.updateItem(it.id, { text: it.text });
+    }
+    for (const id of [...this.#streaming]) if (which(id)) this.#streaming.delete(id);
+  }
+
   beginTurn(): void {
     if (this.turn || this.closed || this.closing) return;
     this.turn = { id: newId("turn"), interrupted: false };
@@ -532,6 +538,8 @@ export class ThreadRuntime implements ThreadContext {
     if (!stopped.size) return;
     const lookup = (id: string) => this.item(id);
     const within = (id: string) => [...ancestors(lookup, id)].some((a) => stopped.has(a.id));
+    this.#finishText(within);
+    for (const id of [...this.#structured.keys()]) if (within(id)) this.#structured.delete(id);
     for (const it of this.#state.items) {
       if (it.type === "tool_call" && (it.status === "running" || it.status === "pending") && within(it.id)) this.updateItem(it.id, { status: "cancelled" });
     }

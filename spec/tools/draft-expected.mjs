@@ -378,6 +378,8 @@ function draftClaude(d, runs) {
     let summaryNext = null;
     let interrupted = false;
     const tasks = new Map(); // a subagent's task_id -> its call's id
+    let autoTurn = null; // the turn Claude started by itself
+    let held = null; // the usage of Claude's own turns held for a turn of the user's
     // The message that starts a run is sent before the process starts (backends start it then).
     const opener = entries.find((e) => e.dir === "in" && e.msg.type === "user");
     for (const e of entries) {
@@ -413,7 +415,10 @@ function draftClaude(d, runs) {
       switch (m.type) {
         case "system": {
           // Claude starts a turn by itself to tell the agent a background subagent ended.
-          if (m.subtype === "init" && !d.turn) d.beginTurn();
+          if (m.subtype === "init" && !d.turn) {
+            d.beginTurn();
+            autoTurn = d.turn.id;
+          }
           if (m.subtype === "init" && m.session_id !== d.thread.session_id) d.setThread({ session_id: m.session_id });
           if (m.subtype === "compact_boundary") {
             d.item({ id: m.uuid, type: "compaction", trigger: m.compact_metadata.trigger, tokens_before: m.compact_metadata.pre_tokens });
@@ -550,10 +555,17 @@ function draftClaude(d, runs) {
           break;
         }
         case "result": {
+          // Claude's own turn, ended while a turn of the user's waited for it: that turn goes on.
+          if (m.origin?.kind === "task-notification" && d.turn && d.turn.id !== autoTurn) {
+            held = addUsage(held, claudeUsage(m));
+            break;
+          }
+          const usage = addUsage(held, claudeUsage(m));
+          held = null;
           d.endTurn({
             ok: !m.is_error,
             error: m.is_error ? (m.result || (m.errors ?? []).join("\n") || m.subtype) : undefined,
-            usage: claudeUsage(m),
+            usage,
             duration_ms: m.duration_ms,
           });
           interrupted = false;

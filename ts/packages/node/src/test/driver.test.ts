@@ -450,6 +450,43 @@ describe("the Claude driver", () => {
     expectTracked(events, runs());
   });
 
+  it("keeps a turn of the user's going past a turn Claude makes by itself before taking the user's message in", async () => {
+    const { sdk, events } = setup({ env: { MINI_CLAUDE_NOTIFY_FIRST: "1" } });
+    const t = await sdk.create({ model: "mini" });
+    await sdk.send(t.id, "background 300 apple");
+    await until(() => events.some((e) => e.type === "turn.completed"));
+    // Sent before the subagent is done: Claude reports the subagent first, then takes this in.
+    const from = events.length;
+    await sdk.send(t.id, "reply hi");
+    const s = await until(async () => {
+      const x = await sdk.snapshot(t.id);
+      return texts(x.items).at(-1) === "hi" && x.thread.status === "idle" && x;
+    });
+    expectIdleAfter(events, from, "hi");
+    const [, second] = results(s.items);
+    expect(results(s.items)).toHaveLength(2);
+    // The user's turn has its message, both replies, and both results' usage.
+    expect(s.items.filter((i) => i.turn_id === second!.turn_id && i.type !== "turn_result").map((i) => (i.type === "user_message" || i.type === "assistant_message" ? i.text : i.type))).toEqual([
+      "reply hi",
+      "the subagent said apple",
+      "hi",
+    ]);
+    expect(second!.usage).toMatchObject({ input_tokens: 2, output_tokens: 4 });
+  });
+
+  it("keeps a background subagent's app tool's structured output for the result that comes after its turn", async () => {
+    const lookup = defineTool({ name: "lookup", description: "Looks it up.", input: { type: "object" }, run: () => ({ text: "42", structured: { answer: 42 } }) });
+    const { sdk } = setup({ tools: [lookup], env: { MINI_CLAUDE_BACKGROUND_APP: "lookup" } });
+    const t = await sdk.create({ model: "mini" });
+    await sdk.send(t.id, "background 200 apple");
+    const s = await until(async () => {
+      const x = await sdk.snapshot(t.id);
+      return results(x.items).length === 2 && x.thread.status === "idle" && x;
+    });
+    const call = s.items.find((i): i is ToolCall => i.type === "tool_call" && i.name === "lookup");
+    expect(call).toMatchObject({ status: "completed", result: { content: "42", structured: { answer: 42 } } });
+  });
+
   it("stops a run's subagents when it ends, and cancels what they were doing", async () => {
     const { sdk, events } = setup();
     const t = await sdk.create({ model: "mini" });

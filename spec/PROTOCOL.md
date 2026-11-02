@@ -118,7 +118,10 @@ running when its harness process ends is `stopped`, and its calls still running 
 
 The harness can start a **turn by itself**, with no `user_message`: Claude Code does when a
 background subagent ends, to tell the agent. It goes as any turn does (`turn.started`, the thread
-`running`, a `turn_result`, `turn.completed`).
+`running`, a `turn_result`, `turn.completed`). If the user sent a message just before (so a turn of
+theirs is running), what the harness does by itself goes in the user's turn, which ends when the
+harness is done with the user's message. A backend that restarts and can't pick up a thread's run
+stops its subagents that were running.
 
 ## Requests
 
