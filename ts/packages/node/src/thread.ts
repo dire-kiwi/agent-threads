@@ -60,11 +60,6 @@ interface OpenRequest {
    * message, unless the user sends one first.
    */
   late?: boolean;
-  /**
-   * How many messages the user had sent when it was opened: one sent since means the conversation
-   * has moved on, and it isn't kept open after its turn.
-   */
-  users: number;
 }
 
 /** A message as sent: its text and attachments, and the client's id for it. */
@@ -543,7 +538,7 @@ export class ThreadRuntime implements ThreadContext {
         : (r.request.turn_id !== undefined && r.request.turn_id !== turn.id) || (r.request.tool_call_id !== undefined && inBackground(lookup, r.request.tool_call_id));
       if (keep) continue;
       this.#requests.delete(id);
-      if (r.late || !this.#keepLate(r.request, r.users)) this.emit({ type: "request.resolved", request_id: id, resolution: { outcome: "cancel" } });
+      if (r.late || !this.#keepLate(r.request)) this.emit({ type: "request.resolved", request_id: id, resolution: { outcome: "cancel" } });
     }
     const ok = end.ok && !turn.interrupted;
     const error = !ok && !turn.interrupted ? end.error || "The turn failed." : undefined;
@@ -694,13 +689,14 @@ export class ThreadRuntime implements ThreadContext {
     const r = { ...request, id: newId(question ? "q" : "perm") } as ThreadRequest;
     if (!question && standing?.server) (r as { server?: string }).server = standing.server;
     if (this.turn) r.turn_id = this.turn.id;
+    if (r.type === "question") r.user_messages = this.#userMessages();
     const call = toolCallId ? this.item(toolCallId) : undefined;
     if (call) {
       r.tool_call_id = call.id;
       if (call.parent_id) r.parent_id = call.parent_id;
       this.updateItem(call.id, { status: "pending" });
     }
-    this.#requests.set(r.id, { request: r, answered, users: this.#userMessages(), ...(standing ? { standing } : {}) });
+    this.#requests.set(r.id, { request: r, answered, ...(standing ? { standing } : {}) });
     this.emit({ type: "request.opened", request: r });
     this.setThread({ status: "waiting" });
     return r.id;
@@ -710,7 +706,7 @@ export class ThreadRuntime implements ThreadContext {
     if (this.#requests.has(requestId)) return false;
     const request = this.#state.requests.find((r) => r.id === requestId);
     if (!request || request.resolution) return false;
-    this.#requests.set(requestId, { request, answered, users: this.#userMessages(), ...(standing ? { standing } : {}) });
+    this.#requests.set(requestId, { request, answered, ...(standing ? { standing } : {}) });
     return true;
   }
 
@@ -750,7 +746,7 @@ export class ThreadRuntime implements ThreadContext {
     const open = this.#requests.get(id);
     if (!open || open.late) return;
     this.#requests.delete(id);
-    if (!(this.interrupted && this.#keepLate(open.request, open.users))) {
+    if (!(this.interrupted && this.#keepLate(open.request))) {
       this.emit({ type: "request.resolved", request_id: id, resolution: { outcome: "cancel" } });
     }
     if (!this.#waiting() && (this.turn || this.#state.thread.status === "waiting")) this.setThread({ status: this.turn ? "running" : "idle" });
@@ -772,13 +768,12 @@ export class ThreadRuntime implements ThreadContext {
    * (its answer would be shown, as a message), not under dont_ask (which dismisses questions), and
    * not when the conversation has moved on (see #movedOn). Whether it did.
    */
-  #keepLate(request: ThreadRequest, users?: number): boolean {
+  #keepLate(request: ThreadRequest): boolean {
     if (request.type !== "question" || !this.#host.lateAnswers || request.questions.some((q) => q.secret)) return false;
-    if (this.#movedOn(request, users) || this.thread.permission_mode === "dont_ask") return false;
+    if (this.#movedOn(request) || this.thread.permission_mode === "dont_ask") return false;
     this.#requests.set(request.id, {
       request,
       late: true,
-      users: this.#userMessages(),
       answered: (r) => {
         // A dismissal sends nothing.
         if (r.outcome === "answer") this.send({ text: lateAnswerText(request, r) });
@@ -788,20 +783,15 @@ export class ThreadRuntime implements ThreadContext {
   }
 
   /**
-   * Whether the conversation has moved on since a request was asked: messages are queued, or the
-   * user sent one since. That's a user message after its tool call in the items, as saved (so it's
-   * known after a restart too); or, for a request with no call, more of them than `users` (how many
-   * there were when it was asked, if that's known).
+   * Whether the conversation has moved on since a question was asked: messages are queued, or the
+   * user sent one since (there are more than its user_messages, which is saved with it, so it's
+   * known after a restart too; one without is taken to have been passed by).
    */
-  #movedOn(request: ThreadRequest, users?: number): boolean {
-    if (this.#queue.length > 0) return true;
-    const items = this.#state.items;
-    const at = request.tool_call_id === undefined ? -1 : items.findIndex((i) => i.id === request.tool_call_id);
-    if (at >= 0) return items.slice(at + 1).some((i) => i.type === "user_message");
-    return users !== undefined && this.#userMessages() > users;
+  #movedOn(q: QuestionRequest): boolean {
+    return this.#queue.length > 0 || q.user_messages === undefined || this.#userMessages() > q.user_messages;
   }
 
-  /** How many messages the user has sent. */
+  /** How many messages the user has sent (user_message items). */
   #userMessages(): number {
     return this.#state.items.filter((i) => i.type === "user_message").length;
   }

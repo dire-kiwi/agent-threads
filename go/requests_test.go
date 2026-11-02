@@ -510,17 +510,33 @@ func TestWithoutLateAnswersATurnThatEndsCancelsItsQuestions(t *testing.T) {
 func jsonOf(v any) string { return string(mustMarshal(v)) }
 
 // The conversation moved on from a question (the user sent a message, which the harness took in)
-// before the backend stopped with its run: the question isn't kept open when the lost turn ends.
+// before the backend stopped with its run: the question isn't kept open when the lost turn ends,
+// whether or not it has a tool_call item.
 func TestAQuestionIsntKeptOpenAfterALostRunOnceTheUserSentAMessage(t *testing.T) {
+	for _, unlinked := range []bool{false, true} {
+		t.Run(map[bool]string{false: "linked", true: "unlinked"}[unlinked], func(t *testing.T) {
+			lostRunAfterAMessage(t, unlinked)
+		})
+	}
+}
+
+func lostRunAfterAMessage(t *testing.T, unlinked bool) {
 	ctx := context.Background()
 	state := agentthreads.NewMemoryState()
-	sdk := newMiniWith(t, agentthreads.NewMemoryStoreOn(state), true, nil)
+	var env map[string]string
+	if unlinked {
+		env = map[string]string{"MINI_CLAUDE_UNLINKED": "1"}
+	}
+	sdk := newMiniWith(t, agentthreads.NewMemoryStoreOn(state), true, env)
 	th, err := sdk.Create(ctx, agentthreads.CreateOptions{Cwd: t.TempDir()})
 	if err != nil {
 		t.Fatal(err)
 	}
 	send(t, sdk, th.ID, "asking AskUserQuestion "+question)
 	q := openRequest(t, sdk, th.ID, "question", "")
+	if (q.ToolCallID() == "") != unlinked {
+		t.Fatalf("got %s", jsonOf(q))
+	}
 	send(t, sdk, th.ID, "reply hi")
 	// Taken in: nothing's queued.
 	until(t, func() bool {
@@ -552,7 +568,7 @@ func TestAQuestionIsntKeptOpenAfterALostRunOnceTheUserSentAMessage(t *testing.T)
 	}
 	sdk.Stop(ctx)
 
-	again := newMiniWith(t, crashed, true, nil)
+	again := newMiniWith(t, crashed, true, env)
 	s, err := again.Snapshot(ctx, th.ID)
 	if err != nil {
 		t.Fatal(err)
@@ -563,4 +579,49 @@ func TestAQuestionIsntKeptOpenAfterALostRunOnceTheUserSentAMessage(t *testing.T)
 	if r := resolutionOf(t, again, th.ID, q); r == nil || r.Outcome != protocol.ResolutionOutcomeCancel {
 		t.Fatalf("resolved with %s", mustMarshal(r))
 	}
+}
+
+// A message the harness took in between a tool call and the question it asks for it came before
+// the question: the conversation hasn't moved on from it.
+func TestKeepsAQuestionOpenAfterAMessageTakenInBeforeItWasAsked(t *testing.T) {
+	ctx := context.Background()
+	sdk := newMiniWith(t, nil, true, map[string]string{"MINI_CLAUDE_ASK_DELAY": "500"})
+	th, _ := sdk.Create(ctx, agentthreads.CreateOptions{Cwd: t.TempDir()})
+	send(t, sdk, th.ID, "asking AskUserQuestion "+question)
+	until(t, func() bool {
+		s, _ := sdk.Snapshot(ctx, th.ID)
+		for _, it := range s.Items {
+			if it.Type() == "tool_call" {
+				return true
+			}
+		}
+		return false
+	})
+	send(t, sdk, th.ID, "reply hi")
+	q := openRequest(t, sdk, th.ID, "question", "")
+	s, _ := sdk.Snapshot(ctx, th.ID)
+	n := 0
+	for _, it := range s.Items {
+		if m, ok := it.Value.(*protocol.UserMessage); ok {
+			if m.Queued {
+				t.Fatalf("queued: %s", jsonOf(s))
+			}
+			n++
+		}
+	}
+	if users := q.Value.(*protocol.QuestionRequest).UserMessages; n != 2 || users == nil || *users != 2 {
+		t.Fatalf("got %s", jsonOf(s))
+	}
+	sdk.Interrupt(ctx, th.ID)
+	s = settledQueue(t, sdk, th.ID)
+	if open := protocol.OpenRequests(s); len(open) != 1 || open[0].ID() != q.ID() {
+		t.Fatalf("got %s", jsonOf(s))
+	}
+	sdk.Respond(ctx, th.ID, q.ID(), protocol.Resolution{Outcome: protocol.ResolutionOutcomeAnswer, Answers: map[string][]string{"Colour?": {"Red"}}})
+	until(t, func() bool {
+		s, _ := sdk.Snapshot(ctx, th.ID)
+		texts := userTexts(s)
+		return texts[len(texts)-1] == "My answer to the question you asked:\n\n- Colour?\n  Red"
+	})
+	settledQueue(t, sdk, th.ID)
 }

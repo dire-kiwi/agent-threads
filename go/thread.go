@@ -48,9 +48,6 @@ type openRequest struct {
 	// late says it's a question kept open after its turn ended (Options.LateAnswers): its answer is
 	// sent as the next message, unless the user sends one first.
 	late bool
-	// users is how many messages the user had sent when it was opened: one sent since means the
-	// conversation has moved on, and it isn't kept open after its turn.
-	users int
 }
 
 // outgoing is a message as sent: its text and attachments, and the client's id for it.
@@ -928,8 +925,7 @@ func (rt *threadRuntime) endTurn(end TurnEnd, carry bool) {
 			continue
 		}
 		rt.dropRequest(id)
-		users := r.users
-		if !rt.keepLate(id, r.request, &users) {
+		if !rt.keepLate(id, r.request) {
 			rt.emit(&protocol.RequestResolvedEvent{RequestID: id, Resolution: cancelled("")})
 		}
 	}
@@ -1205,9 +1201,11 @@ func (rt *threadRuntime) Ask(request protocol.ThreadRequestValue, toolCallID str
 	case *protocol.QuestionRequest:
 		id = NewID("q")
 		r.ID, r.TurnID, r.ToolCallID, r.ParentID = id, turnID, toolCallID, parent
+		users := int64(rt.userMessages())
+		r.UserMessages = &users
 	}
 	req := protocol.ThreadRequest{Value: request}
-	rt.addRequest(id, &openRequest{request: req, answered: answered, standing: standing, users: rt.userMessages()})
+	rt.addRequest(id, &openRequest{request: req, answered: answered, standing: standing})
 	rt.emit(&protocol.RequestOpenedEvent{Request: req})
 	rt.SetThread(func(t *protocol.Thread) { t.Status = protocol.ThreadStatusWaiting })
 	return id
@@ -1237,7 +1235,7 @@ func (rt *threadRuntime) Reopen(requestID string, answered func(protocol.Resolut
 	for _, r := range rt.state.Requests {
 		// One that's been resolved stays in the state, with its resolution, but can't be reopened.
 		if r.ID() == requestID && r.Resolution() == nil {
-			rt.addRequest(requestID, &openRequest{request: r, answered: answered, standing: standing, users: rt.userMessages()})
+			rt.addRequest(requestID, &openRequest{request: r, answered: answered, standing: standing})
 			return true
 		}
 	}
@@ -1315,7 +1313,7 @@ func (rt *threadRuntime) CancelRequest(id string) {
 		return
 	}
 	rt.dropRequest(id)
-	if !(rt.Interrupted() && rt.keepLate(id, open.request, &open.users)) {
+	if !(rt.Interrupted() && rt.keepLate(id, open.request)) {
 		rt.emit(&protocol.RequestResolvedEvent{RequestID: id, Resolution: cancelled("")})
 	}
 	rt.requestsDone()
@@ -1357,11 +1355,10 @@ func (rt *threadRuntime) openRequestIDs() map[string]bool {
 
 // keepLate keeps a question open after its turn ended, with LateAnswers, if it can be: not a secret
 // one (its answer would be shown, as a message), not under dont_ask (which dismisses questions),
-// and not when the conversation has moved on: messages are queued, or the user sent one since it
-// was opened (when there were *users; nil if that isn't known). It says whether it did.
-func (rt *threadRuntime) keepLate(id string, request protocol.ThreadRequest, users *int) bool {
+// and not when the conversation has moved on (see movedOn). It says whether it did.
+func (rt *threadRuntime) keepLate(id string, request protocol.ThreadRequest) bool {
 	q, ok := request.Value.(*protocol.QuestionRequest)
-	if !ok || !rt.sdk.options.LateAnswers || rt.movedOn(request, users) || rt.state.Thread.PermissionMode == protocol.PermissionModeDontAsk {
+	if !ok || !rt.sdk.options.LateAnswers || rt.movedOn(q) || rt.state.Thread.PermissionMode == protocol.PermissionModeDontAsk {
 		return false
 	}
 	for _, x := range q.Questions {
@@ -1369,35 +1366,18 @@ func (rt *threadRuntime) keepLate(id string, request protocol.ThreadRequest, use
 			return false
 		}
 	}
-	rt.addRequest(id, &openRequest{request: request, answered: rt.lateAnswered(q), late: true, users: rt.userMessages()})
+	rt.addRequest(id, &openRequest{request: request, answered: rt.lateAnswered(q), late: true})
 	return true
 }
 
-// movedOn says whether the conversation has moved on since a request was asked: messages are
-// queued, or the user sent one since. That's a user message after its tool call in the items, as
-// saved (so it's known after a restart too); or, for a request with no call, more of them than
-// users (how many there were when it was asked, if that's known).
-func (rt *threadRuntime) movedOn(request protocol.ThreadRequest, users *int) bool {
-	if len(rt.queue) > 0 {
-		return true
-	}
-	if call := request.ToolCallID(); call != "" {
-		for i, it := range rt.state.Items {
-			if it.ID() != call {
-				continue
-			}
-			for _, after := range rt.state.Items[i+1:] {
-				if after.Type() == "user_message" {
-					return true
-				}
-			}
-			return false
-		}
-	}
-	return users != nil && rt.userMessages() > *users
+// movedOn says whether the conversation has moved on since a question was asked: messages are
+// queued, or the user sent one since (there are more than its UserMessages, which is saved with it,
+// so it's known after a restart too; one without is taken to have been passed by).
+func (rt *threadRuntime) movedOn(q *protocol.QuestionRequest) bool {
+	return len(rt.queue) > 0 || q.UserMessages == nil || int64(rt.userMessages()) > *q.UserMessages
 }
 
-// userMessages is how many messages the user has sent.
+// userMessages is how many messages the user has sent (user_message items).
 func (rt *threadRuntime) userMessages() int {
 	n := 0
 	for _, it := range rt.state.Items {
@@ -1440,7 +1420,7 @@ func (rt *threadRuntime) takeUpRequests(all bool) {
 		}
 		t := r.TurnID()
 		over := all || t != "" && (ended[t] || t == interrupted)
-		if !over || !rt.keepLate(r.ID(), r, nil) {
+		if !over || !rt.keepLate(r.ID(), r) {
 			rt.emit(&protocol.RequestResolvedEvent{RequestID: r.ID(), Resolution: cancelled("")})
 		}
 	}

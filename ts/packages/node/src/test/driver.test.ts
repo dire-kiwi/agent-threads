@@ -925,13 +925,15 @@ describe("the Claude driver", () => {
   });
 
   // The conversation moved on from a question (the user sent a message, which the harness took in)
-  // before the backend stopped with its run: the question isn't kept open when the lost turn ends.
-  it("doesn't keep a question open after a lost run once the user sent a message", async () => {
+  // before the backend stopped with its run: the question isn't kept open when the lost turn ends,
+  // whether or not it has a tool_call item.
+  it.each([false, true])("doesn't keep a question open after a lost run once the user sent a message (no tool_call item: %s)", async (unlinked) => {
     const store = new MemoryStore();
-    const { sdk, make } = setup({ store, permissions: "ask", lateAnswers: true });
+    const { sdk, make } = setup({ store, permissions: "ask", lateAnswers: true, env: unlinked ? { MINI_CLAUDE_UNLINKED: "1" } : {} });
     const t = await sdk.create();
     await sdk.send(t.id, `asking AskUserQuestion ${QUESTION}`);
     const q = await openRequest(sdk, t.id, "question");
+    expect(q.tool_call_id === undefined).toBe(unlinked);
     await sdk.send(t.id, "reply hi");
     // Taken in: nothing's queued.
     await until(async () => {
@@ -947,6 +949,26 @@ describe("the Claude driver", () => {
     const again = make(new MemoryStore(crashed));
     expect(openRequests(await again.snapshot(t.id))).toEqual([]);
     expect(await resolutionOf(again, t.id, q)).toEqual({ outcome: "cancel" });
+  });
+
+  // A message the harness took in between a tool call and the question it asks for it came before
+  // the question: the conversation hasn't moved on from it.
+  it("keeps a question open after a message taken in before it was asked", async () => {
+    const { sdk } = setup({ permissions: "ask", lateAnswers: true, env: { MINI_CLAUDE_ASK_DELAY: "500" } });
+    const t = await sdk.create();
+    await sdk.send(t.id, `asking AskUserQuestion ${QUESTION}`);
+    await until(async () => (await sdk.snapshot(t.id)).items.some((i) => i.type === "tool_call"));
+    await sdk.send(t.id, "reply hi");
+    const q = await openRequest(sdk, t.id, "question");
+    const messages = (await sdk.snapshot(t.id)).items.filter((i): i is UserMessage => i.type === "user_message");
+    expect(messages.length === 2 && messages.every((m) => !m.queued)).toBe(true);
+    expect(q).toMatchObject({ user_messages: 2 });
+    await sdk.interrupt(t.id);
+    let s = await settle(sdk, t.id);
+    expect(openRequests(s).map((r) => r.id)).toEqual([q.id]);
+    await sdk.respond(t.id, q.id, { outcome: "answer", answers: { "Colour?": ["Red"] } });
+    s = await settle(sdk, t.id);
+    expect(s.items.filter((i): i is UserMessage => i.type === "user_message").at(-1)!.text).toBe("My answer to the question you asked:\n\n- Colour?\n  Red");
   });
 
   it.each([false, true])("dismisses a question kept open after its turn when the mode changes to dont_ask (restarted: %s)", async (restart) => {
