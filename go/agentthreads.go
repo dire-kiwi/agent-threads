@@ -988,17 +988,33 @@ func (a *AgentThreads) fromStore(ctx context.Context, threadID string) (*threadR
 	if err != nil {
 		return nil, err
 	}
-	state := protocol.InitialState(*thread)
+	base := protocol.InitialState(*thread)
 	if snap != nil {
-		state = *snap
+		base = *snap
 	}
-	events, err := a.store.ReadEvents(ctx, threadID, state.Seq, 0)
+	events, err := a.store.ReadEvents(ctx, threadID, base.Seq, 0)
 	if err != nil {
 		return nil, err
 	}
-	state = protocol.ApplyEvents(state, events)
+	state := protocol.ApplyEvents(base, events)
 	if state.Seq == 0 {
 		state = protocol.InitialState(*thread)
+	}
+	// The session the running turn (if one is) started in, which a turn rebuilt here starts with.
+	running := state.Thread.Status == protocol.ThreadStatusRunning || state.Thread.Status == protocol.ThreadStatusWaiting
+	startedIn := state.Thread.SessionID
+	if turnID := latestTurn(state.Items); running && turnID != "" {
+		session, found := sessionAtStart(base, events, turnID)
+		if !found {
+			all, err := a.store.ReadEvents(ctx, threadID, 0, 0)
+			if err != nil {
+				return nil, err
+			}
+			session, found = sessionAtStart(protocol.InitialState(*thread), all, turnID)
+		}
+		if found {
+			startedIn = session
+		}
 	}
 	// The run it had, read first: a store that can't say leaves the thread to be loaded again later,
 	// rather than taking a run that may still be going for lost.
@@ -1018,18 +1034,17 @@ func (a *AgentThreads) fromStore(ctx context.Context, threadID string) (*threadR
 	}
 	var abandon *RunRecord
 	rt.loop.call(func() {
-		ok, stop := a.reattach(rt, record)
+		ok, stop := a.reattach(rt, record, startedIn)
 		if ok {
 			return
 		}
 		abandon = stop
 		// The process that ran its turn went with the backend before this one, or can't be followed.
-		s := rt.state.Thread.Status
-		if s == protocol.ThreadStatusRunning || s == protocol.ThreadStatusWaiting || rt.state.Thread.Run != nil {
+		if running || rt.state.Thread.Run != nil {
 			if rt.state.Thread.Run != nil {
 				rt.lostRun = rt.state.Thread.Run.ID
 			}
-			recoverLost(rt)
+			recoverLost(rt, startedIn)
 		}
 	})
 	if abandon != nil {
@@ -1040,9 +1055,9 @@ func (a *AgentThreads) fromStore(ctx context.Context, threadID string) (*threadR
 
 // reattach re-attaches a thread just loaded to its run (record), if it has one that outlived the
 // backend before: its turn and open requests are as they were when the run was last saved, and the
-// session carries on reading the run from there. It says whether it did; if it couldn't, it returns
-// the run, to be stopped.
-func (a *AgentThreads) reattach(rt *threadRuntime, record *RunRecord) (bool, *RunRecord) {
+// session carries on reading the run from there (a turn the run data hasn't is rebuilt, starting in
+// the session startedIn). It says whether it did; if it couldn't, it returns the run, to be stopped.
+func (a *AgentThreads) reattach(rt *threadRuntime, record *RunRecord, startedIn string) (bool, *RunRecord) {
 	if record == nil {
 		return false, nil
 	}
@@ -1057,7 +1072,7 @@ func (a *AgentThreads) reattach(rt *threadRuntime, record *RunRecord) (bool, *Ru
 			t := *data.Turn
 			rt.turn = &t
 		} else {
-			rt.turn = &turnState{ID: lastTurn(rt.state.Items), Session: rt.state.Thread.SessionID}
+			rt.turn = &turnState{ID: lastTurn(rt.state.Items), Session: startedIn}
 		}
 	}
 	rt.adoptRun(*record)
@@ -1091,21 +1106,44 @@ func (a *AgentThreads) reattach(rt *threadRuntime, record *RunRecord) (bool, *Ru
 	return true, nil
 }
 
-func lastTurn(items []protocol.Item) string {
+// latestTurn is the turn of the last item that has one, or "".
+func latestTurn(items []protocol.Item) string {
 	for i := len(items) - 1; i >= 0; i-- {
 		if t := items[i].TurnID(); t != "" {
 			return t
 		}
 	}
+	return ""
+}
+
+// lastTurn is the turn of the last item that has one, or a new turn id.
+func lastTurn(items []protocol.Item) string {
+	if t := latestTurn(items); t != "" {
+		return t
+	}
 	return NewID("turn")
 }
 
-// recoverLost ends a turn whose process was lost when the backend stopped.
-func recoverLost(rt *threadRuntime) {
+// sessionAtStart is the thread's session_id when the turn turnID started ("" for none), from events
+// folded onto from; found is false if its turn.started isn't among them. (A session the turn starts
+// is set after its turn.started.)
+func sessionAtStart(from protocol.Snapshot, events []protocol.ThreadEvent, turnID string) (session string, found bool) {
+	state := from
+	for _, e := range events {
+		if t, ok := e.Value.(*protocol.TurnStartedEvent); ok && t.TurnID == turnID {
+			session, found = state.Thread.SessionID, true
+		}
+		state = protocol.ApplyEvent(state, e)
+	}
+	return session, found
+}
+
+// recoverLost ends a turn whose process was lost when the backend stopped. startedIn is the session
+// it started in.
+func recoverLost(rt *threadRuntime, startedIn string) {
 	s := rt.state.Thread.Status
 	if s == protocol.ThreadStatusRunning || s == protocol.ThreadStatusWaiting {
-		// Its session as it is now, which is as it was when it started unless the turn started it.
-		rt.turn = &turnState{ID: lastTurn(rt.state.Items), Session: rt.state.Thread.SessionID}
+		rt.turn = &turnState{ID: lastTurn(rt.state.Items), Session: startedIn}
 		for _, r := range rt.state.Requests {
 			rt.emit(&protocol.RequestResolvedEvent{RequestID: r.ID(), Resolution: protocol.Resolution{Outcome: protocol.ResolutionOutcomeCancel}})
 		}

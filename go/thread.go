@@ -980,8 +980,15 @@ func (rt *threadRuntime) rewind(turnID string) error {
 		}
 	}
 	rt.queue = queue
+	// A rewind not yet made (resume_at) went back to before a later turn of the same session: with
+	// no mark of its own to go to, this one still needs that one made, as the turns since added
+	// nothing to the session but the ones it took back are still in it.
+	resumeAt := point.ResumeAt
+	if th := rt.state.Thread; resumeAt == "" && point.SessionID != "" && point.SessionID == th.SessionID {
+		resumeAt = th.ResumeAt
+	}
 	rt.emit(&protocol.ItemsRemovedEvent{ItemIDs: gone})
-	rt.SetThread(func(t *protocol.Thread) { t.SessionID, t.ResumeAt = point.SessionID, point.ResumeAt })
+	rt.SetThread(func(t *protocol.Thread) { t.SessionID, t.ResumeAt = point.SessionID, resumeAt })
 	rt.AddItem(&protocol.Notice{ID: NewID("n"), Level: protocol.NoticeLevelInfo, Code: "rewind", Text: rewindText})
 	rt.session.OptionsChanged()
 	return nil

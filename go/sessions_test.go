@@ -321,6 +321,31 @@ func TestRewind(t *testing.T) {
 		}
 	})
 
+	t.Run("keeps a Codex revert not yet made when a second rewind, to before turns with no mark, needs it", func(t *testing.T) {
+		s := newSessionsScene(t, agentthreads.RevertPoint, "")
+		s.turn("one", "S", "c1")
+		s.turn("two", "", "") // failed before Codex marked it
+		s.turn("three", "", "c3")
+		ids := turnIDs(s.snap().Items)
+		if err := s.rewind(ids[2]); err != nil {
+			t.Fatal(err)
+		}
+		if th := s.snap().Thread; th.SessionID != "S" || th.ResumeAt != "c3" {
+			t.Fatalf("got %s", mustMarshal(th))
+		}
+		// Codex still has turn three: reverting to before it is what takes it back to before turn two.
+		if err := s.rewind(ids[1]); err != nil {
+			t.Fatal(err)
+		}
+		snap := s.snap()
+		if snap.Thread.SessionID != "S" || snap.Thread.ResumeAt != "c3" {
+			t.Fatalf("got %s", mustMarshal(snap.Thread))
+		}
+		if n := len(turnIDs(snap.Items)); n != 1 {
+			t.Fatalf("%d turns, not 1", n)
+		}
+	})
+
 	t.Run("is refused while a turn runs, and for a turn the thread hasn't", func(t *testing.T) {
 		s := newSessionsScene(t, agentthreads.ResumeAtPoint, "")
 		s.turn("one", "S1", "m1")
@@ -468,5 +493,82 @@ func TestRewindPoints(t *testing.T) {
 		sameAs(t, "1", point(f, []*protocol.TurnSession{s("A", "a1", true), s("A", "", false), s("A", "a3", false)}, 1), P{SessionID: "A", ResumeAt: "a3"})
 		sameAs(t, "2", point(f, []*protocol.TurnSession{s("A", "a1", true), s("A", "", false), s("B", "b1", true)}, 1), P{SessionID: "A"})
 		sameAs(t, "3", point(f, []*protocol.TurnSession{s("A", "a1", true)}, 0), P{})
+	})
+}
+
+// lostTurn is a thread whose turn was running when its backend went (without closing), loaded by
+// another backend: created with sessionID, with before done to it first. It returns the second
+// backend, the thread, and its snapshot.
+func lostTurn(t *testing.T, sessionID string, before func(s *sessionsScene)) (*agentthreads.AgentThreads, string, protocol.Snapshot) {
+	t.Helper()
+	ctx := context.Background()
+	store := agentthreads.NewMemoryStore()
+	h := &sessionHarness{point: agentthreads.ResumeAtPoint}
+	// Never closed: it goes as a backend that stopped would.
+	first := agentthreads.New(agentthreads.Options{
+		Store:        store,
+		Harnesses:    map[string]agentthreads.Harness{"fake": h},
+		Capabilities: agentthreads.Capabilities{Permissions: agentthreads.Allow},
+		OnError:      func(error) {},
+	})
+	th, err := first.Create(ctx, agentthreads.CreateOptions{SessionID: sessionID})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if before != nil {
+		before(&sessionsScene{t: t, sdk: first, h: h, id: th.ID})
+	}
+	if err := first.Send(ctx, th.ID, "the lost one", agentthreads.SendOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	// The harness says which session the turn runs in (a new one, if the thread had none), then the
+	// backend goes.
+	session := sessionID
+	if session == "" {
+		session = "S-new"
+	}
+	h.on(func(c agentthreads.ThreadContext) { c.SetThread(func(t *protocol.Thread) { t.SessionID = session }) })
+	if _, err := first.EventsSince(ctx, th.ID, 0, 0); err != nil {
+		t.Fatal(err)
+	}
+	next := agentthreads.New(agentthreads.Options{
+		Store:        store,
+		Harnesses:    map[string]agentthreads.Harness{"fake": &sessionHarness{point: agentthreads.ResumeAtPoint}},
+		Capabilities: agentthreads.Capabilities{Permissions: agentthreads.Allow},
+		OnError:      func(err error) { t.Errorf("OnError: %v", err) },
+	})
+	t.Cleanup(func() { next.Stop(context.Background()) })
+	snap, err := next.Snapshot(ctx, th.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return next, th.ID, snap
+}
+
+func TestLostTurnSession(t *testing.T) {
+	ctx := context.Background()
+	t.Run("records that it started the session it got", func(t *testing.T) {
+		next, id, snap := lostTurn(t, "", nil)
+		sameAs(t, "sessions", turnSessions(snap.Items), []*protocol.TurnSession{{ID: "S-new", Started: true}})
+		if err := next.Rewind(ctx, id, turnIDs(snap.Items)[0]); err != nil {
+			t.Fatal(err)
+		}
+		if after, _ := next.Snapshot(ctx, id); after.Thread.SessionID != "" {
+			t.Fatalf("got %s", mustMarshal(after.Thread))
+		}
+	})
+	t.Run("records that it started the one it got after a new_session", func(t *testing.T) {
+		_, _, snap := lostTurn(t, "", func(s *sessionsScene) {
+			s.turn("one", "S-old", "m1")
+			if err := s.sdk.NewSession(ctx, s.id); err != nil {
+				t.Fatal(err)
+			}
+		})
+		sameAs(t, "sessions", turnSessions(snap.Items), []*protocol.TurnSession{{ID: "S-old", At: "m1", Started: true}, {ID: "S-new", Started: true}})
+	})
+	t.Run("records that it continued a session the thread adopted", func(t *testing.T) {
+		next, id, snap := lostTurn(t, "S0", nil)
+		sameAs(t, "sessions", turnSessions(snap.Items), []*protocol.TurnSession{{ID: "S0"}})
+		refused(t, next.Rewind(ctx, id, turnIDs(snap.Items)[0]), "can't be rewound to before that turn")
 	})
 }

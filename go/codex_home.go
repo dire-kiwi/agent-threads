@@ -85,10 +85,9 @@ func sameSpec(a, b toolSpec) bool {
 
 // codexSessionState is what the driver keeps about a Codex session, next to Codex's own record of
 // it: the dynamic tools the session was started with, which Codex keeps for it (resuming can't
-// change them), and Codex's token totals for it after its last turn.
+// change them).
 type codexSessionState struct {
-	DynamicTools []toolSpec   `json:"dynamicTools"`
-	Totals       *codexTotals `json:"totals"`
+	DynamicTools []toolSpec `json:"dynamicTools"`
 }
 
 func sessionStatePath(home, session string) string {
