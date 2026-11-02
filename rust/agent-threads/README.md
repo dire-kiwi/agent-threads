@@ -109,6 +109,28 @@ title, command (shell calls), MCP server and the call it's for. An answer given 
 the thread, per tool. Claude's AskUserQuestion and Codex's requestUserInput are always questions to
 the user.
 
+## What the protocol leaves out
+
+See [Pass-through](../../spec/PROTOCOL.md#pass-through) in the protocol:
+
+```rust
+let sdk = AgentThreads::new(Options {
+    raw: true, // events, items and requests carry the harness message they came from
+    on_harness_message: Some(Arc::new(|m: &HarnessMessage| {
+        // every line a harness writes (m.line, and m.message parsed), e.g. Claude's system
+        // messages or Codex's token usage
+    })),
+    ..Default::default()
+});
+let usage = sdk.control(&id, json!({"subtype": "get_context_usage"})).await?; // Claude Code
+let limits = sdk.control(&id, json!({"method": "account/rateLimits/read"})).await?; // Codex
+```
+
+`control` needs the thread's process to be running (it is from the first `send` until the SDK
+closes): it's an `Error::Command` when it isn't, and an `Error::Control` when the harness refuses the
+request or exits first. Usage limits are in each thread's `rate_limits`, and Claude's API retries
+and hooks are `notice` items (codes `retry` and `hook`).
+
 ## Stores
 
 `MemoryStore` (`MemoryStore::with_state` shares one between instances), `FileStore` (a directory of

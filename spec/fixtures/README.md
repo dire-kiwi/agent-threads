@@ -13,6 +13,11 @@ The Codex sessions' `skills/list` exchange was added afterwards (on 2026-11-01),
 codex-cli 0.165.0 gives in a fresh CODEX_HOME and a working directory and home with no skills;
 `spec/tools/scenarios/codex.mjs` records it from now on.
 
+The `pass-through` sessions (2026-11-02) are made by hand from the `plain-reply` recordings, since
+what they add (an API retry, hooks, a usage limit that's been reached, rate limit windows, the
+answers to control requests) can't be recorded on demand: their messages are shaped as Claude Code
+2.1.312 and codex-cli 0.165.0 send them, with made-up values. They aren't re-recorded.
+
 ## Layout
 
 Each fixture is a directory `spec/fixtures/<harness>/<scenario>/`:
@@ -40,6 +45,7 @@ Each fixture is a directory `spec/fixtures/<harness>/<scenario>/`:
 | `resume` | A turn, a backend restart, then a turn in a new process | `--resume <session_id>` | `thread/resume` |
 | `compaction` | A turn, then `/compact` | sent as a message | sent as `thread/compact/start` |
 | `error` | A turn that fails (the model doesn't exist) | an error result | a failed turn, after a warning |
+| `pass-through` | What the protocol leaves out ([PROTOCOL.md](../PROTOCOL.md#pass-through)): `raw`, the harness message handler and control requests, plus rate limits and notices | `api_retry` and `hook_response` notices, a rejected `rate_limit_event`, a line the driver doesn't know, and `get_context_usage` (and one Claude refuses) | `account/rateLimits/updated` windows, `account/rateLimits/read`, a method answered with a `null` result, and one Codex refuses |
 
 Some things the recordings show that a backend has to deal with: Claude Code echoes the backend's
 own `control_response`s back on stdout; it loads app and MCP tools lazily, so the agent calls
@@ -59,6 +65,8 @@ What a backend's conformance test does with each fixture:
    environment. Give it the fixture's `tools` (each tool returns its `result` text), its
    `mcp_servers` (the fake CLI never starts them), and a permission policy from `permissions`:
    `allow` allows every tool without asking, `ask` asks the user (opens a request) for every one.
+   If the fixture has `"raw": true`, turn the SDK's `raw` option on, and give it a harness message
+   handler that keeps what it's called with.
 2. **Create the thread** with `thread`'s options (`harness`, `model`, `effort`...) and the working
    directory, and collect every event the SDK sends for it, deltas included.
 3. **Run the steps** in order:
@@ -73,12 +81,21 @@ What a backend's conformance test does with each fixture:
    - `{"restart": true}`: close the SDK as an app shutting down would (closing its harness
      processes) and make a new one on the same store. Don't create the thread again; the next
      `send` resumes it.
+   - `{"control": {...}, "result": ...}`: call `control` with the thread's id and the request, and
+     check that it returns `result` (equal as JSON). With `"error": "<text>"` instead of `result`,
+     check that it fails, with an error whose message contains the text.
 4. **Finish.** After the last step, close the SDK and wait for the fake CLI processes to exit.
 5. **Check.** The state directory has a report `run-<n>.json` for each of the session's runs, and
    each says `"ok": true` (see [../tools/README.md](../tools/README.md#reports)); and the events
    match `expected.jsonl` by the rules below (`node spec/tools/check-events.mjs <fixture dir>
    <events.jsonl>` does it, or a backend implements them natively). It's also worth checking that
    `snapshot(thread_id)` equals folding the events with `applyEvent`.
+6. **Pass-through.** If the fixture has `harness_messages`, each of them (a pattern, matched as a
+   wait's is) matches the `message` of at least one call of the harness message handler for the
+   thread. If it has `raw_checks`, each `{"event": <pattern>, "raw": <pattern or null>}` has at
+   least one event that matches `event`, and every event that does has a `raw` that matches `raw`
+   (or none, when it's `null`). An `item.added`'s or `request.opened`'s `raw` is its item's or
+   request's.
 
 A wait is always on the last event the backend makes before the command, so once it's seen the
 fake CLI is waiting for that command and nothing else can happen in between: the event order is the
@@ -96,7 +113,9 @@ backend drives each CLI:
   resumes the session.
 - **Claude Code.** Arguments `-p --output-format stream-json --verbose --include-partial-messages
   --input-format stream-json --replay-user-messages --permission-prompt-tool stdio
-  --strict-mcp-config --forward-subagent-text --model <model>`, plus `--resume <session_id>`, and
+  --strict-mcp-config --forward-subagent-text --include-hook-events --model <model>` (the fake CLI
+  doesn't check `--include-hook-events`, which the recordings don't have; it makes Claude Code
+  report hooks, for their notices), plus `--resume <session_id>`, and
   `--mcp-config` with the thread's MCP servers (stdio ones as `type: stdio`) and, when it has app
   tools, an in-process server named `app` (`{"type": "sdk", "name": "app"}`). It sends a
   `control_request` `initialize` first (with `sdkMcpServers: ["app"]` when there are app tools),
@@ -178,10 +197,32 @@ backend drives each CLI:
   The subagent's own prompt (its first user message) isn't an item.
 - **Questions**: AskUserQuestion's `can_use_tool` is always a question (whatever the policy). Each
   question's `id` is its text, and `allow_other` is set (Claude Code always offers "Other").
+- **Notices**: a `system` message `api_retry` is a `notice` with `level: warning` and `code:
+  retry`, whose `text` is `API request failed (<error>, status <error_status>); retrying in <n>s
+  (attempt <attempt> of <max_retries>).`, where `n` is `retry_delay_ms` divided by 1000 and rounded
+  up to a whole number; the parenthesis has whichever of the error and the status it has (with `error_status: null`,
+  just the error), and is left out (with the space before it) if it has neither. A `hook_response`
+  whose `outcome` is `error` is a `notice` with `level: warning` and `code: hook`, whose `text` is
+  `Hook <hook_name> failed` (with ` (exit code <exit_code>)` when it has one) and whose `detail` is
+  its `stderr`, trimmed, or if that's empty its `output`, trimmed (left out if that's empty too). Any other
+  `hook_response` whose `output`, trimmed, isn't empty is a `notice` with `level: info`, `code:
+  hook`, `text` `Hook <hook_name> ran` and that output as its `detail`; the rest aren't notices.
+  Either has the message's `parent_tool_use_id` as its `parent_id`.
+- **Rate limits**: a `rate_limit_event`'s `rate_limit_info` reports one limit, and so does the
+  `api_error_params.rate_limit_info` of a message (an `assistant`, `user` or `result`) whose
+  `api_error` is `usage_limit_reached`, before anything else that message leads to. Its `id` is the
+  `rateLimitType` (`unknown` when there's none). Its `status`: `allowed` is `allowed`;
+  `allowed_warning` is `warning`; `rejected` is `rejected`, unless extra usage carries on
+  (`isUsingOverage` is true, or `overageStatus` is `allowed` or `allowed_warning`), which makes it
+  `warning`; any other (or none) reports nothing. `utilization` times 100 is `used_percent`, and
+  `resetsAt` (Unix seconds) is `resets_at`, as `YYYY-MM-DDTHH:MM:SSZ`. The thread's `rate_limits`
+  take it in as [PROTOCOL.md](../PROTOCOL.md#threads) says, with a `thread.updated` if that changes
+  them.
 - **Left out**: `assistant` messages from the `<synthetic>` model (the error is in the turn's
-  result), user messages that aren't a replay or a tool result, system messages other than `init`
-  and `compact_boundary`, `rate_limit_event`, stream events other than text and thinking deltas,
-  and the echoes of the backend's own control responses. A replayed (`isReplay`) user message
+  result), user messages that aren't a replay or a tool result, system messages other than `init`,
+  `compact_boundary`, `api_retry` and `hook_response`, stream events other than text and thinking
+  deltas, the echoes of the backend's own control responses, and messages of types the driver
+  doesn't know. A replayed (`isReplay`) user message
   takes in the queued message with the same text, if there is one.
 - **The result**: `ok` is `!is_error`; `error` is the result's text; `duration_ms` is the
   result's. `usage` is the result's `model_usage_since_last_result`, summed over its models:
@@ -211,6 +252,14 @@ backend drives each CLI:
   with one `<id>: <labels>` line per question.
 - **Notices**: a `warning` notification is a `notice` with `level: warning`; an `error` that will
   be retried is a `notice` with `code: retry`. One that won't is the turn's `error`.
+- **Rate limits**: an `account/rateLimits/updated` notification's `rateLimits` reports a limit for
+  each of its `primary` and `secondary` windows that isn't null or missing, named `primary` and
+  `secondary` (with its `limitId` and `:` in front, when it has a `limitId` other than `codex`):
+  `usedPercent` is `used_percent`, and makes the `status` `rejected` when it's 100 or more (but
+  `warning` if the notification's `credits` has `hasCredits` or `unlimited` true, since credits carry
+  on past it) and `allowed` otherwise; `resetsAt` (Unix seconds) is `resets_at`, as `YYYY-MM-DDTHH:MM:SSZ`;
+  `windowDurationMins` is `window_minutes`. The thread's `rate_limits` take them in as
+  [PROTOCOL.md](../PROTOCOL.md#threads) says, with a `thread.updated` if that changes them.
 - **Usage**: Codex reports the thread's running totals, so a turn's usage is how far the last
   totals in the turn are past the thread's usage before it. `input_tokens` leaves out the cached
   ones (`cache_read_tokens`), as Claude's do. `duration_ms` is the turn's `durationMs`.
