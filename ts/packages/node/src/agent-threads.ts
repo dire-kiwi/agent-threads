@@ -144,7 +144,7 @@ export class AgentThreads {
     if (rt) {
       rt.config = this.#config(threadId);
       rt.policy = this.#policy(threadId);
-      rt.session?.optionsChanged();
+      rt.session?.configChanged();
       // A run that outlives the backend is saved knowing it, without an event to save it with.
       rt.persist().catch(() => {}); // A store that fails has said so.
     }
@@ -283,7 +283,10 @@ export class AgentThreads {
     (await this.#ready({ type: "respond", thread_id: threadId, request_id: requestId, resolution })).respond(requestId, resolution);
   }
 
-  /** Changes the thread's model, effort or permission mode, from its next turn. */
+  /**
+   * Changes the thread's model, effort or permission mode: straight away where the harness takes
+   * them in its running process, and otherwise from the next turn.
+   */
   async setOptions(threadId: string, options: { model?: string; effort?: string; permission_mode?: PermissionMode }): Promise<void> {
     const rt = await this.#ready({ type: "set_options", thread_id: threadId, ...options });
     const patch: Partial<Thread> = {};

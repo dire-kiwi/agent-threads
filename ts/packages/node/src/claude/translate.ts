@@ -153,6 +153,11 @@ export function questions(input: unknown): Question[] {
   }));
 }
 
+/** A permission mode as Claude Code names it, for set_permission_mode and setMode. */
+export function claudeMode(mode: string | undefined): string {
+  return claudePermissionMode(mode) ?? "default";
+}
+
 /** The permission mode as Claude Code names it, or nothing for the default. */
 export function claudePermissionMode(mode: string | undefined): string | undefined {
   switch (mode) {

@@ -20,6 +20,7 @@
 //   concurrent <server> <json>  starts MCP calls ({"calls": [[tool, args]...]}) on one server, then
 //                       elicits approval for the one at "ask"
 //   plan                two turn/plan/updated notifications
+//   propose <text>      a proposed plan (a plan item), as in plan mode
 //   search <query>      a web search
 //   sub <prompt>        spawns a subagent (a child thread), which replies, and waits for it
 //   sleep <ms>          waits (or until it's interrupted)
@@ -279,6 +280,12 @@ async function step(line) {
       notify("turn/plan/updated", { ...ids, explanation: "The steps", plan: [{ step: "one", status: "inProgress" }, { step: "two", status: "pending" }] });
       notify("turn/plan/updated", { ...ids, explanation: "The steps", plan: [{ step: "one", status: "completed" }, { step: "two", status: "inProgress" }] });
       return;
+    case "propose": {
+      const id = `${turn.id}-plan`;
+      item("item/started", { type: "plan", id, text: "" });
+      notify("item/plan/delta", { ...ids, itemId: id, delta: arg });
+      return item("item/completed", { type: "plan", id, text: arg });
+    }
     case "search": {
       const id = uid("ws");
       item("item/started", { type: "webSearch", id, query: "", action: null });

@@ -13,6 +13,7 @@ import type {
   ImageViewThreadItem,
   McpToolCallThreadItem,
   SandboxMode,
+  SandboxPolicy,
   ThreadItem,
   TokenUsageBreakdown,
   ToolRequestUserInputQuestion,
@@ -149,6 +150,18 @@ export function codexPolicy(mode: PermissionMode | undefined): { approvalPolicy:
       return { approvalPolicy: "never", sandbox: "danger-full-access" };
     default:
       return { approvalPolicy: "untrusted", sandbox: "workspace-write" };
+  }
+}
+
+/** A sandbox mode as turn/start's sandboxPolicy has it. */
+export function sandboxPolicy(mode: SandboxMode): SandboxPolicy {
+  switch (mode) {
+    case "read-only":
+      return { type: "readOnly" };
+    case "danger-full-access":
+      return { type: "dangerFullAccess" };
+    default:
+      return { type: "workspaceWrite" };
   }
 }
 

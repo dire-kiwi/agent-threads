@@ -528,7 +528,7 @@ export class ThreadRuntime implements ThreadContext {
   }
 
   ask(request: NewRequest, toolCallId: string | undefined, answered: (resolution: Resolution) => void, standing?: string): string {
-    const r = { ...request, id: newId(request.type === "question" ? "q" : "perm") } as ThreadRequest;
+    const r = { ...request, id: newId(request.type === "question" ? "q" : request.type === "plan" ? "plan" : "perm") } as ThreadRequest;
     if (this.turn) r.turn_id = this.turn.id;
     const call = toolCallId ? this.item(toolCallId) : undefined;
     if (call) {

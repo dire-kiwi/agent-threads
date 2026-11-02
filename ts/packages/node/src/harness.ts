@@ -6,6 +6,7 @@ import type {
   Attachment,
   Item,
   PermissionRequest,
+  PlanRequest,
   QuestionRequest,
   Resolution,
   Thread,
@@ -49,7 +50,10 @@ export interface TurnEnd {
 }
 
 /** A request to open, without the fields the core fills in. */
-export type NewRequest = Omit<PermissionRequest, "id" | "turn_id" | "tool_call_id" | "parent_id"> | Omit<QuestionRequest, "id" | "turn_id" | "tool_call_id" | "parent_id">;
+export type NewRequest =
+  | Omit<PermissionRequest, "id" | "turn_id" | "tool_call_id" | "parent_id">
+  | Omit<QuestionRequest, "id" | "turn_id" | "tool_call_id" | "parent_id">
+  | Omit<PlanRequest, "id" | "turn_id" | "tool_call_id" | "parent_id">;
 
 /** An item to add, without its turn (the core sets the running turn's). */
 export type NewItem = Item extends infer I ? (I extends Item ? Omit<I, "turn_id"> : never) : never;
@@ -147,8 +151,13 @@ export interface HarnessSession {
    * process that has them). They're sent again with the next turn's start().
    */
   release(): void;
-  /** The thread's options (model, effort, permission mode) or config changed. */
+  /**
+   * The thread's options (model, effort, permission mode) changed: they go to the running process
+   * where the harness takes them, and otherwise apply from the next turn.
+   */
   optionsChanged(): void;
+  /** The thread's config (tools, MCP servers, skills, system prompt) changed: the next turn needs a new process. */
+  configChanged(): void;
   /** Stop the harness process, if it's running. */
   close(): Promise<void>;
 

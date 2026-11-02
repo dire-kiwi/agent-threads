@@ -501,16 +501,140 @@ describe("the Codex driver", () => {
     expect(results(s.items).map((r) => r.ok)).toEqual([true, true]);
   });
 
-  it("starts a new process, resuming the session, when the options change", async () => {
+  it("gives the process new options with its next turn", async () => {
+    const { sdk, sent, runs } = setup();
+    const t = await sdk.create({ harness: "codex", model: "a", effort: "low", cwd: tempDir() });
+    await sdk.send(t.id, "reply one");
+    await settle(sdk, t.id);
+    await sdk.setOptions(t.id, { model: "b", effort: "high", permission_mode: "bypass" });
+    await sdk.send(t.id, "reply two");
+    await settle(sdk, t.id);
+    await sdk.send(t.id, "reply three");
+    await settle(sdk, t.id);
+    expect(runs()).toHaveLength(1);
+    const turns = sent("turn/start").map((m) => m.params);
+    expect(turns[0]).not.toHaveProperty("model");
+    expect(turns[0]).not.toHaveProperty("approvalPolicy");
+    expect(turns[1]).toMatchObject({ model: "b", effort: "high", approvalPolicy: "never", sandboxPolicy: { type: "dangerFullAccess" } });
+    // Codex keeps them.
+    expect(turns[2]).not.toHaveProperty("model");
+    expect(turns[2]).not.toHaveProperty("approvalPolicy");
+    expect(turns.map((p) => p.collaborationMode)).toEqual([undefined, undefined, undefined]);
+  });
+
+  it("starts a new process, resuming the session, when the config changes", async () => {
     const { sdk, sent, runs } = setup();
     const t = await sdk.create({ harness: "codex", model: "a", cwd: tempDir() });
     await sdk.send(t.id, "reply one");
     await settle(sdk, t.id);
     await sdk.setOptions(t.id, { model: "b", permission_mode: "bypass" });
+    await sdk.configure(t.id, { systemPrompt: "Be brief." });
     await sdk.send(t.id, "reply two");
     await settle(sdk, t.id);
     expect(runs()).toHaveLength(2);
     expect(sent("thread/resume")[0]!.params).toMatchObject({ model: "b", approvalPolicy: "never", sandbox: "danger-full-access" });
+    // The new process has them: its turn doesn't override them.
+    expect(sent("turn/start")[0]!.params).not.toHaveProperty("model");
+    expect(sent("turn/start")[0]!.params).not.toHaveProperty("approvalPolicy");
+  });
+
+  describe("in plan mode", () => {
+    const planTurns = (sent: (m: string) => { [k: string]: any }[]) => sent("turn/start").map((m) => m.params);
+
+    it("asks the user about a proposed plan, and implements it in the same turn once it's approved", async () => {
+      const { sdk, sent, runs } = setup({ permissions: "ask" });
+      const t = await sdk.create({ harness: "codex", model: "m", permission_mode: "plan", cwd: tempDir() });
+      await sdk.send(t.id, "propose Change apple to apricot.");
+      const r = await request(sdk, t.id);
+      expect(r).toMatchObject({ type: "plan", plan: "Change apple to apricot." });
+      let s = await sdk.snapshot(t.id);
+      expect(s.thread.status).toBe("waiting");
+      expect(results(s.items)).toEqual([]);
+      await sdk.respond(t.id, r.id, { outcome: "allow" });
+      s = await settle(sdk, t.id);
+      expect(s.thread.permission_mode).toBe("default");
+      expect(runs()).toHaveLength(1);
+      const turns = planTurns(sent);
+      expect(turns[0]).toMatchObject({ collaborationMode: { mode: "plan", settings: { model: "m" } } });
+      expect(turns[1]).toMatchObject({
+        input: [{ type: "text", text: "Implement the plan." }],
+        collaborationMode: { mode: "default" },
+        approvalPolicy: "untrusted",
+        sandboxPolicy: { type: "workspaceWrite" },
+      });
+      // One turn, of both Codex turns.
+      expect(results(s.items)).toHaveLength(1);
+      expect(results(s.items)[0]).toMatchObject({ ok: true, duration_ms: 14, usage: { input_tokens: 120, cache_read_tokens: 80, output_tokens: 20 } });
+      expect(texts(s.items)).toEqual(["Change apple to apricot."]);
+
+      // Codex stays in its default mode, which isn't sent again.
+      await sdk.send(t.id, "reply done");
+      await settle(sdk, t.id);
+      expect(planTurns(sent)[2]).not.toHaveProperty("collaborationMode");
+    });
+
+    it("sends the user's feedback, and plans again; denied without any, the turn ends", async () => {
+      const { sdk, sent } = setup();
+      const t = await sdk.create({ harness: "codex", permission_mode: "plan", cwd: tempDir() });
+      await sdk.send(t.id, "propose One.");
+      let r = await request(sdk, t.id);
+      await sdk.respond(t.id, r.id, { outcome: "deny", message: "propose Two." });
+      r = await until(async () => (await sdk.snapshot(t.id)).requests.find((x) => x.id !== r.id));
+      expect(r).toMatchObject({ type: "plan", plan: "Two." });
+      await sdk.respond(t.id, r.id, { outcome: "deny" });
+      const s = await settle(sdk, t.id);
+      expect(s.thread.permission_mode).toBe("plan");
+      expect(results(s.items)).toMatchObject([{ ok: true }]);
+      const turns = planTurns(sent);
+      expect(turns).toHaveLength(2);
+      expect(turns[1]).toMatchObject({ input: [{ type: "text", text: "propose Two." }], collaborationMode: { mode: "plan" } });
+      expect(turns[1]).not.toHaveProperty("approvalPolicy");
+    });
+
+    it("carries on in the mode the user approves the plan in", async () => {
+      const { sdk, sent } = setup();
+      const t = await sdk.create({ harness: "codex", permission_mode: "plan", cwd: tempDir() });
+      await sdk.send(t.id, "propose One.");
+      const r = await request(sdk, t.id);
+      await sdk.respond(t.id, r.id, { outcome: "allow", permission_mode: "accept_edits" });
+      const s = await settle(sdk, t.id);
+      expect(s.thread.permission_mode).toBe("accept_edits");
+      expect(planTurns(sent)[1]).toMatchObject({ approvalPolicy: "on-request", sandboxPolicy: { type: "workspaceWrite" }, collaborationMode: { mode: "default" } });
+    });
+
+    it("takes a message sent while a plan waits as more to plan with", async () => {
+      const { sdk, sent, events } = setup();
+      const t = await sdk.create({ harness: "codex", permission_mode: "plan", cwd: tempDir() });
+      await sdk.send(t.id, "propose One.");
+      const r = await request(sdk, t.id);
+      await sdk.send(t.id, "reply And two.", { client_id: "more" });
+      const s = await settle(sdk, t.id);
+      expect(events).toContainEqual(expect.objectContaining({ type: "request.resolved", request_id: r.id, resolution: { outcome: "cancel" } }));
+      expect(s.items.find((i) => i.type === "user_message" && i.client_id === "more")).toMatchObject({ steered: true });
+      expect(texts(s.items)).toEqual(["One.", "And two."]);
+      expect(results(s.items)).toHaveLength(1);
+      expect(planTurns(sent)[1]).toMatchObject({ input: [{ type: "text", text: "reply And two." }], collaborationMode: { mode: "plan" } });
+    });
+
+    it("ends the turn when it's interrupted while a plan waits", async () => {
+      const { sdk, events } = setup();
+      const t = await sdk.create({ harness: "codex", permission_mode: "plan", cwd: tempDir() });
+      await sdk.send(t.id, "propose One.");
+      const r = await request(sdk, t.id);
+      await sdk.interrupt(t.id);
+      const s = await settle(sdk, t.id);
+      expect(results(s.items)).toMatchObject([{ ok: false, interrupted: true }]);
+      expect(events).toContainEqual(expect.objectContaining({ type: "request.resolved", request_id: r.id, resolution: { outcome: "cancel" } }));
+      expect(s.requests).toEqual([]);
+    });
+
+    it("doesn't ask about a plan outside plan mode", async () => {
+      const { sdk } = setup();
+      const t = await sdk.create({ harness: "codex", cwd: tempDir() });
+      await sdk.send(t.id, "propose One.");
+      const s = await settle(sdk, t.id);
+      expect(results(s.items)).toMatchObject([{ ok: true }]);
+    });
   });
 
   it("turns off the user's and the project's skills, keeping the app's and Codex's own", async () => {

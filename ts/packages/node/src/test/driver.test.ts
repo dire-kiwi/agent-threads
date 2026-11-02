@@ -157,13 +157,78 @@ describe("the Claude driver", () => {
     expect(events.filter((e) => e.type === "turn.started")).toHaveLength(2);
   });
 
+  it("gives a running process a new model and permission mode", async () => {
+    const { sdk, runs } = setup();
+    const t = await sdk.create({ model: "a" });
+    await sdk.send(t.id, "reply one");
+    await settle(sdk, t.id);
+    await sdk.setOptions(t.id, { model: "b", permission_mode: "accept_edits" });
+    await sdk.send(t.id, "reply two");
+    const s = await settle(sdk, t.id);
+    expect(texts(s.items)).toEqual(["one", "two"]);
+    expect(runs()).toHaveLength(1);
+    const controls = runs()[0]!.sent.filter((m) => m.type === "control_request").map((m) => m.request);
+    expect(controls).toContainEqual({ subtype: "set_model", model: "b" });
+    expect(controls).toContainEqual({ subtype: "set_permission_mode", mode: "acceptEdits" });
+  });
+
+  it("asks the user about a plan, and approving it leaves plan mode for the mode they pick", async () => {
+    const { sdk, runs } = setup({ permissions: "ask" });
+    const t = await sdk.create({ permission_mode: "plan" });
+    await sdk.send(t.id, 'tool ExitPlanMode {"plan":"#Plan\\n-one"}');
+    const r = await until(async () => (await sdk.snapshot(t.id)).requests[0]);
+    expect(r).toMatchObject({ type: "plan", plan: "#Plan\n-one" });
+    await sdk.respond(t.id, r.id, { outcome: "allow", permission_mode: "accept_edits" });
+    let s = await settle(sdk, t.id);
+    expect(s.thread.permission_mode).toBe("accept_edits");
+    const answer = runs()[0]!.sent.find((m) => m.type === "control_response") as unknown as { response: { response: unknown } };
+    expect(answer.response.response).toMatchObject({ behavior: "allow", updatedPermissions: [{ type: "setMode", mode: "acceptEdits", destination: "session" }] });
+    // The process has the mode: the next turn runs in it, and isn't told it again.
+    await sdk.send(t.id, "reply next");
+    s = await settle(sdk, t.id);
+    expect(runs()).toHaveLength(1);
+    expect(runs()[0]!.sent.filter((m) => m.type === "control_request" && (m.request as { subtype: string }).subtype === "set_permission_mode")).toEqual([]);
+  });
+
+  it("sends a plan back with the user's feedback", async () => {
+    const { sdk, runs } = setup();
+    const t = await sdk.create({ permission_mode: "plan" });
+    await sdk.send(t.id, 'tool ExitPlanMode {"plan":"p"}');
+    const r = await until(async () => (await sdk.snapshot(t.id)).requests[0]);
+    await sdk.respond(t.id, r.id, { outcome: "deny", message: "Not yet." });
+    const s = await settle(sdk, t.id);
+    expect(s.thread.permission_mode).toBe("plan");
+    expect(s.items.find((i) => i.type === "tool_call")).toMatchObject({ name: "ExitPlanMode", status: "denied", result: { content: "Not yet." } });
+    const answer = runs()[0]!.sent.find((m) => m.type === "control_response") as unknown as { response: { response: unknown } };
+    expect(answer.response.response).toEqual({ behavior: "deny", message: "Not yet." });
+  });
+
+  it("allows what a process that can't be switched to bypass mode asks, until a new one starts in it", async () => {
+    const { sdk, runs, events } = setup({ permissions: "ask", env: { MINI_CLAUDE_ASK_DELAY: "300" } });
+    const t = await sdk.create({});
+    await sdk.send(t.id, 'tool Bash {"command":"ls"}');
+    await sdk.setOptions(t.id, { permission_mode: "bypass" });
+    let s = await settle(sdk, t.id);
+    expect(events.filter((e) => e.type === "request.opened")).toEqual([]);
+    expect(s.items.filter((i) => i.type === "tool_call").map((i) => [i.name, i.status])).toEqual([["Bash", "completed"]]);
+    // It was put in acceptEdits mode, the nearest it could be.
+    const controls = runs()[0]!.sent.filter((m) => m.type === "control_request").map((m) => m.request);
+    expect(controls).toContainEqual({ subtype: "set_permission_mode", mode: "acceptEdits" });
+    // The next turn has a process started in bypass mode.
+    await sdk.send(t.id, "reply next");
+    s = await settle(sdk, t.id);
+    expect(runs()).toHaveLength(2);
+    expect(runs()[1]!.argv).toEqual(expect.arrayContaining(["--permission-mode", "bypassPermissions"]));
+  });
+
   it("runs a carried-over turn with options changed during the turn before", async () => {
     const { sdk, runs } = setup({ steer: "late" });
-    const t = await sdk.create({ model: "old-model" });
+    // A new effort needs a new process (a model or permission mode doesn't).
+    const t = await sdk.create({ effort: "low" });
     await sdk.send(t.id, "slow");
     await until(async () => (await sdk.snapshot(t.id)).thread.session_id);
     await sdk.send(t.id, "reply steered");
-    await sdk.setOptions(t.id, { model: "new-model" });
+    await sdk.setOptions(t.id, { effort: "high" });
     await sdk.interrupt(t.id);
     const s = await until(async () => {
       const s = await sdk.snapshot(t.id);
@@ -172,8 +237,8 @@ describe("the Claude driver", () => {
     expect(texts(s.items)).toEqual(["steered"]);
     expect(s.items.filter((i) => i.type === "user_message" && i.queued)).toEqual([]);
     const [first, second] = runs();
-    expect(first!.argv).toEqual(expect.arrayContaining(["--model", "old-model"]));
-    expect(second!.argv).toEqual(expect.arrayContaining(["--model", "new-model", "--resume", s.thread.session_id!]));
+    expect(first!.argv).toEqual(expect.arrayContaining(["--effort", "low"]));
+    expect(second!.argv).toEqual(expect.arrayContaining(["--effort", "high", "--resume", s.thread.session_id!]));
   });
 
   it("stops carrying a steered message over to a harness that keeps failing, and keeps it for a retry that works", async () => {

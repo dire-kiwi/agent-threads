@@ -44,6 +44,7 @@ describe("a run's checkpoint", () => {
       live: () => true,
       release: () => {},
       optionsChanged: () => {},
+      configChanged: () => {},
       close: async () => {},
       checkpoint: () => (started ? { id: "run_1", offset: 42, state } : undefined),
     };
