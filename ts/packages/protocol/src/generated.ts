@@ -38,7 +38,7 @@ export type ToolKind = "shell" | "read" | "edit" | "search" | "web" | "mcp" | "a
  */
 export type ToolStatus = "pending" | "running" | "completed" | "failed" | "denied" | "cancelled";
 /**
- * An open request, told apart by type.
+ * A request, told apart by type: open, or resolved (with its resolution).
  */
 export type ThreadRequest = PermissionRequest | QuestionRequest;
 
@@ -591,6 +591,7 @@ export interface PermissionRequest {
    * The subagent tool_call that's asking, if one is.
    */
   parent_id?: string;
+  resolution?: Resolution;
   turn_id?: string;
   created_at?: string;
   /**
@@ -616,6 +617,7 @@ export interface QuestionRequest {
    * The subagent tool_call that's asking, if one is.
    */
   parent_id?: string;
+  resolution?: Resolution;
   turn_id?: string;
   created_at?: string;
   /**
@@ -672,17 +674,51 @@ export interface RequestResolvedEvent {
   raw?: unknown;
 }
 /**
- * A thread's whole state as of seq: what applying its events, in order, from the start gives.
+ * A thread's state as of seq: what applying its events, in order, from the start gives. A window (a snapshot taken with a limit) has only its last items, and what they need from before them (start, context).
  */
 export interface Snapshot {
   thread: Thread;
   items: Item[];
   /**
-   * The open requests, oldest first.
+   * The thread's requests, oldest first: the open ones, and the resolved ones with their resolution. A window has the open ones, and the resolved ones its items have (see PROTOCOL.md, Windows).
    */
   requests: ThreadRequest[];
   /**
    * The seq of the last saved event it includes; 0 for none.
+   */
+  seq: number;
+  /**
+   * A window: the index, in the thread's whole list of items, of the first item of the window. The items before it are left out, but for those in context. Absent (or 0): items has them all.
+   */
+  start?: number;
+  /**
+   * A window: the indices, in the thread's whole list of items, of the items from before start it has anyway because the window needs them (the subagent calls its items and open requests belong to, the open requests' tool calls, and the subagents still running, with the subagents those belong to). They're the first context.length of items, in order; the rest are the thread's items from start on.
+   */
+  context?: number[];
+}
+/**
+ * The thread's items before an index (a window's start), a page at a time, for a client that has a window to load earlier items into.
+ */
+export interface ItemPage {
+  thread_id: string;
+  /**
+   * The items of context, then the thread's items from start up to the index asked for.
+   */
+  items: Item[];
+  /**
+   * The requests its items (after the context ones) have, oldest first.
+   */
+  requests: ThreadRequest[];
+  /**
+   * The index, in the thread's whole list of items, of its first item after the context ones. 0: there are none before it.
+   */
+  start: number;
+  /**
+   * The indices of the items from before start it has anyway because its items need them (the subagent calls they belong to): the first context.length of items, in order.
+   */
+  context: number[];
+  /**
+   * The seq of the last saved event its items and requests include.
    */
   seq: number;
 }

@@ -4,8 +4,8 @@ The support-chat app of [chat-node](../chat-node/README.md), with its server in 
 [Go backend](../../go/README.md). It speaks the same wire protocol ([../PROTOCOL.md](../PROTOCOL.md))
 over its own WebSocket, so chat-node's React frontend talks to it unchanged. The SDK has no network
 layer, and [main.go](main.go) is the whole seam: events out (`sdk.Subscribe` to every client),
-commands in (a client's `command` to `sdk.HandleJSON`), plus `Snapshot` and `EventsSince` for
-clients that connect or reconnect.
+commands in (a client's `command` to `sdk.HandleJSON`), plus `Snapshot` (or `SnapshotWindow`),
+`ItemsBefore` and `EventsSince` for clients that connect, scroll back or reconnect.
 
 It has what chat-node's server has:
 
@@ -64,6 +64,7 @@ go test ./...
 
 They run the server and talk to it over its WebSocket as the frontend does, with Claude Code played
 by the fake CLI replaying a recorded session (no login, no cost; it needs `node`): a thread created,
-the app's tool called and its order in the call's result, a catch-up with `events_since`, and the
-checks that keep other pages and bad input out. chat-node's Playwright tests (`e2e/`) pass against
+the app's tool called and its order in the call's result, a catch-up with `events_since`, a window
+and the page before it (`snapshot` with a `limit`, `items_before`), and the checks that keep other
+pages and bad input out. chat-node's Playwright tests (`e2e/`) pass against
 this server too, with their `e2e/server.ts` starting `chat-go` instead of `server/main.ts`.

@@ -400,10 +400,10 @@ func TestRestart(t *testing.T) {
 				b := s.start()
 				expectRecovered(t, b, id)
 				snap := snapshotOf(t, b, id)
-				if snap.Thread.Status != protocol.ThreadStatusWaiting || snap.Thread.Run == nil || snap.Thread.Run.ReattachedAt == "" || len(snap.Requests) != 1 {
+				if snap.Thread.Status != protocol.ThreadStatusWaiting || snap.Thread.Run == nil || snap.Thread.Run.ReattachedAt == "" || len(protocol.OpenRequests(snap)) != 1 {
 					t.Fatalf("got %s", mustMarshal(snap))
 				}
-				b.call("handle", map[string]any{"type": "respond", "thread_id": id, "request_id": snap.Requests[0].ID(), "resolution": map[string]any{"outcome": "allow"}})
+				b.call("handle", map[string]any{"type": "respond", "thread_id": id, "request_id": protocol.OpenRequests(snap)[0].ID(), "resolution": map[string]any{"outcome": "allow"}})
 				b.waitFor(`{"type":"thread.updated","thread":{"status":"idle"}}`)
 				b.call("stop")
 				<-b.exited
@@ -491,7 +491,7 @@ func TestRestart(t *testing.T) {
 				b := s.start()
 				expectRecovered(t, b, id)
 				snap := snapshotOf(t, b, id)
-				b.call("handle", map[string]any{"type": "respond", "thread_id": id, "request_id": snap.Requests[0].ID(), "resolution": map[string]any{"outcome": "allow"}})
+				b.call("handle", map[string]any{"type": "respond", "thread_id": id, "request_id": protocol.OpenRequests(snap)[0].ID(), "resolution": map[string]any{"outcome": "allow"}})
 				b.waitFor(`{"type":"thread.updated","thread":{"status":"idle"}}`)
 				b.call("stop")
 				<-b.exited
@@ -654,7 +654,7 @@ func TestRestartDoesntAskAgainWhatWasAnswered(t *testing.T) {
 			// The tool's still running: nothing's asked of the user, and the turn runs on.
 			time.Sleep(500 * time.Millisecond)
 			snap := snapshotOf(t, b, id)
-			if len(snap.Requests) != 0 || snap.Thread.Status != protocol.ThreadStatusRunning {
+			if len(protocol.OpenRequests(snap)) != 0 || snap.Thread.Status != protocol.ThreadStatusRunning {
 				t.Fatalf("got %s", mustMarshal(snap))
 			}
 			resolved, notice := -1, -1

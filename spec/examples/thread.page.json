@@ -1,0 +1,76 @@
+{
+  "thread_id": "th_1",
+  "items": [
+    {
+      "id": "tc1",
+      "type": "tool_call",
+      "name": "Bash",
+      "kind": "shell",
+      "input": {
+        "command": "npm test"
+      },
+      "status": "completed",
+      "command": "npm test",
+      "turn_id": "t1",
+      "result": {
+        "content": "1 failing: sum adds the last number twice",
+        "exit_code": 1
+      }
+    },
+    {
+      "id": "tc2",
+      "type": "tool_call",
+      "name": "Agent",
+      "kind": "subagent",
+      "input": {
+        "description": "Find the bug",
+        "prompt": "Find why sum() is wrong.",
+        "subagent_type": "general-purpose"
+      },
+      "status": "completed",
+      "title": "Find the bug",
+      "turn_id": "t1",
+      "result": {
+        "content": "sum() starts from the last number instead of 0."
+      }
+    },
+    {
+      "id": "tc3",
+      "type": "tool_call",
+      "name": "Read",
+      "kind": "read",
+      "input": {
+        "file_path": "/work/app/src/sum.ts"
+      },
+      "status": "completed",
+      "path": "/work/app/src/sum.ts",
+      "result": {
+        "content": "export const sum = (xs) => xs.reduce((a, x) => a + x, xs.at(-1));",
+        "truncated": true
+      },
+      "parent_id": "tc2",
+      "turn_id": "t1"
+    }
+  ],
+  "requests": [
+    {
+      "id": "p1",
+      "type": "permission",
+      "tool_call_id": "tc1",
+      "name": "Bash",
+      "kind": "shell",
+      "input": {
+        "command": "npm test"
+      },
+      "title": "npm test",
+      "turn_id": "t1",
+      "resolution": {
+        "outcome": "allow",
+        "always": true
+      }
+    }
+  ],
+  "start": 2,
+  "context": [],
+  "seq": 34
+}

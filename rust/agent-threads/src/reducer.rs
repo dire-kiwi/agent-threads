@@ -4,7 +4,7 @@
 
 use serde_json::{Map, Value};
 
-use crate::protocol::{DeltaEventKind, Item, Snapshot, Thread, ThreadEvent, ThreadRequest};
+use crate::protocol::{DeltaEventKind, Item, Resolution, Snapshot, Thread, ThreadEvent, ThreadRequest};
 
 /// A thread's state before any of its events.
 pub fn initial_state(thread: Thread) -> Snapshot {
@@ -13,6 +13,8 @@ pub fn initial_state(thread: Thread) -> Snapshot {
         items: Vec::new(),
         requests: Vec::new(),
         seq: 0,
+        start: None,
+        context: Vec::new(),
     }
 }
 
@@ -66,12 +68,18 @@ pub fn apply_event(state: &mut Snapshot, event: &ThreadEvent) {
             None => state.requests.push(e.request.clone()),
         },
         ThreadEvent::RequestResolved(e) => {
-            if let Some(at) = state.requests.iter().rposition(|r| r.id() == e.request_id) {
-                state.requests.remove(at);
+            // It stays, with its resolution, so a UI can show how it was answered.
+            if let Some(r) = state.requests.iter_mut().rev().find(|r| r.id() == e.request_id) {
+                r.resolve(e.resolution.clone());
             }
         }
     }
     state.seq = seq;
+}
+
+/// The requests that are open: those not resolved yet, oldest first.
+pub fn open_requests(state: &Snapshot) -> impl Iterator<Item = &ThreadRequest> {
+    state.requests.iter().filter(|r| r.is_open())
 }
 
 /// Applies each of `events` in turn.
@@ -195,6 +203,41 @@ impl ThreadRequest {
             ThreadRequest::Permission(r) => r.turn_id.as_deref(),
             ThreadRequest::Question(r) => r.turn_id.as_deref(),
         }
+    }
+
+    pub fn parent_id(&self) -> Option<&str> {
+        match self {
+            ThreadRequest::Permission(r) => r.parent_id.as_deref(),
+            ThreadRequest::Question(r) => r.parent_id.as_deref(),
+        }
+    }
+
+    pub fn tool_call_id(&self) -> Option<&str> {
+        match self {
+            ThreadRequest::Permission(r) => r.tool_call_id.as_deref(),
+            ThreadRequest::Question(r) => r.tool_call_id.as_deref(),
+        }
+    }
+
+    /// How it was resolved; `None` while it's open.
+    pub fn resolution(&self) -> Option<&Resolution> {
+        match self {
+            ThreadRequest::Permission(r) => r.resolution.as_ref(),
+            ThreadRequest::Question(r) => r.resolution.as_ref(),
+        }
+    }
+
+    /// Whether it's open: not resolved yet.
+    pub fn is_open(&self) -> bool {
+        self.resolution().is_none()
+    }
+
+    fn resolve(&mut self, resolution: Resolution) {
+        let at = match self {
+            ThreadRequest::Permission(r) => &mut r.resolution,
+            ThreadRequest::Question(r) => &mut r.resolution,
+        };
+        *at = Some(resolution);
     }
 }
 

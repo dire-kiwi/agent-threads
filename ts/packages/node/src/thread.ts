@@ -3,8 +3,9 @@
 // subscribers, and saved to the store in order (deltas aren't saved).
 
 import { applyEvent, type Attachment, type Item, type Resolution, type Snapshot, type Thread, type ThreadEvent, type ThreadRequest, type Usage, type UserMessage } from "@dire-kiwi/agent-threads-protocol";
-import type { HarnessSession, Message, NewItem, NewRequest, ThreadConfig, ThreadContext, TurnEnd } from "./harness.js";
+import type { HarnessSession, LaunchOptions, Message, NewItem, NewRequest, ThreadConfig, ThreadContext, TurnEnd } from "./harness.js";
 import { newId } from "./ids.js";
+import { normalLaunch, sameLaunch, storedThread, type StoredThread } from "./launch.js";
 import { decide, permissionKey, type PermissionDecision, type PermissionPolicy, type PermissionQuery } from "./permissions.js";
 import type { Spawner } from "./spawner.js";
 import { StoreError, type RunRecord, type Store } from "./store.js";
@@ -70,6 +71,8 @@ export class ThreadRuntime implements ThreadContext {
   lostRun: string | undefined;
 
   #host: RuntimeHost;
+  /** How its harness process is started: stored with the thread. */
+  #launch: LaunchOptions;
   /** The live state, with the text streamed so far. */
   #state: Snapshot;
   /** The saved events' state, without deltas: what a change is a change to. */
@@ -94,8 +97,9 @@ export class ThreadRuntime implements ThreadContext {
   /** App tools' structured output, by tool call, until the harness gives the call its result. */
   #structured = new Map<string, unknown>();
 
-  constructor(host: RuntimeHost, state: Snapshot, config: ThreadConfig, policy: PermissionPolicy) {
+  constructor(host: RuntimeHost, state: Snapshot, config: ThreadConfig, launch: LaunchOptions, policy: PermissionPolicy) {
     this.#host = host;
+    this.#launch = normalLaunch(launch);
     this.#state = state;
     this.#saved = state;
     this.threadId = state.thread.id;
@@ -107,6 +111,9 @@ export class ThreadRuntime implements ThreadContext {
 
   get thread(): Thread {
     return this.#state.thread;
+  }
+  get launch(): LaunchOptions {
+    return this.#launch;
   }
   get snapshot(): Snapshot {
     return this.#state;
@@ -176,7 +183,7 @@ export class ThreadRuntime implements ThreadContext {
       if (threadChanged) {
         this.#threadChanged = false;
         try {
-          await store.updateThread(this.#state.thread);
+          await store.updateThread(this.storedThread());
         } catch (e) {
           this.#threadChanged = true;
           throw e;
@@ -334,6 +341,20 @@ export class ThreadRuntime implements ThreadContext {
   }
 
   // ---------- items and the thread ----------
+
+  /** The thread as the store keeps it: with its launch options, which clients aren't sent. */
+  storedThread(): StoredThread {
+    return storedThread(this.#state.thread, this.#launch);
+  }
+
+  /** Changes how the harness process is started, from the next one; it's saved with the thread. */
+  setLaunch(launch: LaunchOptions): void {
+    if (sameLaunch(launch, this.#launch)) return;
+    this.#launch = normalLaunch(launch);
+    this.#threadChanged = true;
+    this.#scheduleFlush();
+    this.session?.optionsChanged();
+  }
 
   item(id: string): Item | undefined {
     const items = this.#saved.items;
@@ -545,7 +566,7 @@ export class ThreadRuntime implements ThreadContext {
   reopen(requestId: string, answered: (resolution: Resolution) => void, standing?: string): boolean {
     if (this.#requests.has(requestId)) return false;
     const request = this.#state.requests.find((r) => r.id === requestId);
-    if (!request) return false;
+    if (!request || request.resolution) return false;
     this.#requests.set(requestId, { request, answered, ...(standing ? { standing } : {}) });
     return true;
   }

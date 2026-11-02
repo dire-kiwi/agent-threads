@@ -178,6 +178,9 @@ pub fn texts(s: &Value) -> Vec<String> {
 /// What each run of mini-claude or mini-codex was started with and sent, from its log.
 pub struct MiniRun {
     pub argv: Vec<String>,
+    /// Its CLAUDE_CONFIG_DIR or CODEX_HOME, and the variables MINI_LOG_ENV names (null if unset).
+    pub config_dir: Option<String>,
+    pub env: Value,
     pub sent: Vec<Value>,
     pub notes: Vec<Value>,
 }
@@ -196,8 +199,11 @@ pub fn mini_runs(log: &Path) -> Vec<MiniRun> {
                 .iter()
                 .map(|a| a.as_str().unwrap().to_string())
                 .collect();
+            let config_dir = v.get("configDir").or(v.get("codexHome")).and_then(Value::as_str);
             out.push(MiniRun {
                 argv,
+                config_dir: config_dir.map(String::from),
+                env: v.get("env").cloned().unwrap_or_default(),
                 sent: Vec::new(),
                 notes: Vec::new(),
             });
