@@ -76,6 +76,8 @@ function matches(v: unknown, p: unknown): boolean {
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
+const QUESTION = '{"questions":[{"question":"Colour?","options":[{"label":"Blue"},{"label":"Red"}]}]}';
+
 async function until(what: () => boolean, ms = 15_000): Promise<void> {
   const deadline = Date.now() + ms;
   while (!what()) {
@@ -323,13 +325,17 @@ describe.skipIf(process.platform === "win32")("a backend restart", () => {
     },
   );
 
-  it("takes up a background subagent's request after a restart with no turn running, and runs the turn Claude starts after", { timeout: 60_000 }, async () => {
-    const s = mini({ POLICY: "ask" });
+  // With a question and late answers on, it's the subagent's still, not a question kept open after
+  // its turn: the same request is taken up again, and the answer goes to the subagent.
+  it.each(["permission", "question"] as const)("takes up a background subagent's %s request after a restart with no turn running, and runs the turn Claude starts after", { timeout: 60_000 }, async (kind) => {
+    const question = kind === "question";
+    const s = mini({ POLICY: "ask", ...(question ? { MINI_CLAUDE_BACKGROUND_ASK: QUESTION, LATE_ANSWERS: "1" } : {}) });
     const a = s.start();
     const thread = await a.call<{ id: string }>("create", { harness: "claude", cwd: s.dirs.cwd });
     await a.call("handle", { type: "send", thread_id: thread.id, text: "background 200 apple" } satisfies Command);
     await a.waitFor({ type: "turn.completed" });
     await a.waitFor({ type: "thread.updated", thread: { status: "waiting" } });
+    const before = openRequests(await a.call<Snapshot>("snapshot", thread.id));
     await a.call("saved", thread.id);
     await a.call("close");
     await a.exited;
@@ -338,8 +344,14 @@ describe.skipIf(process.platform === "win32")("a backend restart", () => {
     expect(await b.call("recover")).toEqual({ reattached: [thread.id], lost: [] });
     let snap = await b.call<Snapshot>("snapshot", thread.id);
     expect(snap.thread.status).toBe("waiting");
+    const open = openRequests(snap);
+    expect(open).toHaveLength(1);
+    expect(open[0]!.id).toBe(before[0]!.id);
+    expect(open[0]!.type).toBe(kind);
+    expect(b.events.filter((e) => e.type === "request.resolved")).toEqual([]);
     const from = b.events.length;
-    await b.call("handle", { type: "respond", thread_id: thread.id, request_id: openRequests(snap)[0]!.id, resolution: { outcome: "allow" } } satisfies Command);
+    const resolution = question ? { outcome: "answer" as const, answers: { "Colour?": ["Blue"] } } : { outcome: "allow" as const };
+    await b.call("handle", { type: "respond", thread_id: thread.id, request_id: open[0]!.id, resolution } satisfies Command);
     // Answered with no turn running, the thread is idle; then Claude's report is a turn of its own.
     await until(() => b.events.slice(from).filter((e) => e.type === "turn.completed").length === 1);
     snap = await b.call<Snapshot>("snapshot", thread.id);
@@ -352,6 +364,38 @@ describe.skipIf(process.platform === "win32")("a backend restart", () => {
     expect(second!.turn_id).not.toBe(first!.turn_id);
     const saved = await savedEvents(s.dirs.store, thread.id);
     expect(saved.filter((e) => e.type === "turn.started")).toHaveLength(2);
+    // Answered to the subagent, not sent as a message.
+    expect(snap.items.filter((i) => i.type === "user_message")).toHaveLength(1);
+  });
+
+  it("keeps a question its interrupted turn gave up open across a restart", { timeout: 60_000 }, async () => {
+    const s = mini({ POLICY: "ask", LATE_ANSWERS: "1", MINI_CLAUDE_INTERRUPT_DELAY: "1500" });
+    const a = s.start();
+    const thread = await a.call<{ id: string }>("create", { harness: "claude", cwd: s.dirs.cwd });
+    await a.call("handle", { type: "send", thread_id: thread.id, text: `asking AskUserQuestion ${QUESTION}` } satisfies Command);
+    const opened = await a.waitFor({ type: "request.opened" });
+    const q = opened.type === "request.opened" ? opened.request : undefined;
+    await a.call("handle", { type: "interrupt", thread_id: thread.id } satisfies Command);
+    // The harness gave it up (the thread doesn't wait on it any more); the turn hasn't ended yet.
+    const asked = a.events.indexOf(opened);
+    await until(() => a.events.slice(asked).some((e) => e.type === "thread.updated" && e.thread.status === "running"));
+    expect(a.events.some((e) => e.type === "turn.completed")).toBe(false);
+    await a.call("saved", thread.id);
+    await a.call("close");
+    await a.exited;
+
+    const b = s.start();
+    expect(await b.call("recover")).toEqual({ reattached: [thread.id], lost: [] });
+    await b.waitFor({ type: "turn.completed" });
+    let snap = await b.call<Snapshot>("snapshot", thread.id);
+    expect(snap.thread.status).toBe("idle");
+    expect(openRequests(snap).map((r) => r.id)).toEqual([q!.id]);
+    await b.call("handle", { type: "respond", thread_id: thread.id, request_id: q!.id, resolution: { outcome: "answer", answers: { "Colour?": ["Red"] } } } satisfies Command);
+    await until(() => b.events.filter((e) => e.type === "turn.completed").length === 2);
+    snap = await b.call<Snapshot>("snapshot", thread.id);
+    await b.call("close", { stop: true });
+    await b.exited;
+    expect(snap.items.filter((i) => i.type === "user_message").at(-1)).toMatchObject({ text: "My answer to the question you asked:\n\n- Colour?\n  Red" });
   });
 
   it("keeps the text streamed before it died, also when the run ends while it's down before finishing its message", { timeout: 60_000 }, async () => {

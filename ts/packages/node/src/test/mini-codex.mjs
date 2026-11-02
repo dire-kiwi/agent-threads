@@ -23,6 +23,15 @@
 //   propose <text>      a proposed plan (a plan item), as in plan mode
 //   search <query>      a web search
 //   sub <prompt>        spawns a subagent (a child thread), which replies, and waits for it
+//   bg <command>        spawns a subagent that runs on after the turn: it runs the command (asking
+//                       first), replies, and ends (its turn fails if the command is declined)
+//   bgmcp <server> <tool> [late]  spawns a subagent that runs on after the turn: it starts two calls
+//                       of the tool alike, and elicits approval for one (which can't be told apart);
+//                       late: once the turn has ended
+//   endchild <status>   the last subagent's turn ends with that status (and no message)
+//   followup <status>   the last subagent takes up a turn again, which ends with that status (and
+//                       no message)
+//   closechild          closes the last subagent (closeAgent, whose agentsStates say it's shut down)
 //   sleep <ms>          waits (or until it's interrupted)
 //   slow                waits for an interrupt
 //   stubborn            ignores interrupts, and a closed stdin (saying "not stopping"), until it's
@@ -69,6 +78,7 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 let thread = null; // { id, totals, params, dynamicTools }
 let extraRoots = [];
 let turn = null; // { id, interrupted, wake, heard }
+let lastChild = null; // { id, turn }: the last subagent spawned, and its turn
 let stubborn = false;
 
 const sessions = home && join(home, "mini-sessions");
@@ -300,11 +310,81 @@ async function step(line) {
       item("item/started", { ...base, status: "inProgress", receiverThreadIds: [] });
       item("item/completed", { ...base, status: "completed", receiverThreadIds: [child] });
       const childTurn = uid("turn");
+      lastChild = { id: child, turn: childTurn };
       notify("turn/started", { threadId: child, turn: { id: childTurn, status: "inProgress", items: [] } });
       item("item/started", { type: "userMessage", id: uid("um"), content: [{ type: "text", text: arg }] }, child);
       message(`child says ${arg}`, child);
       notify("turn/completed", { threadId: child, turn: { id: childTurn, status: "completed", items: [] } });
+      const wait = { type: "collabAgentToolCall", id: uid("wait"), tool: "wait", senderThreadId: thread.id, receiverThreadIds: [child], prompt: null };
+      item("item/started", { ...wait, status: "inProgress", agentsStates: {} });
+      item("item/completed", { ...wait, status: "completed", agentsStates: { [child]: { status: "completed", message: `child says ${arg}` } } });
       return message("the subagent is done");
+    }
+    case "bg": {
+      const id = uid("spawn");
+      const child = uid("child");
+      const base = { type: "collabAgentToolCall", id, tool: "spawnAgent", senderThreadId: thread.id, prompt: `run ${arg}`, model: "mini-child" };
+      item("item/started", { ...base, status: "inProgress", receiverThreadIds: [], agentsStates: {} });
+      item("item/completed", { ...base, status: "completed", receiverThreadIds: [child], agentsStates: { [child]: { status: "pendingInit", message: null } } });
+      const childTurn = uid("turn");
+      lastChild = { id: child, turn: childTurn };
+      const on = (method, it) => notify(method, { item: it, threadId: child, turnId: childTurn });
+      notify("turn/started", { threadId: child, turn: { id: childTurn, status: "inProgress", items: [] } });
+      const cid = uid("exec");
+      const command = `/bin/bash -lc '${arg}'`;
+      const cbase = { type: "commandExecution", id: cid, command, cwd: process.cwd(), commandActions: [] };
+      on("item/started", { ...cbase, status: "inProgress", aggregatedOutput: null, exitCode: null });
+      // The child carries on by itself: this turn doesn't wait for it.
+      void request("item/commandExecution/requestApproval", { threadId: child, turnId: childTurn, itemId: cid, command, cwd: process.cwd() }).then((r) => {
+        const ok = r.result?.decision === "accept";
+        on("item/completed", { ...cbase, status: ok ? "completed" : "declined", aggregatedOutput: ok ? `ran ${arg}\n` : null, exitCode: ok ? 0 : null });
+        if (ok) message(`child ran ${arg}`, child);
+        const error = ok ? null : { message: "the child wasn't allowed to" };
+        notify("turn/completed", { threadId: child, turn: { id: childTurn, status: ok ? "completed" : "failed", error, items: [] } });
+      });
+      return message("started");
+    }
+    case "bgmcp": {
+      const [server, tool, late] = rest;
+      const id = uid("spawn");
+      const child = uid("child");
+      const base = { type: "collabAgentToolCall", id, tool: "spawnAgent", senderThreadId: thread.id, prompt: `call ${tool} twice`, model: "mini-child" };
+      item("item/started", { ...base, status: "inProgress", receiverThreadIds: [], agentsStates: {} });
+      item("item/completed", { ...base, status: "completed", receiverThreadIds: [child], agentsStates: { [child]: { status: "pendingInit", message: null } } });
+      const childTurn = uid("turn");
+      lastChild = { id: child, turn: childTurn };
+      notify("turn/started", { threadId: child, turn: { id: childTurn, status: "inProgress", items: [] } });
+      for (let i = 0; i < 2; i++) {
+        const it = { type: "mcpToolCall", id: uid("mcp"), server, tool, arguments: { x: 1 }, status: "inProgress" };
+        notify("item/started", { item: it, threadId: child, turnId: childTurn });
+      }
+      // The child carries on by itself: this turn doesn't wait for it.
+      const elicit = () =>
+        void request("mcpServer/elicitation/request", {
+          threadId: child,
+          turnId: childTurn,
+          serverName: server,
+          mode: "form",
+          message: `Allow the ${server} MCP server to run tool "${tool}"?`,
+          requestedSchema: { type: "object", properties: {} },
+          _meta: { codex_approval_kind: "mcp_tool_call", tool_params: { x: 1 } },
+        });
+      if (late) setTimeout(elicit, 50);
+      else elicit();
+      return message("started");
+    }
+    case "followup":
+      lastChild.turn = uid("turn");
+      notify("turn/started", { threadId: lastChild.id, turn: { id: lastChild.turn, status: "inProgress", items: [] } });
+    // falls through
+    case "endchild":
+      notify("turn/completed", { threadId: lastChild.id, turn: { id: lastChild.turn, status: arg, error: null, items: [] } });
+      return message(`the subagent's turn is ${arg}`);
+    case "closechild": {
+      const close = { type: "collabAgentToolCall", id: uid("close"), tool: "closeAgent", senderThreadId: thread.id, receiverThreadIds: [lastChild.id], prompt: null };
+      item("item/started", { ...close, status: "inProgress", agentsStates: {} });
+      item("item/completed", { ...close, status: "completed", agentsStates: { [lastChild.id]: { status: "shutdown", message: null } } });
+      return message("closed it");
     }
     case "sleep":
       return wait(Number(arg));

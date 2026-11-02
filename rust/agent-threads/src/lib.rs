@@ -44,7 +44,9 @@ pub use harness::{
     BoxFuture, ControlReply, Harness, HarnessMessage, HarnessMessageHandler, HarnessSession, LaunchOptions, McpServer,
     Message, RunCheckpoint, Skill, ThreadConfig, TurnEnd,
 };
-pub use permissions::{Decided, PermissionContext, PermissionDecision, PermissionPolicy, PermissionQuery};
+pub use permissions::{
+    DONT_ASK_DENIAL, Decided, PermissionContext, PermissionDecision, PermissionPolicy, PermissionQuery, StandingKey,
+};
 pub use protocol::{Command, Item, ItemPage, Snapshot, Thread, ThreadEvent};
 pub use sessions::{RewindError, RewindPoint, resume_at_point, revert_point};
 #[doc(hidden)]

@@ -1701,7 +1701,7 @@ func (s *claudeSession) canUseTool(run *claudeRun, requestID string, req jmap, e
 		}
 	}
 	run.setOpen(requestID, &claudeOpen{Turn: turn, Request: req})
-	ask := func(request protocol.ThreadRequestValue, toolCallID string, answered func(protocol.Resolution), standing string) string {
+	ask := func(request protocol.ThreadRequestValue, toolCallID string, answered func(protocol.Resolution), standing *StandingKey) string {
 		if existing != "" && ctx.Reopen(existing, answered, standing) {
 			return existing
 		}
@@ -1765,7 +1765,7 @@ func (s *claudeSession) canUseTool(run *claudeRun, requestID string, req jmap, e
 				deny(msg)
 				denied()
 			}
-		}, "")
+		}, nil)
 		run.asked[requestID] = id
 		return
 	}
@@ -1795,7 +1795,7 @@ func (s *claudeSession) canUseTool(run *claudeRun, requestID string, req jmap, e
 				deny(msg)
 				denied()
 			}
-		}, "")
+		}, nil)
 		run.asked[requestID] = id
 		return
 	}

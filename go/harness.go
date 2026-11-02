@@ -202,15 +202,19 @@ type ThreadContext interface {
 	// only the text).
 	ToolOutput(toolCallID string, structured any)
 
-	// Decide is the permission policy's answer (or the user's standing one).
+	// Decide is the permission policy's answer, after the thread's standing answers; what the policy
+	// would ask the user about, the thread's permission mode may decide instead (bypass allows it,
+	// dont_ask denies it).
 	Decide(query PermissionQuery) Decision
 	// Ask opens a request (for the tool call toolCallID, which is set pending) and calls answered
 	// when the user responds. It isn't called when the request is cancelled because its turn ended.
-	// standing (the tool's permission key) lets an answer given "always" stand for the thread.
-	Ask(request protocol.ThreadRequestValue, toolCallID string, answered func(protocol.Resolution), standing string) string
+	// standing (the tool's PermissionKey, or nil) lets an answer given "always" stand for the
+	// thread. A request the thread's standing answers or permission mode answer isn't opened:
+	// answered is called with their answer, as a task of its own.
+	Ask(request protocol.ThreadRequestValue, toolCallID string, answered func(protocol.Resolution), standing *StandingKey) string
 	// Reopen takes up a request opened before the backend restarted, which is still open: answered
 	// is called when the user responds, as for Ask. It says whether it's open.
-	Reopen(requestID string, answered func(protocol.Resolution), standing string) bool
+	Reopen(requestID string, answered func(protocol.Resolution), standing *StandingKey) bool
 	// Persist saves the thread's run as it is now (with a spawner whose runs outlive the backend),
 	// before the driver does something that mustn't be done twice: after a restart, it's
 	// re-attached as of this. done is called (on the thread's goroutine) once it's saved, with the
@@ -226,6 +230,9 @@ type ThreadContext interface {
 	// StopSubagents says the subagents of these calls that are still running were stopped (their
 	// harness process ended): their calls still running are cancelled, and their open requests too.
 	StopSubagents(ids []string)
+	// EndSubagent sets a subagent call's subagent. If it was running and has ended, what it left
+	// unfinished is cancelled: its calls still running, its streaming text and its open requests.
+	EndSubagent(id string, subagent protocol.SubagentState)
 	// Error reports something that went wrong that isn't the turn's, to the app's OnError.
 	Error(err error)
 	// Post runs fn on the thread's goroutine, after what's running there now.

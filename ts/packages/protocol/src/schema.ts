@@ -116,6 +116,12 @@ export const schema: { readonly $defs: { readonly [name: string]: unknown } } = 
         },
         "permission_mode": {
           "$ref": "#/$defs/PermissionMode"
+        },
+        "standing_answers": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/StandingAnswer"
+          }
         }
       }
     },
@@ -1020,6 +1026,9 @@ export const schema: { readonly $defs: { readonly [name: string]: unknown } } = 
         "kind": {
           "$ref": "#/$defs/ToolKind"
         },
+        "server": {
+          "type": "string"
+        },
         "input": {},
         "title": {
           "type": "string"
@@ -1075,6 +1084,10 @@ export const schema: { readonly $defs: { readonly [name: string]: unknown } } = 
         },
         "turn_id": {
           "type": "string"
+        },
+        "user_messages": {
+          "type": "integer",
+          "minimum": 0
         },
         "created_at": {
           "type": "string",
@@ -1340,6 +1353,12 @@ export const schema: { readonly $defs: { readonly [name: string]: unknown } } = 
         "run": {
           "$ref": "#/$defs/Run"
         },
+        "standing_answers": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/StandingAnswer"
+          }
+        },
         "rate_limits": {
           "type": "array",
           "items": {
@@ -1375,8 +1394,35 @@ export const schema: { readonly $defs: { readonly [name: string]: unknown } } = 
         "default",
         "accept_edits",
         "plan",
-        "bypass"
+        "bypass",
+        "dont_ask"
       ]
+    },
+    "StandingAnswer": {
+      "type": "object",
+      "required": [
+        "kind",
+        "name",
+        "outcome"
+      ],
+      "properties": {
+        "kind": {
+          "$ref": "#/$defs/ToolKind"
+        },
+        "server": {
+          "type": "string"
+        },
+        "name": {
+          "type": "string"
+        },
+        "outcome": {
+          "type": "string",
+          "enum": [
+            "allow",
+            "deny"
+          ]
+        }
+      }
     },
     "Run": {
       "type": "object",

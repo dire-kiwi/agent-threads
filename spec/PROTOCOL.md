@@ -56,6 +56,7 @@ of the backend and ends with it; a `shim` run is supervised by `agent-threads-sh
 backend restart, and its `reattached_at` is set when a restarted backend picks it up again
 ([RUNDIR.md](RUNDIR.md) has how backends and the shim share a run).
 `usage` sums the thread's turns. `metadata` is the app's own, given when it created the thread.
+`standing_answers` are the answers that stand for the rest of the thread (see [Requests](#requests)).
 
 `rate_limits` are the usage limits of the account the harness runs on (a subscription's session and
 weekly limits), as the harness last reported them in this thread: each has the harness's `id` for
@@ -128,8 +129,11 @@ A **background** subagent's call completes as soon as it has started the subagen
 on: its `subagent.status` stays `running`, and its items keep coming, after its turn has ended
 too. Its calls and requests aren't cancelled when its turn ends, so the thread can be `waiting`
 (on one of its requests) with no turn running; answering it leaves the thread `idle`. When it ends,
-its `subagent.summary` is its report (its call's `result` only says it started). A subagent still
-running when its harness process ends is `stopped`, and its calls still running are `cancelled`.
+its `subagent.summary` is its report (its call's `result`, if it has one, only says it started).
+A subagent still running when its harness process ends is `stopped`, and its calls still running
+are `cancelled`. Whenever a subagent ends, what it left unfinished goes with it: its calls still
+running are `cancelled`, and its open requests are resolved with `cancel`. Codex's child threads are background subagents: the `spawnAgent` call returns as
+soon as the child has started.
 
 The harness can start a **turn by itself**, with no `user_message`: Claude Code does when a
 background subagent ends, to tell the agent. It goes as any turn does (`turn.started`, the thread
@@ -196,8 +200,9 @@ its `resolution` set, so a UI can go on showing what was asked and how it was an
 without a `resolution` is open.
 
 - `permission`: the agent wants to call a tool and the app's permission policy said "ask". It has
-  the tool's `name`, `kind` and `input`, the `tool_call_id` of the call when there is one, a `title`
-  and the harness's `reason`. Policies that answer `allow` or `deny` themselves don't open one.
+  the tool's `name`, `kind`, `server` (for an `mcp` tool) and `input`, the `tool_call_id` of the
+  call when there is one, a `title` and the harness's `reason`. Policies that answer `allow` or
+  `deny` themselves don't open one.
 - `question`: the agent asks one or more `questions` (Claude's AskUserQuestion, Codex's
   requestUserInput). Each has an `id`, the `question`, an optional `header`, and `options` to choose
   from (`multi_select` for more than one). With no options, or with `allow_other`, the answer is
@@ -214,6 +219,23 @@ thread's is `plan`), and the harness leaves plan mode straight away, in the same
 it planning, and its `message` is the user's feedback on the plan. For a question it's `answer`, with `answers` mapping each question's
 id to the chosen option labels or the free text. `cancel` dismisses either; the backend also
 resolves its open requests with `cancel` when their turn ends first.
+
+An answer given with `always` is kept in the thread's `standing_answers`, as a `StandingAnswer`:
+the tool's `kind`, `server` and `name`, and the `outcome`. A permission request for a tool with a
+standing answer isn't opened: the call gets its outcome. The app can set a thread's standing answers
+when it creates it, and replace or clear them with `set_options`; open requests a new standing
+answer is for are answered with it straight away.
+
+A backend can be set to keep **questions open after their turn**: one still open when its turn
+ends (or that the harness gives up on because the user interrupted the turn) isn't cancelled, and
+stays open while the thread is idle. Answering it sends the answers to the agent as the user's next
+message, as a `send` would, which starts a turn. It isn't kept, or stays open, once the
+conversation has moved on: when the user sends a message (after it was asked, before or after its
+turn ended), or a message was left queued when its turn ended. A question has `user_messages`, how
+many `user_message` items the thread had when it was asked, so that's known after a restart too. Nor is one with a `secret` question,
+or under `dont_ask`. Such a question stays open across a backend restart, as does one the harness gave up
+because its turn was interrupted, while that turn hasn't ended yet; a request the harness still has
+(a background subagent's, say) is taken up again as it was.
 
 ## Events
 
@@ -351,7 +373,7 @@ Every command has `type` and `thread_id`.
 | `send` | `text`, `attachments?`, `client_id?` | Send the agent a message. With no turn running it starts one; with one running it steers it (the message joins the running turn, as a `user_message` with `steered`). A steered message the harness doesn't take in before the turn ends starts the next turn. |
 | `interrupt` | | Stop the running turn. Its `turn_result` has `interrupted`. Does nothing if no turn is running. |
 | `respond` | `request_id`, `resolution` | Answer an open request. Answering one that isn't open does nothing. |
-| `set_options` | `model?`, `effort?`, `permission_mode?` | Change the thread's options; ones left out stay as they are. They apply straight away where the harness allows, and otherwise from the next turn, and a `thread.updated` follows. |
+| `set_options` | `model?`, `effort?`, `permission_mode?`, `standing_answers?` | Change the thread's options; ones left out stay as they are. They apply straight away where the harness allows, and otherwise from the next turn, and a `thread.updated` follows. `standing_answers` replaces the thread's (`[]` clears them). |
 | `rewind` | `turn_id` | Take the conversation back to before that turn: the harness forgets it and every turn after, and their items are removed. See [Sessions](#sessions). |
 | `new_session` | | The next turn starts a new conversation with the harness; the items stay. Does nothing if the thread has no session. |
 | `compact` | | Compact the harness's context now, in a turn of its own (with no `user_message`) that adds a `compaction` item. |
@@ -361,8 +383,13 @@ thread has no session yet: interrupt the turn, or wait for it, first.
 
 `permission_mode` is `default` (ask via the permission policy), `accept_edits` (file edits in the
 thread's `cwd` are allowed without asking), `plan` (the agent plans and changes nothing, and asks to
-start on its plan with a `plan` request) or `bypass` (nothing is asked). `effort` is the harness's own
-name for a reasoning effort.
+start on its plan with a `plan` request), `bypass` (nothing is asked: what would be is allowed) or
+`dont_ask` (nothing is asked: what would be is denied, and questions are dismissed). The mode the
+thread has now decides what a harness process started under another one asks about, and a
+`set_options` that changes it to `bypass` or `dont_ask` answers the thread's open requests as that
+mode would: `bypass` allows its permission and plan requests (not its questions, which only the user
+answers), and `dont_ask` denies them and cancels its questions. `effort` is the harness's own name
+for a reasoning effort.
 
 Claude Code takes a new model and permission mode in its running process (`set_model` and
 `set_permission_mode`), so they apply straight away, even to the running turn; a new effort applies

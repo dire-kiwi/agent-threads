@@ -5,11 +5,12 @@ import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { afterEach, describe, expect, it } from "vitest";
-import { applyEvents, initialState, openRequests, type Item, type ThreadEvent, type ToolCall, type TurnResult, type UserMessage } from "@dire-kiwi/agent-threads-protocol";
+import { applyEvents, initialState, openRequests, type Item, type ThreadEvent, type ThreadRequest, type ToolCall, type TurnResult, type UserMessage } from "@dire-kiwi/agent-threads-protocol";
 import { AgentThreads, CommandError, ControlError, type AgentThreadsOptions } from "../agent-threads.js";
 import type { HarnessMessage } from "../harness.js";
 import { claudeCode, type ClaudeCodeOptions } from "../claude/driver.js";
 import type { LaunchOptions } from "../harness.js";
+import { DONT_ASK_DENIAL } from "../permissions.js";
 import { shim } from "../shim.js";
 import type { Store } from "../store.js";
 import { FileStore } from "../stores/file.js";
@@ -127,6 +128,13 @@ function expectIdleAfter(events: ThreadEvent[], from: number, text: string) {
   expect(reply, `the reply ${text}`).toBeGreaterThanOrEqual(0);
   expect(idle, "going idle").toBeGreaterThan(reply);
   expect(later[idle]).toMatchObject({ thread: { status: "idle" } });
+}
+
+const QUESTION = '{"questions":[{"question":"Colour?","options":[{"label":"Blue"},{"label":"Red"}]}]}';
+
+/** Waits for the thread's open request of a type, other than `not`. */
+function openRequest(sdk: AgentThreads, id: string, type: "permission" | "question", not?: string): Promise<ThreadRequest> {
+  return until(async () => openRequests(await sdk.snapshot(id)).find((r) => r.type === type && r.id !== not));
 }
 
 const results = (items: Item[]) => items.filter((i): i is TurnResult => i.type === "turn_result");
@@ -853,6 +861,266 @@ describe("the Claude driver", () => {
     const s = await settle(sdk, t.id);
     expect(asked).toEqual(["safe/execute", "danger/execute", "undefined/execute"]);
     expect(texts(s.items).filter((x) => x.startsWith("denied"))).toHaveLength(2);
+  });
+
+  it("keeps standing answers with the thread, and lets the app seed and clear them", async () => {
+    const store = new MemoryStore();
+    const { sdk, make } = setup({ store, permissions: "ask" });
+    const t = await sdk.create({ standing_answers: [{ kind: "web", name: "WebFetch", outcome: "deny" }] });
+    await sdk.send(t.id, 'tool WebFetch {"url":"https://example.com"}');
+    let s = await settle(sdk, t.id);
+    expect(texts(s.items).at(-1)).toBe("denied: The user has denied this tool for the rest of the thread.");
+
+    await sdk.send(t.id, 'tool Bash {"command":"ls"}');
+    const r = await openRequest(sdk, t.id, "permission");
+    await sdk.respond(t.id, r.id, { outcome: "allow", always: true });
+    s = await settle(sdk, t.id);
+    const standing = [
+      { kind: "web", name: "WebFetch", outcome: "deny" },
+      { kind: "shell", name: "Bash", outcome: "allow" },
+    ];
+    expect(s.thread.standing_answers).toEqual(standing);
+    await sdk.close();
+    open = open.filter((x) => x !== sdk);
+
+    // Kept with the thread: a backend that starts again has them.
+    const again = make(store);
+    expect((await again.get(t.id))?.standing_answers).toEqual(standing);
+    expect((await store.getThread(t.id))?.standing_answers).toEqual(standing);
+    await again.send(t.id, 'tool Bash {"command":"pwd"}');
+    s = await settle(again, t.id);
+    expect(texts(s.items).at(-1)).toBe('ran with {"command":"pwd"}');
+    expect(openRequests(s)).toEqual([]);
+
+    // Cleared, they don't stand any more; set_options leaves them as they are without them.
+    await again.handle({ type: "set_options", thread_id: t.id, standing_answers: [] });
+    await again.setOptions(t.id, { model: "m" });
+    expect((await again.snapshot(t.id)).thread.standing_answers).toBeUndefined();
+    await again.send(t.id, 'tool Bash {"command":"pwd"}');
+    await openRequest(again, t.id, "permission");
+
+    // Seeding one answers the open requests it's for.
+    await again.handle({ type: "set_options", thread_id: t.id, standing_answers: [{ kind: "shell", name: "Bash", outcome: "allow" }] });
+    s = await settle(again, t.id);
+    expect(texts(s.items).at(-1)).toBe('ran with {"command":"pwd"}');
+  });
+
+  it("answers the open requests for the same tool with an answer given `always`", async () => {
+    const { sdk, events } = setup({ permissions: "ask" });
+    const t = await sdk.create();
+    // Two at once (as from parallel subagents).
+    await sdk.send(t.id, 'twice Bash {"command":"ls"}');
+    const first = await openRequest(sdk, t.id, "permission");
+    await openRequest(sdk, t.id, "permission", first.id);
+    await sdk.respond(t.id, first.id, { outcome: "deny", always: true, message: "No." });
+    const s = await settle(sdk, t.id);
+    expect(events.flatMap((e) => (e.type === "request.resolved" ? [e.resolution] : []))).toEqual([
+      { outcome: "deny", always: true, message: "No." },
+      { outcome: "deny", message: "The user has denied this tool for the rest of the thread." },
+    ]);
+    expect(texts(s.items)).toHaveLength(2);
+    expect(s.thread.standing_answers).toEqual([{ kind: "shell", name: "Bash", outcome: "deny" }]);
+  });
+
+  it("answers open permission requests when the mode changes, and decides later ones by it", async () => {
+    const { sdk } = setup({ permissions: "ask" });
+    const t = await sdk.create();
+
+    // bypass allows an open permission request, but doesn't answer a question for the user.
+    await sdk.send(t.id, `tool AskUserQuestion ${QUESTION}`);
+    const q = await openRequest(sdk, t.id, "question");
+    await sdk.setOptions(t.id, { permission_mode: "bypass" });
+    expect(openRequests(await sdk.snapshot(t.id))).toHaveLength(1);
+    await sdk.respond(t.id, q.id, { outcome: "answer", answers: { "Colour?": ["Blue"] } });
+    await settle(sdk, t.id);
+
+    await sdk.setOptions(t.id, { permission_mode: "default" });
+    await sdk.send(t.id, 'tool Bash {"command":"ls"}');
+    await openRequest(sdk, t.id, "permission");
+    await sdk.setOptions(t.id, { permission_mode: "bypass" });
+    let s = await settle(sdk, t.id);
+    expect(texts(s.items).at(-1)).toBe('ran with {"command":"ls"}');
+
+    // dont_ask denies an open permission request, and what would be asked after it.
+    await sdk.setOptions(t.id, { permission_mode: "default" });
+    await sdk.send(t.id, 'tool Bash {"command":"pwd"}');
+    await openRequest(sdk, t.id, "permission");
+    await sdk.setOptions(t.id, { permission_mode: "dont_ask" });
+    s = await settle(sdk, t.id);
+    expect(texts(s.items).at(-1)).toBe(`denied: ${DONT_ASK_DENIAL}`);
+    for (const text of ['tool Bash {"command":"id"}', `tool AskUserQuestion ${QUESTION}`]) {
+      await sdk.send(t.id, text);
+      s = await settle(sdk, t.id);
+      expect(texts(s.items).at(-1)).toBe(`denied: ${DONT_ASK_DENIAL}`);
+    }
+    expect(s.items.filter((i) => i.type === "tool_call").at(-1)).toMatchObject({ status: "denied" });
+    // Requests were opened for the first three calls only.
+    expect((await sdk.eventsSince(t.id, 0)).filter((e) => e.type === "request.opened")).toHaveLength(3);
+  });
+
+  it("answers a question left open when its turn ends with a message", async () => {
+    const store = new MemoryStore();
+    const { sdk, make, events, runs } = setup({ store, permissions: "ask", lateAnswers: true });
+    const t = await sdk.create();
+    await sdk.send(t.id, `asking AskUserQuestion ${QUESTION}`);
+    const q = await openRequest(sdk, t.id, "question");
+    await sdk.interrupt(t.id);
+    let s = await settle(sdk, t.id);
+    expect(s.thread.status).toBe("idle");
+    expect(openRequests(s).map((r) => r.id)).toEqual([q.id]);
+    expect(results(s.items)[0]).toMatchObject({ interrupted: true });
+    await sdk.close();
+    open = open.filter((x) => x !== sdk);
+
+    // Still open after a restart; the answer goes to the agent as the next message.
+    const again = make(store);
+    expect(openRequests(await again.snapshot(t.id)).map((r) => r.id)).toEqual([q.id]);
+    const from = events.length;
+    await again.handle({
+      type: "respond",
+      thread_id: t.id,
+      request_id: q.id,
+      resolution: { outcome: "answer", answers: { "Colour?": ["Blue"] }, message: "Thanks." },
+    });
+    s = await settle(again, t.id);
+    const text = "My answer to the question you asked:\n\n- Colour?\n  Blue\n\nThanks.";
+    expect(s.items.filter((i): i is UserMessage => i.type === "user_message").at(-1)!.text).toBe(text);
+    expect(results(s.items)).toHaveLength(2);
+    expect(openRequests(s)).toEqual([]);
+    expect(runs().at(-1)!.sent.some((m) => m.type === "user" && JSON.stringify(m).includes("Colour?"))).toBe(true);
+    expect(events.slice(from).filter((e) => e.type === "request.resolved")).toHaveLength(1);
+
+    // One the conversation has moved on from (a message was sent) is cancelled instead.
+    await again.send(t.id, `asking AskUserQuestion ${QUESTION}`);
+    const q2 = await openRequest(again, t.id, "question");
+    await again.interrupt(t.id);
+    s = await settle(again, t.id);
+    expect(openRequests(s).map((r) => r.id)).toEqual([q2.id]);
+    await again.send(t.id, "reply hi");
+    s = await settle(again, t.id);
+    expect(openRequests(s)).toEqual([]);
+    expect(events.filter((e) => e.type === "request.resolved").at(-1)).toMatchObject({ request_id: q2.id, resolution: { outcome: "cancel" } });
+    // Answering it now does nothing.
+    const before = s.items.filter((i) => i.type === "user_message").length;
+    await again.respond(t.id, q2.id, { outcome: "answer", answers: { "Colour?": ["Red"] } });
+    s = await settle(again, t.id);
+    expect(s.items.filter((i) => i.type === "user_message")).toHaveLength(before);
+  });
+
+  /** Asks a question, and interrupts its turn: the harness cancels it, and it's kept open. Doesn't wait for the turn to end. */
+  async function interruptedQuestion(sdk: AgentThreads, id: string): Promise<ThreadRequest> {
+    await sdk.send(id, `asking AskUserQuestion ${QUESTION}`);
+    const q = await openRequest(sdk, id, "question");
+    await sdk.interrupt(id);
+    // No longer waiting on it, though it's open.
+    await until(async () => (await sdk.snapshot(id)).thread.status !== "waiting");
+    return q;
+  }
+
+  /** The resolution a thread's request got, if it has one. */
+  const resolutionOf = async (sdk: AgentThreads, id: string, q: ThreadRequest) => (await sdk.snapshot(id)).requests.find((r) => r.id === q.id)?.resolution;
+
+  it("doesn't keep a question open once the user sends a message during its turn", async () => {
+    const { sdk } = setup({ permissions: "ask", lateAnswers: true, env: { MINI_CLAUDE_INTERRUPT_DELAY: "300" } });
+    const t = await sdk.create();
+
+    // The message comes after the harness gave the question up, before the turn ends.
+    let q = await interruptedQuestion(sdk, t.id);
+    expect(await resolutionOf(sdk, t.id, q)).toBeUndefined();
+    await sdk.send(t.id, "reply hi");
+    let s = await settle(sdk, t.id);
+    expect(openRequests(s)).toEqual([]);
+    expect(await resolutionOf(sdk, t.id, q)).toEqual({ outcome: "cancel" });
+    const before = s.items.filter((i) => i.type === "user_message").length;
+    await sdk.respond(t.id, q.id, { outcome: "answer", answers: { "Colour?": ["Red"] } });
+    expect((await settle(sdk, t.id)).items.filter((i) => i.type === "user_message")).toHaveLength(before);
+
+    // And before it.
+    await sdk.send(t.id, `asking AskUserQuestion ${QUESTION}`);
+    q = await openRequest(sdk, t.id, "question");
+    await sdk.send(t.id, "reply later");
+    await sdk.interrupt(t.id);
+    s = await settle(sdk, t.id);
+    expect(openRequests(s)).toEqual([]);
+    expect(await resolutionOf(sdk, t.id, q)).toEqual({ outcome: "cancel" });
+  });
+
+  // The conversation moved on from a question (the user sent a message, which the harness took in)
+  // before the backend stopped with its run: the question isn't kept open when the lost turn ends,
+  // whether or not it has a tool_call item.
+  it.each([false, true])("doesn't keep a question open after a lost run once the user sent a message (no tool_call item: %s)", async (unlinked) => {
+    const store = new MemoryStore();
+    const { sdk, make } = setup({ store, permissions: "ask", lateAnswers: true, env: unlinked ? { MINI_CLAUDE_UNLINKED: "1" } : {} });
+    const t = await sdk.create();
+    await sdk.send(t.id, `asking AskUserQuestion ${QUESTION}`);
+    const q = await openRequest(sdk, t.id, "question");
+    expect(q.tool_call_id === undefined).toBe(unlinked);
+    await sdk.send(t.id, "reply hi");
+    // Taken in: nothing's queued.
+    await until(async () => {
+      const messages = (await sdk.snapshot(t.id)).items.filter((i): i is UserMessage => i.type === "user_message");
+      return messages.length === 2 && messages.every((m) => !m.queued);
+    });
+    await sdk.eventsSince(t.id, 0); // saved
+    // As if the backend died with the run.
+    const crashed = structuredClone(store.state);
+    await sdk.close();
+    open = open.filter((x) => x !== sdk);
+
+    const again = make(new MemoryStore(crashed));
+    expect(openRequests(await again.snapshot(t.id))).toEqual([]);
+    expect(await resolutionOf(again, t.id, q)).toEqual({ outcome: "cancel" });
+  });
+
+  // A message the harness took in between a tool call and the question it asks for it came before
+  // the question: the conversation hasn't moved on from it.
+  it("keeps a question open after a message taken in before it was asked", async () => {
+    const { sdk } = setup({ permissions: "ask", lateAnswers: true, env: { MINI_CLAUDE_ASK_DELAY: "500" } });
+    const t = await sdk.create();
+    await sdk.send(t.id, `asking AskUserQuestion ${QUESTION}`);
+    await until(async () => (await sdk.snapshot(t.id)).items.some((i) => i.type === "tool_call"));
+    await sdk.send(t.id, "reply hi");
+    const q = await openRequest(sdk, t.id, "question");
+    const messages = (await sdk.snapshot(t.id)).items.filter((i): i is UserMessage => i.type === "user_message");
+    expect(messages.length === 2 && messages.every((m) => !m.queued)).toBe(true);
+    expect(q).toMatchObject({ user_messages: 2 });
+    await sdk.interrupt(t.id);
+    let s = await settle(sdk, t.id);
+    expect(openRequests(s).map((r) => r.id)).toEqual([q.id]);
+    await sdk.respond(t.id, q.id, { outcome: "answer", answers: { "Colour?": ["Red"] } });
+    s = await settle(sdk, t.id);
+    expect(s.items.filter((i): i is UserMessage => i.type === "user_message").at(-1)!.text).toBe("My answer to the question you asked:\n\n- Colour?\n  Red");
+  });
+
+  it.each([false, true])("dismisses a question kept open after its turn when the mode changes to dont_ask (restarted: %s)", async (restart) => {
+    const store = new MemoryStore();
+    const { sdk, make } = setup({ store, permissions: "ask", lateAnswers: true });
+    const t = await sdk.create();
+    const q = await interruptedQuestion(sdk, t.id);
+    let s = await settle(sdk, t.id);
+    expect(openRequests(s).map((r) => r.id)).toEqual([q.id]);
+    let now = sdk;
+    if (restart) {
+      await sdk.close();
+      open = open.filter((x) => x !== sdk);
+      now = make(store);
+    }
+    await now.setOptions(t.id, { permission_mode: "dont_ask" });
+    s = await settle(now, t.id);
+    expect(openRequests(s)).toEqual([]);
+    expect(await resolutionOf(now, t.id, q)).toEqual({ outcome: "cancel", message: DONT_ASK_DENIAL });
+    // Dismissed, it sent nothing.
+    expect(results(s.items)).toHaveLength(1);
+  });
+
+  it("cancels a turn's questions when it ends, without lateAnswers", async () => {
+    const { sdk } = setup({ permissions: "ask" });
+    const t = await sdk.create();
+    await sdk.send(t.id, `asking AskUserQuestion ${QUESTION}`);
+    await openRequest(sdk, t.id, "question");
+    await sdk.interrupt(t.id);
+    const s = await settle(sdk, t.id);
+    expect(openRequests(s)).toEqual([]);
   });
 
   it("drops a policy's answer that comes after Claude stopped asking", async () => {

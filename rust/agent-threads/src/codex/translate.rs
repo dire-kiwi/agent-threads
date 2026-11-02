@@ -6,7 +6,7 @@ use serde_json::{Map, Value, json};
 use crate::claude::{result_text, slim};
 use crate::harness::McpServer;
 use crate::ids::unix_time;
-use crate::protocol::{PermissionMode, RateLimit, RateLimitStatus, Usage};
+use crate::protocol::{PermissionMode, RateLimit, RateLimitStatus, SubagentState, SubagentStatus, Usage};
 
 /// The MCP server that serves a thread's app tools when Codex can't take them as dynamic tools.
 pub(crate) const APP_SERVER: &str = "app";
@@ -223,6 +223,73 @@ pub(crate) fn codex_done(item: &Value, denied: bool) -> Map<String, Value> {
         _ => {}
     }
     patch
+}
+
+/// What a spawnAgent call's completion changes in its call. The spawn returns as soon as the child
+/// thread has started, and the child runs on: a background subagent, until its turn ends.
+pub(crate) fn spawn_done(item: &Value) -> Value {
+    let status = match item["status"].as_str() {
+        Some("failed") => "failed",
+        Some("interrupted") => "cancelled",
+        _ => "completed",
+    };
+    let started = item["receiverThreadIds"].as_array().is_some_and(|r| !r.is_empty());
+    if status != "completed" || !started {
+        return json!({"status": status});
+    }
+    let subagent = SubagentState {
+        status: SubagentStatus::Running,
+        background: true,
+        model: item["model"].as_str().filter(|m| !m.is_empty()).map(String::from),
+        activity: None,
+        agent_type: None,
+        summary: None,
+        tool_uses: None,
+    };
+    json!({"status": status, "subagent": subagent})
+}
+
+/// How a collab call's agentsStates entry says a child thread is getting on, as a SubagentStatus.
+pub(crate) fn collab_status(state: &Value) -> Option<SubagentStatus> {
+    Some(match state["status"].as_str()? {
+        "pendingInit" | "running" => SubagentStatus::Running,
+        "completed" => SubagentStatus::Completed,
+        "errored" | "notFound" => SubagentStatus::Failed,
+        "shutdown" | "interrupted" => SubagentStatus::Stopped,
+        _ => return None,
+    })
+}
+
+/// A subagent after an agentsStates entry about its child thread (None if it says nothing).
+pub(crate) fn collab_subagent(s: &SubagentState, state: &Value) -> Option<SubagentState> {
+    let status = collab_status(state)?;
+    let mut next = s.clone();
+    next.status = status;
+    if status == SubagentStatus::Running {
+        // Taken up again, it hasn't a report yet.
+        next.summary = None;
+    } else if let Some(m) = state["message"].as_str().filter(|m| !m.is_empty()) {
+        next.summary = Some(m.to_string());
+    }
+    Some(next)
+}
+
+/// A subagent after its child thread's turn ended, with the child's last message (or the turn's
+/// error).
+pub(crate) fn child_turn_subagent(s: &SubagentState, turn: &Value, last: Option<String>) -> SubagentState {
+    let mut next = s.clone();
+    next.status = match turn["status"].as_str() {
+        Some("completed") => SubagentStatus::Completed,
+        Some("interrupted") => SubagentStatus::Stopped,
+        _ => SubagentStatus::Failed,
+    };
+    let error = turn["error"]["message"]
+        .as_str()
+        .filter(|_| next.status == SubagentStatus::Failed);
+    if let Some(summary) = error.map(String::from).or(last).filter(|s| !s.is_empty()) {
+        next.summary = Some(summary);
+    }
+    next
 }
 
 /// What a model call used (a tokenUsage report's `last`), as usage: a turn used its calls' sum.

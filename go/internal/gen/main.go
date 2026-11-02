@@ -233,6 +233,11 @@ func (g *generator) enum(name, description string, values []any) {
 	g.p(")\n\n")
 }
 
+// optionalLists are lists where absent and empty mean different things (absent: leave it as it is;
+// empty: clear it). They're pointers to slices, so that an empty one is written as [] (omitempty
+// drops an empty slice) and read back as empty, not absent.
+var optionalLists = map[string]bool{"SetOptionsCommand.standing_answers": true}
+
 type field struct {
 	doc, name, json, typ string
 	omitempty            bool
@@ -258,7 +263,7 @@ func (g *generator) object(name string, def *object) {
 			prop := props.get(key).(*object)
 			typ, kind := g.typeOf(name, key, prop)
 			f := field{name: camel(key), json: key, typ: typ, omitempty: !required[key]}
-			if !required[key] && (kind == "number" || kind == "struct") {
+			if !required[key] && (kind == "number" || kind == "struct" || optionalLists[name+"."+key]) {
 				f.typ = "*" + typ
 			}
 			if required[key] && (kind == "slice" || kind == "map") {

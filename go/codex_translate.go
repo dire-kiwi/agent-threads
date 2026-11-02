@@ -160,6 +160,77 @@ type codexTokens struct {
 	CacheWriteInputTokens *int64 `json:"cacheWriteInputTokens,omitempty"`
 }
 
+// spawnDone is what a spawnAgent call's completion changes in its call. The spawn returns as soon
+// as the child thread has started, and the child runs on: a background subagent, until its turn
+// ends.
+func spawnDone(item jmap) Patch {
+	status := protocol.ToolStatusCompleted
+	switch item.str("status") {
+	case "failed":
+		status = protocol.ToolStatusFailed
+	case "interrupted":
+		status = protocol.ToolStatusCancelled
+	}
+	if status != protocol.ToolStatusCompleted || len(item.arr("receiverThreadIds")) == 0 {
+		return Patch{"status": status}
+	}
+	return Patch{"status": status, "subagent": protocol.SubagentState{Status: protocol.SubagentStatusRunning, Background: true, Model: item.str("model")}}
+}
+
+// collabStatus is how a collab call's agentsStates entry says a child thread is getting on, as a
+// SubagentStatus ("" if it doesn't say).
+func collabStatus(state jmap) protocol.SubagentStatus {
+	switch state.str("status") {
+	case "pendingInit", "running":
+		return protocol.SubagentStatusRunning
+	case "completed":
+		return protocol.SubagentStatusCompleted
+	case "errored", "notFound":
+		return protocol.SubagentStatusFailed
+	case "shutdown", "interrupted":
+		return protocol.SubagentStatusStopped
+	}
+	return ""
+}
+
+// collabSubagent is a subagent after an agentsStates entry about its child thread (!ok if it says
+// nothing).
+func collabSubagent(s protocol.SubagentState, state jmap) (protocol.SubagentState, bool) {
+	status := collabStatus(state)
+	if status == "" {
+		return s, false
+	}
+	s.Status = status
+	if status == protocol.SubagentStatusRunning {
+		// Taken up again, it hasn't a report yet.
+		s.Summary = ""
+	} else if m := state.str("message"); m != "" {
+		s.Summary = m
+	}
+	return s, true
+}
+
+// childTurnSubagent is a subagent after its child thread's turn ended, with the child's last
+// message (or the turn's error).
+func childTurnSubagent(s protocol.SubagentState, turn jmap, last string) protocol.SubagentState {
+	switch turn.str("status") {
+	case "completed":
+		s.Status = protocol.SubagentStatusCompleted
+	case "interrupted":
+		s.Status = protocol.SubagentStatusStopped
+	default:
+		s.Status = protocol.SubagentStatusFailed
+	}
+	summary := last
+	if e := turn.obj("error"); s.Status == protocol.SubagentStatusFailed && e.has("message") {
+		summary = e.str("message")
+	}
+	if summary != "" {
+		s.Summary = summary
+	}
+	return s
+}
+
 // callUsage is what a model call used (a tokenUsage report's last), as usage: a turn used its
 // calls' sum. Its input tokens include the cached ones, which (as Claude's do) input_tokens leaves
 // out.

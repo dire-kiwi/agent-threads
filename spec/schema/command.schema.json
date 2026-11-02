@@ -57,7 +57,8 @@
         "thread_id": { "type": "string" },
         "model": { "type": "string" },
         "effort": { "type": "string" },
-        "permission_mode": { "$ref": "thread.schema.json#/$defs/PermissionMode" }
+        "permission_mode": { "$ref": "thread.schema.json#/$defs/PermissionMode" },
+        "standing_answers": { "type": "array", "items": { "$ref": "thread.schema.json#/$defs/StandingAnswer" }, "description": "Replaces the thread's standing answers ([] clears them)." }
       }
     },
     "RewindCommand": {

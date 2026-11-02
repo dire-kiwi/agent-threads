@@ -15,6 +15,7 @@ import {
   type Item,
   type ItemPage,
   type PermissionMode,
+  type StandingAnswer,
   type Resolution,
   type Snapshot,
   type Thread,
@@ -58,6 +59,13 @@ export interface AgentThreadsOptions extends Capabilities {
   /** Called with errors that aren't any command's: a store that fails, a subscriber that throws. */
   onError?: (error: unknown) => void;
   /**
+   * Questions still open when their turn ends (it was interrupted, say) stay open, rather than
+   * being cancelled: an answer is sent to the agent as the user's next message, unless the
+   * conversation has moved on first (the user sent a message, or one was left queued). Secret ones
+   * are cancelled still, and dont_ask dismisses them.
+   */
+  lateAnswers?: boolean;
+  /**
    * Fill in `raw` on events, items and requests: the harness message each came from. Off by
    * default; it's saved with the events, so they take more room.
    */
@@ -81,6 +89,11 @@ export interface CreateOptions extends Capabilities {
   title?: string;
   /** The app's own data about the thread (e.g. the user it's for); tools and the policy get it. */
   metadata?: { [k: string]: unknown };
+  /**
+   * Answers that stand from the start (from the app's own rules, say), as answers given with
+   * `always` do.
+   */
+  standing_answers?: StandingAnswer[];
   /** The thread's id; a new one by default. */
   id?: string;
   /**
@@ -102,6 +115,8 @@ export interface ThreadOptions {
   /** "" clears it. */
   effort?: string;
   permission_mode?: PermissionMode;
+  /** Replaces the thread's standing answers; `[]` clears them. */
+  standing_answers?: StandingAnswer[];
   /**
    * Replaces how the thread's harness process is started, in full. Only the app sets it: the
    * `set_options` command doesn't.
@@ -160,6 +175,7 @@ export class AgentThreads {
       permission_mode: options.permission_mode ?? "default",
       cwd: options.cwd ?? process.cwd(),
       ...(options.metadata ? { metadata: options.metadata } : {}),
+      ...(options.standing_answers?.length ? { standing_answers: options.standing_answers } : {}),
       created_at: new Date().toISOString(),
     };
     const { tools, mcpServers, skills, permissions, systemPrompt } = options;
@@ -338,11 +354,12 @@ export class AgentThreads {
         return this.respond(command.thread_id, command.request_id, command.resolution);
       case "set_options": {
         // Only the thread's options a client may change: not its launch options.
-        const { thread_id, model, effort, permission_mode } = command;
+        const { thread_id, model, effort, permission_mode, standing_answers } = command;
         return this.setOptions(thread_id, {
           ...(model !== undefined ? { model } : {}),
           ...(effort !== undefined ? { effort } : {}),
           ...(permission_mode !== undefined ? { permission_mode } : {}),
+          ...(standing_answers !== undefined ? { standing_answers } : {}),
         });
       }
       case "rewind":
@@ -371,9 +388,10 @@ export class AgentThreads {
   }
 
   /**
-   * Changes the thread's model, effort, permission mode or launch options: the model and permission
-   * mode straight away where the harness takes them in its running process, and otherwise from the
-   * next turn.
+   * Changes the thread's model, effort, permission mode or launch options, or its standing answers
+   * (`[]` clears them): the model and permission mode straight away where the harness takes them in
+   * its running process, and otherwise from the next turn. Open permission requests the new mode or
+   * standing answers answer (bypass allows them, dont_ask denies them) are answered at once.
    */
   async setOptions(threadId: string, options: ThreadOptions): Promise<void> {
     const { launch, ...rest } = options;
@@ -382,10 +400,13 @@ export class AgentThreads {
     if (options.model !== undefined) patch.model = options.model || undefined;
     if (options.effort !== undefined) patch.effort = options.effort || undefined;
     if (options.permission_mode !== undefined) patch.permission_mode = options.permission_mode;
-    const before = JSON.stringify(rt.thread);
+    if (options.standing_answers !== undefined) patch.standing_answers = options.standing_answers.length ? options.standing_answers : undefined;
+    const optionsOf = (t: Thread) => JSON.stringify([t.model, t.effort, t.permission_mode]);
+    const before = optionsOf(rt.thread);
     rt.setThread(patch);
-    if (JSON.stringify(rt.thread) !== before) rt.session?.optionsChanged();
+    if (optionsOf(rt.thread) !== before) rt.session?.optionsChanged();
     if (launch) rt.setLaunch(launch);
+    rt.settle();
   }
 
   /**
@@ -532,6 +553,7 @@ export class AgentThreads {
         }
       },
       error: (e: unknown) => this.#error(e),
+      lateAnswers: !!this.#options.lateAnswers,
     };
     const rt = new ThreadRuntime(host, state, this.#config(id), launch, this.#policy(id));
     const harness = this.harnesses[state.thread.harness];
@@ -572,6 +594,10 @@ export class AgentThreads {
     if (running || rt.thread.run) {
       if (rt.thread.run) rt.lostRun = rt.thread.run.id;
       recoverLost(rt, lost);
+    } else {
+      // Questions kept open after their turns ended are taken up again (or cancelled, if they
+      // can't be any more).
+      rt.takeUpRequests(false);
     }
     return rt;
   }
@@ -605,12 +631,13 @@ export class AgentThreads {
       await this.#abandon(record);
       return false;
     }
-    // Requests the session didn't take up again can't be answered.
-    const open = new Set(rt.openRequests.map((r) => r.id));
-    for (const r of openRequests(rt.snapshot)) if (!open.has(r.id)) rt.emit({ type: "request.resolved", request_id: r.id, resolution: { outcome: "cancel" } });
+    // Requests the session didn't take up again can't be answered by the harness: questions kept
+    // open after their turns (or given up by an interrupted one) stay open, the others are
+    // cancelled.
+    rt.takeUpRequests(false);
     // With none left (one answered before the restart is closed, say), the turn runs on, or the
     // thread is idle if none was running.
-    if (!open.size && rt.thread.status === "waiting") rt.setThread({ status: rt.turn ? "running" : "idle" });
+    if (!rt.openRequests.length && rt.thread.status === "waiting") rt.setThread({ status: rt.turn ? "running" : "idle" });
     rt.setThread({ run: { ...run, reattached_at: new Date().toISOString() } });
     if (rt.turn) {
       rt.addItem({
@@ -693,10 +720,8 @@ function recoverLost(rt: ThreadRuntime, lost: LostTurn): void {
   const turn = s === "running" || (s === "waiting" && open !== undefined);
   if (turn) rt.turn = { id: open ?? newId("turn"), interrupted: false, ...(lost.session ? { session: lost.session } : {}) };
   rt.stopSubagents(items.filter((i) => i.type === "tool_call" && i.subagent?.status === "running").map((i) => i.id));
-  // Its open requests can't be answered now.
-  for (const r of openRequests(rt.snapshot)) {
-    rt.emit({ type: "request.resolved", request_id: r.id, resolution: { outcome: "cancel" } });
-  }
+  // Its open requests can't be answered now (but for questions that can be answered late).
+  rt.takeUpRequests(true);
   if (turn) {
     rt.addItem({
       id: newId("n"),

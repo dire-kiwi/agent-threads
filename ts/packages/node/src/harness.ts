@@ -10,12 +10,13 @@ import type {
   QuestionRequest,
   RateLimit,
   Resolution,
+  SubagentState,
   Thread,
   TurnSession,
   Usage,
   UserMessage,
 } from "@dire-kiwi/agent-threads-protocol";
-import type { PermissionDecision, PermissionQuery } from "./permissions.js";
+import type { PermissionDecision, PermissionQuery, StandingKey } from "./permissions.js";
 import type { RewindPoint } from "./sessions.js";
 import type { Spawner } from "./spawner.js";
 import type { RunRecord } from "./store.js";
@@ -109,11 +110,14 @@ export function unixTime(seconds: number): string {
   return new Date(Math.floor(seconds) * 1000).toISOString().replace(/\.\d{3}Z$/, "Z");
 }
 
-/** A request to open, without the fields the core fills in. */
+/**
+ * A request to open, without the fields the core fills in. Its `parent_id` says which subagent's
+ * call it's from when it's about none of the calls (otherwise the call's is taken).
+ */
 export type NewRequest =
-  | Omit<PermissionRequest, "id" | "turn_id" | "tool_call_id" | "parent_id">
-  | Omit<QuestionRequest, "id" | "turn_id" | "tool_call_id" | "parent_id">
-  | Omit<PlanRequest, "id" | "turn_id" | "tool_call_id" | "parent_id">;
+  | Omit<PermissionRequest, "id" | "turn_id" | "tool_call_id">
+  | Omit<QuestionRequest, "id" | "turn_id" | "tool_call_id">
+  | Omit<PlanRequest, "id" | "turn_id" | "tool_call_id">;
 
 /** An item to add, without its turn (the core sets the running turn's). */
 export type NewItem = Item extends infer I ? (I extends Item ? Omit<I, "turn_id"> : never) : never;
@@ -175,21 +179,27 @@ export interface ThreadContext {
   /**
    * Opens a request (for the tool call `toolCallId`, which is set `pending`) and calls `answered`
    * when the user responds. It isn't called when the request is cancelled because its turn ended.
-   * `standing` (permissionKey of the tool) lets an answer given `always` stand for the thread.
+   * `standing` (permissionKey of the tool) lets an answer given `always` stand for the thread. A
+   * request the thread's standing answers or permission mode answer isn't opened: `answered` is
+   * called with their answer, in a microtask.
    */
-  ask(request: NewRequest, toolCallId: string | undefined, answered: (resolution: Resolution) => void, standing?: string): string;
+  ask(request: NewRequest, toolCallId: string | undefined, answered: (resolution: Resolution) => void, standing?: StandingKey): string;
   /**
    * Takes up a request opened before the backend restarted, which is still open: `answered` is
    * called when the user responds, as for ask(). Whether it's open.
    */
-  reopen(requestId: string, answered: (resolution: Resolution) => void, standing?: string): boolean;
+  reopen(requestId: string, answered: (resolution: Resolution) => void, standing?: StandingKey): boolean;
   /**
    * Saves the thread's run as it is now (with a spawner whose runs outlive the backend), before
    * the driver does something that mustn't be done twice: after a restart, it's re-attached as of
    * this. Resolves once it's saved; rejects if the store can't save it.
    */
   persist(): Promise<void>;
-  /** Closes a request the harness no longer wants answered. */
+  /**
+   * Closes a request the harness no longer wants answered. (A question kept open after its turn
+   * isn't the harness's any more, and stays open; so does one the harness gives up on because the
+   * user interrupted its turn, with lateAnswers.)
+   */
   cancelRequest(id: string): void;
   /** The running turn ended. */
   endTurn(end: TurnEnd): void;
@@ -203,6 +213,11 @@ export interface ThreadContext {
    * ended): their calls still running are cancelled, and their open requests too.
    */
   stopSubagents(ids: Iterable<string>): void;
+  /**
+   * Sets a subagent call's subagent. If it was running and has ended, what it left unfinished is
+   * cancelled: its calls still running, its streaming text and its open requests.
+   */
+  endSubagent(id: string, subagent: SubagentState): void;
   /** Something went wrong that isn't the turn's: for the app's onError. */
   error(error: unknown): void;
 }
@@ -220,6 +235,15 @@ export function* ancestors(item: (id: string) => Item | undefined, id: string): 
 /** Whether a tool_call is a background subagent's that's still running. */
 export function runningInBackground(it: Item | undefined): boolean {
   return it?.type === "tool_call" && !!it.subagent?.background && it.subagent.status === "running";
+}
+
+/**
+ * Whether a request is a background subagent's that's still running (about one of its calls, or
+ * from it): it carries on after the turn it was asked in has ended.
+ */
+export function requestInBackground(item: (id: string) => Item | undefined, r: { tool_call_id?: string; parent_id?: string }): boolean {
+  if (r.tool_call_id) return inBackground(item, r.tool_call_id);
+  return !!r.parent_id && (runningInBackground(item(r.parent_id)) || inBackground(item, r.parent_id));
 }
 
 /**

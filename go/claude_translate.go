@@ -380,6 +380,8 @@ func claudePermissionMode(mode protocol.PermissionMode) string {
 	case protocol.PermissionModeBypass:
 		return "bypassPermissions"
 	}
+	// dont_ask too: Claude asks, and agent-threads denies what it asks about (so the policy still
+	// allows what it allows).
 	return ""
 }
 

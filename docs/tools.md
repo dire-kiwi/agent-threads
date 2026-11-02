@@ -199,6 +199,13 @@ context has the thread and its metadata. The policy answers:
   answer given with `always` stands for that tool (the same name, kind and MCP server) for the rest
   of the thread.
 
+**Standing answers.** The answers given with `always` are kept with the thread, in its
+`standing_answers` (`{kind, server?, name, outcome}`), so they stand after a restart too. They come
+before the policy: a call to a tool with one is allowed or denied without asking. The app reads
+them on the thread, can give a thread some when it creates it (`standing_answers` in its options:
+from the app's own rules, say), and replaces or clears them with `set_options` (`standing_answers:
+[]` clears them). Open requests a new standing answer is for are answered at once.
+
 The default policy asks about everything. A policy can be a constant, or a function (or, in Node
 and Rust, an async one, to look something up):
 
@@ -248,6 +255,15 @@ that read, with no shell syntax that could make them do more
 open a `question` request for the user (`QuestionCard`), whatever the policy says. A `secret`
 answer goes only to the harness: what's saved and sent shows `[secret]`.
 
+**Answering after the turn.** A request still open when its turn ends (the user interrupted it, or
+the harness stopped) is cancelled. With `lateAnswers` (Go `LateAnswers`, Rust `late_answers`) on the
+backend's options, a question stays open instead, while the thread is idle: answering it sends the
+answers to the agent as the user's next message (`My answer to the question you asked: ...`), which
+starts a turn. A question the conversation has moved on from is cancelled: when the user sends a
+message after it was asked (another late answer included), or if a message was left queued when its
+turn ended. Secret questions are cancelled still, since their answers would be shown in the message,
+and `dont_ask` dismisses questions kept open too.
+
 **Permission modes** (`permission_mode` on `create`, or a `set_options` command) change what the
 harness asks about at all:
 
@@ -257,6 +273,12 @@ harness asks about at all:
 | `accept_edits` | edits in the thread's `cwd` go ahead without asking | `on-request` in `workspace-write` |
 | `plan` | plans, and changes nothing | `untrusted` in `read-only`, collaboration mode `plan` |
 | `bypass` | nothing is asked | `never` in `danger-full-access` |
+| `dont_ask` | as `default`, but what the policy would ask the user about is denied, and questions are dismissed | as `default`, likewise |
+
+The mode a thread has now decides, even for a process started under another one: what the policy
+would ask about is allowed under `bypass` and denied under `dont_ask` (the agent is told it was
+denied because of the mode). Changing to `bypass` allows the thread's open permission requests (it
+doesn't answer questions), and changing to `dont_ask` denies them and dismisses its questions.
 
 A new mode or model applies straight away where it can: Claude Code's running process is switched
 (`set_permission_mode`, `set_model`), even mid-turn, and Codex takes them with its next turn, in

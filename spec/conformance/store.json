@@ -28,6 +28,18 @@
       "requests": [],
       "seq": 4
     },
+    "T1_standing": { "id": "th_1", "harness": "claude", "status": "idle", "model": "haiku", "permission_mode": "dont_ask", "cwd": "/work", "standing_answers": [{ "kind": "shell", "name": "Bash", "outcome": "allow" }, { "kind": "mcp", "server": "github", "name": "create_issue", "outcome": "deny" }], "created_at": "2026-11-01T00:00:00Z", "updated_at": "2026-11-01T00:00:09Z" },
+    "E6": { "type": "thread.updated", "thread_id": "th_1", "seq": 6, "thread": { "id": "th_1", "harness": "claude", "status": "idle", "model": "haiku", "permission_mode": "dont_ask", "cwd": "/work", "standing_answers": [{ "kind": "shell", "name": "Bash", "outcome": "allow" }, { "kind": "mcp", "server": "github", "name": "create_issue", "outcome": "deny" }], "created_at": "2026-11-01T00:00:00Z", "updated_at": "2026-11-01T00:00:09Z" } },
+    "E7": { "type": "request.opened", "thread_id": "th_1", "seq": 7, "request": { "id": "q_1", "type": "question", "turn_id": "t1", "questions": [{ "id": "color", "question": "Which colour?", "options": [{ "label": "Blue" }, { "label": "Red" }], "allow_other": true }] } },
+    "S7": {
+      "thread": { "id": "th_1", "harness": "claude", "status": "idle", "model": "haiku", "permission_mode": "dont_ask", "cwd": "/work", "standing_answers": [{ "kind": "shell", "name": "Bash", "outcome": "allow" }, { "kind": "mcp", "server": "github", "name": "create_issue", "outcome": "deny" }], "created_at": "2026-11-01T00:00:00Z", "updated_at": "2026-11-01T00:00:09Z" },
+      "items": [
+        { "id": "u1", "type": "user_message", "text": "Fix the failing test", "client_id": "c1", "turn_id": "t1" },
+        { "id": "tc1", "type": "tool_call", "name": "Bash", "kind": "shell", "input": { "command": "echo 'ünïcödé ✓' && printf '%s\\n' \"a\tb\"", "nested": { "list": [1, 2.5, null, true, { "x": "" }] } }, "status": "completed", "command": "echo 'ünïcödé ✓'", "turn_id": "t1", "result": { "content": "ünïcödé ✓\na\tb\n", "exit_code": 0 } }
+      ],
+      "requests": [{ "id": "q_1", "type": "question", "turn_id": "t1", "questions": [{ "id": "color", "question": "Which colour?", "options": [{ "label": "Blue" }, { "label": "Red" }], "allow_other": true }] }],
+      "seq": 7
+    },
     "R1": { "id": "run_1", "thread_id": "th_1", "spawner": "shim", "offset": 0, "started_at": "2026-11-01T00:00:01Z", "data": { "dir": "/var/lib/app/runs/run_1" } },
     "R1_read": { "id": "run_1", "thread_id": "th_1", "spawner": "shim", "offset": 18342, "started_at": "2026-11-01T00:00:01Z", "data": { "dir": "/var/lib/app/runs/run_1" } },
     "R1_ended": { "id": "run_1", "thread_id": "th_1", "spawner": "shim", "offset": 20117, "started_at": "2026-11-01T00:00:01Z", "ended_at": "2026-11-01T00:05:00Z", "data": { "dir": "/var/lib/app/runs/run_1", "exit": { "code": 0 } } },
@@ -72,6 +84,17 @@
       "steps": [
         { "op": "createThread", "args": [{ "$": "T2" }], "result": null },
         { "op": "getThread", "args": ["th_2"], "result": { "$": "T2" } }
+      ]
+    },
+    {
+      "name": "keeps a thread's standing answers, and drops them when an update leaves them out",
+      "steps": [
+        { "op": "createThread", "args": [{ "$": "T1" }], "result": null },
+        { "op": "updateThread", "args": [{ "$": "T1_standing" }], "result": null },
+        { "op": "getThread", "args": ["th_1"], "result": { "$": "T1_standing" } },
+        { "op": "listThreads", "args": [], "result": [{ "$": "T1_standing" }] },
+        { "op": "updateThread", "args": [{ "$": "T1" }], "result": null },
+        { "op": "getThread", "args": ["th_1"], "result": { "$": "T1" } }
       ]
     },
     {
@@ -256,6 +279,20 @@
         { "op": "reopen", "args": [], "result": null },
         { "op": "listThreads", "args": [], "result": [{ "$": "T1_running" }] },
         { "op": "getThread", "args": ["th_2"], "result": null }
+      ]
+    },
+    {
+      "name": "keeps standing answers and open requests when it's reopened",
+      "persistent": true,
+      "steps": [
+        { "op": "createThread", "args": [{ "$": "T1" }], "result": null },
+        { "op": "appendEvents", "args": ["th_1", [{ "$": "E1" }, { "$": "E2" }, { "$": "E3" }, { "$": "E4" }, { "$": "E5" }, { "$": "E6" }, { "$": "E7" }]], "result": null },
+        { "op": "updateThread", "args": [{ "$": "T1_standing" }], "result": null },
+        { "op": "saveSnapshot", "args": ["th_1", { "$": "S7" }], "result": null },
+        { "op": "reopen", "args": [], "result": null },
+        { "op": "getThread", "args": ["th_1"], "result": { "$": "T1_standing" } },
+        { "op": "readEvents", "args": ["th_1", { "after": 5 }], "result": [{ "$": "E6" }, { "$": "E7" }] },
+        { "op": "loadSnapshot", "args": ["th_1"], "result": { "$": "S7" } }
       ]
     }
   ]

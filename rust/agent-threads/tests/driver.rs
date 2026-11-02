@@ -10,12 +10,13 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use agent_threads::protocol::{PermissionMode, ToolKind};
+use agent_threads::protocol::{PermissionMode, Resolution, StandingAnswer, ToolKind};
 use agent_threads::reducer::open_requests;
 use agent_threads::{
-    AgentThreads, Capabilities, ClaudeCodeOptions, CreateOptions, Error, FileStore, HarnessMessage, LaunchOptions,
-    McpServer, MemoryState, MemoryStore, Options, PermissionDecision, PermissionPolicy, RunRecord, SendOptions, Skill,
-    Snapshot, Spawner, SqliteStore, Store, StoreError, StoreResult, ThreadEvent, ThreadOptions, ToolContext, tool,
+    AgentThreads, Capabilities, ClaudeCodeOptions, CreateOptions, DONT_ASK_DENIAL, Error, FileStore, HarnessMessage,
+    LaunchOptions, McpServer, MemoryState, MemoryStore, Options, PermissionDecision, PermissionPolicy, RunRecord,
+    SendOptions, Skill, Snapshot, Spawner, SqliteStore, Store, StoreError, StoreResult, ThreadEvent, ThreadOptions,
+    ToolContext, tool,
 };
 use async_trait::async_trait;
 use common::{items, mini_runs, settle, texts, until};
@@ -30,6 +31,7 @@ struct Setup {
     spawner: Option<Arc<dyn Spawner>>,
     capabilities: Capabilities,
     errors: Arc<Mutex<Vec<String>>>,
+    late_answers: bool,
     /// What the app's on_harness_message has been given.
     messages: Arc<Mutex<Vec<HarnessMessage>>>,
 }
@@ -47,6 +49,7 @@ impl Default for Setup {
                 ..Default::default()
             },
             errors: Arc::default(),
+            late_answers: false,
             messages: Arc::default(),
         }
     }
@@ -82,6 +85,7 @@ impl Env {
             capabilities: self.setup.capabilities.clone(),
             on_error: Some(Arc::new(move |e| errors.lock().unwrap().push(e.to_string()))),
             event_capacity: 1 << 16,
+            late_answers: self.setup.late_answers,
             on_harness_message: Some(Arc::new(move |m| messages.lock().unwrap().push(m.clone()))),
             ..Default::default()
         })
@@ -669,6 +673,594 @@ async fn asks_the_policy_and_remembers_an_answer_given_always() {
     );
     assert_eq!(*seen.lock().unwrap(), ["Read", "WebFetch", "Bash"]);
     assert_eq!(texts(&s).last().unwrap(), r#"ran with {"command":"pwd"}"#);
+}
+
+fn asking(policy: PermissionPolicy) -> Setup {
+    Setup {
+        capabilities: Capabilities {
+            permissions: Some(policy),
+            ..Default::default()
+        },
+        ..Default::default()
+    }
+}
+
+fn resolution(v: Value) -> Resolution {
+    serde_json::from_value(v).unwrap()
+}
+
+/// A snapshot's open requests (resolved ones stay, with their resolution).
+fn open(s: &Value) -> Vec<&Value> {
+    s["requests"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|r| r.get("resolution").is_none())
+        .collect()
+}
+
+/// Waits for the thread's open request with a type, other than `not`.
+async fn open_request(sdk: &AgentThreads, id: &str, ty: &str, not: Option<&str>) -> Value {
+    until(5, || async {
+        let s = serde_json::to_value(sdk.snapshot(id).await.unwrap()).unwrap();
+        open(&s)
+            .into_iter()
+            .find(|r| r["type"] == ty && Some(r["id"].as_str().unwrap()) != not)
+            .cloned()
+    })
+    .await
+}
+
+const QUESTION: &str = r#"{"questions":[{"question":"Colour?","options":[{"label":"Blue"},{"label":"Red"}]}]}"#;
+
+#[tokio::test(flavor = "multi_thread")]
+async fn keeps_standing_answers_with_the_thread_and_lets_the_app_seed_and_clear_them() {
+    let state = MemoryState::new();
+    let env = setup(Setup {
+        store: Some(Arc::new(MemoryStore::with_state(state.clone()))),
+        ..asking(PermissionPolicy::ask())
+    });
+    let seeded: Vec<StandingAnswer> =
+        serde_json::from_value(json!([{"kind": "web", "name": "WebFetch", "outcome": "deny"}])).unwrap();
+    let t = env
+        .sdk
+        .create(CreateOptions {
+            standing_answers: seeded,
+            ..create()
+        })
+        .await
+        .unwrap();
+    env.sdk
+        .send(
+            &t.id,
+            r#"tool WebFetch {"url":"https://example.com"}"#,
+            SendOptions::default(),
+        )
+        .await
+        .unwrap();
+    let s = settle(&env.sdk, &t.id).await;
+    assert_eq!(
+        texts(&s).last().unwrap(),
+        "denied: The user has denied this tool for the rest of the thread."
+    );
+
+    env.sdk
+        .send(&t.id, r#"tool Bash {"command":"ls"}"#, SendOptions::default())
+        .await
+        .unwrap();
+    let r = open_request(&env.sdk, &t.id, "permission", None).await;
+    env.sdk
+        .respond(
+            &t.id,
+            r["id"].as_str().unwrap(),
+            resolution(json!({"outcome": "allow", "always": true})),
+        )
+        .await
+        .unwrap();
+    let s = settle(&env.sdk, &t.id).await;
+    let standing = json!([
+        {"kind": "web", "name": "WebFetch", "outcome": "deny"},
+        {"kind": "shell", "name": "Bash", "outcome": "allow"},
+    ]);
+    assert_eq!(s["thread"]["standing_answers"], standing);
+    env.sdk.close(false).await.unwrap();
+
+    // Kept with the thread: a backend that starts again has them.
+    let env = setup(Setup {
+        store: Some(Arc::new(MemoryStore::with_state(state.clone()))),
+        ..asking(PermissionPolicy::ask())
+    });
+    let got = serde_json::to_value(env.sdk.get(&t.id).await.unwrap().unwrap()).unwrap();
+    assert_eq!(got["standing_answers"], standing);
+    let stored = MemoryStore::with_state(state.clone())
+        .get_thread(&t.id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(stored["standing_answers"], standing);
+    env.sdk
+        .send(&t.id, r#"tool Bash {"command":"pwd"}"#, SendOptions::default())
+        .await
+        .unwrap();
+    let s = settle(&env.sdk, &t.id).await;
+    assert_eq!(texts(&s).last().unwrap(), r#"ran with {"command":"pwd"}"#);
+    assert!(open(&s).is_empty());
+
+    // Cleared, they don't stand any more; set_options leaves them as they are without them.
+    let clear = json!({"type": "set_options", "thread_id": t.id, "standing_answers": []});
+    env.sdk.handle_json(clear).await.unwrap();
+    env.sdk
+        .set_options(
+            &t.id,
+            ThreadOptions {
+                model: Some("m".into()),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    let s = serde_json::to_value(env.sdk.snapshot(&t.id).await.unwrap()).unwrap();
+    assert!(s["thread"].get("standing_answers").is_none());
+    env.sdk
+        .send(&t.id, r#"tool Bash {"command":"pwd"}"#, SendOptions::default())
+        .await
+        .unwrap();
+    open_request(&env.sdk, &t.id, "permission", None).await;
+
+    // Seeding one answers the open requests it's for.
+    let seed = json!({"type": "set_options", "thread_id": t.id, "standing_answers": [{"kind": "shell", "name": "Bash", "outcome": "allow"}]});
+    env.sdk.handle_json(seed).await.unwrap();
+    let s = settle(&env.sdk, &t.id).await;
+    assert_eq!(texts(&s).last().unwrap(), r#"ran with {"command":"pwd"}"#);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn an_answer_given_always_answers_the_open_requests_for_the_same_tool() {
+    let mut env = setup(asking(PermissionPolicy::ask()));
+    let t = env.sdk.create(create()).await.unwrap();
+    // Two at once (as from parallel subagents).
+    env.sdk
+        .send(&t.id, r#"twice Bash {"command":"ls"}"#, SendOptions::default())
+        .await
+        .unwrap();
+    let first = open_request(&env.sdk, &t.id, "permission", None).await;
+    open_request(&env.sdk, &t.id, "permission", first["id"].as_str()).await;
+    let first_id = first["id"].as_str().unwrap();
+    env.sdk
+        .respond(
+            &t.id,
+            first_id,
+            resolution(json!({"outcome": "deny", "always": true, "message": "No."})),
+        )
+        .await
+        .unwrap();
+    let s = settle(&env.sdk, &t.id).await;
+    let resolved: Vec<Value> = env
+        .events_json()
+        .into_iter()
+        .filter(|e| e["type"] == "request.resolved")
+        .map(|e| e["resolution"].clone())
+        .collect();
+    assert_eq!(
+        resolved,
+        [
+            json!({"outcome": "deny", "always": true, "message": "No."}),
+            json!({"outcome": "deny", "message": "The user has denied this tool for the rest of the thread."}),
+        ]
+    );
+    assert_eq!(texts(&s).len(), 2);
+    assert_eq!(
+        s["thread"]["standing_answers"],
+        json!([{"kind": "shell", "name": "Bash", "outcome": "deny"}])
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_mode_change_answers_open_permission_requests_and_decides_later_ones() {
+    let env = setup(asking(PermissionPolicy::ask()));
+    let t = env.sdk.create(create()).await.unwrap();
+    let mode = |m: PermissionMode| ThreadOptions {
+        permission_mode: Some(m),
+        ..Default::default()
+    };
+
+    // bypass allows an open permission request, but doesn't answer a question for the user.
+    env.sdk
+        .send(
+            &t.id,
+            &format!("tool AskUserQuestion {QUESTION}"),
+            SendOptions::default(),
+        )
+        .await
+        .unwrap();
+    let q = open_request(&env.sdk, &t.id, "question", None).await;
+    env.sdk.set_options(&t.id, mode(PermissionMode::Bypass)).await.unwrap();
+    let s = serde_json::to_value(env.sdk.snapshot(&t.id).await.unwrap()).unwrap();
+    assert_eq!(open(&s).len(), 1);
+    env.sdk
+        .respond(
+            &t.id,
+            q["id"].as_str().unwrap(),
+            resolution(json!({"outcome": "answer", "answers": {"Colour?": ["Blue"]}})),
+        )
+        .await
+        .unwrap();
+    settle(&env.sdk, &t.id).await;
+
+    env.sdk.set_options(&t.id, mode(PermissionMode::Default)).await.unwrap();
+    env.sdk
+        .send(&t.id, r#"tool Bash {"command":"ls"}"#, SendOptions::default())
+        .await
+        .unwrap();
+    open_request(&env.sdk, &t.id, "permission", None).await;
+    env.sdk.set_options(&t.id, mode(PermissionMode::Bypass)).await.unwrap();
+    let s = settle(&env.sdk, &t.id).await;
+    assert_eq!(texts(&s).last().unwrap(), r#"ran with {"command":"ls"}"#);
+
+    // dont_ask denies an open permission request, and what would be asked after it.
+    env.sdk.set_options(&t.id, mode(PermissionMode::Default)).await.unwrap();
+    env.sdk
+        .send(&t.id, r#"tool Bash {"command":"pwd"}"#, SendOptions::default())
+        .await
+        .unwrap();
+    open_request(&env.sdk, &t.id, "permission", None).await;
+    env.sdk.set_options(&t.id, mode(PermissionMode::DontAsk)).await.unwrap();
+    let s = settle(&env.sdk, &t.id).await;
+    assert_eq!(texts(&s).last().unwrap(), &format!("denied: {DONT_ASK_DENIAL}"));
+    for text in [
+        r#"tool Bash {"command":"id"}"#.to_string(),
+        format!("tool AskUserQuestion {QUESTION}"),
+    ] {
+        env.sdk.send(&t.id, &text, SendOptions::default()).await.unwrap();
+        let s = settle(&env.sdk, &t.id).await;
+        assert_eq!(texts(&s).last().unwrap(), &format!("denied: {DONT_ASK_DENIAL}"));
+    }
+    let s = serde_json::to_value(env.sdk.snapshot(&t.id).await.unwrap()).unwrap();
+    assert_eq!(items(&s, "tool_call").last().unwrap()["status"], "denied");
+    // Requests were opened for the first three calls only.
+    let opened = serde_json::to_value(env.sdk.events_since(&t.id, 0, None).await.unwrap())
+        .unwrap()
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|e| e["type"] == "request.opened")
+        .count();
+    assert_eq!(opened, 3);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_question_left_open_when_its_turn_ends_is_answered_with_a_message() {
+    let state = MemoryState::new();
+    let env = setup(Setup {
+        store: Some(Arc::new(MemoryStore::with_state(state.clone()))),
+        late_answers: true,
+        ..asking(PermissionPolicy::ask())
+    });
+    let t = env.sdk.create(create()).await.unwrap();
+    env.sdk
+        .send(
+            &t.id,
+            &format!("asking AskUserQuestion {QUESTION}"),
+            SendOptions::default(),
+        )
+        .await
+        .unwrap();
+    let q = open_request(&env.sdk, &t.id, "question", None).await;
+    env.sdk.interrupt(&t.id).await.unwrap();
+    let s = settle(&env.sdk, &t.id).await;
+    assert_eq!(s["thread"]["status"], "idle");
+    assert_eq!(open(&s)[0]["id"], q["id"]);
+    assert_eq!(results(&s)[0]["interrupted"], true);
+    env.sdk.close(false).await.unwrap();
+
+    // Still open after a restart; the answer goes to the agent as the next message.
+    let mut env = setup(Setup {
+        store: Some(Arc::new(MemoryStore::with_state(state.clone()))),
+        late_answers: true,
+        ..asking(PermissionPolicy::ask())
+    });
+    let s = serde_json::to_value(env.sdk.snapshot(&t.id).await.unwrap()).unwrap();
+    assert_eq!(open(&s)[0]["id"], q["id"]);
+    let respond = json!({"type": "respond", "thread_id": t.id, "request_id": q["id"],
+        "resolution": {"outcome": "answer", "answers": {"Colour?": ["Blue"]}, "message": "Thanks."}});
+    env.sdk.handle_json(respond).await.unwrap();
+    let s = settle(&env.sdk, &t.id).await;
+    let text = "My answer to the question you asked:\n\n- Colour?\n  Blue\n\nThanks.";
+    assert_eq!(items(&s, "user_message").last().unwrap()["text"], text);
+    assert_eq!(results(&s).len(), 2);
+    assert!(open(&s).is_empty());
+    let sent: Vec<Value> = env.runs().last().unwrap().sent.clone();
+    assert!(
+        sent.iter()
+            .any(|m| m["type"] == "user" && m.to_string().contains("Colour?"))
+    );
+    assert_eq!(
+        env.events_json()
+            .iter()
+            .filter(|e| e["type"] == "request.resolved")
+            .count(),
+        1
+    );
+
+    // One the conversation has moved on from (a message was sent) is cancelled instead.
+    env.sdk
+        .send(
+            &t.id,
+            &format!("asking AskUserQuestion {QUESTION}"),
+            SendOptions::default(),
+        )
+        .await
+        .unwrap();
+    let q2 = open_request(&env.sdk, &t.id, "question", None).await;
+    env.sdk.interrupt(&t.id).await.unwrap();
+    let s = settle(&env.sdk, &t.id).await;
+    assert_eq!(open(&s)[0]["id"], q2["id"]);
+    env.sdk.send(&t.id, "reply hi", SendOptions::default()).await.unwrap();
+    let s = settle(&env.sdk, &t.id).await;
+    assert!(open(&s).is_empty());
+    let last = env
+        .events_json()
+        .into_iter()
+        .rfind(|e| e["type"] == "request.resolved")
+        .unwrap();
+    assert_eq!(
+        (last["request_id"].clone(), last["resolution"]["outcome"].clone()),
+        (q2["id"].clone(), json!("cancel"))
+    );
+    // Answering it now does nothing.
+    let before = items(&s, "user_message").len();
+    env.sdk
+        .respond(
+            &t.id,
+            q2["id"].as_str().unwrap(),
+            resolution(json!({"outcome": "answer", "answers": {"Colour?": ["Red"]}})),
+        )
+        .await
+        .unwrap();
+    let s = settle(&env.sdk, &t.id).await;
+    assert_eq!(items(&s, "user_message").len(), before);
+}
+
+/// Asks a question, and interrupts its turn: the harness cancels the question, which is kept open.
+/// Doesn't wait for the turn to end.
+async fn interrupted_question(sdk: &AgentThreads, id: &str) -> Value {
+    sdk.send(
+        id,
+        &format!("asking AskUserQuestion {QUESTION}"),
+        SendOptions::default(),
+    )
+    .await
+    .unwrap();
+    let q = open_request(sdk, id, "question", None).await;
+    sdk.interrupt(id).await.unwrap();
+    // No longer waiting on it, though it's open.
+    until(5, || async {
+        let s = sdk.snapshot(id).await.unwrap();
+        (s.thread.status != agent_threads::protocol::ThreadStatus::Waiting).then_some(())
+    })
+    .await;
+    q
+}
+
+/// The resolution the thread's request got, if it has one.
+async fn resolution_of(sdk: &AgentThreads, thread: &str, request: &Value) -> Value {
+    let s = serde_json::to_value(sdk.snapshot(thread).await.unwrap()).unwrap();
+    s["requests"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|r| r["id"] == request["id"])
+        .map(|r| r["resolution"].clone())
+        .unwrap_or(Value::Null)
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_question_isnt_kept_open_once_the_user_sends_a_message_during_its_turn() {
+    let env = setup(Setup {
+        late_answers: true,
+        env: vec![("MINI_CLAUDE_INTERRUPT_DELAY", "300".into())],
+        ..asking(PermissionPolicy::ask())
+    });
+    let t = env.sdk.create(create()).await.unwrap();
+
+    // The message comes after the harness gave the question up, before the turn ends.
+    let q = interrupted_question(&env.sdk, &t.id).await;
+    assert!(resolution_of(&env.sdk, &t.id, &q).await.is_null());
+    env.sdk.send(&t.id, "reply hi", SendOptions::default()).await.unwrap();
+    let s = settle(&env.sdk, &t.id).await;
+    assert!(open(&s).is_empty());
+    assert_eq!(resolution_of(&env.sdk, &t.id, &q).await, json!({"outcome": "cancel"}));
+    let before = items(&s, "user_message").len();
+    let answer = resolution(json!({"outcome": "answer", "answers": {"Colour?": ["Red"]}}));
+    env.sdk
+        .respond(&t.id, q["id"].as_str().unwrap(), answer.clone())
+        .await
+        .unwrap();
+    assert_eq!(items(&settle(&env.sdk, &t.id).await, "user_message").len(), before);
+
+    // And before it.
+    env.sdk
+        .send(
+            &t.id,
+            &format!("asking AskUserQuestion {QUESTION}"),
+            SendOptions::default(),
+        )
+        .await
+        .unwrap();
+    let q = open_request(&env.sdk, &t.id, "question", None).await;
+    env.sdk
+        .send(&t.id, "reply later", SendOptions::default())
+        .await
+        .unwrap();
+    env.sdk.interrupt(&t.id).await.unwrap();
+    let s = settle(&env.sdk, &t.id).await;
+    assert!(open(&s).is_empty());
+    assert_eq!(resolution_of(&env.sdk, &t.id, &q).await, json!({"outcome": "cancel"}));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn dont_ask_dismisses_questions_kept_open_after_their_turns_before_and_after_a_restart() {
+    let state = MemoryState::new();
+    let make = || {
+        setup(Setup {
+            store: Some(Arc::new(MemoryStore::with_state(state.clone()))),
+            late_answers: true,
+            ..asking(PermissionPolicy::ask())
+        })
+    };
+    let dont_ask = ThreadOptions {
+        permission_mode: Some(PermissionMode::DontAsk),
+        ..Default::default()
+    };
+    let env = make();
+    let t = env.sdk.create(create()).await.unwrap();
+    for restart in [false, true] {
+        let env = make();
+        env.sdk
+            .set_options(
+                &t.id,
+                ThreadOptions {
+                    permission_mode: Some(PermissionMode::Default),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        let q = interrupted_question(&env.sdk, &t.id).await;
+        let s = settle(&env.sdk, &t.id).await;
+        assert_eq!(open(&s)[0]["id"], q["id"]);
+        let env = if restart {
+            env.sdk.close(false).await.unwrap();
+            make()
+        } else {
+            env
+        };
+        env.sdk.set_options(&t.id, dont_ask.clone()).await.unwrap();
+        let s = settle(&env.sdk, &t.id).await;
+        assert!(open(&s).is_empty(), "restart: {restart}");
+        assert_eq!(
+            resolution_of(&env.sdk, &t.id, &q).await,
+            json!({"outcome": "cancel", "message": DONT_ASK_DENIAL})
+        );
+        // Dismissed, it sent nothing.
+        assert_eq!(results(&s).len(), if restart { 2 } else { 1 });
+        env.sdk.close(false).await.unwrap();
+    }
+}
+
+/// The conversation moved on from a question (the user sent a message, which the harness took in)
+/// before the backend stopped with its run: the question isn't kept open when the lost turn ends,
+/// whether or not it has a tool_call item.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_question_isnt_kept_open_after_a_lost_run_once_the_user_sent_a_message() {
+    for unlinked in [false, true] {
+        lost_run_after_a_message(unlinked).await;
+    }
+}
+
+async fn lost_run_after_a_message(unlinked: bool) {
+    let state = MemoryState::new();
+    let make = |store: MemoryStore| {
+        setup(Setup {
+            store: Some(Arc::new(store)),
+            late_answers: true,
+            env: if unlinked {
+                vec![("MINI_CLAUDE_UNLINKED", "1".into())]
+            } else {
+                vec![]
+            },
+            ..asking(PermissionPolicy::ask())
+        })
+    };
+    let env = make(MemoryStore::with_state(state.clone()));
+    let t = env.sdk.create(create()).await.unwrap();
+    env.sdk
+        .send(
+            &t.id,
+            &format!("asking AskUserQuestion {QUESTION}"),
+            SendOptions::default(),
+        )
+        .await
+        .unwrap();
+    let q = open_request(&env.sdk, &t.id, "question", None).await;
+    assert_eq!(q.get("tool_call_id").is_none(), unlinked, "{q}");
+    env.sdk.send(&t.id, "reply hi", SendOptions::default()).await.unwrap();
+    // Taken in: nothing's queued.
+    until(5, || async {
+        let s = serde_json::to_value(env.sdk.snapshot(&t.id).await.unwrap()).unwrap();
+        let messages = items(&s, "user_message").into_iter().cloned().collect::<Vec<_>>();
+        (messages.len() == 2 && messages.iter().all(|m| m.get("queued").is_none())).then_some(())
+    })
+    .await;
+    env.sdk.events_since(&t.id, 0, None).await.unwrap(); // saved
+    // As if the backend died with the run.
+    let copy = common::crashed(&MemoryStore::with_state(state), &t.id).await;
+    env.sdk.close(false).await.unwrap();
+
+    let again = make(copy);
+    let s = serde_json::to_value(again.sdk.snapshot(&t.id).await.unwrap()).unwrap();
+    assert!(open(&s).is_empty(), "unlinked: {unlinked}: {s}");
+    assert_eq!(resolution_of(&again.sdk, &t.id, &q).await, json!({"outcome": "cancel"}));
+}
+
+/// A message the harness took in between a tool call and the question it asks for it came before
+/// the question: the conversation hasn't moved on from it.
+#[tokio::test(flavor = "multi_thread")]
+async fn keeps_a_question_open_after_a_message_taken_in_before_it_was_asked() {
+    let env = setup(Setup {
+        late_answers: true,
+        env: vec![("MINI_CLAUDE_ASK_DELAY", "500".into())],
+        ..asking(PermissionPolicy::ask())
+    });
+    let t = env.sdk.create(create()).await.unwrap();
+    env.sdk
+        .send(
+            &t.id,
+            &format!("asking AskUserQuestion {QUESTION}"),
+            SendOptions::default(),
+        )
+        .await
+        .unwrap();
+    until(5, || async {
+        let s = serde_json::to_value(env.sdk.snapshot(&t.id).await.unwrap()).unwrap();
+        (!items(&s, "tool_call").is_empty()).then_some(())
+    })
+    .await;
+    env.sdk.send(&t.id, "reply hi", SendOptions::default()).await.unwrap();
+    let q = open_request(&env.sdk, &t.id, "question", None).await;
+    let s = serde_json::to_value(env.sdk.snapshot(&t.id).await.unwrap()).unwrap();
+    let messages = items(&s, "user_message");
+    assert!(
+        messages.len() == 2 && messages.iter().all(|m| m.get("queued").is_none()),
+        "{s}"
+    );
+    assert_eq!(q["user_messages"], 2);
+    env.sdk.interrupt(&t.id).await.unwrap();
+    let s = settle(&env.sdk, &t.id).await;
+    assert_eq!(open(&s).first().map(|r| &r["id"]), Some(&q["id"]), "{s}");
+    let answer = resolution(json!({"outcome": "answer", "answers": {"Colour?": ["Red"]}}));
+    env.sdk.respond(&t.id, q["id"].as_str().unwrap(), answer).await.unwrap();
+    let s = settle(&env.sdk, &t.id).await;
+    let text = "My answer to the question you asked:\n\n- Colour?\n  Red";
+    assert_eq!(items(&s, "user_message").last().unwrap()["text"], text);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn without_late_answers_a_turn_that_ends_cancels_its_questions() {
+    let env = setup(asking(PermissionPolicy::ask()));
+    let t = env.sdk.create(create()).await.unwrap();
+    env.sdk
+        .send(
+            &t.id,
+            &format!("asking AskUserQuestion {QUESTION}"),
+            SendOptions::default(),
+        )
+        .await
+        .unwrap();
+    open_request(&env.sdk, &t.id, "question", None).await;
+    env.sdk.interrupt(&t.id).await.unwrap();
+    let s = settle(&env.sdk, &t.id).await;
+    assert!(open(&s).is_empty());
 }
 
 #[tokio::test(flavor = "multi_thread")]

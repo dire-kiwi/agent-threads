@@ -1,11 +1,13 @@
 // Codex's items, plans, questions and usage in the protocol's terms (spec/fixtures/README.md,
 // "Codex").
 
-import type { FileChange, PermissionMode, Question, RateLimit, Todo, ToolStatus, Usage } from "@dire-kiwi/agent-threads-protocol";
+import type { FileChange, PermissionMode, Question, RateLimit, SubagentState, SubagentStatus, Todo, ToolStatus, Usage } from "@dire-kiwi/agent-threads-protocol";
 import { unixTime, type McpServer } from "../harness.js";
 import { resultText, slim, type ToolFields } from "../claude/translate.js";
 import type {
   AskForApproval,
+  CollabAgentState,
+  CollabAgentToolCallThreadItem,
   CommandExecutionThreadItem,
   DynamicToolCallThreadItem,
   FileChangeThreadItem,
@@ -17,6 +19,7 @@ import type {
   ThreadItem,
   TokenUsageBreakdown,
   ToolRequestUserInputQuestion,
+  Turn,
   TurnPlanStep,
   WebSearchThreadItem,
 } from "./protocol.js";
@@ -103,6 +106,52 @@ export function codexDone(item: ToolItem, denied: boolean): { [k: string]: unkno
       break;
   }
   return patch;
+}
+
+/**
+ * What a spawnAgent call's completion changes in its call. The spawn returns as soon as the child
+ * thread has started, and the child runs on: a background subagent, until its turn ends.
+ */
+export function spawnDone(item: CollabAgentToolCallThreadItem): { [k: string]: unknown } {
+  const status: ToolStatus = item.status === "failed" ? "failed" : item.status === "interrupted" ? "cancelled" : "completed";
+  if (status !== "completed" || !item.receiverThreadIds?.length) return { status };
+  return { status, subagent: { status: "running", background: true, ...(item.model ? { model: item.model } : {}) } satisfies SubagentState };
+}
+
+/** How a collab call's agentsStates entry says a child thread is getting on, as a SubagentStatus. */
+export function collabStatus(state: CollabAgentState | undefined): SubagentStatus | undefined {
+  switch (state?.status) {
+    case "pendingInit":
+    case "running":
+      return "running";
+    case "completed":
+      return "completed";
+    case "errored":
+    case "notFound":
+      return "failed";
+    case "shutdown":
+    case "interrupted":
+      return "stopped";
+  }
+  return undefined;
+}
+
+/** A subagent after an agentsStates entry about its child thread (undefined if it says nothing). */
+export function collabSubagent(s: SubagentState, state: CollabAgentState | undefined): SubagentState | undefined {
+  const status = collabStatus(state);
+  if (!status) return undefined;
+  const next: SubagentState = { ...s, status };
+  // Taken up again, it hasn't a report yet.
+  if (status === "running") delete next.summary;
+  else if (state?.message) next.summary = state.message;
+  return next;
+}
+
+/** A subagent after its child thread's turn ended, with the child's last message (or the turn's error). */
+export function childTurnSubagent(s: SubagentState, turn: Turn | undefined, last: string | undefined): SubagentState {
+  const status: SubagentStatus = turn?.status === "completed" ? "completed" : turn?.status === "interrupted" ? "stopped" : "failed";
+  const summary = (status === "failed" ? turn?.error?.message : undefined) ?? last;
+  return { ...s, status, ...(summary ? { summary } : {}) };
 }
 
 /**
