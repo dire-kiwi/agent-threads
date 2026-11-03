@@ -475,6 +475,10 @@ pub(crate) struct ClaudeSession {
     marking: Option<String>,
     steer_timer: Option<Timer>,
     stop_timer: Option<Timer>,
+    /// Turns of its own Claude owes, to report background subagents that ended (see owe_turn), and
+    /// when it's given up waiting for them.
+    owed: u32,
+    owed_timer: Option<Timer>,
     /// When those go off (ms since the epoch), for a checkpoint.
     steer_at: Option<u64>,
     stop_at: Option<u64>,
@@ -494,6 +498,8 @@ impl ClaudeSession {
             marking: None,
             steer_timer: None,
             stop_timer: None,
+            owed: 0,
+            owed_timer: None,
             steer_at: None,
             stop_at: None,
             tmp: None,
@@ -875,6 +881,7 @@ impl ClaudeSession {
         let at = run.at.clone();
         if self.current.as_deref() == Some(id) {
             self.current = None;
+            self.owed_turn(true);
             if let Some(last) = self.last.replace(id.to_string())
                 && last != id
             {
@@ -1217,6 +1224,9 @@ impl ClaudeSession {
                 }
             }
             "result" => {
+                if m["origin"]["kind"] == "task-notification" {
+                    self.owed_turn(false);
+                }
                 let run = self.runs.get_mut(id).unwrap();
                 // The turn's requests are moot now; its open questions are cancelled with it. A
                 // background subagent's carry on.
@@ -1402,7 +1412,39 @@ impl ClaudeSession {
         };
         let Some(s) = &c.subagent else { return };
         let next = subagent_task(s, m);
+        // A background subagent that ends is reported to the agent in a turn Claude starts by
+        // itself: its process is needed until then (see keeps_process).
+        if s.background
+            && s.status == crate::protocol::SubagentStatus::Running
+            && next.status != crate::protocol::SubagentStatus::Running
+        {
+            self.owe_turn(ctx);
+        }
         ctx.update_item(&call, json!({"subagent": next}));
+    }
+
+    /// Claude owes the agent a turn of its own, to report a background subagent that ended: until it
+    /// comes (its result has origin.kind task-notification), or for the steer grace at most, the
+    /// thread isn't let go of as idle.
+    fn owe_turn(&mut self, ctx: &mut ThreadContext) {
+        self.owed += 1;
+        if let Some(t) = self.owed_timer.take() {
+            t.cancel();
+        }
+        self.owed_timer = Some(ctx.timer::<ClaudeSession>(self.o.steer_grace, |s, _| {
+            s.owed = 0;
+            s.owed_timer = None;
+        }));
+    }
+
+    /// Claude made a turn it owed, or its process has gone (`all`).
+    fn owed_turn(&mut self, all: bool) {
+        self.owed = if all { 0 } else { self.owed.saturating_sub(1) };
+        if self.owed == 0
+            && let Some(t) = self.owed_timer.take()
+        {
+            t.cancel();
+        }
     }
 
     fn control_request(&mut self, ctx: &mut ThreadContext, id: &str, request_id: &str, req: Value) {
@@ -1975,8 +2017,13 @@ impl HarnessSession for ClaudeSession {
         }
     }
 
+    fn keeps_process(&self) -> bool {
+        self.owed > 0 && self.live_id().is_some()
+    }
+
     fn close_idle(&mut self, ctx: &mut ThreadContext) -> bool {
         let Some(id) = self.live_id() else { return false };
+        self.owed_turn(true);
         self.clear_steer();
         self.clear_stop();
         // Its input is closed, so it exits once it's done (or is signalled after the close grace). Retired: what it says on its way out

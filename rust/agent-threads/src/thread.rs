@@ -1557,7 +1557,7 @@ impl Actor {
     /// has been idle long enough, and stops waiting to if it's busy again.
     fn check_idle(&mut self) {
         let Some(after) = self.core.host.idle_close else { return };
-        if !self.core.idle_now() {
+        if !self.idle_now() {
             if let Idle::Armed(_, timer) = std::mem::replace(&mut self.core.idle, Idle::Busy) {
                 timer.abort();
             }
@@ -1573,13 +1573,19 @@ impl Actor {
             tokio::time::sleep(after).await;
             let _ = tx.send(Box::new(move |a: &mut Actor| {
                 // Unless it's been busy since (a message came first, say).
-                if matches!(a.core.idle, Idle::Armed(m, _) if m == n) && a.core.idle_now() {
+                if matches!(a.core.idle, Idle::Armed(m, _) if m == n) && a.idle_now() {
                     a.close_idle();
                 }
             }));
         })
         .abort_handle();
         self.core.idle = Idle::Armed(n, timer);
+    }
+
+    /// Whether the thread is idle (ThreadContext::idle_now), and its session doesn't need its process
+    /// still (HarnessSession::keeps_process).
+    pub(crate) fn idle_now(&self) -> bool {
+        self.core.idle_now() && !self.session.keeps_process()
     }
 
     /// Lets the idle thread's harness process go (the caller checks it's idle): the session stops

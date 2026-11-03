@@ -34,7 +34,8 @@
 //                         instead, which is answered before the turn ends, and its tool_result
 //                         comes <ms> after; with MINI_CLAUDE_BACKGROUND_ASK=<json>, it asks
 //                         AskUserQuestion with that input instead of calling Bash. With MINI_CLAUDE_NOTIFY_FIRST=1, messages that come
-//                         while a background subagent runs wait for the turn that reports it
+//                         while a background subagent runs wait for the turn that reports it; with
+//                         MINI_CLAUDE_REPORT_DELAY=<ms>, that turn starts that long after the subagent ends
 //
 // It answers every control request with success and an empty response, but a `never_answered` one.
 //
@@ -311,6 +312,9 @@ async function step(text) {
       out({ type: "system", subtype: "task_updated", task_id: task, patch: { status: "completed" }, session_id: session });
       out({ type: "system", subtype: "task_notification", task_id: task, tool_use_id: agent, status: "completed", summary: words.join(" "), usage: { tool_uses: 1 }, session_id: session });
       backgrounds--;
+      // As Claude may, it reports the subagent a while after it ends.
+      const reportDelay = Number(process.env.MINI_CLAUDE_REPORT_DELAY ?? 0);
+      if (reportDelay) await sleep(reportDelay);
       if (busy) return void wake?.();
       busy = true;
       out({ type: "system", subtype: "init", session_id: session });

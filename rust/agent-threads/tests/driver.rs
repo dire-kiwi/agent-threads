@@ -3217,8 +3217,10 @@ async fn a_steered_message_carried_over_goes_to_the_live_process_before_its_let_
 
 #[tokio::test(flavor = "multi_thread")]
 async fn keeps_the_process_while_a_background_subagent_runs_and_lets_it_go_after() {
+    // Claude reports the subagent a while after it ends: the process is kept for that turn too.
     let env = setup(Setup {
         idle_close: Some(Duration::ZERO),
+        env: vec![("MINI_CLAUDE_REPORT_DELAY", "200".into())],
         ..Default::default()
     });
     let t = env.sdk.create(create()).await.unwrap();

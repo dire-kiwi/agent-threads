@@ -913,14 +913,15 @@ impl AgentThreads {
     /// Lets the thread's harness process go now, as [`Options::idle_close`] does once a thread has
     /// been idle long enough: the thread keeps its session, and its next turn resumes it in a new
     /// process. Whether it had one to let go. Refused while a turn is running, and while the
-    /// process is still needed after its turn: by a background subagent that's running, or a
-    /// request that's open (a question kept open after its turn doesn't need it).
+    /// process is still needed after its turn: by a background subagent that's running (or one
+    /// whose end Claude hasn't reported to the agent yet), or a request that's open (a question
+    /// kept open after its turn doesn't need it).
     pub async fn release(&self, thread_id: &str) -> Result<bool> {
         self.ready(thread_id)
             .await?
             .call(|a| {
                 idle(a, "released")?;
-                if !a.core.idle_now() {
+                if !a.idle_now() {
                     return Err(Error::Command(
                         "the thread's harness process is still needed (a background subagent is running, or a request is open)"
                             .into(),

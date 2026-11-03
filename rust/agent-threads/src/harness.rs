@@ -286,6 +286,12 @@ pub trait HarnessSession: Send + Any {
     fn close_idle(&mut self, _ctx: &mut ThreadContext) -> bool {
         false
     }
+    /// Whether the process is still needed though the thread looks idle: Claude Code owes the agent
+    /// a turn of its own, to report a background subagent that ended. The thread isn't let go of
+    /// as idle meanwhile. By default, never.
+    fn keeps_process(&self) -> bool {
+        false
+    }
     /// Stop the harness process, if it's running; the future resolves once it has gone.
     fn close(&mut self, ctx: &mut ThreadContext) -> BoxFuture<()>;
 
