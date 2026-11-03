@@ -228,13 +228,16 @@ export function sandboxPolicy(mode: SandboxMode, workspace: SandboxPolicy | unde
   return p;
 }
 
-/** An MCP server as Codex's `mcp_servers` config has it, or why it can't be. */
+/**
+ * An MCP server as Codex's `mcp_servers` config has it, or why it can't be: the table made from its
+ * own fields, over its Codex settings.
+ */
 export function mcpServerConfig(s: McpServer): { [k: string]: unknown } | { unsupported: string } {
   if ("url" in s) {
     if (s.type === "sse") return { unsupported: "Codex doesn't support SSE MCP servers" };
-    return { url: s.url, ...(s.headers && Object.keys(s.headers).length ? { http_headers: s.headers } : {}) };
+    return { ...s.codex, url: s.url, ...(s.headers && Object.keys(s.headers).length ? { http_headers: s.headers } : {}) };
   }
-  return { command: s.command, ...(s.args ? { args: s.args } : {}), ...(s.env ? { env: s.env } : {}) };
+  return { ...s.codex, command: s.command, ...(s.args ? { args: s.args } : {}), ...(s.env ? { env: s.env } : {}) };
 }
 
 /**

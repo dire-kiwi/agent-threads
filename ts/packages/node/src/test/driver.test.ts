@@ -1,8 +1,8 @@
 // What the recorded fixtures don't cover, against a scriptable fake `claude` (mini-claude.mjs):
 // steering that outlives a turn, policies, failures, restarts, option changes and stopping.
 
-import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
-import { join } from "node:path";
+import { existsSync, mkdirSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { basename, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { afterEach, describe, expect, it } from "vitest";
 import { applyEvents, initialState, openRequests, type Item, type ThreadEvent, type ThreadRequest, type ToolCall, type TurnResult, type UserMessage } from "@dire-kiwi/agent-threads-protocol";
@@ -782,7 +782,8 @@ describe("the Claude driver", () => {
     const skills = join(plugin, "skills");
     expect(readFileSync(join(skills, "support", "SKILL.md"), "utf8")).toMatch(/Be kind/);
     expect(readFileSync(join(skills, "greet", "SKILL.md"), "utf8")).toBe("Say hi.");
-    expect(JSON.parse(flag("--mcp-config"))).toEqual({
+    // In a file of the run's own (see below).
+    expect(JSON.parse(readFileSync(flag("--mcp-config"), "utf8"))).toEqual({
       mcpServers: { docs: { type: "http", url: "https://example.com/mcp" }, echo: { type: "stdio", command: "node", args: ["echo.mjs"] } },
     });
     expect(flag("--append-system-prompt")).toBe("You help.");
@@ -791,6 +792,59 @@ describe("the Claude driver", () => {
     // The generated plugin goes when the process that used it stops.
     await sdk.close();
     expect(existsSync(skills)).toBe(false);
+  });
+
+  // An MCP server whose environment and headers have a secret: it isn't on any process's command line
+  // while Claude runs (its --mcp-config is a file readable by the user only), and the file goes with
+  // the run.
+  const mcpConfigInAPrivateFile = async (spawner?: ReturnType<typeof shim>) => {
+    const secret = `secret-${process.pid}-${Date.now()}-${Math.random()}`;
+    const { sdk, runs } = setup({
+      ...(spawner ? { spawner } : {}),
+      mcpServers: {
+        // Codex's settings are Codex's alone: Claude Code takes MCP_TOOL_TIMEOUT from its environment.
+        echo: { command: "node", args: ["echo.mjs"], env: { ECHO_TOKEN: secret }, codex: { tool_timeout_sec: 600 } },
+        docs: { url: "https://example.com/mcp", headers: { authorization: `Bearer ${secret}` } },
+      },
+    });
+    open = open.filter((x) => x !== sdk);
+    try {
+      const t = await sdk.create();
+      await sdk.send(t.id, "reply hi");
+      await settle(sdk, t.id);
+      const argv = runs()[0]!.argv;
+      expect(argv.some((a) => a.includes(secret))).toBe(false);
+      // Claude stays up between turns: nothing running has the secret on its command line.
+      if (process.platform === "linux") {
+        for (const pid of readdirSync("/proc")) {
+          let cmdline = "";
+          try {
+            cmdline = readFileSync(join("/proc", pid, "cmdline"), "utf8");
+          } catch {
+            continue;
+          }
+          expect(cmdline.includes(secret), `/proc/${pid} has the secret on its command line`).toBe(false);
+        }
+      }
+      const file = argv[argv.indexOf("--mcp-config") + 1]!;
+      expect(basename(file)).toMatch(/^mcp-/);
+      const config = JSON.parse(readFileSync(file, "utf8"));
+      expect(config.mcpServers.echo).toEqual({ type: "stdio", command: "node", args: ["echo.mjs"], env: { ECHO_TOKEN: secret } });
+      if (process.platform !== "win32") expect(statSync(file).mode & 0o777).toBe(0o600);
+      // It goes with the run.
+      await sdk.close({ stop: true });
+      expect(existsSync(file)).toBe(false);
+    } finally {
+      await sdk.close({ stop: true });
+    }
+  };
+
+  it("writes the MCP config to a private file, not the command line", async () => {
+    await mcpConfigInAPrivateFile();
+  });
+
+  it.skipIf(process.platform === "win32")("writes the MCP config to a private file under the shim too", async () => {
+    await mcpConfigInAPrivateFile(shim(shimPath(), { runsDir: tempDir(), pollMs: 20 }));
   });
 
   it("lets an app opt in to the user's own settings", async () => {

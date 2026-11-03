@@ -141,7 +141,8 @@ backend drives each CLI:
   report hooks, for their notices), plus `--resume <session_id>` (and `--resume-session-at
   <resume_at>` after a rewind), and
   `--mcp-config` with the thread's MCP servers (stdio ones as `type: stdio`) and, when it has app
-  tools, an in-process server named `app` (`{"type": "sdk", "name": "app"}`). It sends a
+  tools, an in-process server named `app` (`{"type": "sdk", "name": "app"}`), as a file of the
+  run's own that's readable by the user only (the backends don't put it on the command line). It sends a
   `control_request` `initialize` first (with `sdkMcpServers: ["app"]` when there are app tools),
   and waits for its response before the first user message. User messages are
   `{"type":"user","message":{"role":"user","content":[{"type":"text","text":...}]},"parent_tool_use_id":null}`.

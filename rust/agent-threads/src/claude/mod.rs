@@ -182,6 +182,8 @@ struct RunState {
     held_usage: Option<Usage>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     plugin_dir: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    mcp_config: Option<String>,
     /// The running turn's mark: the main conversation's last message in it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     at: Option<String>,
@@ -240,6 +242,8 @@ struct Run {
     held_usage: Option<Usage>,
     /// The generated plugin with the thread's skills, for this run only.
     plugin_dir: Option<PathBuf>,
+    /// The file with its --mcp-config, for this run only.
+    mcp_config: Option<PathBuf>,
     /// The running turn's mark: the uuid of the main conversation's last message in it.
     at: Option<String>,
     /// The message it was started to resume its session at (--resume-session-at).
@@ -279,6 +283,7 @@ impl Run {
             auto_turn: None,
             held_usage: None,
             plugin_dir: None,
+            mcp_config: None,
             at: None,
             resume_at: None,
             launched: None,
@@ -399,6 +404,7 @@ impl Run {
             auto_turn: self.auto_turn.clone(),
             held_usage: self.held_usage.clone(),
             plugin_dir: self.plugin_dir.as_ref().map(|p| p.to_string_lossy().into()),
+            mcp_config: self.mcp_config.as_ref().map(|p| p.to_string_lossy().into()),
             at: self.at.clone(),
             resume_at: self.resume_at.clone(),
             launched: self.launched.clone(),
@@ -425,6 +431,7 @@ impl Run {
         self.auto_turn = st.auto_turn.clone();
         self.held_usage = st.held_usage.clone();
         self.plugin_dir = st.plugin_dir.as_ref().map(PathBuf::from);
+        self.mcp_config = st.mcp_config.as_ref().map(PathBuf::from);
         self.at = st.at.clone();
         self.resume_at = st.resume_at.clone();
         self.launched = st.launched.clone();
@@ -696,7 +703,22 @@ impl ClaudeSession {
             }
             return;
         }
-        let args = self.args(ctx, id);
+        // What the run needs written for it (its MCP config, its skills) and couldn't be: it doesn't
+        // start without it, and the turn fails.
+        let args = match self.args(ctx, id) {
+            Ok(args) => args,
+            Err(e) => {
+                self.exited(
+                    ctx,
+                    id,
+                    ExitStatus {
+                        error: Some(e),
+                        ..Default::default()
+                    },
+                );
+                return;
+            }
+        };
         let o = &self.o;
         let mut env: HashMap<String, String> = std::env::vars().collect();
         for (k, v) in &o.env {
@@ -750,7 +772,7 @@ impl ClaudeSession {
         self.run(id).unwrap().control(init, false);
     }
 
-    fn args(&mut self, ctx: &ThreadContext, id: &str) -> Vec<String> {
+    fn args(&mut self, ctx: &ThreadContext, id: &str) -> Result<Vec<String>, String> {
         let t = ctx.thread();
         let config = ctx.config();
         let o = self.o.clone();
@@ -798,14 +820,14 @@ impl ClaudeSession {
             servers.insert(
                 name.clone(),
                 match s {
-                    crate::harness::McpServer::Stdio { command, args, env } => {
+                    crate::harness::McpServer::Stdio { command, args, env, .. } => {
                         let mut v = json!({"type": "stdio", "command": command, "args": args});
                         if !env.is_empty() {
                             v["env"] = json!(env);
                         }
                         v
                     }
-                    crate::harness::McpServer::Http { url, headers }
+                    crate::harness::McpServer::Http { url, headers, .. }
                     | crate::harness::McpServer::Sse { url, headers } => {
                         let kind = if matches!(s, crate::harness::McpServer::Sse { .. }) {
                             "sse"
@@ -822,26 +844,33 @@ impl ClaudeSession {
             );
         }
         if !servers.is_empty() {
-            args.extend(["--mcp-config".into(), json!({"mcpServers": servers}).to_string()]);
+            // In a file of the run's own, readable by the user only, not on the command line, where
+            // anyone could read the servers' environment and headers (often API keys) for as long
+            // as the process runs.
+            let config = json!({"mcpServers": servers}).to_string();
+            let file = self
+                .dir()
+                .and_then(|d| crate::attachments::write_private(&d, &format!("mcp-{id}.json"), config.as_bytes()))
+                .map_err(|e| format!("its MCP servers' config couldn't be written: {e}"))?;
+            args.extend(["--mcp-config".into(), file.to_string_lossy().into()]);
+            if let Some(r) = self.run(id) {
+                r.mcp_config = Some(file);
+            }
         }
         if !config.skills.is_empty() {
             // A plugin of the run's own, made from the skills as they are now: Claude finds a
             // plugin's skills (as app:<name>) even with --setting-sources "", which hides
             // .claude/skills directories.
-            let written = self.dir().and_then(|d| {
-                let dir = d.join(format!("plugin-{id}"));
-                write_plugin(&dir, &config.skills).map(|_| dir)
-            });
-            match written {
-                Ok(dir) => {
-                    args.extend(["--plugin-dir".into(), dir.to_string_lossy().into()]);
-                    if let Some(r) = self.run(id) {
-                        r.plugin_dir = Some(dir);
-                    }
-                }
-                Err(e) => ctx.error(Error::Other(format!(
-                    "the app's skills couldn't be written for Claude Code: {e}"
-                ))),
+            let dir = self
+                .dir()
+                .and_then(|d| {
+                    let dir = d.join(format!("plugin-{id}"));
+                    write_plugin(&dir, &config.skills).map(|_| dir)
+                })
+                .map_err(|e| format!("the app's skills couldn't be written: {e}"))?;
+            args.extend(["--plugin-dir".into(), dir.to_string_lossy().into()]);
+            if let Some(r) = self.run(id) {
+                r.plugin_dir = Some(dir);
             }
         }
         if let Some(p) = &config.system_prompt {
@@ -853,7 +882,7 @@ impl ClaudeSession {
         }
         args.extend(o.args.iter().cloned());
         args.extend(launch.args.iter().cloned());
-        args
+        Ok(args)
     }
 
     fn exited(&mut self, ctx: &mut ThreadContext, id: &str, status: ExitStatus) {
@@ -866,6 +895,9 @@ impl ClaudeSession {
         run.cancel.cancel();
         if let Some(dir) = &run.plugin_dir {
             let _ = std::fs::remove_dir_all(dir);
+        }
+        if let Some(file) = &run.mcp_config {
+            let _ = std::fs::remove_file(file);
         }
         run.pending.clear();
         run.fail_controls("Claude Code exited before it answered.");

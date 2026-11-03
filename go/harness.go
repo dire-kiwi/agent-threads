@@ -20,6 +20,13 @@ import (
 // ThreadContext.Post.
 
 // MCPServer is an external MCP server: a command to run (stdio), or a URL (streamable HTTP, or SSE).
+//
+// Codex is settings for Codex's table for the server (its mcp_servers.<name> config), besides those
+// made from the server's own fields: tool_timeout_sec, startup_timeout_sec,
+// default_tools_approval_mode, enabled_tools and so on, as Codex's config documents them. Claude Code
+// has no such settings for a server, and ignores them: it takes its MCP tool timeout from the
+// MCP_TOOL_TIMEOUT environment variable (milliseconds), which the harness options' or a thread's
+// launch options' Env can set.
 type MCPServer struct {
 	// Type is "stdio", "http" or "sse"; "stdio" with a Command, "http" with a URL, if it's left out.
 	Type    string            `json:"type,omitempty"`
@@ -28,6 +35,7 @@ type MCPServer struct {
 	Env     map[string]string `json:"env,omitempty"`
 	URL     string            `json:"url,omitempty"`
 	Headers map[string]string `json:"headers,omitempty"`
+	Codex   map[string]any    `json:"codex,omitempty"`
 }
 
 // Skill is a skill: a directory with a SKILL.md (and anything it refers to), or a SKILL.md's text.

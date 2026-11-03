@@ -20,16 +20,25 @@ use crate::thread::ThreadContext;
 use crate::tools::Tool;
 
 /// An external MCP server: a command to run (stdio), or a URL (streamable HTTP, or SSE).
+///
+/// `codex` is settings for Codex's table for the server (its `mcp_servers.<name>` config), besides
+/// those made from the server's own fields: `tool_timeout_sec`, `startup_timeout_sec`,
+/// `default_tools_approval_mode`, `enabled_tools` and so on, as Codex's config documents them.
+/// Claude Code has no such settings for a server, and ignores them: it takes its MCP tool timeout
+/// from the `MCP_TOOL_TIMEOUT` environment variable (milliseconds), which the harness options' or
+/// a thread's launch options' `env` can set.
 #[derive(Clone, Debug, PartialEq)]
 pub enum McpServer {
     Stdio {
         command: String,
         args: Vec<String>,
         env: BTreeMap<String, String>,
+        codex: serde_json::Map<String, Value>,
     },
     Http {
         url: String,
         headers: BTreeMap<String, String>,
+        codex: serde_json::Map<String, Value>,
     },
     Sse {
         url: String,
@@ -44,6 +53,7 @@ impl McpServer {
             command: command.into(),
             args: args.into_iter().map(Into::into).collect(),
             env: BTreeMap::new(),
+            codex: serde_json::Map::new(),
         }
     }
 
@@ -52,11 +62,29 @@ impl McpServer {
         McpServer::Http {
             url: url.into(),
             headers: BTreeMap::new(),
+            codex: serde_json::Map::new(),
         }
     }
 
-    /// One as the Node backend's options (and the fixtures) write it: `{command, args?, env?}` or
-    /// `{type?, url, headers?}`.
+    /// With a setting for Codex's table for the server (see [`McpServer`]), such as
+    /// `("tool_timeout_sec", json!(3900))`. Codex has no SSE servers, so an SSE server has none.
+    pub fn codex(mut self, key: impl Into<String>, value: impl Into<Value>) -> Self {
+        if let McpServer::Stdio { codex, .. } | McpServer::Http { codex, .. } = &mut self {
+            codex.insert(key.into(), value.into());
+        }
+        self
+    }
+
+    /// The server's settings for Codex.
+    pub fn codex_settings(&self) -> Option<&serde_json::Map<String, Value>> {
+        match self {
+            McpServer::Stdio { codex, .. } | McpServer::Http { codex, .. } => Some(codex),
+            McpServer::Sse { .. } => None,
+        }
+    }
+
+    /// One as the Node backend's options (and the fixtures) write it: `{command, args?, env?,
+    /// codex?}` or `{type?, url, headers?, codex?}`.
     pub fn from_json(v: &Value) -> Option<Self> {
         let strings = |v: Option<&Value>| -> BTreeMap<String, String> {
             v.and_then(Value::as_object)
@@ -67,6 +95,7 @@ impl McpServer {
                 })
                 .unwrap_or_default()
         };
+        let codex = v.get("codex").and_then(Value::as_object).cloned().unwrap_or_default();
         if let Some(url) = v.get("url").and_then(Value::as_str) {
             let headers = strings(v.get("headers"));
             return Some(if v.get("type").and_then(Value::as_str) == Some("sse") {
@@ -78,6 +107,7 @@ impl McpServer {
                 McpServer::Http {
                     url: url.into(),
                     headers,
+                    codex,
                 }
             });
         }
@@ -90,6 +120,7 @@ impl McpServer {
             command,
             args: args.unwrap_or_default(),
             env: strings(v.get("env")),
+            codex,
         })
     }
 }

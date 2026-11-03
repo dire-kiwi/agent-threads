@@ -137,6 +137,7 @@ type claudeRunState struct {
 	AutoTurn    string          `json:"autoTurn,omitempty"`
 	HeldUsage   *protocol.Usage `json:"heldUsage,omitempty"`
 	PluginDir   string          `json:"pluginDir,omitempty"`
+	MCPConfig   string          `json:"mcpConfig,omitempty"`
 	At          string          `json:"at,omitempty"`       // the running turn's mark: the main conversation's last message in it
 	ResumeAt    string          `json:"resumeAt,omitempty"` // the thread's resume_at it was started with
 	Launched    *launched       `json:"launched,omitempty"`
@@ -194,6 +195,8 @@ type claudeRun struct {
 	heldUsage *protocol.Usage
 	// pluginDir is the generated plugin with the thread's skills, for this run only.
 	pluginDir string
+	// mcpConfig is the file with its --mcp-config, for this run only.
+	mcpConfig string
 	// at is the running turn's mark: the uuid of the main conversation's last message in it.
 	at string
 	// resumeAt is the message it was started to resume its session at (--resume-session-at).
@@ -317,7 +320,7 @@ func without(list []string, x string) []string {
 }
 
 func (r *claudeRun) state() claudeRunState {
-	st := claudeRunState{V: 1, Ready: r.ready, Waiting: append([]string{}, r.waiting...), Next: r.nextRequest, Streamed: []string{}, Sent: append([]sentMessage{}, r.sent...), PluginDir: r.pluginDir, At: r.at, ResumeAt: r.resumeAt, Launched: r.launched}
+	st := claudeRunState{V: 1, Ready: r.ready, Waiting: append([]string{}, r.waiting...), Next: r.nextRequest, Streamed: []string{}, Sent: append([]sentMessage{}, r.sent...), PluginDir: r.pluginDir, MCPConfig: r.mcpConfig, At: r.at, ResumeAt: r.resumeAt, Launched: r.launched}
 	st.Pending = [][2]string{}
 	for _, id := range r.pendingOrder {
 		st.Pending = append(st.Pending, [2]string{id, r.pending[id].subtype})
@@ -403,7 +406,7 @@ func (r *claudeRun) restore(st claudeRunState, answered func(subtype string) fun
 	}
 	r.agents = append([]string(nil), st.Agents...)
 	r.autoTurn, r.heldUsage = st.AutoTurn, st.HeldUsage
-	r.pluginDir = st.PluginDir
+	r.pluginDir, r.mcpConfig = st.PluginDir, st.MCPConfig
 	r.at, r.resumeAt = st.At, st.ResumeAt
 	r.launched = st.Launched
 }
@@ -1229,7 +1232,18 @@ func (s *claudeSession) args(run *claudeRun) ([]string, error) {
 		}
 	}
 	if len(servers) > 0 {
-		args = append(args, "--mcp-config", string(mustJSON(map[string]any{"mcpServers": servers})))
+		// In a file of the run's own, readable by the user only, not on the command line, where anyone
+		// could read the servers' environment and headers (often API keys) for as long as it runs.
+		dir, err := s.dir()
+		if err != nil {
+			return nil, err
+		}
+		file := filepath.Join(dir, "mcp-"+run.id+".json")
+		if err := os.WriteFile(file, mustJSON(map[string]any{"mcpServers": servers}), 0o600); err != nil {
+			return nil, err
+		}
+		run.mcpConfig = file
+		args = append(args, "--mcp-config", file)
 	}
 	if len(cfg.Skills) > 0 {
 		// A plugin of the run's own, made from the skills as they are now: Claude finds a plugin's
@@ -1270,6 +1284,9 @@ func (s *claudeSession) exited(run *claudeRun, status ExitStatus) {
 	run.abort()
 	if run.pluginDir != "" {
 		os.RemoveAll(run.pluginDir)
+	}
+	if run.mcpConfig != "" {
+		os.Remove(run.mcpConfig)
 	}
 	pending := run.pending
 	order := run.pendingOrder

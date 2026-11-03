@@ -161,7 +161,9 @@ conformance runner is `tests/store.rs`.
 drivers do (spec/fixtures/README.md, "What the backend must send"): one process per thread, kept
 between turns; steering; interrupts; resume; app tools as Claude's in-process MCP server over the
 control channel, or Codex's dynamic tools with a loopback streamable-HTTP MCP server (127.0.0.1, a
-random bearer token) where Codex won't take them (`AppTools::Mcp` asks for it); MCP servers; skills
+random bearer token) where Codex won't take them (`AppTools::Mcp` asks for it); MCP servers (in an
+`--mcp-config` file of the run's own, readable by the user only, for Claude; with each server's
+`codex` settings, such as `tool_timeout_sec`, for Codex); skills
 (a generated plugin for Claude, `skills/extraRoots/set` for Codex, which also turns off the user's
 and the project's skills); and isolated config: Claude runs with `--setting-sources ""` and
 `--strict-mcp-config` unless `user_settings`, and Codex with a CODEX_HOME of the app's own

@@ -149,8 +149,35 @@ mcp_servers: [
 .into(),
 ```
 
-(In Rust, `McpServer::Stdio { command, args, env }`, `Http { url, headers }` and `Sse { url,
-headers }` are the variants, for environment and headers.)
+(In Rust, `McpServer::Stdio { command, args, env, codex }`, `Http { url, headers, codex }` and
+`Sse { url, headers }` are the variants, for environment and headers.)
+
+A server can have **Codex settings** (`codex`; Go `Codex`; Rust `codex`, or `.codex(key, value)`):
+more keys for Codex's table for the server (its `mcp_servers.<name>` config), such as
+`tool_timeout_sec`, `startup_timeout_sec` and `default_tools_approval_mode`. The table's own keys
+(`command`, `args`, `env`, `url`, `http_headers`) come from the server's own fields. A server whose
+tools can run for a long time needs `tool_timeout_sec`, or Codex's default timeout cuts its calls
+off; a `-c mcp_servers.<name>.…` in the harness's arguments doesn't help, since `thread/start`'s
+`mcp_servers` replaces that table.
+
+```ts
+// Node
+board: { command: "board-mcp", args: ["--serve"], codex: { tool_timeout_sec: 3900, default_tools_approval_mode: "approve" } },
+```
+
+```go
+// Go
+"board": {Command: "board-mcp", Args: []string{"--serve"}, Codex: map[string]any{"tool_timeout_sec": 3900, "default_tools_approval_mode": "approve"}},
+```
+
+```rust
+// Rust
+("board".to_string(), McpServer::stdio("board-mcp", ["--serve"]).codex("tool_timeout_sec", 3900)),
+```
+
+Claude Code has no settings for a server, and ignores them: it takes its MCP tool timeout from the
+`MCP_TOOL_TIMEOUT` environment variable (milliseconds), which the harness options' or a thread's
+launch options' `env` can set.
 
 A call to an MCP tool is a `tool_call` of kind `mcp`, with `server` set and `name` the tool's own
 name (without Claude's `mcp__<server>__` prefix), and the permission policy is asked about it with
@@ -158,7 +185,8 @@ the same `name` and `server`.
 
 | | Claude Code | Codex |
 | --- | --- | --- |
-| Servers | `--mcp-config` with `--strict-mcp-config`, so only the app's servers load | `mcp_servers` in `thread/start`'s config (`http_headers` for headers) |
+| Servers | `--mcp-config` with `--strict-mcp-config`, so only the app's servers load. The config is a file of the run's own (`mcp-<run id>.json` in the thread's private temporary directory, readable by the user only, removed with the run), not the argument itself, so the servers' environment and headers aren't on the process's command line for anyone to read | `mcp_servers` in `thread/start`'s config (`http_headers` for headers), with each server's Codex settings |
+| Tool timeout | `MCP_TOOL_TIMEOUT` in the environment (milliseconds) | `tool_timeout_sec` in a server's Codex settings |
 | SSE servers | Yes | No: Codex has no SSE transport, so the server is left out and a `notice` says so |
 
 ## Skills
