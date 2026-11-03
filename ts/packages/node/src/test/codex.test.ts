@@ -146,6 +146,13 @@ describe("the Codex driver", () => {
         gh: { command: "gh-mcp", args: ["--stdio"], env: { TOKEN: "x" } },
         docs: { url: "https://example.com/mcp", headers: { "X-Key": "k" } },
         old: { type: "sse", url: "https://example.com/sse" },
+        // Settings for Codex's table for the server, under its own fields.
+        board: {
+          command: "board-mcp",
+          args: ["--serve"],
+          codex: { tool_timeout_sec: 3900, startup_timeout_sec: 20, default_tools_approval_mode: "approve", command: "not-this" },
+        },
+        search: { url: "https://example.com/search", codex: { tool_timeout_sec: 600 } },
       },
       codex: { config: { model_reasoning_summary: "auto" } },
     });
@@ -172,6 +179,8 @@ describe("the Codex driver", () => {
         mcp_servers: {
           gh: { command: "gh-mcp", args: ["--stdio"], env: { TOKEN: "x" } },
           docs: { url: "https://example.com/mcp", http_headers: { "X-Key": "k" } },
+          board: { command: "board-mcp", args: ["--serve"], tool_timeout_sec: 3900, startup_timeout_sec: 20, default_tools_approval_mode: "approve" },
+          search: { url: "https://example.com/search", tool_timeout_sec: 600 },
         },
       },
       dynamicTools: [{ type: "function", name: "lookup_order", description: "Looks up an order.", inputSchema: lookupOrder().input }],

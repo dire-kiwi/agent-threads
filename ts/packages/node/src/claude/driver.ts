@@ -108,6 +108,7 @@ interface RunState {
   autoTurn?: string;
   heldUsage?: Usage;
   pluginDir?: string;
+  mcpConfig?: string;
   /** The running turn's mark: the main conversation's last message in it. */
   at?: string;
   /** The message it was started to resume its session at (the thread's resume_at then). */
@@ -158,6 +159,8 @@ class Run {
   heldUsage: Usage | undefined;
   /** The generated plugin with the thread's skills, for this run only. */
   pluginDir: string | undefined;
+  /** The file with its --mcp-config, for this run only. */
+  mcpConfig: string | undefined;
   /** The running turn's mark: the uuid of the main conversation's last message in it. */
   at: string | undefined;
   /** The message it was started to resume its session at (--resume-session-at). */
@@ -223,6 +226,7 @@ class Run {
       ...(this.autoTurn ? { autoTurn: this.autoTurn } : {}),
       ...(this.heldUsage ? { heldUsage: this.heldUsage } : {}),
       ...(this.pluginDir ? { pluginDir: this.pluginDir } : {}),
+      ...(this.mcpConfig ? { mcpConfig: this.mcpConfig } : {}),
       ...(this.at ? { at: this.at } : {}),
       ...(this.resumeAt ? { resumeAt: this.resumeAt } : {}),
       ...(this.launched ? { launched: this.launched } : {}),
@@ -247,6 +251,7 @@ class Run {
     this.autoTurn = st.autoTurn;
     this.heldUsage = st.heldUsage;
     if (st.pluginDir) this.pluginDir = st.pluginDir;
+    if (st.mcpConfig) this.mcpConfig = st.mcpConfig;
     this.at = st.at;
     this.resumeAt = st.resumeAt;
     if (st.launched) this.launched = { ...st.launched };
@@ -737,7 +742,13 @@ class ClaudeSession implements HarnessSession {
           ? { type: s.type ?? "http", url: s.url, ...(s.headers ? { headers: s.headers } : {}) }
           : { type: "stdio", command: s.command, args: s.args ?? [], ...(s.env ? { env: s.env } : {}) };
     }
-    if (Object.keys(servers).length) args.push("--mcp-config", JSON.stringify({ mcpServers: servers }));
+    if (Object.keys(servers).length) {
+      // In a file of the run's own, readable by the user only, not on the command line, where anyone
+      // could read the servers' environment and headers (often API keys) for as long as it runs.
+      run.mcpConfig = join(this.#dir(), `mcp-${run.id}.json`);
+      writeFileSync(run.mcpConfig, JSON.stringify({ mcpServers: servers }), { mode: 0o600 });
+      args.push("--mcp-config", run.mcpConfig);
+    }
     if (skills.length) {
       // A plugin of the run's own, made from the skills as they are now: Claude finds a plugin's
       // skills (as app:<name>) even with --setting-sources "", which hides .claude/skills directories.
@@ -756,6 +767,7 @@ class ClaudeSession implements HarnessSession {
     run.exited = true;
     run.abort.abort();
     if (run.pluginDir) rmSync(run.pluginDir, { recursive: true, force: true });
+    if (run.mcpConfig) rmSync(run.mcpConfig, { force: true });
     for (const p of run.pending.values()) p.resolve(null);
     run.pending.clear();
     const ctx = this.#ctx;

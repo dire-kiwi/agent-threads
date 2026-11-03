@@ -22,10 +22,19 @@ import type { Spawner } from "./spawner.js";
 import type { RunRecord } from "./store.js";
 import type { Tool } from "./tools.js";
 
-/** An external MCP server: a command to run (stdio), or a URL (streamable HTTP, or SSE). */
+/**
+ * An external MCP server: a command to run (stdio), or a URL (streamable HTTP, or SSE).
+ *
+ * `codex` is settings for Codex's table for the server (its `mcp_servers.<name>` config), besides
+ * those made from the server's own fields: `tool_timeout_sec`, `startup_timeout_sec`,
+ * `default_tools_approval_mode`, `enabled_tools` and so on, as Codex's config documents them.
+ * Claude Code has no such settings for a server, and ignores them: it takes its MCP tool timeout from
+ * the `MCP_TOOL_TIMEOUT` environment variable (milliseconds), which the harness options' or a
+ * thread's launch options' `env` can set.
+ */
 export type McpServer =
-  | { type?: "stdio"; command: string; args?: string[]; env?: { [k: string]: string } }
-  | { type?: "http" | "sse"; url: string; headers?: { [k: string]: string } };
+  | { type?: "stdio"; command: string; args?: string[]; env?: { [k: string]: string }; codex?: { [k: string]: unknown } }
+  | { type?: "http" | "sse"; url: string; headers?: { [k: string]: string }; codex?: { [k: string]: unknown } };
 
 /** A skill: a directory with a SKILL.md (and anything it refers to), or a SKILL.md's text. */
 export type Skill = string | { name: string; content: string };
