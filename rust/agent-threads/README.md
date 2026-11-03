@@ -171,6 +171,16 @@ the graces: `stop_grace` (10s) for an interrupt to end the turn, `close_grace` (
 exit after its input closes, and Claude's `steer_grace` (30s) to take in steered messages after a
 turn.
 
+A thread's process is kept while the thread is idle, for its next turn, unless the app lets it go.
+`Options::idle_close` does that once a thread has been idle that long (nothing running, queued or
+asked, and no background subagent still running; `Some(Duration::ZERO)` as soon as it is), and
+`AgentThreads::release(id)` does it now (refused while a turn runs, or while the process is still
+needed). Claude's input is closed, or Codex's app server stopped; the thread keeps its session, and
+its next message resumes it in a new process. A message sent before then goes to the live process,
+and a steered message a turn carries over keeps it going. Its run ends as one that exited, so a
+backend that restarts doesn't re-attach to it; one that re-attaches to an idle process (it restarted
+first) lets it go once the thread has been idle that long again.
+
 A thread's own `LaunchOptions` (`CreateOptions::launch`, or `ThreadOptions::launch` with
 `set_options`) add arguments, environment changes, directories (`--add-dir`, or Codex's writable
 roots) and a config directory (CLAUDE_CONFIG_DIR, or a CODEX_HOME used as it is) to those its

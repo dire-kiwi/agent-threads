@@ -126,6 +126,14 @@ its next message, gets no notice. A thread that a command loads before `recover(
 `recover()` first: it's also what starts pruning (now, and every hour), which stops runs no thread
 follows any more and removes old run directories.
 
+**Idle processes.** A thread's process is kept between its turns, so with the shim an idle one
+survives restarts too, for days if the thread does nothing. To let idle processes go, give the
+backend an idle time (`idleCloseMs` in Node, `IdleClose` in Go, `idle_close` in Rust; zero lets
+one go as soon as its thread is idle), or call `release(threadId)` for a thread. The thread keeps
+its session, and its next message resumes it in a new process; the run ends as one that exited, so
+`recover()` doesn't re-attach to it. One re-attached while idle is let go once its thread has been
+idle that long again.
+
 **Give threads their own capabilities back first.** A thread's own tools, MCP servers, skills and
 policy (given to `create`) aren't stored. If a re-attached run calls one of the thread's own tools,
 the backend needs it, so `configure()` those threads before `recover()` (tools given to the backend

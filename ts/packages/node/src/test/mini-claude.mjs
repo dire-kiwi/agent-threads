@@ -38,9 +38,9 @@
 //
 // It answers every control request with success and an empty response, but a `never_answered` one.
 //
-// MINI_CLAUDE_LOG names a file each run appends its argv (with CLAUDE_CONFIG_DIR, and the
-// variables MINI_LOG_ENV names, comma-separated), every line it's sent and each result it sends
-// ({"result": ...}) to. With
+// MINI_CLAUDE_LOG names a file each run appends its argv (with CLAUDE_CONFIG_DIR, its pid and the
+// variables MINI_LOG_ENV names, comma-separated), every line it's sent, each result it sends
+// ({"result": ...}) and its exit ({"exited": pid}) to. With
 // MINI_CLAUDE_STEER=late, messages sent during a turn are taken in after its result (as the next
 // turn); with MINI_CLAUDE_STEER=never, they never are (and the process has to be restarted); with
 // MINI_CLAUDE_STEER=hold, they're never taken in either, and an interrupt while no turn runs gets
@@ -60,7 +60,8 @@ const log = process.env.MINI_CLAUDE_LOG;
 const steer = process.env.MINI_CLAUDE_STEER ?? "now";
 const note = (v) => log && appendFileSync(log, JSON.stringify(v) + "\n");
 const loggedEnv = Object.fromEntries((process.env.MINI_LOG_ENV ?? "").split(",").filter(Boolean).map((k) => [k, process.env[k] ?? null]));
-note({ argv: process.argv.slice(2), configDir: process.env.CLAUDE_CONFIG_DIR, env: loggedEnv });
+note({ argv: process.argv.slice(2), configDir: process.env.CLAUDE_CONFIG_DIR, env: loggedEnv, pid: process.pid });
+process.on("exit", () => note({ exited: process.pid }));
 
 let uuids = 0;
 // As Claude does, the main conversation's messages have uuids (where a session can be resumed at).

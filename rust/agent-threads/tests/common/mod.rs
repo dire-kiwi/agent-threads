@@ -183,6 +183,9 @@ pub struct MiniRun {
     pub env: Value,
     pub sent: Vec<Value>,
     pub notes: Vec<Value>,
+    /// It has exited (it logs its exit).
+    pub exited: bool,
+    pid: Option<u64>,
 }
 
 pub fn mini_runs(log: &Path) -> Vec<MiniRun> {
@@ -206,7 +209,14 @@ pub fn mini_runs(log: &Path) -> Vec<MiniRun> {
                 env: v.get("env").cloned().unwrap_or_default(),
                 sent: Vec::new(),
                 notes: Vec::new(),
+                exited: false,
+                pid: v.get("pid").and_then(Value::as_u64),
             });
+        } else if let Some(pid) = v.get("exited").and_then(Value::as_u64) {
+            // Runs' lines interleave: its exit is the run's with its pid.
+            if let Some(r) = out.iter_mut().find(|r| r.pid == Some(pid)) {
+                r.exited = true;
+            }
         } else if v.get("jsonrpc").is_some()
             || v.get("method").is_some()
             || v.get("id").is_some()

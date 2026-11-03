@@ -130,6 +130,18 @@ pub(crate) struct Host {
     /// Fill in events' `raw` (the raw option).
     pub raw: bool,
     pub on_harness_message: Option<HarnessMessageHandler>,
+    /// Options::idle_close.
+    pub idle_close: Option<Duration>,
+}
+
+/// Where a thread is in letting its idle harness process go (Options::idle_close).
+enum Idle {
+    /// It isn't idle, or has no process to let go.
+    Busy,
+    /// Idle: its process goes when the timer (the `n`th armed) goes off.
+    Armed(u64, tokio::task::AbortHandle),
+    /// Idle, and its process was let go (or it had none).
+    Done,
 }
 
 /// A thread on its task: the core and the driver's session.
@@ -183,6 +195,9 @@ pub struct ThreadContext {
     pub(crate) disposed: bool,
     /// The task ends.
     exit: bool,
+    /// Letting its idle process go, and how many times that's been armed.
+    idle: Idle,
+    idle_armed: u64,
 }
 
 /// A timer a driver set, which it can cancel.
@@ -1419,6 +1434,18 @@ impl ThreadContext {
         self.disposed = true;
         self.exit = true;
     }
+
+    /// Whether the thread is idle, and its harness process isn't needed until the next turn: no
+    /// turn is running, nothing is queued, no request is open (but questions kept open after their
+    /// turns, whose answers go as messages) and no background subagent is running.
+    pub(crate) fn idle_now(&self) -> bool {
+        self.turn.is_none()
+            && !self.closing
+            && !self.disposed
+            && self.queue.is_empty()
+            && self.requests.iter().all(|(_, o)| o.late)
+            && !self.saved.items.iter().any(running_in_background)
+    }
 }
 
 impl Actor {
@@ -1472,6 +1499,8 @@ impl Actor {
             tx: tx.clone(),
             disposed: false,
             exit: false,
+            idle: Idle::Busy,
+            idle_armed: 0,
         };
         let session = open(&core);
         (tx, Actor { core, session }, rx)
@@ -1486,6 +1515,7 @@ impl Actor {
                 let Ok(job) = rx.try_recv() else { break };
                 self.job(job);
             }
+            self.check_idle();
             while self.core.flush_queued {
                 self.flush().await;
             }
@@ -1521,6 +1551,46 @@ impl Actor {
                 Effect::ConfigChanged => s.config_changed(c),
             }
         }
+    }
+
+    /// After a batch of jobs, with Options::idle_close: lets the harness process go once the thread
+    /// has been idle long enough, and stops waiting to if it's busy again.
+    fn check_idle(&mut self) {
+        let Some(after) = self.core.host.idle_close else { return };
+        if !self.core.idle_now() {
+            if let Idle::Armed(_, timer) = std::mem::replace(&mut self.core.idle, Idle::Busy) {
+                timer.abort();
+            }
+            return;
+        }
+        if !matches!(self.core.idle, Idle::Busy) || !self.session.live() {
+            return;
+        }
+        self.core.idle_armed += 1;
+        let n = self.core.idle_armed;
+        let tx = self.core.tx.clone();
+        let timer = tokio::spawn(async move {
+            tokio::time::sleep(after).await;
+            let _ = tx.send(Box::new(move |a: &mut Actor| {
+                // Unless it's been busy since (a message came first, say).
+                if matches!(a.core.idle, Idle::Armed(m, _) if m == n) && a.core.idle_now() {
+                    a.close_idle();
+                }
+            }));
+        })
+        .abort_handle();
+        self.core.idle = Idle::Armed(n, timer);
+    }
+
+    /// Lets the idle thread's harness process go (the caller checks it's idle): the session stops
+    /// it, keeping the thread's session for the next turn. Whether there was one.
+    pub(crate) fn close_idle(&mut self) -> bool {
+        if let Idle::Armed(_, timer) = std::mem::replace(&mut self.core.idle, Idle::Done) {
+            timer.abort();
+        }
+        let closed = self.session.close_idle(&mut self.core);
+        self.drain();
+        closed
     }
 
     /// Takes the conversation back to before the turn `turn_id`: its items and every later turn's
