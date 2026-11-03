@@ -330,19 +330,24 @@ func sandboxPolicy(mode string, workspace json.RawMessage, config map[string]any
 	return p
 }
 
-// mcpServerConfig is an MCP server as Codex's mcp_servers config has it, or why it can't be.
+// mcpServerConfig is an MCP server as Codex's mcp_servers config has it, or why it can't be: the
+// table made from its own fields, over its Codex settings.
 func mcpServerConfig(s MCPServer) (map[string]any, string) {
+	c := map[string]any{}
+	for k, v := range s.Codex {
+		c[k] = v
+	}
 	if s.URL != "" {
 		if s.Type == "sse" {
 			return nil, "Codex doesn't support SSE MCP servers"
 		}
-		c := map[string]any{"url": s.URL}
+		c["url"] = s.URL
 		if len(s.Headers) > 0 {
 			c["http_headers"] = s.Headers
 		}
 		return c, ""
 	}
-	c := map[string]any{"command": s.Command}
+	c["command"] = s.Command
 	if s.Args != nil {
 		c["args"] = s.Args
 	}
