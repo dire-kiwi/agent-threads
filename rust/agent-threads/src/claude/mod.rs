@@ -196,6 +196,16 @@ struct RunState {
     steer_at: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     stop_at: Option<u64>,
+    /// Turns of its own Claude owes, to report background subagents that ended, and when it's
+    /// given up waiting for them (ms since the epoch).
+    #[serde(default, skip_serializing_if = "is_zero")]
+    owed: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    owed_at: Option<u64>,
+}
+
+fn is_zero(n: &u32) -> bool {
+    *n == 0
 }
 
 /// One `claude` process, and what's needed to read it.
@@ -405,6 +415,8 @@ impl Run {
             stale: false,
             steer_at: None,
             stop_at: None,
+            owed: 0,
+            owed_at: None,
         }
     }
 
@@ -479,6 +491,7 @@ pub(crate) struct ClaudeSession {
     /// when it's given up waiting for them.
     owed: u32,
     owed_timer: Option<Timer>,
+    owed_at: Option<u64>,
     /// When those go off (ms since the epoch), for a checkpoint.
     steer_at: Option<u64>,
     stop_at: Option<u64>,
@@ -500,6 +513,7 @@ impl ClaudeSession {
             stop_timer: None,
             owed: 0,
             owed_timer: None,
+            owed_at: None,
             steer_at: None,
             stop_at: None,
             tmp: None,
@@ -1428,22 +1442,31 @@ impl ClaudeSession {
     /// thread isn't let go of as idle.
     fn owe_turn(&mut self, ctx: &mut ThreadContext) {
         self.owed += 1;
+        let grace = self.o.steer_grace;
+        self.wait_owed(ctx, grace);
+    }
+
+    /// Gives up waiting for the turns Claude owes after `after`.
+    fn wait_owed(&mut self, ctx: &mut ThreadContext, after: Duration) {
         if let Some(t) = self.owed_timer.take() {
             t.cancel();
         }
-        self.owed_timer = Some(ctx.timer::<ClaudeSession>(self.o.steer_grace, |s, _| {
+        self.owed_at = Some(now_ms() + after.as_millis() as u64);
+        self.owed_timer = Some(ctx.timer::<ClaudeSession>(after, |s, _| {
             s.owed = 0;
             s.owed_timer = None;
+            s.owed_at = None;
         }));
     }
 
     /// Claude made a turn it owed, or its process has gone (`all`).
     fn owed_turn(&mut self, all: bool) {
         self.owed = if all { 0 } else { self.owed.saturating_sub(1) };
-        if self.owed == 0
-            && let Some(t) = self.owed_timer.take()
-        {
-            t.cancel();
+        if self.owed == 0 {
+            if let Some(t) = self.owed_timer.take() {
+                t.cancel();
+            }
+            self.owed_at = None;
         }
     }
 
@@ -2075,6 +2098,8 @@ impl HarnessSession for ClaudeSession {
         let mut state = run.state();
         state.stale = self.stale;
         state.steer_at = self.steer_at;
+        state.owed = self.owed;
+        state.owed_at = self.owed_at.filter(|_| self.owed > 0);
         state.stop_at = self.stop_at;
         let proc = run.proc.as_ref();
         Some(RunCheckpoint {
@@ -2131,6 +2156,13 @@ impl HarnessSession for ClaudeSession {
                 continue;
             }
             self.reopen_request(ctx, &id, &request_id, open);
+        }
+        // Reports of background subagents that ended which Claude hadn't made yet: its process is
+        // still needed for them.
+        if st.owed > 0 {
+            self.owed = st.owed;
+            let at = st.owed_at.unwrap_or_else(now_ms);
+            self.wait_owed(ctx, Duration::from_millis(at.saturating_sub(now_ms())));
         }
         if let Some(at) = st.steer_at {
             self.steer_after(ctx, &id, Duration::from_millis(at.saturating_sub(now_ms())));

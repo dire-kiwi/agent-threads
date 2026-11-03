@@ -1324,3 +1324,46 @@ async fn claude_lets_an_idle_process_go_after_a_restart() {
 async fn codex_lets_an_idle_process_go_after_a_restart() {
     lets_an_idle_process_go_after_a_restart("codex").await;
 }
+
+/// A backend that restarts after a background subagent ended, but before Claude made the turn that
+/// reports it, keeps the process for that turn (with idle_close), and lets it go after.
+#[tokio::test(flavor = "multi_thread")]
+async fn claude_keeps_an_idle_process_for_a_report_it_owes_across_a_restart() {
+    let _one = serial().await;
+    let s = mini_scene(&[("CLOSE_GRACE_MS", "100"), ("MINI_CLAUDE_REPORT_DELAY", "3000")]);
+    let mut a = s.start();
+    let thread = a.call("create", json!({"harness": "claude", "cwd": s.cwd})).await;
+    let id = thread["id"].as_str().unwrap().to_string();
+    a.call(
+        "handle",
+        json!({"type": "send", "thread_id": id, "text": "background 300 apple"}),
+    )
+    .await;
+    let snap = snapshot_until(&mut a, &id, |s| {
+        of_type(s, "turn_result").len() == 1
+            && s["thread"]["status"] == "idle"
+            && of_type(s, "tool_call")
+                .first()
+                .is_some_and(|c| c["subagent"]["status"] == "completed")
+    })
+    .await;
+    let run = snap["thread"]["run"]["id"].as_str().unwrap().to_string();
+    a.call("saved", json!(id)).await;
+    a.call("close", json!({"stop": false})).await;
+    a.exited().await;
+
+    let mut b = s.start_with(&[("IDLE_CLOSE_MS", "0")]);
+    assert_eq!(
+        b.call("recover", json!(null)).await,
+        json!({"reattached": [id], "lost": []})
+    );
+    let snap = snapshot_until(&mut b, &id, |s| {
+        of_type(s, "turn_result").len() == 2 && s["thread"]["status"] == "idle" && s["thread"].get("run").is_none()
+    })
+    .await;
+    let texts: Vec<&Value> = of_type(&snap, "assistant_message").iter().map(|m| &m["text"]).collect();
+    assert_eq!(texts.last().unwrap(), &&json!("the subagent said apple"), "{snap}");
+    until(|| s.runs.join(&run).join("exit").exists()).await;
+    b.call("close", json!({"stop": true})).await;
+    b.exited().await;
+}
