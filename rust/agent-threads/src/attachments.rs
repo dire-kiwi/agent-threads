@@ -140,7 +140,7 @@ pub(crate) fn message_parts(
 }
 
 /// Writes `bytes` to `dir/name` (making `dir`), readable by the user only.
-fn write_private(dir: &Path, name: &str, bytes: &[u8]) -> std::io::Result<std::path::PathBuf> {
+pub(crate) fn write_private(dir: &Path, name: &str, bytes: &[u8]) -> std::io::Result<std::path::PathBuf> {
     std::fs::create_dir_all(dir)?;
     let path = dir.join(name);
     let mut o = std::fs::OpenOptions::new();

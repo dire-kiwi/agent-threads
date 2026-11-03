@@ -216,6 +216,7 @@ async fn starts_the_thread_with_its_options_mcp_servers_app_tools_and_system_pro
                 command: "gh-mcp".into(),
                 args: vec!["--stdio".into()],
                 env: [("TOKEN".into(), "x".into())].into(),
+                codex: Default::default(),
             },
         ),
         (
@@ -223,7 +224,22 @@ async fn starts_the_thread_with_its_options_mcp_servers_app_tools_and_system_pro
             McpServer::Http {
                 url: "https://example.com/mcp".into(),
                 headers: [("X-Key".into(), "k".into())].into(),
+                codex: Default::default(),
             },
+        ),
+        // Settings for Codex's table for the server, under its own fields.
+        (
+            "board".to_string(),
+            McpServer::stdio("board-mcp", ["--serve"])
+                .codex("tool_timeout_sec", 3900)
+                .codex("startup_timeout_sec", 20)
+                .codex("default_tools_approval_mode", "approve")
+                .codex("command", "not-this"),
+        ),
+        (
+            "search".to_string(),
+            McpServer::from_json(&json!({"url": "https://example.com/search", "codex": {"tool_timeout_sec": 600}}))
+                .unwrap(),
         ),
         (
             "old".to_string(),
@@ -283,6 +299,14 @@ async fn starts_the_thread_with_its_options_mcp_servers_app_tools_and_system_pro
                 "mcp_servers": {
                     "gh": {"command": "gh-mcp", "args": ["--stdio"], "env": {"TOKEN": "x"}},
                     "docs": {"url": "https://example.com/mcp", "http_headers": {"X-Key": "k"}},
+                    "board": {
+                        "command": "board-mcp",
+                        "args": ["--serve"],
+                        "tool_timeout_sec": 3900,
+                        "startup_timeout_sec": 20,
+                        "default_tools_approval_mode": "approve",
+                    },
+                    "search": {"url": "https://example.com/search", "tool_timeout_sec": 600},
                 },
             },
             "dynamicTools": [{"type": "function", "name": "lookup_order", "description": "Looks up an order.", "inputSchema": schema}],

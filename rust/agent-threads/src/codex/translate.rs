@@ -411,25 +411,27 @@ pub(crate) fn sandbox_policy(mode: &str, workspace: Option<&Value>, config: &Map
     p
 }
 
-/// An MCP server as Codex's `mcp_servers` config has it, or why it can't be.
+/// An MCP server as Codex's `mcp_servers` config has it, or why it can't be: the table made from
+/// its own fields, over its Codex settings.
 pub(crate) fn mcp_server_config(s: &McpServer) -> Result<Value, &'static str> {
+    let mut v = Value::Object(s.codex_settings().cloned().unwrap_or_default());
     match s {
-        McpServer::Sse { .. } => Err("Codex doesn't support SSE MCP servers"),
-        McpServer::Http { url, headers } => {
-            let mut v = json!({"url": url});
+        McpServer::Sse { .. } => return Err("Codex doesn't support SSE MCP servers"),
+        McpServer::Http { url, headers, .. } => {
+            v["url"] = json!(url);
             if !headers.is_empty() {
                 v["http_headers"] = json!(headers);
             }
-            Ok(v)
         }
-        McpServer::Stdio { command, args, env } => {
-            let mut v = json!({"command": command, "args": args});
+        McpServer::Stdio { command, args, env, .. } => {
+            v["command"] = json!(command);
+            v["args"] = json!(args);
             if !env.is_empty() {
                 v["env"] = json!(env);
             }
-            Ok(v)
         }
     }
+    Ok(v)
 }
 
 /// The limits an `account/rateLimits/updated` notification's snapshot reports: its primary and

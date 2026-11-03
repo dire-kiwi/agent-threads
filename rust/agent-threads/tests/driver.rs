@@ -1723,7 +1723,17 @@ async fn passes_skills_mcp_servers_and_the_system_prompt_isolated_from_the_users
             name: "greet".into(),
             content: "Say hi.".into(),
         }],
-        mcp_servers: [("echo".to_string(), McpServer::stdio("node", ["echo.mjs"]))].into(),
+        mcp_servers: [(
+            "echo".to_string(),
+            McpServer::Stdio {
+                command: "node".into(),
+                args: vec!["echo.mjs".into()],
+                env: [("ECHO_TOKEN".into(), "a-token".into())].into(),
+                // Codex's alone: Claude Code takes MCP_TOOL_TIMEOUT from its environment.
+                codex: [("tool_timeout_sec".into(), json!(600))].into_iter().collect(),
+            },
+        )]
+        .into(),
         ..Default::default()
     };
     let t = env
@@ -1740,17 +1750,103 @@ async fn passes_skills_mcp_servers_and_the_system_prompt_isolated_from_the_users
     let flag = |name: &str| argv[argv.iter().position(|a| a == name).unwrap() + 1].clone();
     // A plugin, which Claude finds even with --setting-sources "", that was there while it ran.
     assert!(flag("--plugin-dir").contains("plugin-"));
-    let mcp: Value = serde_json::from_str(&flag("--mcp-config")).unwrap();
+    let mcp: Value = serde_json::from_str(&std::fs::read_to_string(flag("--mcp-config")).unwrap()).unwrap();
     assert_eq!(
         mcp["mcpServers"]["docs"],
         json!({"type": "http", "url": "https://example.com/mcp"})
     );
     assert_eq!(
         mcp["mcpServers"]["echo"],
-        json!({"type": "stdio", "command": "node", "args": ["echo.mjs"]})
+        json!({"type": "stdio", "command": "node", "args": ["echo.mjs"], "env": {"ECHO_TOKEN": "a-token"}})
     );
     assert_eq!(flag("--append-system-prompt"), "You help.");
     assert!(contains_all(&argv, &["--setting-sources", "", "--strict-mcp-config"]));
+}
+
+/// Starts a thread with an MCP server whose environment has a secret, under `spawner`: the secret
+/// isn't on any process's command line while it runs (Claude's --mcp-config is a file, readable by
+/// the user only), and the file goes with the run.
+async fn mcp_config_in_a_private_file(spawner: Option<Arc<dyn Spawner>>) {
+    let secret = format!("secret-{}-{}", std::process::id(), rand_suffix());
+    let env = setup(Setup {
+        spawner,
+        capabilities: Capabilities {
+            permissions: Some(PermissionPolicy::allow()),
+            mcp_servers: [
+                (
+                    "echo".to_string(),
+                    McpServer::Stdio {
+                        command: "node".into(),
+                        args: vec!["echo.mjs".into()],
+                        env: [("ECHO_TOKEN".into(), secret.clone())].into(),
+                        codex: Default::default(),
+                    },
+                ),
+                (
+                    "docs".to_string(),
+                    McpServer::Http {
+                        url: "https://example.com/mcp".into(),
+                        headers: [("authorization".into(), format!("Bearer {secret}"))].into(),
+                        codex: Default::default(),
+                    },
+                ),
+            ]
+            .into(),
+            ..Default::default()
+        },
+        ..Default::default()
+    });
+    let t = env.sdk.create(create()).await.unwrap();
+    env.sdk.send(&t.id, "reply hi", SendOptions::default()).await.unwrap();
+    settle(&env.sdk, &t.id).await;
+    let argv = env.runs()[0].argv.clone();
+    assert!(!argv.iter().any(|a| a.contains(&secret)), "{argv:?}");
+    // Claude stays up between turns: nothing running has the secret on its command line.
+    #[cfg(target_os = "linux")]
+    for entry in std::fs::read_dir("/proc").unwrap().flatten() {
+        if let Ok(cmdline) = std::fs::read(entry.path().join("cmdline")) {
+            assert!(
+                !String::from_utf8_lossy(&cmdline).contains(&secret),
+                "{} has the secret on its command line",
+                entry.path().display()
+            );
+        }
+    }
+    let file = PathBuf::from(&argv[argv.iter().position(|a| a == "--mcp-config").unwrap() + 1]);
+    assert!(file.file_name().unwrap().to_string_lossy().starts_with("mcp-"));
+    let mcp: Value = serde_json::from_str(&std::fs::read_to_string(&file).unwrap()).unwrap();
+    assert_eq!(mcp["mcpServers"]["echo"]["env"]["ECHO_TOKEN"], json!(secret));
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        assert_eq!(std::fs::metadata(&file).unwrap().permissions().mode() & 0o777, 0o600);
+    }
+    // It goes with the run.
+    env.sdk.close(true).await.unwrap();
+    assert!(!file.exists());
+}
+
+fn rand_suffix() -> u128 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos()
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn writes_the_mcp_config_to_a_private_file_not_the_command_line() {
+    mcp_config_in_a_private_file(None).await;
+}
+
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread")]
+async fn writes_the_mcp_config_to_a_private_file_under_the_shim_too() {
+    let runs = common::temp_dir();
+    mcp_config_in_a_private_file(Some(agent_threads::shim(
+        common::shim_path(),
+        agent_threads::ShimOptions::new(&runs),
+    )))
+    .await;
 }
 
 #[tokio::test(flavor = "multi_thread")]
