@@ -703,7 +703,22 @@ impl ClaudeSession {
             }
             return;
         }
-        let args = self.args(ctx, id);
+        // What the run needs written for it (its MCP config, its skills) and couldn't be: it doesn't
+        // start without it, and the turn fails.
+        let args = match self.args(ctx, id) {
+            Ok(args) => args,
+            Err(e) => {
+                self.exited(
+                    ctx,
+                    id,
+                    ExitStatus {
+                        error: Some(e),
+                        ..Default::default()
+                    },
+                );
+                return;
+            }
+        };
         let o = &self.o;
         let mut env: HashMap<String, String> = std::env::vars().collect();
         for (k, v) in &o.env {
@@ -757,7 +772,7 @@ impl ClaudeSession {
         self.run(id).unwrap().control(init, false);
     }
 
-    fn args(&mut self, ctx: &ThreadContext, id: &str) -> Vec<String> {
+    fn args(&mut self, ctx: &ThreadContext, id: &str) -> Result<Vec<String>, String> {
         let t = ctx.thread();
         let config = ctx.config();
         let o = self.o.clone();
@@ -833,39 +848,29 @@ impl ClaudeSession {
             // anyone could read the servers' environment and headers (often API keys) for as long
             // as the process runs.
             let config = json!({"mcpServers": servers}).to_string();
-            let written = self
+            let file = self
                 .dir()
-                .and_then(|d| crate::attachments::write_private(&d, &format!("mcp-{id}.json"), config.as_bytes()));
-            match written {
-                Ok(file) => {
-                    args.extend(["--mcp-config".into(), file.to_string_lossy().into()]);
-                    if let Some(r) = self.run(id) {
-                        r.mcp_config = Some(file);
-                    }
-                }
-                Err(e) => ctx.error(Error::Other(format!(
-                    "the MCP servers' config couldn't be written for Claude Code: {e}"
-                ))),
+                .and_then(|d| crate::attachments::write_private(&d, &format!("mcp-{id}.json"), config.as_bytes()))
+                .map_err(|e| format!("its MCP servers' config couldn't be written: {e}"))?;
+            args.extend(["--mcp-config".into(), file.to_string_lossy().into()]);
+            if let Some(r) = self.run(id) {
+                r.mcp_config = Some(file);
             }
         }
         if !config.skills.is_empty() {
             // A plugin of the run's own, made from the skills as they are now: Claude finds a
             // plugin's skills (as app:<name>) even with --setting-sources "", which hides
             // .claude/skills directories.
-            let written = self.dir().and_then(|d| {
-                let dir = d.join(format!("plugin-{id}"));
-                write_plugin(&dir, &config.skills).map(|_| dir)
-            });
-            match written {
-                Ok(dir) => {
-                    args.extend(["--plugin-dir".into(), dir.to_string_lossy().into()]);
-                    if let Some(r) = self.run(id) {
-                        r.plugin_dir = Some(dir);
-                    }
-                }
-                Err(e) => ctx.error(Error::Other(format!(
-                    "the app's skills couldn't be written for Claude Code: {e}"
-                ))),
+            let dir = self
+                .dir()
+                .and_then(|d| {
+                    let dir = d.join(format!("plugin-{id}"));
+                    write_plugin(&dir, &config.skills).map(|_| dir)
+                })
+                .map_err(|e| format!("the app's skills couldn't be written: {e}"))?;
+            args.extend(["--plugin-dir".into(), dir.to_string_lossy().into()]);
+            if let Some(r) = self.run(id) {
+                r.plugin_dir = Some(dir);
             }
         }
         if let Some(p) = &config.system_prompt {
@@ -877,7 +882,7 @@ impl ClaudeSession {
         }
         args.extend(o.args.iter().cloned());
         args.extend(launch.args.iter().cloned());
-        args
+        Ok(args)
     }
 
     fn exited(&mut self, ctx: &mut ThreadContext, id: &str, status: ExitStatus) {
