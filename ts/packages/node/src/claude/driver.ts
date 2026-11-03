@@ -119,6 +119,12 @@ interface RunState {
   /** When the session's timers for it go off (ms since the epoch). */
   steerAt?: number;
   stopAt?: number;
+  /**
+   * Turns of its own Claude owes, to report background subagents that ended, and when it's given
+   * up waiting for them (ms since the epoch).
+   */
+  owed?: number;
+  owedAt?: number;
 }
 
 /** One `claude` process, and what's needed to read it. */
@@ -204,7 +210,7 @@ class Run {
     return p;
   }
 
-  state(): Omit<RunState, "steerAt" | "stopAt"> {
+  state(): Omit<RunState, "steerAt" | "stopAt" | "owed" | "owedAt"> {
     return {
       v: 1,
       ready: this.ready,
@@ -288,6 +294,7 @@ class ClaudeSession implements HarnessSession {
    */
   #owed = 0;
   #owedTimer: NodeJS.Timeout | undefined;
+  #owedAt: number | undefined;
   /** When those go off, for a checkpoint. */
   #steerAt: number | undefined;
   #stopAt: number | undefined;
@@ -489,6 +496,7 @@ class ClaudeSession implements HarnessSession {
       ...(this.#stale ? { stale: true } : {}),
       ...(this.#steerAt !== undefined ? { steerAt: this.#steerAt } : {}),
       ...(this.#stopAt !== undefined ? { stopAt: this.#stopAt } : {}),
+      ...(this.#owed > 0 ? { owed: this.#owed, ...(this.#owedAt !== undefined ? { owedAt: this.#owedAt } : {}) } : {}),
     };
     const dir = (run.proc as { dir?: unknown }).dir;
     const input = run.proc?.inputOffset;
@@ -528,6 +536,12 @@ class ClaudeSession implements HarnessSession {
       if (run.proc.answered?.(id)) run.open.delete(id);
       else this.#reopen(run, id, open);
     }
+    // Reports of background subagents that ended which Claude hadn't made yet: its process is still
+    // needed for them.
+    if (st.owed && st.owed > 0) {
+      this.#owed = st.owed;
+      this.#waitOwed(Math.max(0, (st.owedAt ?? Date.now()) - Date.now()));
+    }
     if (st.steerAt !== undefined) this.#steerAfter(run, Math.max(0, st.steerAt - Date.now()));
     if (st.stopAt !== undefined) this.#stopAfter(run, Math.max(0, st.stopAt - Date.now()));
     return true;
@@ -539,6 +553,8 @@ class ClaudeSession implements HarnessSession {
     this.#closed = true;
     clearTimeout(this.#steerTimer);
     clearTimeout(this.#stopTimer);
+    // (What Claude owes stays in the checkpoint, for the backend that re-attaches.)
+    clearTimeout(this.#owedTimer);
     run.detached = true;
     run.proc.detach();
     run.abort.abort();
@@ -1050,13 +1066,20 @@ class ClaudeSession implements HarnessSession {
    */
   #oweTurn(): void {
     this.#owed++;
+    this.#waitOwed(this.#o.steerGraceMs ?? 30_000);
+  }
+
+  /** Gives up waiting for the turns Claude owes after `ms`. */
+  #waitOwed(ms: number): void {
     clearTimeout(this.#owedTimer);
+    this.#owedAt = Date.now() + ms;
     this.#owedTimer = setTimeout(() => {
       this.#owedTimer = undefined;
+      this.#owedAt = undefined;
       this.#owed = 0;
       // No event says so: the core checks again whether the thread is idle.
       this.#ctx.recheckIdle();
-    }, this.#o.steerGraceMs ?? 30_000);
+    }, ms);
     this.#owedTimer.unref?.();
   }
 
@@ -1066,6 +1089,7 @@ class ClaudeSession implements HarnessSession {
     if (this.#owed === 0) {
       clearTimeout(this.#owedTimer);
       this.#owedTimer = undefined;
+      this.#owedAt = undefined;
     }
   }
 

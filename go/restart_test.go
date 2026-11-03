@@ -1046,3 +1046,41 @@ func TestLetsAnIdleProcessGoAfterARestart(t *testing.T) {
 		})
 	}
 }
+
+// A backend that restarts after a background subagent ended, but before Claude made the turn that
+// reports it, keeps the process for that turn (with IdleClose), and lets it go after.
+func TestKeepsAnIdleProcessForAReportItOwesAcrossARestart(t *testing.T) {
+	needNode(t)
+	t.Parallel()
+	s := miniScene(t, "CLOSE_GRACE_MS=100", "MINI_CLAUDE_REPORT_DELAY=3000")
+	a := s.start()
+	id := s.create(a, "claude")
+	a.call("handle", map[string]any{"type": "send", "thread_id": id, "text": "background 300 apple"})
+	var snap protocol.Snapshot
+	until(t, func() bool {
+		snap = snapshotOf(t, a, id)
+		calls := toolCalls(snap)
+		return len(turnResults(snap.Items)) == 1 && snap.Thread.Status == protocol.ThreadStatusIdle &&
+			len(calls) > 0 && calls[0].Subagent != nil && calls[0].Subagent.Status == protocol.SubagentStatusCompleted
+	})
+	if snap.Thread.Run == nil {
+		t.Fatalf("no run: %s", mustMarshal(snap.Thread))
+	}
+	run := snap.Thread.Run.ID
+	a.call("saved", id)
+	a.call("close")
+	<-a.exited
+
+	b := s.startWith("IDLE_CLOSE_MS=0")
+	expectRecovered(t, b, id)
+	until(t, func() bool {
+		snap = snapshotOf(t, b, id)
+		return len(turnResults(snap.Items)) == 2 && snap.Thread.Status == protocol.ThreadStatusIdle && snap.Thread.Run == nil
+	})
+	if got := texts(snap); len(got) == 0 || got[len(got)-1] != "the subagent said apple" {
+		t.Fatalf("texts: %q", got)
+	}
+	until(t, func() bool { _, err := os.Stat(filepath.Join(s.runs, run, "exit")); return err == nil })
+	b.call("stop")
+	<-b.exited
+}

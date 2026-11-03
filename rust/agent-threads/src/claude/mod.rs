@@ -2188,6 +2188,10 @@ impl HarnessSession for ClaudeSession {
         if let Some(t) = self.stop_timer.take() {
             t.cancel();
         }
+        // Kept as it is for the last checkpoint: the backend that re-attaches waits on.
+        if let Some(t) = self.owed_timer.take() {
+            t.cancel();
+        }
         run.detached = true;
         proc.detach();
         run.cancel.cancel();

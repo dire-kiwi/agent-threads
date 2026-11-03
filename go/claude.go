@@ -143,7 +143,11 @@ type claudeRunState struct {
 	Stale       bool            `json:"stale,omitempty"`
 	SteerAt     *int64          `json:"steerAt,omitempty"`
 	StopAt      *int64          `json:"stopAt,omitempty"`
-	raw         json.RawMessage `json:"-"`
+	// Owed is how many turns of its own Claude owes, to report background subagents that ended, and
+	// OwedAt when it gives up waiting for them (ms since the epoch).
+	Owed   int             `json:"owed,omitempty"`
+	OwedAt *int64          `json:"owedAt,omitempty"`
+	raw    json.RawMessage `json:"-"`
 }
 
 type pendingControl struct {
@@ -786,6 +790,10 @@ func (s *claudeSession) Checkpoint() *RunCheckpoint {
 	st.Stale = s.stale
 	st.SteerAt = s.steerTimer.pending()
 	st.StopAt = s.stopTimer.pending()
+	if s.owed > 0 {
+		st.Owed = s.owed
+		st.OwedAt = s.owedTimer.pending()
+	}
 	input := dp.InputOffset()
 	return &RunCheckpoint{ID: run.id, Offset: dp.Offset(), Dir: dp.Dir(), Input: &input, State: st, Ended: run.exited}
 }
@@ -836,6 +844,16 @@ func (s *claudeSession) Reattach(record RunRecord) bool {
 		}
 	}
 	nowMs := time.Now().UnixMilli()
+	// Reports of background subagents that ended which Claude hadn't made yet: its process is still
+	// needed for them.
+	if st.Owed > 0 {
+		s.owed = st.Owed
+		at := nowMs
+		if st.OwedAt != nil {
+			at = *st.OwedAt
+		}
+		s.waitOwed(time.Duration(max(0, at-nowMs)) * time.Millisecond)
+	}
 	if st.SteerAt != nil {
 		s.steerAfter(run, time.Duration(max(0, *st.SteerAt-nowMs))*time.Millisecond)
 	}
@@ -858,6 +876,7 @@ func (s *claudeSession) Detach() bool {
 	// Their deadlines stay in the checkpoint saved after this, for the backend that re-attaches.
 	s.steerTimer.pause()
 	s.stopTimer.pause()
+	s.owedTimer.pause()
 	run.detached = true
 	dp.Detach()
 	run.abort()
@@ -1705,8 +1724,14 @@ func (s *claudeSession) task(run *claudeRun, m jmap) {
 // the thread isn't let go of as idle.
 func (s *claudeSession) oweTurn() {
 	s.owed++
+	s.waitOwed(orDuration(s.o.SteerGrace, 30*time.Second))
+}
+
+// waitOwed gives up waiting for the turns Claude owes after d. The timer's deadline goes in the
+// checkpoint (owedAt), for a backend that re-attaches.
+func (s *claudeSession) waitOwed(d time.Duration) {
 	s.owedTimer.stop()
-	s.owedTimer = startTimer(s.ctx, orDuration(s.o.SteerGrace, 30*time.Second), func() {
+	s.owedTimer = startTimer(s.ctx, d, func() {
 		s.owed, s.owedTimer = 0, nil
 	})
 }
