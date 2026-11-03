@@ -154,7 +154,9 @@ again to finish saving. The file store undoes a write that fails partway, so a r
 - **Isolated config**: threads run with `--setting-sources ""` and `--strict-mcp-config`, so they
   see only the app's MCP servers and skills. The skills go in a plugin (`app`) generated for each
   process and passed with `--plugin-dir`, which Claude loads even with no setting sources (a
-  `.claude/skills` directory it wouldn't), so they're `app:<name>`. `claudeCode({ userSettings:
+  `.claude/skills` directory it wouldn't), so they're `app:<name>`. The MCP servers go in an `--mcp-config` file of
+  the process's own, readable by the user only, so their environment and headers aren't on its
+  command line. `claudeCode({ userSettings:
   true })` lets threads see the user's own settings instead; `configDir` points Claude at another
   config (and login).
 - **Attachments**: images with data go to Claude as images, and files with textual data (`text/*`,
@@ -204,7 +206,7 @@ again to finish saving. The file store undoes a write that fails partway, so a r
   changed gets an error saying where the app's tools are. The driver keeps what each session started
   with (and its totals) in `<home>/agent-threads/sessions/`.
 - **MCP servers** go in `thread/start`'s config as `mcp_servers` (stdio, or streamable HTTP with
-  `http_headers`; Codex has no SSE). **Skills** are written to a directory for the process and
+  `http_headers`; Codex has no SSE), with each server's `codex` settings (`tool_timeout_sec`, say). **Skills** are written to a directory for the process and
   given with `skills/extraRoots/set`. Without `userConfig`, the other skills Codex finds (the
   user's `~/.agents/skills`, the project's, the machine's: a CODEX_HOME of its own doesn't keep
   those out) are listed with `skills/list` and turned off in the thread's config, so it has only the
