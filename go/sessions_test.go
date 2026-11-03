@@ -32,14 +32,14 @@ func (h *sessionHarness) Open(ctx agentthreads.ThreadContext) agentthreads.Sessi
 	return &sessionFake{h: h}
 }
 
-// on runs fn with the thread's context on its goroutine, and waits for it.
+// on runs fn with the thread's context on its goroutine, and waits for it and for what it saved to
+// be taken for the writer (so an EventsSince after it waits for that to be written). The loop takes
+// a task's saves only once the task has returned, so it's the next task posted that says so.
 func (h *sessionHarness) on(fn func(agentthreads.ThreadContext)) {
 	ctx := *h.ctx.Load()
 	done := make(chan struct{})
-	ctx.Post(func() {
-		fn(ctx)
-		close(done)
-	})
+	ctx.Post(func() { fn(ctx) })
+	ctx.Post(func() { close(done) })
 	<-done
 }
 
