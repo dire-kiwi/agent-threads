@@ -588,6 +588,25 @@ func (s *codexSession) Retire() {
 
 func (s *codexSession) Live() bool { return s.live() != nil }
 
+// KeepsProcess: Codex's app server owes the agent nothing once the thread is idle.
+func (s *codexSession) KeepsProcess() bool { return false }
+
+func (s *codexSession) CloseIdle() bool {
+	run := s.live()
+	if run == nil {
+		return false
+	}
+	s.clearStop()
+	// Its input is closed, so the app server exits (or is signalled after the close grace). Retired:
+	// what it says on its way out is left out, and its end changes nothing. It's the thread's run no
+	// more, so its record ends now, and a backend that restarts doesn't re-attach to it.
+	s.stop(run, true, false, nil)
+	if r := s.ctx.Thread().Run; r != nil && r.ID == run.id {
+		s.ctx.SetThread(func(t *protocol.Thread) { t.Run = nil })
+	}
+	return true
+}
+
 func (s *codexSession) Release() {
 	run := s.live()
 	if run == nil {

@@ -18,7 +18,7 @@ type loop struct {
 	stopped bool
 	// stoppedCh is closed by stop.
 	stoppedCh chan struct{}
-	// after runs after each task (to save what it did).
+	// after runs after each task (to save what it did, and see whether the thread is idle).
 	after   func()
 	onPanic func(error)
 }
