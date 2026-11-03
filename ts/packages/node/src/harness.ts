@@ -220,6 +220,11 @@ export interface ThreadContext {
   endSubagent(id: string, subagent: SubagentState): void;
   /** Something went wrong that isn't the turn's: for the app's onError. */
   error(error: unknown): void;
+  /**
+   * Whether the session still needs its process (HarnessSession.keepsProcess) changed with no event
+   * to say so: the core checks again whether the thread is idle (idleCloseMs).
+   */
+  recheckIdle(): void;
 }
 
 /** The calls of the subagents an item is inside, innermost first. */
@@ -312,6 +317,21 @@ export interface HarnessSession {
    * next turn starts a new one. Without it, the core calls configChanged().
    */
   retire?(): void;
+  /**
+   * The thread is idle (no turn running, nothing queued, no request open but questions kept open
+   * after their turns, no background subagent running), and the app lets its process go
+   * (AgentThreadsOptions.idleCloseMs, AgentThreads.release): stop it gently, keeping the thread's
+   * session (and its options as they are), so the next turn starts a new process that resumes it.
+   * Nothing it says on its way out reaches the thread, and its run ends as one that exited.
+   * Whether there was one to stop. Without it, there's never one.
+   */
+  closeIdle?(): boolean;
+  /**
+   * Whether the process is still needed though the thread looks idle: Claude Code owes the agent a
+   * turn of its own, to report a background subagent that ended. The thread isn't let go of as idle
+   * meanwhile (call ThreadContext.recheckIdle when that changes with no event). Without it, never.
+   */
+  keepsProcess?(): boolean;
   /** Stop the harness process, if it's running. */
   close(): Promise<void>;
   /**

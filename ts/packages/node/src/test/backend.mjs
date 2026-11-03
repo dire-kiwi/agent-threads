@@ -11,7 +11,7 @@
 // tool `lookup`, which appends a line to that file each time it runs, and then (with TOOL_HANG)
 // doesn't return. STOP_GRACE_MS and CLOSE_GRACE_MS are the drivers' stopGraceMs and closeGraceMs.
 // With SAVE_DELAY_MS, each save (appendEvents) takes that long. SPAWNER=direct runs the harnesses
-// as its own children instead of under the shim.
+// as its own children instead of under the shim. IDLE_CLOSE_MS is idleCloseMs.
 
 import { appendFileSync } from "node:fs";
 import { createInterface } from "node:readline";
@@ -39,6 +39,7 @@ const sdk = new AgentThreads({
   },
   permissions: env.POLICY ?? "allow",
   lateAnswers: !!env.LATE_ANSWERS,
+  ...(env.IDLE_CLOSE_MS ? { idleCloseMs: Number(env.IDLE_CLOSE_MS) } : {}),
   tools: env.TOOL_MARKER
     ? [
         defineTool({
@@ -66,6 +67,7 @@ const ops = {
   // Resolves once every event so far is saved (and the run with them).
   saved: async (id) => void (await sdk.eventsSince(id, 0)),
   recover: () => sdk.recover(),
+  release: (id) => sdk.release(id),
   close: async (options) => {
     await sdk.close(options);
     await sdk.store.close();

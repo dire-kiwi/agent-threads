@@ -282,6 +282,12 @@ class ClaudeSession implements HarnessSession {
   #marking: string | undefined;
   #steerTimer: NodeJS.Timeout | undefined;
   #stopTimer: NodeJS.Timeout | undefined;
+  /**
+   * Turns of its own Claude owes, to report background subagents that ended (see #oweTurn), and
+   * when it's given up waiting for them.
+   */
+  #owed = 0;
+  #owedTimer: NodeJS.Timeout | undefined;
   /** When those go off, for a checkpoint. */
   #steerAt: number | undefined;
   #stopAt: number | undefined;
@@ -441,6 +447,25 @@ class ClaudeSession implements HarnessSession {
     const run = this.#live();
     // It has the messages on its stdin: stopped at once, it can't take them in unseen.
     if (run) void this.#stop(run, true, true);
+  }
+
+  keepsProcess(): boolean {
+    return this.#owed > 0 && !!this.#live();
+  }
+
+  closeIdle(): boolean {
+    const run = this.#live();
+    if (!run) return false;
+    this.#owedTurn(true);
+    this.#clearSteer();
+    this.#clearStop();
+    // Its input is closed, so it exits once it's done (or is signalled after the close grace).
+    // Retired: what it says on its way out is left out, and its end changes nothing. It's the
+    // thread's run no more, so its record ends now, and a backend that restarts doesn't re-attach
+    // to it.
+    void this.#stop(run, true);
+    if (this.#ctx.thread.run?.id === run.id) this.#ctx.setThread({ run: undefined });
+    return true;
   }
 
   async close(): Promise<void> {
@@ -762,6 +787,7 @@ class ClaudeSession implements HarnessSession {
     if (this.#run === run) {
       this.#run = null;
       this.#last = run;
+      this.#owedTurn(true);
     }
     if (ctx.thread.run?.id === run.id) ctx.setThread({ run: undefined });
     // Its subagents end with it.
@@ -902,6 +928,7 @@ class ClaudeSession implements HarnessSession {
         break;
       }
       case "result": {
+        if (m.origin?.kind === "task-notification") this.#owedTurn(false);
         // The turn's requests are moot now; its open questions are cancelled with it. A background
         // subagent's carry on.
         const lookup = (id: string) => ctx.item(id);
@@ -1009,7 +1036,37 @@ class ClaudeSession implements HarnessSession {
     const id = typeof m.tool_use_id === "string" ? m.tool_use_id : run.tasks.get(m.task_id);
     const it = id ? ctx.item(id) : undefined;
     if (it?.type !== "tool_call" || !it.subagent) return;
-    ctx.updateItem(it.id, { subagent: subagentTask(it.subagent, m) });
+    const next = subagentTask(it.subagent, m);
+    // A background subagent that ends is reported to the agent in a turn Claude starts by itself:
+    // its process is needed until then (see keepsProcess).
+    if (it.subagent.background && it.subagent.status === "running" && next.status !== "running") this.#oweTurn();
+    ctx.updateItem(it.id, { subagent: next });
+  }
+
+  /**
+   * Claude owes the agent a turn of its own, to report a background subagent that ended: until it
+   * comes (its result has origin.kind task-notification), or for the steer grace at most, the
+   * thread isn't let go of as idle.
+   */
+  #oweTurn(): void {
+    this.#owed++;
+    clearTimeout(this.#owedTimer);
+    this.#owedTimer = setTimeout(() => {
+      this.#owedTimer = undefined;
+      this.#owed = 0;
+      // No event says so: the core checks again whether the thread is idle.
+      this.#ctx.recheckIdle();
+    }, this.#o.steerGraceMs ?? 30_000);
+    this.#owedTimer.unref?.();
+  }
+
+  /** Claude made a turn it owed, or its process has gone (`all`). */
+  #owedTurn(all: boolean): void {
+    this.#owed = all ? 0 : Math.max(0, this.#owed - 1);
+    if (this.#owed === 0) {
+      clearTimeout(this.#owedTimer);
+      this.#owedTimer = undefined;
+    }
   }
 
   #controlRequest(run: Run, requestId: string, req: Json): void {

@@ -19,7 +19,7 @@ import {
   type Usage,
   type UserMessage,
 } from "@dire-kiwi/agent-threads-protocol";
-import { ancestors, inBackground, requestInBackground, type HarnessMessage, type HarnessSession, type LaunchOptions, type Message, type NewItem, type NewRequest, type ThreadConfig, type ThreadContext, type TurnEnd } from "./harness.js";
+import { ancestors, inBackground, requestInBackground, runningInBackground, type HarnessMessage, type HarnessSession, type LaunchOptions, type Message, type NewItem, type NewRequest, type ThreadConfig, type ThreadContext, type TurnEnd } from "./harness.js";
 import { newId } from "./ids.js";
 import { normalLaunch, sameLaunch, storedThread, type StoredThread } from "./launch.js";
 import { DONT_ASK_DENIAL, decide, modeDecision, permissionKey, standsFor, type PermissionDecision, type PermissionPolicy, type PermissionQuery, type StandingKey } from "./permissions.js";
@@ -87,6 +87,8 @@ export interface RuntimeHost {
   error(error: unknown): void;
   /** AgentThreadsOptions.lateAnswers. */
   lateAnswers?: boolean;
+  /** AgentThreadsOptions.idleCloseMs. */
+  idleCloseMs?: number;
 }
 
 export class ThreadRuntime implements ThreadContext {
@@ -127,6 +129,14 @@ export class ThreadRuntime implements ThreadContext {
   #structured = new Map<string, unknown>();
   /** The harness message being handled, which events made now have as their `raw` (with the raw option). */
   #raw: unknown = undefined;
+  /**
+   * Where it is in letting its idle harness process go (idleCloseMs): busy (not idle, or it has no
+   * process to let go), armed (idle: its process goes when #idleTimer goes off), or done (idle, and
+   * its process was let go, or it had none). Off for good once the backend closes.
+   */
+  #idle: "busy" | "armed" | "done" | "off" = "busy";
+  #idleTimer: NodeJS.Timeout | undefined;
+  #idleCheck = false;
 
   constructor(host: RuntimeHost, state: Snapshot, config: ThreadConfig, launch: LaunchOptions, policy: PermissionPolicy) {
     this.#host = host;
@@ -177,6 +187,7 @@ export class ThreadRuntime implements ThreadContext {
       this.#unsaved.push(e);
       this.#scheduleFlush();
     }
+    this.#scheduleIdleCheck();
     this.#host.publish(e);
   }
 
@@ -376,6 +387,89 @@ export class ThreadRuntime implements ThreadContext {
     this.closed = true;
     clearTimeout(this.#retry);
     this.#retry = undefined;
+    this.stopIdle();
+  }
+
+  // ---------- letting an idle process go ----------
+
+  /**
+   * Whether the thread is idle, and its harness process isn't needed until the next turn: no turn
+   * is running, nothing is queued, no request is open (but questions kept open after their turns,
+   * whose answers go as messages), no background subagent is running, and the session doesn't need
+   * its process still (HarnessSession.keepsProcess: Claude owes a report of one that ended).
+   */
+  idleNow(): boolean {
+    return (
+      !this.turn &&
+      !this.closing &&
+      !this.closed &&
+      !this.#queue.length &&
+      !this.#waiting() &&
+      !this.#saved.items.some(runningInBackground) &&
+      !this.session?.keepsProcess?.()
+    );
+  }
+
+  /**
+   * With idleCloseMs, checks whether the thread is idle once what's happening now is done (the
+   * events made in the same tick are taken together, as they're saved): it's checked after every
+   * change, since every change is an event.
+   */
+  recheckIdle(): void {
+    this.#scheduleIdleCheck();
+  }
+
+  #scheduleIdleCheck(): void {
+    if (this.#host.idleCloseMs === undefined || this.#idleCheck) return;
+    this.#idleCheck = true;
+    queueMicrotask(() => {
+      this.#idleCheck = false;
+      this.#checkIdle();
+    });
+  }
+
+  /**
+   * With idleCloseMs: lets the harness process go once the thread has been idle that long, and
+   * stops waiting to if it's busy again. Once let go, it isn't again until the thread has been
+   * busy. Only a live process is waited on: one re-attached to after a restart is waited on afresh.
+   */
+  #checkIdle(): void {
+    const after = this.#host.idleCloseMs;
+    if (after === undefined || this.#idle === "off") return;
+    if (!this.idleNow()) {
+      clearTimeout(this.#idleTimer);
+      this.#idleTimer = undefined;
+      this.#idle = "busy";
+      return;
+    }
+    if (this.#idle !== "busy" || !this.session?.live()) return;
+    this.#idle = "armed";
+    const timer = setTimeout(() => {
+      // Unless it's been busy since (a message came first, say).
+      if (this.#idleTimer !== timer) return;
+      this.#idleTimer = undefined;
+      if (this.#idle === "armed" && this.idleNow()) this.closeIdle();
+    }, after);
+    timer.unref?.();
+    this.#idleTimer = timer;
+  }
+
+  /**
+   * Lets the idle thread's harness process go (the caller checks it's idle): the session stops it,
+   * keeping the thread's session for the next turn. Whether there was one.
+   */
+  closeIdle(): boolean {
+    clearTimeout(this.#idleTimer);
+    this.#idleTimer = undefined;
+    if (this.#idle !== "off") this.#idle = "done";
+    return this.session?.closeIdle?.() ?? false;
+  }
+
+  /** Stops waiting to let the process go, for good: the backend is closing, or the thread going. */
+  stopIdle(): void {
+    clearTimeout(this.#idleTimer);
+    this.#idleTimer = undefined;
+    this.#idle = "off";
   }
 
   // ---------- items and the thread ----------
