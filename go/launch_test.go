@@ -38,6 +38,9 @@ type miniRun struct {
 	Env       map[string]*string
 	Sent      []map[string]any
 	Notes     []map[string]any
+	// Pid is its process's, and Exited says it has exited (it logs its exit).
+	Pid    int
+	Exited bool
 }
 
 // miniRuns reads a mini-claude or mini-codex log.
@@ -68,7 +71,19 @@ func miniRuns(t *testing.T, log string) []miniRun {
 				}
 			}
 			json.Unmarshal(v["env"], &r.Env)
+			json.Unmarshal(v["pid"], &r.Pid)
 			out = append(out, r)
+			continue
+		}
+		if exited, ok := v["exited"]; ok {
+			// Runs' lines interleave: its exit is the run's with its pid.
+			var pid int
+			json.Unmarshal(exited, &pid)
+			for i := range out {
+				if out[i].Pid == pid && pid != 0 {
+					out[i].Exited = true
+				}
+			}
 			continue
 		}
 		var m map[string]any

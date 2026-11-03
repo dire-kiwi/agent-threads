@@ -144,7 +144,11 @@ type claudeRunState struct {
 	Stale       bool            `json:"stale,omitempty"`
 	SteerAt     *int64          `json:"steerAt,omitempty"`
 	StopAt      *int64          `json:"stopAt,omitempty"`
-	raw         json.RawMessage `json:"-"`
+	// Owed is how many turns of its own Claude owes, to report background subagents that ended, and
+	// OwedAt when it gives up waiting for them (ms since the epoch).
+	Owed   int             `json:"owed,omitempty"`
+	OwedAt *int64          `json:"owedAt,omitempty"`
+	raw    json.RawMessage `json:"-"`
 }
 
 type pendingControl struct {
@@ -542,6 +546,10 @@ type claudeSession struct {
 	stale      bool
 	steerTimer *loopTimer
 	stopTimer  *loopTimer
+	// owed is how many turns of its own Claude owes, to report background subagents that ended (see
+	// oweTurn), and owedTimer when it gives up waiting for them.
+	owed      int
+	owedTimer *loopTimer
 	// marking is the turn whose marks go to the thread as they come (ThreadContext.Mark): one of a
 	// message once Claude has echoed a message of it back (what it says before then may be from
 	// before the turn: set_model's reply, say), and a compaction or a turn Claude started by itself
@@ -719,6 +727,27 @@ func (s *claudeSession) Retire() {
 
 func (s *claudeSession) Live() bool { return s.live() != nil }
 
+func (s *claudeSession) KeepsProcess() bool { return s.owed > 0 && s.live() != nil }
+
+func (s *claudeSession) CloseIdle() bool {
+	run := s.live()
+	if run == nil {
+		return false
+	}
+	s.owedTurn(true)
+	s.clearSteer()
+	s.clearStop()
+	// Its input is closed, so it exits once it's done (or is signalled after the close grace).
+	// Retired: what it says on its way out is left out, and its end changes nothing. It's the
+	// thread's run no more, so its record ends now, and a backend that restarts doesn't re-attach to
+	// it.
+	s.stop(run, true, false, nil)
+	if r := s.ctx.Thread().Run; r != nil && r.ID == run.id {
+		s.ctx.SetThread(func(t *protocol.Thread) { t.Run = nil })
+	}
+	return true
+}
+
 func (s *claudeSession) Release() {
 	s.clearSteer()
 	// It has the messages on its stdin: stopped at once, it can't take them in unseen.
@@ -764,6 +793,10 @@ func (s *claudeSession) Checkpoint() *RunCheckpoint {
 	st.Stale = s.stale
 	st.SteerAt = s.steerTimer.pending()
 	st.StopAt = s.stopTimer.pending()
+	if s.owed > 0 {
+		st.Owed = s.owed
+		st.OwedAt = s.owedTimer.pending()
+	}
 	input := dp.InputOffset()
 	return &RunCheckpoint{ID: run.id, Offset: dp.Offset(), Dir: dp.Dir(), Input: &input, State: st, Ended: run.exited}
 }
@@ -814,6 +847,16 @@ func (s *claudeSession) Reattach(record RunRecord) bool {
 		}
 	}
 	nowMs := time.Now().UnixMilli()
+	// Reports of background subagents that ended which Claude hadn't made yet: its process is still
+	// needed for them.
+	if st.Owed > 0 {
+		s.owed = st.Owed
+		at := nowMs
+		if st.OwedAt != nil {
+			at = *st.OwedAt
+		}
+		s.waitOwed(time.Duration(max(0, at-nowMs)) * time.Millisecond)
+	}
 	if st.SteerAt != nil {
 		s.steerAfter(run, time.Duration(max(0, *st.SteerAt-nowMs))*time.Millisecond)
 	}
@@ -836,6 +879,7 @@ func (s *claudeSession) Detach() bool {
 	// Their deadlines stay in the checkpoint saved after this, for the backend that re-attaches.
 	s.steerTimer.pause()
 	s.stopTimer.pause()
+	s.owedTimer.pause()
 	run.detached = true
 	dp.Detach()
 	run.abort()
@@ -1302,6 +1346,7 @@ func (s *claudeSession) exited(run *claudeRun, status ExitStatus) {
 	if s.run == run {
 		s.run = nil
 		s.last = run
+		s.owedTurn(true)
 	}
 	if r := ctx.Thread().Run; r != nil && r.ID == run.id {
 		ctx.SetThread(func(t *protocol.Thread) { t.Run = nil })
@@ -1509,6 +1554,9 @@ func (s *claudeSession) message(run *claudeRun, m jmap) {
 			ctx.CancelRequest(ours)
 		}
 	case "result":
+		if m.obj("origin").str("kind") == "task-notification" {
+			s.owedTurn(false)
+		}
 		// The turn's requests are moot now; its open questions are cancelled with it. A background
 		// subagent's carry on.
 		for _, id := range append([]string(nil), run.openOrder...) {
@@ -1679,7 +1727,43 @@ func (s *claudeSession) task(run *claudeRun, m jmap) {
 	if id == "" || !ok || !isCall || call.Subagent == nil {
 		return
 	}
-	ctx.UpdateItem(call.ID, Patch{"subagent": subagentTask(*call.Subagent, m)})
+	next := subagentTask(*call.Subagent, m)
+	// A background subagent that ends is reported to the agent in a turn Claude starts by itself:
+	// its process is needed until then (see KeepsProcess).
+	if prev := call.Subagent; prev.Background && prev.Status == protocol.SubagentStatusRunning && next.Status != protocol.SubagentStatusRunning {
+		s.oweTurn()
+	}
+	ctx.UpdateItem(call.ID, Patch{"subagent": next})
+}
+
+// oweTurn says Claude owes the agent a turn of its own, to report a background subagent that ended:
+// until it comes (its result has origin.kind task-notification), or for the steer grace at most,
+// the thread isn't let go of as idle.
+func (s *claudeSession) oweTurn() {
+	s.owed++
+	s.waitOwed(orDuration(s.o.SteerGrace, 30*time.Second))
+}
+
+// waitOwed gives up waiting for the turns Claude owes after d. The timer's deadline goes in the
+// checkpoint (owedAt), for a backend that re-attaches.
+func (s *claudeSession) waitOwed(d time.Duration) {
+	s.owedTimer.stop()
+	s.owedTimer = startTimer(s.ctx, d, func() {
+		s.owed, s.owedTimer = 0, nil
+	})
+}
+
+// owedTurn says Claude made a turn it owed, or its process has gone (all).
+func (s *claudeSession) owedTurn(all bool) {
+	if all {
+		s.owed = 0
+	} else if s.owed > 0 {
+		s.owed--
+	}
+	if s.owed == 0 {
+		s.owedTimer.stop()
+		s.owedTimer = nil
+	}
 }
 
 // toolUseOf is the tool call a request of Claude's is about: a can_use_tool's, or an app tool's

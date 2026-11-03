@@ -76,6 +76,17 @@ export interface AgentThreadsOptions extends Capabilities {
    * token usage...). It runs as the output is read, so it should be quick.
    */
   onHarnessMessage?: (message: HarnessMessage) => void;
+  /**
+   * Lets a thread's harness process go once the thread has been idle this long, in milliseconds:
+   * after a turn ends with nothing queued, no open request (but questions kept open after their
+   * turns) and no background subagent running, Claude Code's input is closed and Codex's app server
+   * is stopped. The thread keeps its session, and its next turn resumes it in a new process. A
+   * message sent before then goes to the live process, as ever. 0 lets it go as soon as the thread
+   * is idle; undefined (the default) keeps it until the session changes or the backend closes. A
+   * backend that restarts and re-attaches to an idle process waits this long again. release() does
+   * it now.
+   */
+  idleCloseMs?: number;
 }
 
 export interface CreateOptions extends Capabilities {
@@ -225,6 +236,7 @@ export class AgentThreads {
     this.#open();
     const rt = this.#threads.get(threadId);
     if (rt) {
+      rt.stopIdle();
       await rt.session?.close();
       rt.dispose();
       this.#threads.delete(threadId);
@@ -426,6 +438,23 @@ export class AgentThreads {
     }
   }
 
+  /**
+   * Lets the thread's harness process go now, as idleCloseMs does once a thread has been idle long
+   * enough: the thread keeps its session, and its next turn resumes it in a new process. Resolves
+   * with whether it had one to let go. Refused while a turn is running, and while the process is
+   * still needed after its turn: by a background subagent that's running (or one whose end Claude
+   * hasn't reported to the agent yet), or a request that's open (a question kept open after its
+   * turn doesn't need it).
+   */
+  async release(threadId: string): Promise<boolean> {
+    this.#open();
+    const rt = await this.#load(threadId);
+    this.#open();
+    idle(rt, "released");
+    if (!rt.idleNow()) throw new CommandError("the thread's harness process is still needed (a background subagent is running, or a request is open)");
+    return rt.closeIdle();
+  }
+
   /** The next turn starts a new conversation with the harness; the thread's items stay. */
   async newSession(threadId: string): Promise<void> {
     const rt = await this.#ready({ type: "new_session", thread_id: threadId });
@@ -465,6 +494,7 @@ export class AgentThreads {
     await Promise.allSettled([...this.#loading.values()]);
     await Promise.all(
       [...this.#threads.values()].map(async (rt) => {
+        rt.stopIdle();
         // Left going, saved as it is now, to be re-attached to (#saveAll reports a failure).
         if (!stop && this.spawner.durable && rt.session?.detach?.()) return void (await rt.persist().catch(() => {}));
         // A turn cut short by shutting down ends as an interrupted one.
@@ -554,6 +584,7 @@ export class AgentThreads {
       },
       error: (e: unknown) => this.#error(e),
       lateAnswers: !!this.#options.lateAnswers,
+      ...(this.#options.idleCloseMs !== undefined ? { idleCloseMs: Math.max(0, this.#options.idleCloseMs) } : {}),
     };
     const rt = new ThreadRuntime(host, state, this.#config(id), launch, this.#policy(id));
     const harness = this.harnesses[state.thread.harness];

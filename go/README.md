@@ -87,6 +87,16 @@ sdk.Close(ctx) // on shutdown: stops the harness processes (or with the shim, le
   (or with the shim leaves them going) and saves everything; `Stop` stops shim runs too.
 - `Recover(ctx)`, with the shim spawner, re-attaches to runs that outlived the last process
   ([docs/shim.md](../docs/shim.md)).
+- A thread's process is kept while the thread is idle, for its next turn, unless the app lets it
+  go. `Options.IdleClose` does that once a thread has been idle that long (nothing running, queued
+  or asked, and no background subagent still running; a pointer to zero as soon as it is), and
+  `Release(ctx, id)` does it now (refused while a turn runs, or while the process is still needed).
+  Claude's input is closed, or Codex's app server stopped; the thread keeps its session, and its
+  next message resumes it in a new process. A message sent before then goes to the live process,
+  and a steered message a turn carries over keeps it going. Its run ends as one that exited, so a
+  backend that restarts doesn't re-attach to it; one that re-attaches to an idle process lets it go
+  once the thread has been idle that long again. A harness of the app's own supports it by
+  implementing `IdleClosingSession`.
 - **Tools** ([docs/tools.md](../docs/tools.md) has tools, MCP servers, skills and policies in
   full) implement `Tool` (`Name`, `Description`, `InputSchema`, `Run(ctx, args, call)`), or are
   made with `ToolFunc` or `TypedTool`. `Run`'s `ctx` is cancelled when the thread's harness process
@@ -139,7 +149,7 @@ limits, err := sdk.Control(ctx, threadID, json.RawMessage(`{"method":"account/ra
 ```
 
 `Control` needs the thread's process to be running (it is from the first `Send` until the SDK
-closes): it returns a `*CommandError` when it isn't, and a `*ControlError` when the harness refuses
+closes, unless `IdleClose` or `Release` lets it go): it returns a `*CommandError` when it isn't, and a `*ControlError` when the harness refuses
 the request or exits first. Usage limits are in each thread's `RateLimits`, and Claude's API retries
 and hooks are `notice` items (codes `retry` and `hook`).
 

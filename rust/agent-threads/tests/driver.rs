@@ -32,6 +32,7 @@ struct Setup {
     capabilities: Capabilities,
     errors: Arc<Mutex<Vec<String>>>,
     late_answers: bool,
+    idle_close: Option<Duration>,
     /// What the app's on_harness_message has been given.
     messages: Arc<Mutex<Vec<HarnessMessage>>>,
 }
@@ -50,6 +51,7 @@ impl Default for Setup {
             },
             errors: Arc::default(),
             late_answers: false,
+            idle_close: None,
             messages: Arc::default(),
         }
     }
@@ -86,6 +88,7 @@ impl Env {
             on_error: Some(Arc::new(move |e| errors.lock().unwrap().push(e.to_string()))),
             event_capacity: 1 << 16,
             late_answers: self.setup.late_answers,
+            idle_close: self.setup.idle_close,
             on_harness_message: Some(Arc::new(move |m| messages.lock().unwrap().push(m.clone()))),
             ..Default::default()
         })
@@ -3216,4 +3219,199 @@ async fn a_session_change_cancels_a_question_kept_open_after_its_turn() {
         assert_eq!(items(&s, "user_message").len(), before, "{change} after a restart: {s}");
         env.sdk.close(false).await.unwrap();
     }
+}
+
+// ---------- letting an idle process go (idle_close, release) ----------
+
+/// The thread's snapshot as JSON.
+async fn snap(env: &Env, id: &str) -> Value {
+    serde_json::to_value(env.sdk.snapshot(id).await.unwrap()).unwrap()
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn lets_an_idle_process_go_and_resumes_its_session_in_a_new_one() {
+    let env = setup(Setup {
+        idle_close: Some(Duration::ZERO),
+        ..Default::default()
+    });
+    let t = env.sdk.create(create()).await.unwrap();
+    env.sdk.send(&t.id, "reply one", SendOptions::default()).await.unwrap();
+    let s = settle(&env.sdk, &t.id).await;
+    let session = s["thread"]["session_id"].as_str().unwrap().to_string();
+    // Its input is closed, so it exits; the thread has no run, and keeps its session.
+    until(5, || async {
+        env.runs().first().is_some_and(|r| r.exited).then_some(())
+    })
+    .await;
+    let s = snap(&env, &t.id).await;
+    assert!(s["thread"].get("run").is_none(), "{s}");
+    assert_eq!(s["thread"]["session_id"], session.as_str());
+    assert_eq!(s["thread"]["status"], "idle");
+    env.sdk.send(&t.id, "reply two", SendOptions::default()).await.unwrap();
+    let s = settle(&env.sdk, &t.id).await;
+    assert_eq!(texts(&s), ["one", "two"]);
+    let runs = env.runs();
+    assert_eq!(runs.len(), 2);
+    assert!(has(&runs[1].argv, "--resume", &session));
+    let r = results(&s);
+    assert_eq!(r[1]["session"]["id"], session.as_str());
+    assert!(r[1]["session"].get("started").is_none());
+    assert!(env.setup.errors.lock().unwrap().is_empty());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_message_sent_before_the_idle_time_is_up_goes_to_the_live_process() {
+    let env = setup(Setup {
+        idle_close: Some(Duration::from_millis(400)),
+        ..Default::default()
+    });
+    let t = env.sdk.create(create()).await.unwrap();
+    env.sdk.send(&t.id, "reply one", SendOptions::default()).await.unwrap();
+    settle(&env.sdk, &t.id).await;
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    env.sdk.send(&t.id, "reply two", SendOptions::default()).await.unwrap();
+    settle(&env.sdk, &t.id).await;
+    assert_eq!(env.runs().len(), 1);
+    // The wait starts again when a turn ends.
+    tokio::time::sleep(Duration::from_millis(250)).await;
+    assert!(!env.runs()[0].exited);
+    until(5, || async { env.runs()[0].exited.then_some(()) }).await;
+    assert!(snap(&env, &t.id).await["thread"].get("run").is_none());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_steered_message_carried_over_goes_to_the_live_process_before_its_let_go() {
+    // Claude takes the steered message in after its turn's result: the next turn, in the same
+    // process.
+    let env = setup(Setup {
+        steer: "late",
+        idle_close: Some(Duration::ZERO),
+        ..Default::default()
+    });
+    let t = env.sdk.create(create()).await.unwrap();
+    env.sdk
+        .send(&t.id, "sleep 200 first", SendOptions::default())
+        .await
+        .unwrap();
+    until(5, || async {
+        env.sdk.snapshot(&t.id).await.unwrap().thread.session_id.map(|_| ())
+    })
+    .await;
+    env.sdk
+        .send(&t.id, "reply second", SendOptions::default())
+        .await
+        .unwrap();
+    let s = until(5, || async {
+        let s = snap(&env, &t.id).await;
+        (results(&s).len() == 2 && s["thread"]["status"] == "idle").then_some(s)
+    })
+    .await;
+    assert_eq!(texts(&s), ["first", "second"]);
+    until(5, || async { env.runs()[0].exited.then_some(()) }).await;
+    assert_eq!(env.runs().len(), 1);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn keeps_the_process_while_a_background_subagent_runs_and_lets_it_go_after() {
+    // Claude reports the subagent a while after it ends: the process is kept for that turn too.
+    let env = setup(Setup {
+        idle_close: Some(Duration::ZERO),
+        env: vec![("MINI_CLAUDE_REPORT_DELAY", "200".into())],
+        ..Default::default()
+    });
+    let t = env.sdk.create(create()).await.unwrap();
+    env.sdk
+        .send(&t.id, "background 400 apple", SendOptions::default())
+        .await
+        .unwrap();
+    until(5, || async {
+        (results(&snap(&env, &t.id).await).len() == 1).then_some(())
+    })
+    .await;
+    // Refused while the subagent runs.
+    assert!(matches!(env.sdk.release(&t.id).await, Err(Error::Command(_))));
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert!(!env.runs()[0].exited);
+    // Claude's own turn says how it went, and then it's let go.
+    let s = until(5, || async {
+        let s = snap(&env, &t.id).await;
+        (results(&s).len() == 2 && s["thread"]["status"] == "idle").then_some(s)
+    })
+    .await;
+    assert_eq!(texts(&s).last().unwrap(), "the subagent said apple");
+    until(5, || async { env.runs()[0].exited.then_some(()) }).await;
+    assert_eq!(env.runs().len(), 1);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn keeps_the_process_while_a_background_subagents_request_is_open() {
+    let policy = PermissionPolicy::from_fn(|q, _| match q.kind {
+        ToolKind::Shell => PermissionDecision::Ask,
+        _ => PermissionDecision::Allow,
+    });
+    let env = setup(Setup {
+        capabilities: Capabilities {
+            permissions: Some(policy),
+            ..Default::default()
+        },
+        idle_close: Some(Duration::ZERO),
+        ..Default::default()
+    });
+    let t = env.sdk.create(create()).await.unwrap();
+    env.sdk
+        .send(&t.id, "background 0 apple", SendOptions::default())
+        .await
+        .unwrap();
+    let s = until(5, || async {
+        let s = snap(&env, &t.id).await;
+        (results(&s).len() == 1 && s["thread"]["status"] == "waiting").then_some(s)
+    })
+    .await;
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert!(!env.runs()[0].exited);
+    let request = open(&s)[0]["id"].as_str().unwrap().to_string();
+    env.sdk
+        .respond(&t.id, &request, resolution(json!({"outcome": "allow"})))
+        .await
+        .unwrap();
+    until(5, || async {
+        let s = snap(&env, &t.id).await;
+        (results(&s).len() == 2 && s["thread"]["status"] == "idle").then_some(())
+    })
+    .await;
+    until(5, || async { env.runs()[0].exited.then_some(()) }).await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn release_lets_an_idle_threads_process_go_and_is_refused_while_a_turn_runs() {
+    let env = setup(Setup::default());
+    let t = env.sdk.create(create()).await.unwrap();
+    // No process yet.
+    assert!(!env.sdk.release(&t.id).await.unwrap());
+    env.sdk.send(&t.id, "slow", SendOptions::default()).await.unwrap();
+    until(5, || async {
+        env.sdk.snapshot(&t.id).await.unwrap().thread.session_id.map(|_| ())
+    })
+    .await;
+    assert!(matches!(env.sdk.release(&t.id).await, Err(Error::Command(_))));
+    env.sdk.interrupt(&t.id).await.unwrap();
+    let s = settle(&env.sdk, &t.id).await;
+    // Without idle_close, it's kept.
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert!(!env.runs()[0].exited);
+    assert!(env.sdk.release(&t.id).await.unwrap());
+    until(5, || async { env.runs()[0].exited.then_some(()) }).await;
+    assert!(snap(&env, &t.id).await["thread"].get("run").is_none());
+    assert!(!env.sdk.release(&t.id).await.unwrap());
+    env.sdk
+        .send(&t.id, "reply again", SendOptions::default())
+        .await
+        .unwrap();
+    let after = settle(&env.sdk, &t.id).await;
+    assert_eq!(texts(&after).last().unwrap(), "again");
+    assert!(has(
+        &env.runs()[1].argv,
+        "--resume",
+        s["thread"]["session_id"].as_str().unwrap()
+    ));
 }

@@ -46,9 +46,9 @@
 // them. MINI_CODEX_TOOL_DELAY=<ms> waits that long between a dynamic tool's call and asking for
 // it to be run, and MINI_CODEX_RESULT_DELAY=<ms> between its answer and the item's completion.
 // MINI_CODEX_NO_DYNAMIC=1 refuses
-// thread/start with dynamicTools. MINI_CODEX_LOG names a file each run appends its argv and
-// CODEX_HOME (and the variables MINI_LOG_ENV names, comma-separated), and every message it's sent,
-// to.
+// thread/start with dynamicTools. MINI_CODEX_LOG names a file each run appends its argv,
+// CODEX_HOME and pid (and the variables MINI_LOG_ENV names, comma-separated), every message it's
+// sent, and its exit ({"exited": pid}), to.
 
 import { appendFileSync, existsSync, mkdirSync, readdirSync, readFileSync, realpathSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
@@ -59,7 +59,8 @@ const steerMode = process.env.MINI_CODEX_STEER ?? "now";
 const home = process.env.CODEX_HOME;
 const note = (v) => log && appendFileSync(log, JSON.stringify(v) + "\n");
 const loggedEnv = Object.fromEntries((process.env.MINI_LOG_ENV ?? "").split(",").filter(Boolean).map((k) => [k, process.env[k] ?? null]));
-note({ argv: process.argv.slice(2), codexHome: home, env: loggedEnv });
+note({ argv: process.argv.slice(2), codexHome: home, env: loggedEnv, pid: process.pid });
+process.on("exit", () => note({ exited: process.pid }));
 
 const out = (m) => process.stdout.write(JSON.stringify(m) + "\n");
 const notify = (method, params) => out({ method, params });

@@ -699,6 +699,7 @@ async fn backend() {
         on_error: Some(Arc::new(|e| eprintln!("backend error: {e}"))),
         event_capacity: 1 << 16,
         late_answers: env("LATE_ANSWERS").is_some(),
+        idle_close: ms("IDLE_CLOSE_MS"),
         ..Default::default()
     });
     let out = Arc::new(Mutex::new(std::io::stdout()));
@@ -758,6 +759,11 @@ async fn backend() {
                 .events_since(args.as_str().unwrap(), 0, None)
                 .await
                 .map(|_| Value::Null)
+                .map_err(|e| e.to_string()),
+            "release" => sdk
+                .release(args.as_str().unwrap())
+                .await
+                .map(|r| json!(r))
                 .map_err(|e| e.to_string()),
             "recover" => sdk
                 .recover()
@@ -1250,4 +1256,114 @@ async fn keeps_a_question_its_interrupted_turn_gave_up_open_across_a_restart() {
         messages.last().unwrap()["text"],
         "My answer to the question you asked:\n\n- Colour?\n  Red"
     );
+}
+
+/// A backend that restarts while a thread is idle re-attaches to its process, and (with idle_close)
+/// lets it go: its run ends, so the next backend doesn't re-attach to it, and the next turn resumes
+/// the session in a new process.
+async fn lets_an_idle_process_go_after_a_restart(h: &str) {
+    let _one = serial().await;
+    let s = mini_scene(&[("CLOSE_GRACE_MS", "500")]);
+    let mut a = s.start();
+    let thread = a.call("create", json!({"harness": h, "cwd": s.cwd})).await;
+    let id = thread["id"].as_str().unwrap().to_string();
+    a.call("handle", json!({"type": "send", "thread_id": id, "text": "reply one"}))
+        .await;
+    let snap = snapshot_until(&mut a, &id, |s| {
+        of_type(s, "turn_result").len() == 1 && s["thread"]["status"] == "idle"
+    })
+    .await;
+    let session = snap["thread"]["session_id"].clone();
+    let run = snap["thread"]["run"]["id"].as_str().unwrap().to_string();
+    a.call("saved", json!(id)).await;
+    a.call("close", json!({"stop": false})).await;
+    a.exited().await;
+    let exit = s.runs.join(&run).join("exit");
+    assert!(!exit.exists(), "the run is left going");
+
+    let mut b = s.start_with(&[("IDLE_CLOSE_MS", "0")]);
+    assert_eq!(
+        b.call("recover", json!(null)).await,
+        json!({"reattached": [id], "lost": []})
+    );
+    let snap = snapshot_until(&mut b, &id, |s| s["thread"].get("run").is_none()).await;
+    assert_eq!(snap["thread"]["status"], "idle");
+    assert_eq!(snap["thread"]["session_id"], session);
+    until(|| exit.exists()).await;
+    b.call("saved", json!(id)).await;
+    b.call("close", json!({"stop": false})).await;
+    b.exited().await;
+
+    let mut c = s.start();
+    assert_eq!(
+        c.call("recover", json!(null)).await,
+        json!({"reattached": [], "lost": []})
+    );
+    c.call("handle", json!({"type": "send", "thread_id": id, "text": "reply two"}))
+        .await;
+    let snap = snapshot_until(&mut c, &id, |s| {
+        of_type(s, "turn_result").len() == 2 && s["thread"]["status"] == "idle"
+    })
+    .await;
+    let texts: Vec<&Value> = of_type(&snap, "assistant_message").iter().map(|m| &m["text"]).collect();
+    assert_eq!(texts, [&json!("one"), &json!("two")]);
+    assert_eq!(snap["thread"]["session_id"], session);
+    // No notice of a run lost or picked up again: it ended as one that exited.
+    assert!(of_type(&snap, "notice").is_empty(), "{snap}");
+    assert_ne!(snap["thread"]["run"]["id"], json!(run));
+    c.call("close", json!({"stop": true})).await;
+    c.exited().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn claude_lets_an_idle_process_go_after_a_restart() {
+    lets_an_idle_process_go_after_a_restart("claude").await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn codex_lets_an_idle_process_go_after_a_restart() {
+    lets_an_idle_process_go_after_a_restart("codex").await;
+}
+
+/// A backend that restarts after a background subagent ended, but before Claude made the turn that
+/// reports it, keeps the process for that turn (with idle_close), and lets it go after.
+#[tokio::test(flavor = "multi_thread")]
+async fn claude_keeps_an_idle_process_for_a_report_it_owes_across_a_restart() {
+    let _one = serial().await;
+    let s = mini_scene(&[("CLOSE_GRACE_MS", "100"), ("MINI_CLAUDE_REPORT_DELAY", "3000")]);
+    let mut a = s.start();
+    let thread = a.call("create", json!({"harness": "claude", "cwd": s.cwd})).await;
+    let id = thread["id"].as_str().unwrap().to_string();
+    a.call(
+        "handle",
+        json!({"type": "send", "thread_id": id, "text": "background 300 apple"}),
+    )
+    .await;
+    let snap = snapshot_until(&mut a, &id, |s| {
+        of_type(s, "turn_result").len() == 1
+            && s["thread"]["status"] == "idle"
+            && of_type(s, "tool_call")
+                .first()
+                .is_some_and(|c| c["subagent"]["status"] == "completed")
+    })
+    .await;
+    let run = snap["thread"]["run"]["id"].as_str().unwrap().to_string();
+    a.call("saved", json!(id)).await;
+    a.call("close", json!({"stop": false})).await;
+    a.exited().await;
+
+    let mut b = s.start_with(&[("IDLE_CLOSE_MS", "0")]);
+    assert_eq!(
+        b.call("recover", json!(null)).await,
+        json!({"reattached": [id], "lost": []})
+    );
+    let snap = snapshot_until(&mut b, &id, |s| {
+        of_type(s, "turn_result").len() == 2 && s["thread"]["status"] == "idle" && s["thread"].get("run").is_none()
+    })
+    .await;
+    let texts: Vec<&Value> = of_type(&snap, "assistant_message").iter().map(|m| &m["text"]).collect();
+    assert_eq!(texts.last().unwrap(), &&json!("the subagent said apple"), "{snap}");
+    until(|| s.runs.join(&run).join("exit").exists()).await;
+    b.call("close", json!({"stop": true})).await;
+    b.exited().await;
 }

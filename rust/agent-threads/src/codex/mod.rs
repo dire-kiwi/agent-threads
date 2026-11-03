@@ -3178,6 +3178,19 @@ impl HarnessSession for CodexSession {
         }
     }
 
+    fn close_idle(&mut self, ctx: &mut ThreadContext) -> bool {
+        let Some(id) = self.live_id() else { return false };
+        self.clear_stop();
+        // Its input is closed, so the app server exits (or is signalled after the close grace). Retired: what it says on its way out
+        // is left out, and its end changes nothing. It's the thread's run no more, so its record
+        // ends now, and a backend that restarts doesn't re-attach to it.
+        self.stop(ctx, &id, true, false);
+        if ctx.thread().run.as_ref().is_some_and(|r| r.id == id) {
+            ctx.set_thread(|t| t.run = None);
+        }
+        true
+    }
+
     fn close(&mut self, ctx: &mut ThreadContext) -> BoxFuture<()> {
         self.closed = true;
         self.clear_stop();

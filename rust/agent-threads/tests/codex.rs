@@ -6,6 +6,7 @@ mod common;
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use agent_threads::protocol::{PermissionMode, ToolKind};
 use agent_threads::reducer::open_requests;
@@ -26,10 +27,15 @@ struct Env {
     store: Arc<MemoryStore>,
     rx: tokio::sync::broadcast::Receiver<ThreadEvent>,
     /// How its backend was made, for another on a store of its own.
-    made: (CodexOptions, Capabilities),
+    made: (CodexOptions, Capabilities, Option<Duration>),
 }
 
 fn setup(capabilities: Capabilities, o: CodexOptions, env: &[(&str, &str)]) -> Env {
+    setup_with(capabilities, o, env, None)
+}
+
+/// As setup(), with Options::idle_close.
+fn setup_with(capabilities: Capabilities, o: CodexOptions, env: &[(&str, &str)], idle_close: Option<Duration>) -> Env {
     let log = common::temp_dir().join("log.jsonl");
     let home = common::temp_dir();
     // A home of its own, so the user's own skills don't show up.
@@ -50,7 +56,7 @@ fn setup(capabilities: Capabilities, o: CodexOptions, env: &[(&str, &str)]) -> E
         capabilities.permissions = Some(PermissionPolicy::allow());
     }
     let store = Arc::new(MemoryStore::new());
-    let sdk = backend(o.clone(), capabilities.clone(), store.clone());
+    let sdk = backend(o.clone(), capabilities.clone(), store.clone(), idle_close);
     let rx = sdk.subscribe();
     Env {
         sdk,
@@ -59,17 +65,23 @@ fn setup(capabilities: Capabilities, o: CodexOptions, env: &[(&str, &str)]) -> E
         user_home,
         store,
         rx,
-        made: (o, capabilities),
+        made: (o, capabilities, idle_close),
     }
 }
 
-fn backend(o: CodexOptions, capabilities: Capabilities, store: Arc<dyn Store>) -> AgentThreads {
+fn backend(
+    o: CodexOptions,
+    capabilities: Capabilities,
+    store: Arc<dyn Store>,
+    idle_close: Option<Duration>,
+) -> AgentThreads {
     AgentThreads::new(Options {
         store: Some(store),
         harnesses: vec![codex(o)],
         capabilities,
         on_error: Some(Arc::new(|e| panic!("{e}"))),
         event_capacity: 1 << 16,
+        idle_close,
         ..Default::default()
     })
 }
@@ -84,7 +96,7 @@ fn plain() -> CodexOptions {
 impl Env {
     /// Another backend like this one, on `store`.
     fn make(&self, store: Arc<dyn Store>) -> AgentThreads {
-        backend(self.made.0.clone(), self.made.1.clone(), store)
+        backend(self.made.0.clone(), self.made.1.clone(), store, self.made.2)
     }
 
     /// The requests the last run (or `run`) sent, by method.
@@ -1715,4 +1727,64 @@ async fn a_turn_the_backend_lost_is_reverted_by_the_codex_turn_it_started_once_c
         reverts,
         [json!({"threadId": s["thread"]["session_id"], "beforeTurnId": at})]
     );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn lets_an_idle_app_server_go_and_resumes_the_session_in_a_new_one() {
+    let env = setup_with(Capabilities::default(), plain(), &[], Some(Duration::ZERO));
+    let t = env.sdk.create(create()).await.unwrap();
+    env.sdk
+        .send(&t.id, "reply first", SendOptions::default())
+        .await
+        .unwrap();
+    let s = settle(&env.sdk, &t.id).await;
+    let session = s["thread"]["session_id"].clone();
+    until(5, || async {
+        mini_runs(&env.log).first().is_some_and(|r| r.exited).then_some(())
+    })
+    .await;
+    let s = serde_json::to_value(env.sdk.snapshot(&t.id).await.unwrap()).unwrap();
+    assert!(s["thread"].get("run").is_none(), "{s}");
+    assert_eq!(s["thread"]["session_id"], session);
+    env.sdk.send(&t.id, "reply back", SendOptions::default()).await.unwrap();
+    let s = settle(&env.sdk, &t.id).await;
+    assert_eq!(texts(&s), ["first", "back"]);
+    assert_eq!(mini_runs(&env.log).len(), 2);
+    assert_eq!(env.all_sent("thread/resume")[0]["params"]["threadId"], session);
+    assert_eq!(s["thread"]["session_id"], session);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn keeps_the_app_server_while_a_child_thread_runs_and_lets_it_go_after() {
+    let env = setup_with(shell_asks(), plain(), &[], Some(Duration::ZERO));
+    let t = env.sdk.create(create()).await.unwrap();
+    env.sdk
+        .send(&t.id, "bg touch a.txt", SendOptions::default())
+        .await
+        .unwrap();
+    let s = until(5, || async {
+        let s = serde_json::to_value(env.sdk.snapshot(&t.id).await.unwrap()).unwrap();
+        (results(&s).len() == 1 && s["thread"]["status"] == "waiting").then_some(s)
+    })
+    .await;
+    assert!(env.sdk.release(&t.id).await.is_err());
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert!(!mini_runs(&env.log)[0].exited);
+    let r = &s["requests"][0];
+    env.sdk
+        .respond(
+            &t.id,
+            r["id"].as_str().unwrap(),
+            serde_json::from_value(json!({"outcome": "allow"})).unwrap(),
+        )
+        .await
+        .unwrap();
+    let s = until(5, || async {
+        let s = serde_json::to_value(env.sdk.snapshot(&t.id).await.unwrap()).unwrap();
+        (s["thread"]["status"] == "idle" && calls(&s)[0]["subagent"]["status"] == "completed").then_some(s)
+    })
+    .await;
+    assert_eq!(calls(&s)[1]["status"], "completed");
+    until(5, || async { mini_runs(&env.log)[0].exited.then_some(()) }).await;
+    assert_eq!(mini_runs(&env.log).len(), 1);
 }

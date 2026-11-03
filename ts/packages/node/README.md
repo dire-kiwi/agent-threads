@@ -66,6 +66,9 @@ await sdk.close(); // on shutdown: stops the harness processes (or with the shim
   they happen, and returns how to stop.
 - `recover()`, with the shim spawner, re-attaches to runs that outlived the last process; `close()`
   stops the harnesses (or leaves shim runs going) and saves everything. See below.
+- `release(id)` lets an idle thread's harness process go now, and the `idleCloseMs` option once a
+  thread has been idle that long; the thread keeps its session, and its next message resumes it in
+  a new process (more after the Codex section's list).
 - `CommandError` is what `handle` and the rest throw for a command the client got wrong; `onError`
   (an option) is told about errors that aren't any command's (a store that fails, a subscriber that
   throws).
@@ -180,6 +183,16 @@ again to finish saving. The file store undoes a write that fails partway, so a r
 - **Permission modes** are approval policies and sandboxes: `default` is `untrusted` in
   `workspace-write`, `accept_edits` `on-request` in `workspace-write`, `plan` `untrusted` in
   `read-only`, and `bypass` `never` in `danger-full-access`.
+
+A thread's process (Claude Code's or Codex's) is kept while the thread is idle, for its next turn,
+unless the app lets it go. `idleCloseMs` does that once a thread has been idle that long (nothing
+running, queued or asked, and no background subagent still running; `0` as soon as it is), and
+`release(id)` does it now (refused while a turn runs, or while the process is still needed).
+Claude's input is closed, or Codex's app server stopped; the thread keeps its session, and its next
+message resumes it in a new process. A message sent before then goes to the live process, and a
+steered message a turn carries over keeps it going. Its run ends as one that exited, so a backend
+that restarts doesn't re-attach to it; one that re-attaches to an idle process (it restarted first)
+lets it go once the thread has been idle that long again.
 - **Permissions**: Codex's approval requests (`item/commandExecution/requestApproval`,
   `item/fileChange/requestApproval`, `item/permissions/requestApproval`, and the MCP elicitations it
   approves MCP tool calls with) go to the policy, as do the app's tools. An elicitation that wants a

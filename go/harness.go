@@ -306,6 +306,23 @@ type RetiringSession interface {
 	Retire()
 }
 
+// IdleClosingSession is a Session that can let its harness process go while the thread is idle
+// (Options.IdleClose, AgentThreads.Release). Without it, a thread's process is kept until its
+// session changes or the backend closes.
+type IdleClosingSession interface {
+	Session
+	// CloseIdle is called when the thread is idle (no turn running, nothing queued, no request open
+	// but questions kept open after their turns, no background subagent running) and the app lets
+	// its process go: stop it gently, keeping the thread's session (and its options as they are), so
+	// the next turn starts a new process that resumes it. Nothing it says on its way out reaches the
+	// thread, and its run ends as one that exited. It says whether there was one to stop.
+	CloseIdle() bool
+	// KeepsProcess says whether the process is still needed though the thread looks idle: Claude
+	// Code owes the agent a turn of its own, to report a background subagent that ended. The thread
+	// isn't let go of as idle meanwhile.
+	KeepsProcess() bool
+}
+
 // RewindingSession is a Session that can take its conversation back to before a turn. A harness
 // whose sessions aren't refuses the rewind command.
 type RewindingSession interface {

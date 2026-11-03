@@ -56,12 +56,17 @@ function setup(options: Setup = {}) {
   /** What each run was started with and sent. */
   const runs = () => {
     if (!existsSync(log)) return [];
-    // Its CODEX_HOME, and the variables MINI_LOG_ENV names (null if unset).
-    const out: { argv: string[]; codexHome: string; env: { [k: string]: string | null }; sent: { [k: string]: any }[]; notes: { [k: string]: any }[] }[] = [];
+    // Its CODEX_HOME, the variables MINI_LOG_ENV names (null if unset), and whether it has exited
+    // (it logs its exit).
+    const out: { argv: string[]; codexHome: string; env: { [k: string]: string | null }; pid?: number; exited: boolean; sent: { [k: string]: any }[]; notes: { [k: string]: any }[] }[] = [];
     for (const l of readFileSync(log, "utf8").split("\n").filter(Boolean)) {
       const v = JSON.parse(l);
-      if (v.argv) out.push({ argv: v.argv, codexHome: v.codexHome, env: v.env ?? {}, sent: [], notes: [] });
-      else if ("jsonrpc" in v || "method" in v || "id" in v) out[out.length - 1]!.sent.push(v);
+      if (v.argv) out.push({ argv: v.argv, codexHome: v.codexHome, env: v.env ?? {}, pid: v.pid, exited: false, sent: [], notes: [] });
+      // Runs' lines interleave: its exit is the run's with its pid.
+      else if (v.exited !== undefined) {
+        const run = out.find((r) => r.pid === v.exited);
+        if (run) run.exited = true;
+      } else if ("jsonrpc" in v || "method" in v || "id" in v) out[out.length - 1]!.sent.push(v);
       else out[out.length - 1]!.notes.push(v);
     }
     return out;
@@ -1201,5 +1206,46 @@ describe("a turn the backend lost", () => {
     s = await settle(next, t.id);
     expect(texts(s.items).at(-1)).toBe("again");
     expect(sent("thread/revert")).toEqual([expect.objectContaining({ params: { threadId: s.thread.session_id, beforeTurnId: at } })]);
+  });
+});
+
+describe("letting an idle app server go (idleCloseMs, release)", () => {
+  it("lets an idle app server go, and resumes the session in a new one", async () => {
+    const { sdk, runs, sent } = setup({ idleCloseMs: 0 });
+    const t = await sdk.create({ harness: "codex", cwd: tempDir() });
+    await sdk.send(t.id, "reply first");
+    let s = await settle(sdk, t.id);
+    const session = s.thread.session_id!;
+    await until(() => runs()[0]?.exited);
+    s = await sdk.snapshot(t.id);
+    expect(s.thread.run).toBeUndefined();
+    expect(s.thread.session_id).toBe(session);
+    await sdk.send(t.id, "reply back");
+    s = await settle(sdk, t.id);
+    expect(texts(s.items)).toEqual(["first", "back"]);
+    expect(runs()).toHaveLength(2);
+    expect(sent("thread/resume")[0]!.params.threadId).toBe(session);
+    expect(s.thread.session_id).toBe(session);
+  });
+
+  it("keeps the app server while a child thread runs, and lets it go after", async () => {
+    const { sdk, runs } = setup({ idleCloseMs: 0, permissions: (q) => (q.kind === "shell" ? "ask" : "allow") });
+    const t = await sdk.create({ harness: "codex", cwd: tempDir() });
+    await sdk.send(t.id, "bg touch a.txt");
+    const s = await until(async () => {
+      const x = await sdk.snapshot(t.id);
+      return results(x.items).length === 1 && x.thread.status === "waiting" && x;
+    });
+    await expect(sdk.release(t.id)).rejects.toThrow(/still needed/);
+    await new Promise((r) => setTimeout(r, 100));
+    expect(runs()[0]!.exited).toBe(false);
+    await sdk.respond(t.id, openRequests(s)[0]!.id, { outcome: "allow" });
+    const after = await until(async () => {
+      const x = await sdk.snapshot(t.id);
+      return x.thread.status === "idle" && calls(x.items)[0]!.subagent?.status === "completed" && x;
+    });
+    expect(calls(after.items)[1]!.status).toBe("completed");
+    await until(() => runs()[0]!.exited);
+    expect(runs()).toHaveLength(1);
   });
 });

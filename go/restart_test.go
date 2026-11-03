@@ -79,6 +79,12 @@ func runBackend() {
 		defer mu.Unlock()
 		os.Stdout.Write(append(mustMarshal(msg), '\n'))
 	}
+	// With IDLE_CLOSE_MS (0 included), threads' idle processes are let go after that long.
+	var idleClose *time.Duration
+	if _, ok := os.LookupEnv("IDLE_CLOSE_MS"); ok {
+		d := ms("IDLE_CLOSE_MS")
+		idleClose = &d
+	}
 	sdk := agentthreads.New(agentthreads.Options{
 		Store: store,
 		Harnesses: map[string]agentthreads.Harness{
@@ -89,6 +95,7 @@ func runBackend() {
 		Spawner:      spawner,
 		OnError:      func(err error) { fmt.Fprintf(os.Stderr, "backend error: %v\n", err) },
 		LateAnswers:  env("LATE_ANSWERS") != "",
+		IdleClose:    idleClose,
 	})
 	sdk.Subscribe(func(e protocol.ThreadEvent) { out(map[string]any{"event": e}) })
 	ctx := context.Background()
@@ -128,6 +135,10 @@ func runBackend() {
 			var id string
 			json.Unmarshal(arg(0), &id)
 			_, err = sdk.EventsSince(ctx, id, 0, 0)
+		case "release":
+			var id string
+			json.Unmarshal(arg(0), &id)
+			result, err = sdk.Release(ctx, id)
 		case "recover":
 			result, err = sdk.Recover(ctx)
 		case "delete":
@@ -960,4 +971,116 @@ func TestALostClaudeTurnKeepsItsMark(t *testing.T) {
 	<-b.exited
 	runs := miniRuns(t, log)
 	same(t, "--resume-session-at", flagValues(runs[len(runs)-1].Argv, "--resume-session-at"), []string{at})
+}
+
+// A backend that restarts while a thread is idle re-attaches to its process, and (with IdleClose)
+// lets it go: its run ends, so the next backend doesn't re-attach to it, and the next turn resumes
+// the session in a new process.
+func TestLetsAnIdleProcessGoAfterARestart(t *testing.T) {
+	needNode(t)
+	for _, harness := range []string{"claude", "codex"} {
+		t.Run(harness, func(t *testing.T) {
+			t.Parallel()
+			s := miniScene(t, "CLOSE_GRACE_MS=500")
+			a := s.start()
+			id := s.create(a, harness)
+			a.call("handle", map[string]any{"type": "send", "thread_id": id, "text": "reply one"})
+			var snap protocol.Snapshot
+			until(t, func() bool {
+				snap = snapshotOf(t, a, id)
+				return len(turnResults(snap.Items)) == 1 && snap.Thread.Status == protocol.ThreadStatusIdle
+			})
+			session := snap.Thread.SessionID
+			if snap.Thread.Run == nil {
+				t.Fatalf("no run: %s", mustMarshal(snap.Thread))
+			}
+			run := snap.Thread.Run.ID
+			a.call("saved", id)
+			a.call("close")
+			<-a.exited
+			exit := filepath.Join(s.runs, run, "exit")
+			if _, err := os.Stat(exit); err == nil {
+				t.Fatal("the run isn't left going")
+			}
+
+			b := s.startWith("IDLE_CLOSE_MS=0")
+			expectRecovered(t, b, id)
+			until(t, func() bool {
+				snap = snapshotOf(t, b, id)
+				return snap.Thread.Run == nil
+			})
+			if snap.Thread.Status != protocol.ThreadStatusIdle || snap.Thread.SessionID != session {
+				t.Fatalf("the thread: %s", mustMarshal(snap.Thread))
+			}
+			until(t, func() bool { _, err := os.Stat(exit); return err == nil })
+			b.call("saved", id)
+			b.call("close")
+			<-b.exited
+
+			c := s.start()
+			var r agentthreads.Recovered
+			json.Unmarshal(c.call("recover"), &r)
+			if len(r.Reattached) != 0 || len(r.Lost) != 0 {
+				t.Fatalf("recovered %+v", r)
+			}
+			c.call("handle", map[string]any{"type": "send", "thread_id": id, "text": "reply two"})
+			until(t, func() bool {
+				snap = snapshotOf(t, c, id)
+				return len(turnResults(snap.Items)) == 2 && snap.Thread.Status == protocol.ThreadStatusIdle
+			})
+			c.call("stop")
+			<-c.exited
+			same(t, "texts", texts(snap), []string{"one", "two"})
+			if snap.Thread.SessionID != session {
+				t.Fatalf("the session: %s, not %s", snap.Thread.SessionID, session)
+			}
+			// No notice of a run lost or picked up again: it ended as one that exited.
+			for _, it := range snap.Items {
+				if it.Type() == "notice" {
+					t.Fatalf("a notice: %s", mustMarshal(it))
+				}
+			}
+			if snap.Thread.Run == nil || snap.Thread.Run.ID == run {
+				t.Fatalf("the run: %s", mustMarshal(snap.Thread.Run))
+			}
+		})
+	}
+}
+
+// A backend that restarts after a background subagent ended, but before Claude made the turn that
+// reports it, keeps the process for that turn (with IdleClose), and lets it go after.
+func TestKeepsAnIdleProcessForAReportItOwesAcrossARestart(t *testing.T) {
+	needNode(t)
+	t.Parallel()
+	s := miniScene(t, "CLOSE_GRACE_MS=100", "MINI_CLAUDE_REPORT_DELAY=3000")
+	a := s.start()
+	id := s.create(a, "claude")
+	a.call("handle", map[string]any{"type": "send", "thread_id": id, "text": "background 300 apple"})
+	var snap protocol.Snapshot
+	until(t, func() bool {
+		snap = snapshotOf(t, a, id)
+		calls := toolCalls(snap)
+		return len(turnResults(snap.Items)) == 1 && snap.Thread.Status == protocol.ThreadStatusIdle &&
+			len(calls) > 0 && calls[0].Subagent != nil && calls[0].Subagent.Status == protocol.SubagentStatusCompleted
+	})
+	if snap.Thread.Run == nil {
+		t.Fatalf("no run: %s", mustMarshal(snap.Thread))
+	}
+	run := snap.Thread.Run.ID
+	a.call("saved", id)
+	a.call("close")
+	<-a.exited
+
+	b := s.startWith("IDLE_CLOSE_MS=0")
+	expectRecovered(t, b, id)
+	until(t, func() bool {
+		snap = snapshotOf(t, b, id)
+		return len(turnResults(snap.Items)) == 2 && snap.Thread.Status == protocol.ThreadStatusIdle && snap.Thread.Run == nil
+	})
+	if got := texts(snap); len(got) == 0 || got[len(got)-1] != "the subagent said apple" {
+		t.Fatalf("texts: %q", got)
+	}
+	until(t, func() bool { _, err := os.Stat(filepath.Join(s.runs, run, "exit")); return err == nil })
+	b.call("stop")
+	<-b.exited
 }

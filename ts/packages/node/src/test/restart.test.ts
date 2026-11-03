@@ -741,4 +741,87 @@ describe.skipIf(process.platform === "win32")("a backend restart", () => {
     expect(sent).toHaveLength(1);
     expect(snap.items.filter((i) => i.type === "turn_result")).toHaveLength(1);
   });
+  // A backend that restarts while a thread is idle re-attaches to its process, and (with
+  // idleCloseMs) lets it go: its run ends, so the next backend doesn't re-attach to it, and the next
+  // turn resumes the session in a new process.
+  it.each(["claude", "codex"])("with %s, lets an idle process go after a restart", { timeout: 60_000 }, async (harness) => {
+    const s = mini({ CLOSE_GRACE_MS: "500" });
+    const snapshotUntil = async (b: Backend, id: string, done: (s: Snapshot) => boolean) => {
+      const deadline = Date.now() + 15_000;
+      for (;;) {
+        const snap = await b.call<Snapshot>("snapshot", id);
+        if (done(snap)) return snap;
+        if (Date.now() > deadline) throw new Error(`timed out: ${JSON.stringify(snap.thread)}`);
+        await sleep(10);
+      }
+    };
+    const ofType = (snap: Snapshot, type: string) => snap.items.filter((i) => i.type === type);
+    const a = s.start();
+    const thread = await a.call<{ id: string }>("create", { harness, cwd: s.dirs.cwd });
+    await a.call("handle", { type: "send", thread_id: thread.id, text: "reply one" } satisfies Command);
+    let snap = await snapshotUntil(a, thread.id, (x) => ofType(x, "turn_result").length === 1 && x.thread.status === "idle");
+    const session = snap.thread.session_id;
+    const run = snap.thread.run!.id;
+    await a.call("saved", thread.id);
+    await a.call("close");
+    await a.exited;
+    const exit = join(s.dirs.runs, run, "exit");
+    expect(existsSync(exit), "the run is left going").toBe(false);
+
+    const b = s.start({ IDLE_CLOSE_MS: "0" });
+    expect(await b.call("recover")).toEqual({ reattached: [thread.id], lost: [] });
+    snap = await snapshotUntil(b, thread.id, (x) => x.thread.run === undefined);
+    expect(snap.thread).toMatchObject({ status: "idle", session_id: session });
+    await until(() => existsSync(exit));
+    await b.call("saved", thread.id);
+    await b.call("close");
+    await b.exited;
+
+    const c = s.start();
+    expect(await c.call("recover")).toEqual({ reattached: [], lost: [] });
+    await c.call("handle", { type: "send", thread_id: thread.id, text: "reply two" } satisfies Command);
+    snap = await snapshotUntil(c, thread.id, (x) => ofType(x, "turn_result").length === 2 && x.thread.status === "idle");
+    expect(ofType(snap, "assistant_message").map((m) => (m.type === "assistant_message" ? m.text : ""))).toEqual(["one", "two"]);
+    expect(snap.thread.session_id).toBe(session);
+    // No notice of a run lost or picked up again: it ended as one that exited.
+    expect(ofType(snap, "notice")).toEqual([]);
+    expect(snap.thread.run?.id).not.toBe(run);
+    await c.call("close", { stop: true });
+    await c.exited;
+  });
+  // A backend that restarts after a background subagent ended, but before Claude made the turn that
+  // reports it, keeps the process for that turn (with idleCloseMs), and lets it go after.
+  it("with claude, keeps an idle process for a report it owes across a restart", { timeout: 60_000 }, async () => {
+    const s = mini({ CLOSE_GRACE_MS: "100", MINI_CLAUDE_REPORT_DELAY: "3000" });
+    const snapshotUntil = async (b: Backend, id: string, done: (s: Snapshot) => boolean) => {
+      const deadline = Date.now() + 15_000;
+      for (;;) {
+        const snap = await b.call<Snapshot>("snapshot", id);
+        if (done(snap)) return snap;
+        if (Date.now() > deadline) throw new Error(`timed out: ${JSON.stringify(snap)}`);
+        await sleep(10);
+      }
+    };
+    const ofType = (snap: Snapshot, type: string) => snap.items.filter((i) => i.type === type);
+    const a = s.start();
+    const thread = await a.call<{ id: string }>("create", { harness: "claude", cwd: s.dirs.cwd });
+    await a.call("handle", { type: "send", thread_id: thread.id, text: "background 300 apple" } satisfies Command);
+    let snap = await snapshotUntil(a, thread.id, (x) => {
+      const call = ofType(x, "tool_call")[0];
+      return ofType(x, "turn_result").length === 1 && x.thread.status === "idle" && call?.type === "tool_call" && call.subagent?.status === "completed";
+    });
+    const run = snap.thread.run!.id;
+    await a.call("saved", thread.id);
+    await a.call("close");
+    await a.exited;
+
+    const b = s.start({ IDLE_CLOSE_MS: "0" });
+    expect(await b.call("recover")).toEqual({ reattached: [thread.id], lost: [] });
+    snap = await snapshotUntil(b, thread.id, (x) => ofType(x, "turn_result").length === 2 && x.thread.status === "idle" && x.thread.run === undefined);
+    const texts = ofType(snap, "assistant_message").map((m) => (m.type === "assistant_message" ? m.text : ""));
+    expect(texts.at(-1)).toBe("the subagent said apple");
+    await until(() => existsSync(join(s.dirs.runs, run, "exit")));
+    await b.call("close", { stop: true });
+    await b.exited;
+  });
 });

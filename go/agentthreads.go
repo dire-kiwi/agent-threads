@@ -60,6 +60,15 @@ type Options struct {
 	// so it should be quick, and mustn't call the AgentThreads and wait. A panic is reported to
 	// OnError.
 	OnHarnessMessage func(HarnessMessage)
+	// IdleClose lets a thread's harness process go once the thread has been idle this long: after a
+	// turn ends with nothing queued, no open request (but questions kept open after their turns) and
+	// no background subagent running, Claude Code's input is closed and Codex's app server is
+	// stopped. The thread keeps its session, and its next turn resumes it in a new process. A message
+	// sent before then goes to the live process, as ever. A zero duration lets it go as soon as the
+	// thread is idle; nil (the default) keeps it until the session changes or the backend closes. A
+	// backend that restarts and re-attaches to an idle process waits this long again. Release does it
+	// now.
+	IdleClose *time.Duration
 }
 
 // CreateOptions are a new thread's.
@@ -180,6 +189,11 @@ func New(options Options) *AgentThreads {
 	}
 	if a.store == nil {
 		a.store = NewMemoryStore()
+	}
+	// Its own copy, so the app changing the one it gave changes nothing.
+	if options.IdleClose != nil {
+		d := *options.IdleClose
+		a.options.IdleClose = &d
 	}
 	if a.harnesses == nil {
 		a.harnesses = map[string]Harness{"claude": ClaudeCode(ClaudeOptions{}), "codex": Codex(CodexOptions{})}
@@ -762,6 +776,27 @@ func (a *AgentThreads) Compact(ctx context.Context, threadID string) error {
 		rt.compact(session)
 		return nil
 	})
+}
+
+// Release lets the thread's harness process go now, as Options.IdleClose does once a thread has been
+// idle long enough: the thread keeps its session, and its next turn resumes it in a new process. It
+// says whether it had one to let go. It's refused (with a *CommandError) while a turn is running,
+// and while the process is still needed after its turn: by a background subagent that's running (or
+// one whose end Claude hasn't reported to the agent yet), or a request that's open (a question kept
+// open after its turn doesn't need it).
+func (a *AgentThreads) Release(ctx context.Context, threadID string) (bool, error) {
+	released := false
+	err := a.doErr(ctx, threadID, func(rt *threadRuntime) error {
+		if err := idle(rt, "released"); err != nil {
+			return err
+		}
+		if !rt.idleNow() || rt.keepsProcess() {
+			return commandErr("the thread's harness process is still needed (a background subagent is running, or a request is open)")
+		}
+		released = rt.closeIdle()
+		return nil
+	})
+	return released, err
 }
 
 // idle refuses a command that needs the thread idle: one that's running a turn.

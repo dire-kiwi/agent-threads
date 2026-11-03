@@ -517,6 +517,19 @@ class CodexSession implements HarnessSession {
     if (run && this.#ctx.queued().some((m) => run.held.has(m.id))) void this.#stop(run, true, true);
   }
 
+  closeIdle(): boolean {
+    const run = this.#live();
+    if (!run) return false;
+    this.#clearStop();
+    // Its input is closed, so the app server exits (or is signalled after the close grace).
+    // Retired: what it says on its way out is left out, and its end changes nothing. It's the
+    // thread's run no more, so its record ends now, and a backend that restarts doesn't re-attach
+    // to it.
+    void this.#stop(run, true);
+    if (this.#ctx.thread.run?.id === run.id) this.#ctx.setThread({ run: undefined });
+    return true;
+  }
+
   async close(): Promise<void> {
     this.#closed = true;
     this.#clearStop();

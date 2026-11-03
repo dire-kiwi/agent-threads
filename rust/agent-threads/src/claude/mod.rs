@@ -198,6 +198,16 @@ struct RunState {
     steer_at: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     stop_at: Option<u64>,
+    /// Turns of its own Claude owes, to report background subagents that ended, and when it's
+    /// given up waiting for them (ms since the epoch).
+    #[serde(default, skip_serializing_if = "is_zero")]
+    owed: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    owed_at: Option<u64>,
+}
+
+fn is_zero(n: &u32) -> bool {
+    *n == 0
 }
 
 /// One `claude` process, and what's needed to read it.
@@ -411,6 +421,8 @@ impl Run {
             stale: false,
             steer_at: None,
             stop_at: None,
+            owed: 0,
+            owed_at: None,
         }
     }
 
@@ -482,6 +494,11 @@ pub(crate) struct ClaudeSession {
     marking: Option<String>,
     steer_timer: Option<Timer>,
     stop_timer: Option<Timer>,
+    /// Turns of its own Claude owes, to report background subagents that ended (see owe_turn), and
+    /// when it's given up waiting for them.
+    owed: u32,
+    owed_timer: Option<Timer>,
+    owed_at: Option<u64>,
     /// When those go off (ms since the epoch), for a checkpoint.
     steer_at: Option<u64>,
     stop_at: Option<u64>,
@@ -501,6 +518,9 @@ impl ClaudeSession {
             marking: None,
             steer_timer: None,
             stop_timer: None,
+            owed: 0,
+            owed_timer: None,
+            owed_at: None,
             steer_at: None,
             stop_at: None,
             tmp: None,
@@ -907,6 +927,7 @@ impl ClaudeSession {
         let at = run.at.clone();
         if self.current.as_deref() == Some(id) {
             self.current = None;
+            self.owed_turn(true);
             if let Some(last) = self.last.replace(id.to_string())
                 && last != id
             {
@@ -1249,6 +1270,9 @@ impl ClaudeSession {
                 }
             }
             "result" => {
+                if m["origin"]["kind"] == "task-notification" {
+                    self.owed_turn(false);
+                }
                 let run = self.runs.get_mut(id).unwrap();
                 // The turn's requests are moot now; its open questions are cancelled with it. A
                 // background subagent's carry on.
@@ -1434,7 +1458,48 @@ impl ClaudeSession {
         };
         let Some(s) = &c.subagent else { return };
         let next = subagent_task(s, m);
+        // A background subagent that ends is reported to the agent in a turn Claude starts by
+        // itself: its process is needed until then (see keeps_process).
+        if s.background
+            && s.status == crate::protocol::SubagentStatus::Running
+            && next.status != crate::protocol::SubagentStatus::Running
+        {
+            self.owe_turn(ctx);
+        }
         ctx.update_item(&call, json!({"subagent": next}));
+    }
+
+    /// Claude owes the agent a turn of its own, to report a background subagent that ended: until it
+    /// comes (its result has origin.kind task-notification), or for the steer grace at most, the
+    /// thread isn't let go of as idle.
+    fn owe_turn(&mut self, ctx: &mut ThreadContext) {
+        self.owed += 1;
+        let grace = self.o.steer_grace;
+        self.wait_owed(ctx, grace);
+    }
+
+    /// Gives up waiting for the turns Claude owes after `after`.
+    fn wait_owed(&mut self, ctx: &mut ThreadContext, after: Duration) {
+        if let Some(t) = self.owed_timer.take() {
+            t.cancel();
+        }
+        self.owed_at = Some(now_ms() + after.as_millis() as u64);
+        self.owed_timer = Some(ctx.timer::<ClaudeSession>(after, |s, _| {
+            s.owed = 0;
+            s.owed_timer = None;
+            s.owed_at = None;
+        }));
+    }
+
+    /// Claude made a turn it owed, or its process has gone (`all`).
+    fn owed_turn(&mut self, all: bool) {
+        self.owed = if all { 0 } else { self.owed.saturating_sub(1) };
+        if self.owed == 0 {
+            if let Some(t) = self.owed_timer.take() {
+                t.cancel();
+            }
+            self.owed_at = None;
+        }
     }
 
     fn control_request(&mut self, ctx: &mut ThreadContext, id: &str, request_id: &str, req: Value) {
@@ -2007,6 +2072,25 @@ impl HarnessSession for ClaudeSession {
         }
     }
 
+    fn keeps_process(&self) -> bool {
+        self.owed > 0 && self.live_id().is_some()
+    }
+
+    fn close_idle(&mut self, ctx: &mut ThreadContext) -> bool {
+        let Some(id) = self.live_id() else { return false };
+        self.owed_turn(true);
+        self.clear_steer();
+        self.clear_stop();
+        // Its input is closed, so it exits once it's done (or is signalled after the close grace). Retired: what it says on its way out
+        // is left out, and its end changes nothing. It's the thread's run no more, so its record
+        // ends now, and a backend that restarts doesn't re-attach to it.
+        self.stop(ctx, &id, true, false);
+        if ctx.thread().run.as_ref().is_some_and(|r| r.id == id) {
+            ctx.set_thread(|t| t.run = None);
+        }
+        true
+    }
+
     fn close(&mut self, ctx: &mut ThreadContext) -> BoxFuture<()> {
         self.closed = true;
         self.clear_steer();
@@ -2046,6 +2130,8 @@ impl HarnessSession for ClaudeSession {
         let mut state = run.state();
         state.stale = self.stale;
         state.steer_at = self.steer_at;
+        state.owed = self.owed;
+        state.owed_at = self.owed_at.filter(|_| self.owed > 0);
         state.stop_at = self.stop_at;
         let proc = run.proc.as_ref();
         Some(RunCheckpoint {
@@ -2103,6 +2189,13 @@ impl HarnessSession for ClaudeSession {
             }
             self.reopen_request(ctx, &id, &request_id, open);
         }
+        // Reports of background subagents that ended which Claude hadn't made yet: its process is
+        // still needed for them.
+        if st.owed > 0 {
+            self.owed = st.owed;
+            let at = st.owed_at.unwrap_or_else(now_ms);
+            self.wait_owed(ctx, Duration::from_millis(at.saturating_sub(now_ms())));
+        }
         if let Some(at) = st.steer_at {
             self.steer_after(ctx, &id, Duration::from_millis(at.saturating_sub(now_ms())));
         }
@@ -2125,6 +2218,10 @@ impl HarnessSession for ClaudeSession {
             t.cancel();
         }
         if let Some(t) = self.stop_timer.take() {
+            t.cancel();
+        }
+        // Kept as it is for the last checkpoint: the backend that re-attaches waits on.
+        if let Some(t) = self.owed_timer.take() {
             t.cancel();
         }
         run.detached = true;

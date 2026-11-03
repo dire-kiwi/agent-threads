@@ -133,6 +133,15 @@ pub struct Options {
     /// Codex's token usage...). It's called on the thread's task as the output is read, so it
     /// should be quick, and mustn't wait on the backend.
     pub on_harness_message: Option<HarnessMessageHandler>,
+    /// Lets a thread's harness process go once the thread has been idle this long: after a turn
+    /// ends with nothing queued, no open request (but questions kept open after their turns) and
+    /// no background subagent running, Claude Code's input is closed and Codex's app server is
+    /// stopped. The thread keeps its session, and its next turn resumes it in a new process. A
+    /// message sent before then goes to the live process, as ever. `Some(Duration::ZERO)` lets it
+    /// go as soon as the thread is idle; none (the default) keeps it until the session changes or
+    /// the backend closes. A backend that restarts and re-attaches to an idle process waits this
+    /// long again. [`release`](AgentThreads::release) does it now.
+    pub idle_close: Option<std::time::Duration>,
 }
 
 impl Default for Options {
@@ -147,6 +156,7 @@ impl Default for Options {
             late_answers: false,
             raw: false,
             on_harness_message: None,
+            idle_close: None,
         }
     }
 }
@@ -302,6 +312,7 @@ struct Inner {
     late_answers: bool,
     raw: bool,
     on_harness_message: Option<HarnessMessageHandler>,
+    idle_close: Option<std::time::Duration>,
     events: broadcast::Sender<ThreadEvent>,
     threads: StdMutex<Threads>,
     configs: StdMutex<HashMap<String, Capabilities>>,
@@ -347,6 +358,7 @@ impl AgentThreads {
                 on_error,
                 raw: options.raw,
                 on_harness_message: options.on_harness_message,
+                idle_close: options.idle_close,
                 events,
                 threads: StdMutex::new(Threads::default()),
                 configs: StdMutex::new(HashMap::new()),
@@ -898,6 +910,28 @@ impl AgentThreads {
             .await?
     }
 
+    /// Lets the thread's harness process go now, as [`Options::idle_close`] does once a thread has
+    /// been idle long enough: the thread keeps its session, and its next turn resumes it in a new
+    /// process. Whether it had one to let go. Refused while a turn is running, and while the
+    /// process is still needed after its turn: by a background subagent that's running (or one
+    /// whose end Claude hasn't reported to the agent yet), or a request that's open (a question
+    /// kept open after its turn doesn't need it).
+    pub async fn release(&self, thread_id: &str) -> Result<bool> {
+        self.ready(thread_id)
+            .await?
+            .call(|a| {
+                idle(a, "released")?;
+                if !a.idle_now() {
+                    return Err(Error::Command(
+                        "the thread's harness process is still needed (a background subagent is running, or a request is open)"
+                            .into(),
+                    ));
+                }
+                Ok(a.close_idle())
+            })
+            .await?
+    }
+
     /// Stops every harness process and saves everything. With the shim spawner, runs are left
     /// going instead (their turns too), for [`recover`](Self::recover) to re-attach to when the
     /// app starts again, unless `stop` is set; a driver that can't re-attach has its runs stopped.
@@ -1114,6 +1148,7 @@ impl AgentThreads {
             late_answers: i.late_answers,
             raw: i.raw,
             on_harness_message: i.on_harness_message.clone(),
+            idle_close: i.idle_close,
         })
     }
 

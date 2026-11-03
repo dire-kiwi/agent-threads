@@ -68,12 +68,17 @@ function setup(options: Setup = {}) {
   /** What each run was started with and sent. */
   const runs = () => {
     if (!existsSync(log)) return [];
-    // Its CLAUDE_CONFIG_DIR, and the variables MINI_LOG_ENV names (null if unset).
-    const out: { argv: string[]; configDir?: string; env: { [k: string]: string | null }; sent: { type: string; [k: string]: unknown }[] }[] = [];
+    // Its CLAUDE_CONFIG_DIR, the variables MINI_LOG_ENV names (null if unset), and whether it has
+    // exited (it logs its exit).
+    const out: { argv: string[]; configDir?: string; env: { [k: string]: string | null }; pid?: number; exited: boolean; sent: { type: string; [k: string]: unknown }[] }[] = [];
     for (const l of readFileSync(log, "utf8").split("\n").filter(Boolean)) {
       const v = JSON.parse(l);
-      if (v.argv) out.push({ argv: v.argv, ...(v.configDir !== undefined ? { configDir: v.configDir } : {}), env: v.env ?? {}, sent: [] });
-      else out[out.length - 1]!.sent.push(v);
+      if (v.argv) out.push({ argv: v.argv, ...(v.configDir !== undefined ? { configDir: v.configDir } : {}), env: v.env ?? {}, pid: v.pid, exited: false, sent: [] });
+      // Runs' lines interleave: its exit is the run's with its pid.
+      else if (v.exited !== undefined) {
+        const run = out.find((r) => r.pid === v.exited);
+        if (run) run.exited = true;
+      } else out[out.length - 1]!.sent.push(v);
     }
     return out;
   };
@@ -1623,5 +1628,126 @@ describe("a thread's launch options", () => {
     } finally {
       await sdk.close({ stop: true });
     }
+  });
+});
+
+describe("letting an idle process go (idleCloseMs, release)", () => {
+  const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+
+  it("lets an idle process go, and resumes its session in a new one", async () => {
+    const { sdk, runs } = setup({ idleCloseMs: 0 });
+    const t = await sdk.create();
+    await sdk.send(t.id, "reply one");
+    let s = await settle(sdk, t.id);
+    const session = s.thread.session_id!;
+    // Its input is closed, so it exits; the thread has no run, and keeps its session.
+    await until(() => runs()[0]?.exited);
+    s = await sdk.snapshot(t.id);
+    expect(s.thread.run).toBeUndefined();
+    expect(s.thread).toMatchObject({ session_id: session, status: "idle" });
+    await sdk.send(t.id, "reply two");
+    s = await settle(sdk, t.id);
+    expect(texts(s.items)).toEqual(["one", "two"]);
+    expect(runs()).toHaveLength(2);
+    expect(runs()[1]!.argv).toEqual(expect.arrayContaining(["--resume", session]));
+    const [, second] = results(s.items);
+    expect(second!.session).toMatchObject({ id: session });
+    expect(second!.session).not.toHaveProperty("started");
+  });
+
+  it("gives a message sent before the idle time is up to the live process", async () => {
+    const { sdk, runs } = setup({ idleCloseMs: 400 });
+    const t = await sdk.create();
+    await sdk.send(t.id, "reply one");
+    await settle(sdk, t.id);
+    await sleep(200);
+    await sdk.send(t.id, "reply two");
+    await settle(sdk, t.id);
+    expect(runs()).toHaveLength(1);
+    // The wait starts again when a turn ends.
+    await sleep(250);
+    expect(runs()[0]!.exited).toBe(false);
+    await until(() => runs()[0]!.exited);
+    expect((await sdk.snapshot(t.id)).thread.run).toBeUndefined();
+  });
+
+  it("gives a steered message carried over to the live process before it's let go", async () => {
+    // Claude takes the steered message in after its turn's result: the next turn, in the same
+    // process.
+    const { sdk, runs } = setup({ steer: "late", idleCloseMs: 0 });
+    const t = await sdk.create();
+    await sdk.send(t.id, "sleep 200 first");
+    await until(async () => (await sdk.snapshot(t.id)).thread.session_id);
+    await sdk.send(t.id, "reply second");
+    const s = await until(async () => {
+      const x = await sdk.snapshot(t.id);
+      return results(x.items).length === 2 && x.thread.status === "idle" && x;
+    });
+    expect(texts(s.items)).toEqual(["first", "second"]);
+    await until(() => runs()[0]!.exited);
+    expect(runs()).toHaveLength(1);
+  });
+
+  it("keeps the process while a background subagent runs, and lets it go after", async () => {
+    // Claude reports the subagent's end in a turn of its own, a while after it ends: the process is
+    // kept for it.
+    const { sdk, runs } = setup({ idleCloseMs: 0, env: { MINI_CLAUDE_REPORT_DELAY: "200" } });
+    const t = await sdk.create();
+    await sdk.send(t.id, "background 400 apple");
+    await until(async () => results((await sdk.snapshot(t.id)).items).length === 1);
+    // Refused while the subagent runs.
+    await expect(sdk.release(t.id)).rejects.toThrow(CommandError);
+    await expect(sdk.release(t.id)).rejects.toThrow(/still needed/);
+    await sleep(100);
+    expect(runs()[0]!.exited).toBe(false);
+    // Claude's own turn says how it went, and then it's let go.
+    const s = await until(async () => {
+      const x = await sdk.snapshot(t.id);
+      return results(x.items).length === 2 && x.thread.status === "idle" && x;
+    });
+    expect(texts(s.items).at(-1)).toBe("the subagent said apple");
+    await until(() => runs()[0]!.exited);
+    expect(runs()).toHaveLength(1);
+  });
+
+  it("keeps the process while a background subagent's request is open", async () => {
+    const { sdk, runs } = setup({ idleCloseMs: 0, permissions: (q) => (q.kind === "shell" ? "ask" : "allow") });
+    const t = await sdk.create();
+    await sdk.send(t.id, "background 0 apple");
+    const s = await until(async () => {
+      const x = await sdk.snapshot(t.id);
+      return results(x.items).length === 1 && x.thread.status === "waiting" && x;
+    });
+    await sleep(100);
+    expect(runs()[0]!.exited).toBe(false);
+    await sdk.respond(t.id, openRequests(s)[0]!.id, { outcome: "allow" });
+    await until(async () => {
+      const x = await sdk.snapshot(t.id);
+      return results(x.items).length === 2 && x.thread.status === "idle";
+    });
+    await until(() => runs()[0]!.exited);
+  });
+
+  it("lets an idle thread's process go with release(), which is refused while a turn runs", async () => {
+    const { sdk, runs } = setup();
+    const t = await sdk.create();
+    // No process yet.
+    expect(await sdk.release(t.id)).toBe(false);
+    await sdk.send(t.id, "slow");
+    await until(async () => (await sdk.snapshot(t.id)).thread.session_id);
+    await expect(sdk.release(t.id)).rejects.toThrow(/a turn is running/);
+    await sdk.interrupt(t.id);
+    const s = await settle(sdk, t.id);
+    // Without idleCloseMs, it's kept.
+    await sleep(100);
+    expect(runs()[0]!.exited).toBe(false);
+    expect(await sdk.release(t.id)).toBe(true);
+    await until(() => runs()[0]!.exited);
+    expect((await sdk.snapshot(t.id)).thread.run).toBeUndefined();
+    expect(await sdk.release(t.id)).toBe(false);
+    await sdk.send(t.id, "reply again");
+    const after = await settle(sdk, t.id);
+    expect(texts(after.items).at(-1)).toBe("again");
+    expect(runs()[1]!.argv).toEqual(expect.arrayContaining(["--resume", s.thread.session_id!]));
   });
 });

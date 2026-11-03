@@ -305,6 +305,24 @@ pub trait HarnessSession: Send + Any {
     fn retire(&mut self, ctx: &mut ThreadContext) {
         self.config_changed(ctx);
     }
+    /// The thread is idle (no turn running, nothing queued, no request open but questions kept
+    /// open after their turns, no background subagent running), and the app lets its process go
+    /// ([`Options::idle_close`], [`AgentThreads::release`]): stop it gently, keeping the thread's
+    /// session (and its options as they are), so the next turn starts a new process that resumes
+    /// it. Nothing it says on its way out reaches the thread, and its run ends as one that exited.
+    /// Whether there was one to stop. By default, none.
+    ///
+    /// [`Options::idle_close`]: crate::Options::idle_close
+    /// [`AgentThreads::release`]: crate::AgentThreads::release
+    fn close_idle(&mut self, _ctx: &mut ThreadContext) -> bool {
+        false
+    }
+    /// Whether the process is still needed though the thread looks idle: Claude Code owes the agent
+    /// a turn of its own, to report a background subagent that ended. The thread isn't let go of
+    /// as idle meanwhile. By default, never.
+    fn keeps_process(&self) -> bool {
+        false
+    }
     /// Stop the harness process, if it's running; the future resolves once it has gone.
     fn close(&mut self, ctx: &mut ThreadContext) -> BoxFuture<()>;
 

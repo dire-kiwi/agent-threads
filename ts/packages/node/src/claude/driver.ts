@@ -120,6 +120,12 @@ interface RunState {
   /** When the session's timers for it go off (ms since the epoch). */
   steerAt?: number;
   stopAt?: number;
+  /**
+   * Turns of its own Claude owes, to report background subagents that ended, and when it's given
+   * up waiting for them (ms since the epoch).
+   */
+  owed?: number;
+  owedAt?: number;
 }
 
 /** One `claude` process, and what's needed to read it. */
@@ -207,7 +213,7 @@ class Run {
     return p;
   }
 
-  state(): Omit<RunState, "steerAt" | "stopAt"> {
+  state(): Omit<RunState, "steerAt" | "stopAt" | "owed" | "owedAt"> {
     return {
       v: 1,
       ready: this.ready,
@@ -287,6 +293,13 @@ class ClaudeSession implements HarnessSession {
   #marking: string | undefined;
   #steerTimer: NodeJS.Timeout | undefined;
   #stopTimer: NodeJS.Timeout | undefined;
+  /**
+   * Turns of its own Claude owes, to report background subagents that ended (see #oweTurn), and
+   * when it's given up waiting for them.
+   */
+  #owed = 0;
+  #owedTimer: NodeJS.Timeout | undefined;
+  #owedAt: number | undefined;
   /** When those go off, for a checkpoint. */
   #steerAt: number | undefined;
   #stopAt: number | undefined;
@@ -448,6 +461,25 @@ class ClaudeSession implements HarnessSession {
     if (run) void this.#stop(run, true, true);
   }
 
+  keepsProcess(): boolean {
+    return this.#owed > 0 && !!this.#live();
+  }
+
+  closeIdle(): boolean {
+    const run = this.#live();
+    if (!run) return false;
+    this.#owedTurn(true);
+    this.#clearSteer();
+    this.#clearStop();
+    // Its input is closed, so it exits once it's done (or is signalled after the close grace).
+    // Retired: what it says on its way out is left out, and its end changes nothing. It's the
+    // thread's run no more, so its record ends now, and a backend that restarts doesn't re-attach
+    // to it.
+    void this.#stop(run, true);
+    if (this.#ctx.thread.run?.id === run.id) this.#ctx.setThread({ run: undefined });
+    return true;
+  }
+
   async close(): Promise<void> {
     this.#closed = true;
     this.#clearSteer();
@@ -469,6 +501,7 @@ class ClaudeSession implements HarnessSession {
       ...(this.#stale ? { stale: true } : {}),
       ...(this.#steerAt !== undefined ? { steerAt: this.#steerAt } : {}),
       ...(this.#stopAt !== undefined ? { stopAt: this.#stopAt } : {}),
+      ...(this.#owed > 0 ? { owed: this.#owed, ...(this.#owedAt !== undefined ? { owedAt: this.#owedAt } : {}) } : {}),
     };
     const dir = (run.proc as { dir?: unknown }).dir;
     const input = run.proc?.inputOffset;
@@ -508,6 +541,12 @@ class ClaudeSession implements HarnessSession {
       if (run.proc.answered?.(id)) run.open.delete(id);
       else this.#reopen(run, id, open);
     }
+    // Reports of background subagents that ended which Claude hadn't made yet: its process is still
+    // needed for them.
+    if (st.owed && st.owed > 0) {
+      this.#owed = st.owed;
+      this.#waitOwed(Math.max(0, (st.owedAt ?? Date.now()) - Date.now()));
+    }
     if (st.steerAt !== undefined) this.#steerAfter(run, Math.max(0, st.steerAt - Date.now()));
     if (st.stopAt !== undefined) this.#stopAfter(run, Math.max(0, st.stopAt - Date.now()));
     return true;
@@ -519,6 +558,8 @@ class ClaudeSession implements HarnessSession {
     this.#closed = true;
     clearTimeout(this.#steerTimer);
     clearTimeout(this.#stopTimer);
+    // (What Claude owes stays in the checkpoint, for the backend that re-attaches.)
+    clearTimeout(this.#owedTimer);
     run.detached = true;
     run.proc.detach();
     run.abort.abort();
@@ -774,6 +815,7 @@ class ClaudeSession implements HarnessSession {
     if (this.#run === run) {
       this.#run = null;
       this.#last = run;
+      this.#owedTurn(true);
     }
     if (ctx.thread.run?.id === run.id) ctx.setThread({ run: undefined });
     // Its subagents end with it.
@@ -914,6 +956,7 @@ class ClaudeSession implements HarnessSession {
         break;
       }
       case "result": {
+        if (m.origin?.kind === "task-notification") this.#owedTurn(false);
         // The turn's requests are moot now; its open questions are cancelled with it. A background
         // subagent's carry on.
         const lookup = (id: string) => ctx.item(id);
@@ -1021,7 +1064,45 @@ class ClaudeSession implements HarnessSession {
     const id = typeof m.tool_use_id === "string" ? m.tool_use_id : run.tasks.get(m.task_id);
     const it = id ? ctx.item(id) : undefined;
     if (it?.type !== "tool_call" || !it.subagent) return;
-    ctx.updateItem(it.id, { subagent: subagentTask(it.subagent, m) });
+    const next = subagentTask(it.subagent, m);
+    // A background subagent that ends is reported to the agent in a turn Claude starts by itself:
+    // its process is needed until then (see keepsProcess).
+    if (it.subagent.background && it.subagent.status === "running" && next.status !== "running") this.#oweTurn();
+    ctx.updateItem(it.id, { subagent: next });
+  }
+
+  /**
+   * Claude owes the agent a turn of its own, to report a background subagent that ended: until it
+   * comes (its result has origin.kind task-notification), or for the steer grace at most, the
+   * thread isn't let go of as idle.
+   */
+  #oweTurn(): void {
+    this.#owed++;
+    this.#waitOwed(this.#o.steerGraceMs ?? 30_000);
+  }
+
+  /** Gives up waiting for the turns Claude owes after `ms`. */
+  #waitOwed(ms: number): void {
+    clearTimeout(this.#owedTimer);
+    this.#owedAt = Date.now() + ms;
+    this.#owedTimer = setTimeout(() => {
+      this.#owedTimer = undefined;
+      this.#owedAt = undefined;
+      this.#owed = 0;
+      // No event says so: the core checks again whether the thread is idle.
+      this.#ctx.recheckIdle();
+    }, ms);
+    this.#owedTimer.unref?.();
+  }
+
+  /** Claude made a turn it owed, or its process has gone (`all`). */
+  #owedTurn(all: boolean): void {
+    this.#owed = all ? 0 : Math.max(0, this.#owed - 1);
+    if (this.#owed === 0) {
+      clearTimeout(this.#owedTimer);
+      this.#owedTimer = undefined;
+      this.#owedAt = undefined;
+    }
   }
 
   #controlRequest(run: Run, requestId: string, req: Json): void {

@@ -131,6 +131,11 @@ type threadRuntime struct {
 	// raw is the harness message being handled, which events made now have as their raw (with the
 	// Raw option).
 	raw json.RawMessage
+	// Letting its idle harness process go (Options.IdleClose): idleTimer is armed while it's idle,
+	// and lets the process go when it goes off; idleDone says it went off (or Release let the process
+	// go) since the thread was last busy, so it isn't armed again until the thread has been busy.
+	idleTimer *loopTimer
+	idleDone  bool
 }
 
 func newRuntime(sdk *AgentThreads, state protocol.Snapshot, config ThreadConfig, launch LaunchOptions, policy PermissionPolicy) *threadRuntime {
@@ -153,8 +158,15 @@ func newRuntime(sdk *AgentThreads, state protocol.Snapshot, config ThreadConfig,
 			rt.queue = append(rt.queue, m.ID)
 		}
 	}
-	rt.loop = newLoop(rt.take, sdk.reportError)
+	rt.loop = newLoop(rt.afterTask, sdk.reportError)
 	return rt
+}
+
+// afterTask runs after each of the loop's tasks: it arms (or cancels) letting the idle harness
+// process go, and takes what the task saved.
+func (rt *threadRuntime) afterTask() {
+	rt.checkIdle()
+	rt.take()
 }
 
 // ---------- ThreadContext ----------
@@ -1308,6 +1320,66 @@ func (rt *threadRuntime) undelivered(n int) {
 		text = fmt.Sprintf("%d messages weren't delivered; they go with the next one you send.", n)
 	}
 	rt.AddItem(&protocol.Notice{ID: NewID("n"), Level: protocol.NoticeLevelWarning, Code: "undelivered", Text: text})
+}
+
+// ---------- letting an idle process go ----------
+
+// idleNow says whether the thread is idle, and its harness process isn't needed until the next turn:
+// no turn is running, nothing is queued, no request is open (but questions kept open after their
+// turns, whose answers go as messages), no background subagent is running, and the backend isn't
+// closing it (or leaving it going).
+func (rt *threadRuntime) idleNow() bool {
+	if rt.turn != nil || rt.closing || len(rt.queue) > 0 || rt.waiting() {
+		return false
+	}
+	for _, it := range rt.saved.Items {
+		if runningInBackground(it) {
+			return false
+		}
+	}
+	return !rt.sessionClosing() && !rt.detachedRun()
+}
+
+// checkIdle runs after each of the loop's tasks, with Options.IdleClose: it arms the timer that lets
+// the harness process go once the thread has been idle long enough, and cancels it if it's busy
+// again. It's armed once each time the thread becomes idle, with a live process.
+func (rt *threadRuntime) checkIdle() {
+	after := rt.sdk.options.IdleClose
+	if after == nil || rt.session == nil {
+		return
+	}
+	if !rt.idleNow() || rt.keepsProcess() {
+		rt.idleTimer.stop()
+		rt.idleTimer, rt.idleDone = nil, false
+		return
+	}
+	if rt.idleTimer != nil || rt.idleDone || !rt.session.Live() {
+		return
+	}
+	// The timer's function doesn't run once it's stopped (the thread was busy since: a message came
+	// first, say), though it had gone off.
+	rt.idleTimer = startLoopTimer(rt.loop.post, *after, func() {
+		rt.idleTimer = nil
+		if rt.idleNow() && !rt.keepsProcess() {
+			rt.closeIdle()
+		}
+	})
+}
+
+// keepsProcess says whether the session needs its process still, though the thread is idle
+// (IdleClosingSession.KeepsProcess).
+func (rt *threadRuntime) keepsProcess() bool {
+	s, ok := rt.session.(IdleClosingSession)
+	return ok && s.KeepsProcess()
+}
+
+// closeIdle lets the idle thread's harness process go (the caller checks it's idle): the session
+// stops it, keeping the thread's session for the next turn. It says whether there was one.
+func (rt *threadRuntime) closeIdle() bool {
+	rt.idleTimer.stop()
+	rt.idleTimer, rt.idleDone = nil, true
+	s, ok := rt.session.(IdleClosingSession)
+	return ok && s.CloseIdle()
 }
 
 // ---------- requests ----------
