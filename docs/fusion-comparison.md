@@ -42,9 +42,9 @@ the agent's process lifetime and about permissions.
 | Workflows | A visual workflow editor (IR v2: foreach, loop, step-review, code, notify, ask-user, exit-gate…). Built in: coding, quick-fix, review-heavy, stepwise-coding, design, marketing, lead-generation, compound-engineering, a PR fragment | One lifecycle, with prompts per column and status scripts | Fusion |
 | Automatic AI review | A read-only reviewer session on the validator lane: per step in some workflows, then a Code Review gate. Verdicts APPROVE / REVISE / RETHINK; RETHINK resets git to the step's start and rewinds the session. Plan reviews block at `high`, code reviews at `critical`. Up to 10 post-review fixes; plan and code revisions unbounded by default | Up to six reviewer agents per project, each with its own instructions and skills (API 105), with fix rounds; summaries before merge, from several summarizers to compare (API 84, 103) | — |
 | Quality gates | `testCommand` and `buildCommand` (detected from the lockfile when unset) are hard gates at merge. Optional docs, QA, security, performance, accessibility, UX and browser-verification gates, advisory by default | Reviewers and the project's own scripts; failed PR checks shown on the card | Fusion |
-| Worktrees | `.fusion/worktrees/<task-id>` on `fusion/<task-id>`, from the integration or base branch, or per task; rebased before running. `worktreeInitCommand`, `worktreeCopyFiles` (e.g. `.env`), `setupScript`. `maxWorktrees` 4, `maxConcurrent` 2. Optional `worktrunk`. Multi-repo workspaces (`.fusion/workspace.json`). Tasks whose file scopes overlap are serialized | From the freshly fetched base branch, or `from:` a task, branch, PR or commit (API 96); setup and teardown scripts; subprojects; turned off per project or task; Reclaim space | Fusion |
+| Worktrees | `.fusion/worktrees/<task-id>` on `fusion/<task-id>`, from the integration or base branch, or per task; rebased before running. `worktreeInitCommand`, `worktreeCopyFiles` (e.g. `.env`), `setupScript`. `maxWorktrees` 4, `maxConcurrent` 2. Optional `worktrunk`. Multi-repo workspaces (`.fusion/workspace.json`). Tasks whose file scopes overlap are serialized | From the freshly fetched base branch, or `from:` a task, branch, PR or commit (API 96); ignored files copied in (`.worktreeinclude` too) and folders linked (API 82); setup and teardown scripts; subprojects; turned off per project or task; Reclaim space | — |
 | Merging | `direct` (local squash, the default) or `pull-request`. `autoMerge` on by default, `pushAfterMerge` off. One merge at a time. Conflicts: `smart-prefer-main` (AI resolution, then heuristics, then `-X ours`) in a clean-room `.ai-merge/` worktree. Revert or "AI-undo" a done task | The agent merges in Ready for merge, one task at a time per project, through a PR or not (API 85); dependents then start | — |
-| GitHub | Imports issues and PRs; optional tracking issues commented and closed as the task moves; PR badges; a webhook endpoint; `githubNativeAutoMerge` and `requiredChecks`; a review-response loop that sends an agent to fix or reply on PR threads with no human gate before it pushes. Also GitLab import and a Linear plugin | PR link, preview dot and failed checks on the card; GitHub accounts per profile and project; clone or create repositories (API 55, 102); webhook automations that turn issues into tasks; Asana links | Fusion |
+| GitHub | Imports issues and PRs; optional tracking issues commented and closed as the task moves; PR badges; a webhook endpoint; `githubNativeAutoMerge` and `requiredChecks`; a review-response loop that sends an agent to fix or reply on PR threads with no human gate before it pushes. Also GitLab import and a Linear plugin | PR link, preview dot and failed checks on the card. Watching PRs in review (API 72): while the agent is idle, failed checks (with their logs' ends) and conflicts, and optionally comments and reviews from people who can push, wake it to fix, push and reply. GitHub accounts per profile and project; clone or create repositories (API 55, 102); webhook automations that turn issues into tasks; Asana links | Fusion |
 | Dependencies | A dependency graph (cycles refused) and a Graph view; dependents run in order, the rest in parallel | Dependencies, subprojects and group tasks | — |
 | Permissions | `permissionPolicy` presets `unrestricted` (**the default**: every category allowed), `approval-required`, `locked-down`, by category (git write, file write/delete, commands, network…) and per tool. An approval pauses the task and aborts its session until it's decided in the Mailbox's Approvals tab. A CLI agent's own prompts show as a "waiting on input" banner, answered in its terminal | Six modes per host, project and thread, **Ask by default**: the agent's own tool calls wait on approval cards in the thread; project and automation changes always ask | Huntaway |
 | Questions | `fn_ask_question` cards in chat; `ask-user` workflow nodes; planning waits for answers | Question cards for `request_user_input`, AskUserQuestion and Codex questions; the card on the board says what's asked | — |
@@ -73,21 +73,18 @@ the agent's process lifetime and about permissions.
 
 ## What Huntaway could take from Fusion
 
-Ranked by value for effort:
+Ranked by value for effort. Huntaway already has two of the things Fusion does here: copying ignored files into new
+worktrees (API 82) and waking an agent in review with its PR's failed checks, conflicts and comments (API 72).
 
-1. **Copy files into new worktrees** (`worktreeCopyFiles`): a project setting listing ignored files (`.env`, local
-   config) to copy into each new worktree, with no setup script. The Orca comparison found the same thing.
-2. **Hard test and build gates before merge**: a project's `test` and `build` commands (or ones guessed from the
+1. **Hard test and build gates before merge**: a project's `test` and `build` commands (or ones guessed from the
    lockfile), run in the worktree before Ready for merge; a failure goes back to the agent like a review issue.
-3. **A review-response loop for PRs**: when someone comments on a task's PR, send the comments to its agent to fix
-   or reply. Unlike Fusion, ask before pushing.
-4. **Serialize tasks that touch the same files**: hold a task whose plan's file scope overlaps another one in
+2. **Serialize tasks that touch the same files**: hold a task whose plan's file scope overlaps another one in
    progress, to save merge conflicts.
-5. **Notification webhooks** (ntfy, Slack, Discord) for needs attention, in review, merged and failed, beside web push.
-6. **Token budgets per task**: an alert at a soft limit and a pause into Needs attention at a hard one.
-7. **Tracking issues**: optionally make or update a GitHub issue for a task, comment as it moves, and close it at Done
+3. **Notification webhooks** (ntfy, Slack, Discord) for needs attention, in review, merged and failed, beside web push.
+4. **Token budgets per task**: an alert at a soft limit and a pause into Needs attention at a hard one.
+5. **Tracking issues**: optionally make or update a GitHub issue for a task, comment as it moves, and close it at Done
    (or close the issue it was made from).
-8. **Import MCP servers from other tools' configs** (Claude Desktop, Cursor, VS Code) into a profile or project.
+6. **Import MCP servers from other tools' configs** (Claude Desktop, Cursor, VS Code) into a profile or project.
 
 Not worth taking: running agents in-process on another SDK (Huntaway's strengths come from the real CLIs and
 `ia-shim`), calling Anthropic with a subscription token while posing as Claude Code, `unrestricted` permissions by
