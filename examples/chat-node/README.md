@@ -73,7 +73,7 @@ notice, so the button isn't offered.
 ## The seam: events out, commands in
 
 Everything between the SDK and the browser is in [server/main.ts](server/main.ts) and
-[web/src/App.tsx](web/src/App.tsx). The wire format, which the Go and Rust examples' servers speak
+[web/src/App.tsx](web/src/App.tsx). The wire format, which another server could speak
 too, is in [../PROTOCOL.md](../PROTOCOL.md).
 
 **Events out.** The backend calls one subscriber with every thread's events, deltas included. The
@@ -147,8 +147,7 @@ recording has), and drive the app in Chromium:
   frames and URLs.
 
 `CHAT_E2E_SERVER` runs them against another server that speaks
-[the same protocol](../PROTOCOL.md#running-chat-nodes-smoke-tests-against-another-server), such as
-the Go or Rust example's. They need Playwright's Chromium (`pnpm exec playwright install
+[the same protocol](../PROTOCOL.md#running-chat-nodes-smoke-tests-against-another-server). They need Playwright's Chromium (`pnpm exec playwright install
 chromium`), or set `CHAT_E2E_BROWSER` to the path of a Chromium or Chrome of your own.
 
 ## Files

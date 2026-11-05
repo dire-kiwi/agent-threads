@@ -1,6 +1,6 @@
 # Store conformance
 
-Every backend has a `Store` interface with three implementations built in (Memory, a JSONL file
+The backend has a `Store` interface with three implementations built in (Memory, a JSONL file
 store and SQLite), and apps can write their own on their database. They all have to behave the
 same, so they all pass the cases in [store.json](store.json). This is what the operations are and
 how a test runs the cases. [../tools/test/store.test.mjs](../tools/test/store.test.mjs) has a
@@ -34,8 +34,8 @@ to what was written, as JSON (key order aside).
 
 ## Operations
 
-Named here as in `store.json`; each backend names them idiomatically (`append_events` in Rust,
-`AppendEvents` in Go) and may make them async. "Fails with `x`" means it returns or throws the
+Named here as in `store.json`; a backend names them idiomatically (`appendEvents` in Node) and
+may make them async. "Fails with `x`" means it returns or throws the
 store's error of kind `x`, which each backend maps from its own error type.
 
 | Operation | Does | Fails with |

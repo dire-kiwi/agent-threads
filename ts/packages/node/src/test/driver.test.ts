@@ -1539,7 +1539,7 @@ describe("a thread's launch options", () => {
     expect(run.argv.slice(-5)).toEqual(["--own", "--allowedTools", "Read Edit", "--settings", '{"a":1}']);
     expect(run.configDir).toBe("/profile-a");
     expect(run.env).toEqual({ AT_SET: "a b", AT_GONE: null, AT_KEPT: "kept" });
-    // Stored with the thread, as the other backends store them, and never sent to clients.
+    // Stored with the thread, and never sent to clients.
     expect(((await store.getThread(t.id)) as { launch?: unknown }).launch).toEqual({
       args: ["--allowedTools", "Read Edit", "--settings", '{"a":1}'],
       env: { AT_GONE: null, AT_SET: "a b" },

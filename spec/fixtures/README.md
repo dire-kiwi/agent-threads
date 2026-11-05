@@ -1,7 +1,7 @@
 # Fixtures: the conformance suite
 
 Recorded real sessions of `claude -p` and `codex app-server`, each with the events a backend must
-make of it. Every backend (Node, Go, Rust) runs all of them in its tests: it drives the session
+make of it. The backend (Node) runs all of them in its tests: it drives the session
 through the fake CLI in [../tools/](../tools/README.md), which replays the recording and checks
 what the backend writes to it, and then compares the events it produced with the expected ones.
 No CLI or login is needed.
