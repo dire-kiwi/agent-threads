@@ -26,7 +26,7 @@ after a restart.
 ```sh
 cargo build --release   # target/release/agent-threads-shim
 cargo test              # runs the shim on sh scripts
-make shim               # from the repository's root: shim/target/debug/agent-threads-shim, which the backends' tests use
+make shim               # from the repository's root: shim/target/debug/agent-threads-shim, which the backend's tests use
 cargo install --git https://github.com/dire-kiwi/agent-threads agent-threads-shim
 ```
 
@@ -40,8 +40,6 @@ directory of its own for the runs:
 | Backend | |
 | --- | --- |
 | Node | `shim(path, { runsDir })` ([ts/packages/node](../ts/packages/node/README.md#processes-and-runs-that-survive-a-restart)) |
-| Go | `agentthreads.Shim(path, agentthreads.ShimOptions{RunsDir: dir})` ([go](../go/README.md#runs-that-survive-a-restart)) |
-| Rust | `shim(path, ShimOptions::new(runs_dir))` ([rust/agent-threads](../rust/agent-threads/README.md#processes-and-runs-that-survive-a-restart)) |
 
 Then `recover()` at startup re-attaches to the runs the last process left going. It runs on Unix
-only: on Windows the backends' shim spawner is the direct one.
+only: on Windows the backend's shim spawner is the direct one.

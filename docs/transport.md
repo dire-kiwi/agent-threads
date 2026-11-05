@@ -1,24 +1,24 @@
 # Bring your own network
 
-agent-threads has no network layer. A backend (Node, Go or Rust) runs the threads, **sends events**
+agent-threads has no network layer. The backend (Node) runs the threads, **sends events**
 and **takes commands**, all plain JSON objects ([spec/PROTOCOL.md](../spec/PROTOCOL.md)), and the
 app carries them between the backend and its frontend over whatever it already has: a WebSocket,
-SSE and POST, Electron or Tauri IPC, a message queue. This guide covers what a transport has to
-carry, the rules that make reconnecting work, and four transports in full.
+SSE and POST, Electron IPC, a message queue. This guide covers what a transport has to carry, the
+rules that make reconnecting work, and three transports in full (and a note on Tauri).
 
 ## The seam
 
-A transport carries four things. Every backend has all four:
+A transport carries four things, and the backend has all four:
 
-| | Node | Go | Rust |
-| --- | --- | --- | --- |
-| **Events out**: every thread's events, deltas included | `sdk.subscribe(fn)` | `sdk.Subscribe(fn)`, or `sdk.Events(ctx)` | `sdk.subscribe()` (a tokio `broadcast::Receiver`) |
-| **Commands in**: `send`, `interrupt`, `respond`, `set_options`, `rewind`, `new_session`, `compact` | `sdk.handle(command)` | `sdk.HandleJSON(ctx, data)`, or `sdk.Handle(ctx, command)` | `sdk.handle_json(value)`, or `sdk.handle(command)` |
-| **A snapshot**, for a client that's just connected | `sdk.snapshot(id)` | `sdk.Snapshot(ctx, id)` | `sdk.snapshot(&id)` |
-| **Events after a `seq`**, for a client catching up | `sdk.eventsSince(id, seq)` | `sdk.EventsSince(ctx, id, seq, 0)` | `sdk.events_since(&id, seq, None)` |
+| | |
+| --- | --- |
+| **Events out**: every thread's events, deltas included | `sdk.subscribe(fn)` |
+| **Commands in**: `send`, `interrupt`, `respond`, `set_options`, `rewind`, `new_session`, `compact` | `sdk.handle(command)` |
+| **A snapshot**, for a client that's just connected | `sdk.snapshot(id)` |
+| **Events after a `seq`**, for a client catching up | `sdk.eventsSince(id, seq)` |
 
 Creating, listing and deleting threads (`create`, `list`, `delete`) aren't commands: they're the
-app's own API, which it offers its clients however it likes (the chat examples have `create` and
+app's own API, which it offers its clients however it likes (the chat example has `create` and
 `list` methods next to `command`; see [examples/PROTOCOL.md](../examples/PROTOCOL.md)).
 
 On the frontend, the React package takes the other end of the same four things: a `ThreadSource`
@@ -55,7 +55,7 @@ text the snapshot already has is skipped by its `offset` (the protocol's
 streamed so far, so a client that connects in the middle of a message sees it.
 
 **A gap is a resync.** A client keeps its state's `seq`. When a saved event's `seq` is more than
-one past it (`isGap` / `IsGap` / `is_gap`), events were missed: it asks for `eventsSince(seq)` (or a
+one past it (`isGap`), events were missed: it asks for `eventsSince(seq)` (or a
 fresh snapshot) instead of applying the event. The React package's `ThreadStore` does this through
 `source.resync`, holding events that come meanwhile, and also calls `resync` each time it connects,
 for what was sent while it wasn't listening. A transport that loses events, or a client that was
@@ -68,8 +68,7 @@ when the *next* saved event comes, so after a reconnect, catch up straight away 
 for one: the React store does, since a new source connects.
 
 **Commands come back as errors, not events.** `handle` checks a command against the protocol's
-schema and throws (Node: `CommandError`; Go: `*CommandError`; Rust: `Error::Command`) for one it
-can't carry out: an unknown thread, a malformed command, a closed backend. Send that back to the
+schema and throws a `CommandError` for one it can't carry out: an unknown thread, a malformed command, a closed backend. Send that back to the
 client as the reply to its command; the React components show a rejected `onCommand` as the
 failing component's error. `handle` resolves once the thread has taken the command, not when the
 turn ends: what the command does comes back as events.
@@ -80,29 +79,21 @@ threads it may see (filter by `event.thread_id`), and check a command's `thread_
 `handle`. A permission request answered with `respond` allows the agent to do something, so a
 client that can send commands to a thread can let its agent act. A local app listening on
 127.0.0.1 still has to: any web page the user has open can open a WebSocket to it (see
-[examples/PROTOCOL.md](../examples/PROTOCOL.md#what-a-server-serves) for the checks the examples
-make, which are the least a real app does).
+[examples/PROTOCOL.md](../examples/PROTOCOL.md#what-a-server-serves) for the checks the example
+makes, which are the least a real app does).
 
-**Don't block the subscriber.** Node calls subscribers synchronously, as events happen, on the
-event loop everything else runs on. Go calls `Subscribe`'s functions on one goroutine of the SDK's
-own, one event at a time: a function that blocks holds up every subscriber's events (they queue up
-in memory meanwhile), though not the threads. Each `Events(ctx)` channel has a queue of its own, so
-a slow reader only grows that one. Rust's `subscribe()` is a broadcast channel holding `Options::event_capacity` (4096)
-events: a receiver that falls further behind gets `RecvError::Lagged`, misses some, and should carry
-on, since its clients will see the gap and resync. In each case, hand events to a per-client queue
-or write and move on.
+**Don't block the subscriber.** The backend calls subscribers synchronously, as events happen, on
+the event loop everything else runs on: hand events to a per-client queue or write and move on.
 
-**Shut down cleanly.** On shutdown, close the transport, then `close()` the backend (`Close` in Go,
-`close(false)` in Rust): it stops the harness processes, or with the shim leaves them running for
+**Shut down cleanly.** On shutdown, close the transport, then `close()` the backend: it stops the harness processes, or with the shim leaves them running for
 the next start (see [shim.md](shim.md)), and saves everything. Then close the store, which is the
 app's.
 
 ## Without React
 
-The reducer the React package uses is in every language: fold a snapshot and its events into the
-thread's state with `applyEvent` (`@dire-kiwi/agent-threads-protocol`), `protocol.ApplyEvent` (Go) or
-`agent_threads::reducer::apply_event` (Rust), and check for gaps with `isGap`. A CLI client, a bot
-or a test in any of the three languages can follow a thread the same way:
+The reducer the React package uses is in `@dire-kiwi/agent-threads-protocol`: fold a snapshot and
+its events into the thread's state with `applyEvent`, and check for gaps with `isGap`. A CLI
+client, a bot or a test can follow a thread the same way:
 
 ```ts
 import { applyEvent, isGap, type Snapshot, type ThreadEvent } from "@dire-kiwi/agent-threads-protocol";
@@ -119,12 +110,10 @@ async function onEvent(event: ThreadEvent) {
 
 ## WebSocket
 
-One socket per client, with the client's requests and the server's pushed events on it. The three
-chat examples do exactly this, in each language, and are the fullest reference:
-[chat-node/server/main.ts](../examples/chat-node/server/main.ts),
-[chat-go/main.go](../examples/chat-go/main.go) and [chat-rust/src/main.rs](../examples/chat-rust/src/main.rs),
-all speaking [examples/PROTOCOL.md](../examples/PROTOCOL.md) to one React frontend. Its core, in
-Node with `ws`:
+One socket per client, with the client's requests and the server's pushed events on it. The chat example
+does exactly this, and is the fullest reference:
+[chat-node/server/main.ts](../examples/chat-node/server/main.ts), speaking
+[examples/PROTOCOL.md](../examples/PROTOCOL.md) to its React frontend. Its core, with `ws`:
 
 ```ts
 import { createServer } from "node:http";
@@ -406,104 +395,13 @@ web content, and `at:command` lets it answer permission requests.
 
 ## Tauri
 
-The Rust backend runs in the Tauri app, as managed state. Events go to the webview with `emit`, and
-the rest are commands.
-
-```rust
-use std::sync::Arc;
-
-use agent_threads::{AgentThreads, Options, Snapshot, SqliteStore, ThreadEvent};
-use tauri::{Emitter, Manager, RunEvent, State};
-use tokio::sync::broadcast::error::RecvError;
-
-#[tauri::command]
-async fn at_snapshot(sdk: State<'_, AgentThreads>, thread_id: String) -> Result<Snapshot, String> {
-    sdk.snapshot(&thread_id).await.map_err(|e| e.to_string())
-}
-
-#[tauri::command]
-async fn at_events_since(sdk: State<'_, AgentThreads>, thread_id: String, seq: u64) -> Result<Vec<ThreadEvent>, String> {
-    sdk.events_since(&thread_id, seq, None).await.map_err(|e| e.to_string())
-}
-
-#[tauri::command]
-async fn at_command(sdk: State<'_, AgentThreads>, command: serde_json::Value) -> Result<(), String> {
-    sdk.handle_json(command).await.map_err(|e| e.to_string())
-}
-
-pub fn run() {
-    tauri::Builder::default()
-        .setup(|app| {
-            // app_data_dir() is only a path: on the first launch, it doesn't exist yet.
-            let dir = app.path().app_data_dir()?;
-            std::fs::create_dir_all(&dir)?;
-            let sdk = AgentThreads::new(Options {
-                store: Some(Arc::new(SqliteStore::open(dir.join("threads.db"))?)),
-                ..Default::default()
-            });
-            // Events out: every thread's, to the webview.
-            let mut events = sdk.subscribe();
-            let handle = app.handle().clone();
-            tauri::async_runtime::spawn(async move {
-                loop {
-                    match events.recv().await {
-                        Ok(event) => {
-                            let _ = handle.emit("at:event", &event);
-                        }
-                        Err(RecvError::Lagged(_)) => continue, // the frontend sees the gap in seq and resyncs
-                        Err(RecvError::Closed) => break,
-                    }
-                }
-            });
-            app.manage(sdk);
-            Ok(())
-        })
-        .invoke_handler(tauri::generate_handler![at_snapshot, at_events_since, at_command])
-        .build(tauri::generate_context!())
-        .expect("error while building the app")
-        .run(|app, event| {
-            if let RunEvent::Exit = event {
-                // Save everything, and stop the harnesses (or leave shim runs going).
-                let sdk = app.state::<AgentThreads>().inner().clone();
-                let _ = tauri::async_runtime::block_on(sdk.close(false));
-            }
-        });
-}
-```
-
-```tsx
-import { invoke } from "@tauri-apps/api/core";
-import { listen } from "@tauri-apps/api/event";
-
-// One listener for the app, handing events to the open threads' sources.
-const listeners = new Set<(e: ThreadEvent) => void>();
-void listen<ThreadEvent>("at:event", (m) => {
-  for (const fn of listeners) fn(m.payload);
-});
-
-const snapshot = await invoke<Snapshot>("at_snapshot", { threadId });
-const source: ThreadSource = {
-  snapshot,
-  subscribe: (fn) => {
-    const own = (e: ThreadEvent) => e.thread_id === threadId && fn(e);
-    listeners.add(own);
-    return () => void listeners.delete(own);
-  },
-  resync: (seq) => invoke<ThreadEvent[]>("at_events_since", { threadId, seq }),
-};
-<Thread source={source} onCommand={(command) => invoke("at_command", { command })} />
-```
-
-Tauri passes the commands' arguments in camelCase (`threadId`) to the Rust functions' snake_case
-parameters. `listen` resolves with its unlisten function asynchronously, which is why the example
-listens once and fans out, rather than listening in each `subscribe`. Add the commands to the app's
-capabilities, and keep the backend's own commands (create, list) next to them.
+The backend is Node, so a Tauri app runs it as a [sidecar](https://v2.tauri.app/develop/sidecar/)
+(a Node process it ships and starts) and the webview talks to it over a
+[WebSocket](#websocket) on 127.0.0.1, with the same checks as any local server: the sidecar has no
+IPC of Tauri's own to carry events on.
 
 ## Further
 
-- Go and Rust have the same seam, with their idioms (a `context.Context`, a broadcast channel): see
-  [go/README.md](../go/README.md) and [rust/agent-threads/README.md](../rust/agent-threads/README.md),
-  and the chat examples.
 - An agent's runs can outlive the backend's process with the shim, so the transport restarting
   doesn't have to stop them: [shim.md](shim.md).
 - What the agent can do (tools, MCP servers, skills, permissions) is set on the backend, not

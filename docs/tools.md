@@ -3,19 +3,19 @@
 What an agent can do is set by the app on the backend: its own **tools** (functions in the app's
 language, run in process), external **MCP servers**, **skills**, a **permission policy** that
 decides each tool call, and an optional system prompt. By default a thread sees only these: not the
-user's own Claude Code or Codex config. This guide shows each in Node, Go and Rust, with notes on
-how each harness does it.
+user's own Claude Code or Codex config. This guide shows each, with notes on how each harness does
+it.
 
 ## Capabilities: for every thread, or for one
 
 The five are `Capabilities`, given to the backend for every thread, and to `create` for one thread
 on top of them:
 
-| | Node | Go | Rust |
-| --- | --- | --- | --- |
-| For every thread | `new AgentThreads({ tools, mcpServers, skills, permissions, systemPrompt })` | `Options{Capabilities: Capabilities{...}}` | `Options { capabilities: Capabilities {...}, .. }` |
-| For one thread | `sdk.create({ ..., tools, mcpServers, skills, permissions, systemPrompt })` | `CreateOptions{Capabilities: Capabilities{...}}` | `CreateOptions { capabilities: Capabilities {...}, .. }` |
-| Again, later | `sdk.configure(id, { tools, ... })` | `sdk.Configure(ctx, id, Capabilities{...})` | `sdk.configure(&id, CapabilitiesUpdate {...})` |
+| | |
+| --- | --- |
+| For every thread | `new AgentThreads({ tools, mcpServers, skills, permissions, systemPrompt })` |
+| For one thread | `sdk.create({ ..., tools, mcpServers, skills, permissions, systemPrompt })` |
+| Again, later | `sdk.configure(id, { tools, ... })` |
 
 A thread runs with both: tools by name (the thread's own replacing the instance's of the same
 name), MCP servers by name likewise, the skills of both, both system prompts (the instance's first),
@@ -27,9 +27,7 @@ themselves). The policy and the tools' code change at once, even for a running t
 permission decision is the new policy's, and a call to an app tool runs the tool as it is now (or
 fails, for one that's gone). What the harness is told when its process starts (which tools there
 are, the MCP servers, the skills, the system prompt) changes from the thread's next turn, which
-starts a new process. `configure` changes only what it's given: in Node, the fields it has; in Go,
-those that aren't nil, and the system prompt only when it isn't empty (so it can't be cleared); in
-Rust, those that are `Some` (`Some("")` clears the system prompt).
+starts a new process. `configure` changes only what it's given: the fields it has.
 
 ## App tools
 
@@ -37,11 +35,10 @@ A tool is a name, a description, a JSON Schema for its arguments, and a function
 gets the arguments and a context with the thread's id, the thread's `metadata` (which the app gave
 `create`), and the tool call's id. It returns text for the agent, optionally with `structured`
 output, which goes in the call's `result.structured` for the app's frontend to draw (the harness
-only passes the text to the agent), or an error, which the agent is told. A tool that throws or
-panics returns that as its error.
+only passes the text to the agent), or an error, which the agent is told. A tool that throws returns that
+as its error.
 
 ```ts
-// Node
 import { defineTool } from "@dire-kiwi/agent-threads-node";
 
 const lookupOrder = defineTool<{ order_id: string }>({
@@ -55,51 +52,6 @@ const lookupOrder = defineTool<{ order_id: string }>({
   },
 });
 ```
-
-```go
-// Go
-lookupOrder := agentthreads.TypedTool("lookup_order", "Looks up an order by its id.",
-	`{"type":"object","properties":{"order_id":{"type":"string"}},"required":["order_id"]}`,
-	func(ctx context.Context, a struct {
-		OrderID string `json:"order_id"`
-	}, call agentthreads.ToolContext) (agentthreads.ToolOutput, error) {
-		var user string
-		_ = json.Unmarshal(call.Metadata["user"], &user)
-		order, ok := findOrder(user, a.OrderID)
-		if !ok {
-			return agentthreads.ToolOutput{Text: "There's no order " + a.OrderID + ".", IsError: true}, nil
-		}
-		return agentthreads.ToolOutput{Text: "Order " + a.OrderID + ": " + order.Summary + ".", Structured: order}, nil
-	})
-```
-
-`ToolFunc` takes the arguments as `json.RawMessage` instead, and any type implementing `Tool`
-(`Name`, `Description`, `InputSchema`, `Run`) is a tool too. A returned `error` is the tool's error.
-`ctx` is cancelled if the thread's harness process goes away before the tool returns.
-
-```rust
-// Rust
-use agent_threads::{ToolOutput, tool};
-use serde_json::json;
-
-let lookup_order = tool(
-    "lookup_order",
-    "Looks up an order by its id.",
-    json!({"type": "object", "properties": {"order_id": {"type": "string"}}, "required": ["order_id"]}),
-    |args, ctx| async move {
-        let user = ctx.metadata.get("user").and_then(|u| u.as_str()).unwrap_or_default().to_string();
-        match find_order(&user, args["order_id"].as_str().unwrap_or_default()) {
-            Some(order) => ToolOutput::text(format!("Order {}: {}.", order.id, order.summary)).with_structured(json!(order)),
-            None => ToolOutput::error("There's no such order."),
-        }
-    },
-);
-```
-
-The closure returns anything that's `Into<ToolOutput>`: a `String` or `&str`, a `ToolOutput`, or a
-`Result` of either. Or implement the `Tool` trait (`async_trait`). `ctx.cancelled` is a `Cancellation`:
-`ctx.cancelled.cancelled().await` resolves if the harness process goes away first (to
-`tokio::select!` on), and `ctx.cancelled.is_cancelled()` says whether it has.
 
 **Per-user tools.** Tools get the thread's `metadata`, so one set of tools can serve every user,
 each thread seeing only its own user's data (`create({ metadata: { user } })`). Or give a thread
@@ -116,7 +68,7 @@ tool call, so allow the tools that only read in the policy, or the user is asked
 
 | | Claude Code | Codex |
 | --- | --- | --- |
-| How the tools reach the agent | An in-process MCP server named `app`, declared in `--mcp-config` as an SDK server and answered over stream-json's control channel, as the official Agent SDK does: no HTTP server, no extra binary. Claude sees `mcp__app__lookup_order`; the tool_call is `lookup_order`, kind `app`. | `dynamicTools` on `thread/start`, answered over `item/tool/call`. Codex marks these experimental, so `appTools: "mcp"` (Go `AppToolsOverMCP`, Rust `AppTools::Mcp`) serves them on a loopback MCP server instead (streamable HTTP on 127.0.0.1, a random port and bearer token), as happens when Codex refuses dynamic tools. A resumed session keeps the dynamic tools it started with; tools changed since are served on the MCP server. |
+| How the tools reach the agent | An in-process MCP server named `app`, declared in `--mcp-config` as an SDK server and answered over stream-json's control channel, as the official Agent SDK does: no HTTP server, no extra binary. Claude sees `mcp__app__lookup_order`; the tool_call is `lookup_order`, kind `app`. | `dynamicTools` on `thread/start`, answered over `item/tool/call`. Codex marks these experimental, so `appTools: "mcp"` serves them on a loopback MCP server instead (streamable HTTP on 127.0.0.1, a random port and bearer token), as happens when Codex refuses dynamic tools. A resumed session keeps the dynamic tools it started with; tools changed since are served on the MCP server. |
 
 ## MCP servers
 
@@ -125,35 +77,13 @@ arguments, environment or headers. The harness starts and talks to them; the bac
 about them.
 
 ```ts
-// Node
 mcpServers: {
   shipping: { command: "node", args: ["shipping-mcp.js"], env: { API_KEY: key } },
   docs: { url: "https://example.com/mcp", headers: { authorization: `Bearer ${token}` } },
 },
 ```
 
-```go
-// Go
-MCPServers: map[string]agentthreads.MCPServer{
-	"shipping": {Command: "node", Args: []string{"shipping-mcp.js"}, Env: map[string]string{"API_KEY": key}},
-	"docs":     {URL: "https://example.com/mcp", Headers: map[string]string{"authorization": "Bearer " + token}},
-},
-```
-
-```rust
-// Rust
-mcp_servers: [
-    ("shipping".to_string(), McpServer::stdio("node", ["shipping-mcp.js"])),
-    ("docs".to_string(), McpServer::http("https://example.com/mcp")),
-]
-.into(),
-```
-
-(In Rust, `McpServer::Stdio { command, args, env, codex }`, `Http { url, headers, codex }` and
-`Sse { url, headers }` are the variants, for environment and headers.)
-
-A server can have **Codex settings** (`codex`; Go `Codex`; Rust `codex`, or `.codex(key, value)`):
-more keys for Codex's table for the server (its `mcp_servers.<name>` config), such as
+A server can have **Codex settings** (`codex`): more keys for Codex's table for the server (its `mcp_servers.<name>` config), such as
 `tool_timeout_sec`, `startup_timeout_sec` and `default_tools_approval_mode`. The table's own keys
 (`command`, `args`, `env`, `url`, `http_headers`) come from the server's own fields. A server whose
 tools can run for a long time needs `tool_timeout_sec`, or Codex's default timeout cuts its calls
@@ -161,18 +91,7 @@ off; a `-c mcp_servers.<name>.…` in the harness's arguments doesn't help, sinc
 `mcp_servers` replaces that table.
 
 ```ts
-// Node
 board: { command: "board-mcp", args: ["--serve"], codex: { tool_timeout_sec: 3900, default_tools_approval_mode: "approve" } },
-```
-
-```go
-// Go
-"board": {Command: "board-mcp", Args: []string{"--serve"}, Codex: map[string]any{"tool_timeout_sec": 3900, "default_tools_approval_mode": "approve"}},
-```
-
-```rust
-// Rust
-("board".to_string(), McpServer::stdio("board-mcp", ["--serve"]).codex("tool_timeout_sec", 3900)),
 ```
 
 Claude Code has no settings for a server, and ignores them: it takes its MCP tool timeout from the
@@ -197,14 +116,6 @@ other skill and the agent decides when to use one.
 
 ```ts
 skills: ["./skills/order-support", { name: "tone", content: "---\nname: tone\ndescription: ...\n---\n..." }],
-```
-
-```go
-Skills: []agentthreads.Skill{agentthreads.SkillDir("./skills/order-support"), {Name: "tone", Content: toneMd}},
-```
-
-```rust
-skills: vec![Skill::Dir("skills/order-support".into()), Skill::Inline { name: "tone".into(), content: tone_md }],
 ```
 
 | | Claude Code | Codex |
@@ -234,11 +145,10 @@ them on the thread, can give a thread some when it creates it (`standing_answers
 from the app's own rules, say), and replaces or clears them with `set_options` (`standing_answers:
 []` clears them). Open requests a new standing answer is for are answered at once.
 
-The default policy asks about everything. A policy can be a constant, or a function (or, in Node
-and Rust, an async one, to look something up):
+The default policy asks about everything. A policy can be a constant, or a function (or an async
+one, to look something up):
 
 ```ts
-// Node
 permissions: (q, ctx) => {
   if (q.kind === "read" || q.kind === "search" || q.name === "lookup_order") return "allow";
   if (q.kind === "edit" && !ctx.metadata.canEdit) return { deny: "This thread can't edit files." };
@@ -246,36 +156,9 @@ permissions: (q, ctx) => {
 },
 ```
 
-```go
-// Go
-Permissions: agentthreads.PolicyFunc(func(ctx context.Context, q agentthreads.PermissionQuery, t agentthreads.PermissionContext) agentthreads.Decision {
-	switch {
-	case q.Kind == protocol.ToolKindRead, q.Kind == protocol.ToolKindSearch, q.Name == "lookup_order":
-		return agentthreads.Allow
-	case q.Kind == protocol.ToolKindEdit && string(t.Metadata["canEdit"]) != "true":
-		return agentthreads.DenyWith("This thread can't edit files.")
-	}
-	return agentthreads.Ask
-}),
-```
+A policy that throws denies the call, saying why.
 
-Go's policy runs on the thread's goroutine and must be quick: to leave a decision for later, return
-`Ask`. `Allow`, `Deny` and `Ask` are policies themselves.
-
-```rust
-// Rust
-permissions: Some(PermissionPolicy::from_fn(|q, ctx| match q.kind {
-    ToolKind::Read | ToolKind::Search => PermissionDecision::Allow,
-    _ if q.name == "lookup_order" => PermissionDecision::Allow,
-    ToolKind::Edit if ctx.metadata.get("canEdit") != Some(&json!(true)) => PermissionDecision::deny("This thread can't edit files."),
-    _ => PermissionDecision::Ask,
-})),
-```
-
-`PermissionPolicy::from_async` takes an async closure, and `allow()`, `ask()` and `deny()` are
-constants. A policy that throws or panics denies the call, saying why.
-
-Allowing shell commands safely takes care: the chat examples' policies allow only a few commands
+Allowing shell commands safely takes care: the chat example's policy allows only a few commands
 that read, with no shell syntax that could make them do more
 ([chat-node/server/policy.ts](../examples/chat-node/server/policy.ts)).
 
@@ -284,10 +167,9 @@ open a `question` request for the user (`QuestionCard`), whatever the policy say
 answer goes only to the harness: what's saved and sent shows `[secret]`.
 
 **Answering after the turn.** A request still open when its turn ends (the user interrupted it, or
-the harness stopped) is cancelled. With `lateAnswers` (Go `LateAnswers`, Rust `late_answers`) on the
-backend's options, a question stays open instead, while the thread is idle: answering it sends the
-answers to the agent as the user's next message (`My answer to the question you asked: ...`), which
-starts a turn. A question the conversation has moved on from is cancelled: when the user sends a
+the harness stopped) is cancelled. With `lateAnswers` on the backend's options, a
+question stays open instead, while the thread is idle: answering it sends the answers to the agent
+as the user's next message (`My answer to the question you asked: ...`), which starts a turn. A question the conversation has moved on from is cancelled: when the user sends a
 message after it was asked (another late answer included), or if a message was left queued when its
 turn ended. Secret questions are cancelled still, since their answers would be shown in the message,
 and `dont_ask` dismisses questions kept open too.
@@ -333,8 +215,8 @@ the user's (or one the app points at).
 | | Claude Code | Codex |
 | --- | --- | --- |
 | By default | `--setting-sources ""` (none of the user's or the project's settings, hooks, MCP servers or skills) and `--strict-mcp-config` | A `CODEX_HOME` of the app's own (`home`, `~/.agent-threads/codex` by default), with none of the user's config, MCP servers or skills, and their login (`auth.json` from `$CODEX_HOME` or `~/.codex`) linked in, or copied where it can't be linked |
-| The user's own config instead | `claudeCode({ userSettings: true })` (Go `UserSettings`, Rust `user_settings`) | `codex({ userConfig: true })` (Go `UserConfig`, Rust `user_config`) |
-| Another login | `configDir` (`CLAUDE_CONFIG_DIR`) | `login`: another CODEX_HOME to link the login from, or none (Node `false`, Go `NoLogin`, Rust `None`) |
+| The user's own config instead | `claudeCode({ userSettings: true })` | `codex({ userConfig: true })` |
+| Another login | `configDir` (`CLAUDE_CONFIG_DIR`) | `login`: another CODEX_HOME to link the login from, or none (`false`) |
 | Note | | `home` keeps the app's Codex sessions, which resuming a thread needs: keep it as long as the threads |
 
 Both drivers take `bin` (and `binArgs`, for a script run by `node`), extra `args` and `env`; Codex
@@ -343,9 +225,8 @@ takes extra `config` for `thread/start` (its `config.toml` keys, dotted).
 ### Per-thread launch options
 
 A thread can have launch options of its own, on top of the harness's: given when it's created, and
-changed with `setOptions` (Go `SetOptions`, Rust `set_options`). They're stored with the thread
-(in the store's thread record, as `launch`, not in the protocol's `Thread`, so clients never see
-them), so a thread picked up after a restart starts its processes with them. A change applies from
+changed with `setOptions`. They're stored with the thread (in the store's thread record, as
+`launch`, not in the protocol's `Thread`, so clients never see them), so a thread picked up after a restart starts its processes with them. A change applies from
 the next process the thread starts, as a model change does; the `set_options` command from a client
 can't change them.
 
@@ -365,9 +246,9 @@ await sdk.setOptions(thread.id, { launch: { ...launch, args: ["--disallowedTools
 | | Claude Code | Codex |
 | --- | --- | --- |
 | `args` | After the driver's and the options' `args`: `--allowedTools`, `--disallowedTools`, `--settings` and so on | After `app-server` and the options' `args`: `-c key=value`, say |
-| `env` | On top of the options' `env`; `null` (Go `nil`, Rust `None`) removes a variable | The same |
-| `addDirs` (Go `AddDirs`, Rust `add_dirs`) | `--add-dir`, once for each | Writable roots (`sandbox_workspace_write.writable_roots`, after any the options' `config` gives), relative ones in the thread's `cwd` |
-| `configDir` (Go `ConfigDir`, Rust `config_dir`) | `CLAUDE_CONFIG_DIR`, in place of the options' `configDir` | `CODEX_HOME`, in place of the app's `home`, used as it is: its own login and `config.toml`, nothing linked in |
+| `env` | On top of the options' `env`; `null` removes a variable | The same |
+| `addDirs` | `--add-dir`, once for each | Writable roots (`sandbox_workspace_write.writable_roots`, after any the options' `config` gives), relative ones in the thread's `cwd` |
+| `configDir` | `CLAUDE_CONFIG_DIR`, in place of the options' `configDir` | `CODEX_HOME`, in place of the app's `home`, used as it is: its own login and `config.toml`, nothing linked in |
 
 The harness keeps its sessions in its config directory, so a thread whose `configDir` changes can't
 resume the session it had.

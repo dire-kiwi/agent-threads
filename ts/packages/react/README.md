@@ -3,8 +3,9 @@
 React hooks and components that draw an agent-threads thread from its events and send the user's
 actions back as commands. There's no network layer: the app brings the events over its own
 transport and carries the commands back ([docs/transport.md](../../../docs/transport.md) has
-WebSocket, SSE, Electron and Tauri versions; [spec/PROTOCOL.md](../../../spec/PROTOCOL.md) the
-events and commands). It works with any of the backends (Node, Go, Rust), and needs React 18+.
+WebSocket, SSE and Electron versions; [spec/PROTOCOL.md](../../../spec/PROTOCOL.md) the
+events and commands). It works with the Node backend (or any that speaks the protocol), and needs
+React 18+.
 Nothing is published yet: build it from a checkout and link it into your app, telling the bundler
 to use the app's one React (Vite's `resolve.dedupe: ["react", "react-dom"]`), as
 [the root README](../../../README.md#typescript-packages) says.

@@ -1,8 +1,7 @@
 # The chat examples' wire protocol
 
-The SDK has no network layer: each example app brings its own. The chat examples (`chat-node`, `chat-go` and
-`chat-rust`) all use the one described here, so the React frontend in
-[chat-node/web](chat-node/web) talks to any of their servers unchanged. It's the app's protocol, not
+The SDK has no network layer: each example app brings its own. The chat example (`chat-node`) uses the one described here, so the React frontend in
+[chat-node/web](chat-node/web) would talk to another server that speaks it unchanged. It's the app's protocol, not
 the SDK's: the SDK's part is only what goes inside it, the [protocol](../spec/PROTOCOL.md)'s
 `ThreadEvent`s, `Command`s, `Snapshot`s and `Thread`s, carried as they are.
 
@@ -82,7 +81,7 @@ Replies have an `id` and pushes a `type`, so a client tells them apart by that.
 chat-node's Playwright tests ([chat-node/e2e](chat-node/e2e/chat.spec.ts)) run against any server
 that speaks this protocol: set `CHAT_E2E_SERVER` to its command, and `CHAT_E2E_SUPERVISED` to the
 command that runs it under its supervisor (`$CHAT_E2E_SERVER supervise` by default), e.g.
-`CHAT_E2E_SERVER=../chat-go/chat-go pnpm test:e2e`. The tests start it with this environment:
+`CHAT_E2E_SERVER=../my-chat/my-chat pnpm test:e2e`. The tests start it with this environment:
 
 | Variable | |
 | --- | --- |

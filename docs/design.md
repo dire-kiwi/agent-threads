@@ -8,10 +8,16 @@ This is a summary of the approved plan (AT-2), kept in the repository so later w
 hand. The wire format is specified in [spec/PROTOCOL.md](../spec/PROTOCOL.md) and
 [spec/schema/](../spec/schema/).
 
+The plan had backends in Go and Rust too. They were built (steps 8 and 9 below), then removed
+(AT-36) to keep to the one backend for now: they're in the git history up to commit `5ad670a`
+(`go/`, `rust/`, `examples/chat-go`, `examples/chat-rust`, and their codegen, Makefile targets and
+CI jobs), to bring back if they're needed.
+
 ## Goals
 
-- **Backends** in Go, Rust and TypeScript (Node): native libraries in each language, with the same
-  model and behaviour.
+- **A backend** in TypeScript (Node), with its model and behaviour pinned down by a
+  language-neutral spec, so backends in other languages can follow (Go and Rust ones did, for a
+  while).
 - **Harnesses**: Claude Code (`claude -p`, stream-json) and Codex (`codex app-server`) behind one
   interface. An ACP driver or Grok could come later as further drivers.
 - **App extensibility**: apps define their own tools in their own language, attach MCP servers and
@@ -19,7 +25,7 @@ hand. The wire format is specified in [spec/PROTOCOL.md](../spec/PROTOCOL.md) an
 - **Frontend**: React components and headless hooks that render a thread from the SDK's events and
   send the user's actions back as commands.
 - **No network layer**: a backend produces JSON events and accepts JSON commands. The app carries
-  them over WebSocket, SSE, Electron IPC, Tauri or whatever it already uses.
+  them over WebSocket, SSE, Electron IPC or whatever it already uses.
 
 ## Out of scope
 
@@ -27,7 +33,7 @@ hand. The wire format is specified in [spec/PROTOCOL.md](../spec/PROTOCOL.md) an
 - Transport, auth and multi-host relaying (Huntaway's hub, broker and tunnel).
 - Checkpoints of files (and rewinding them), usage/rate-limit dashboards and terminals. They could
   come later. Rewinding the conversation is in (AT-22): the `rewind` command.
-- Moving Huntaway onto the SDK. That's a follow-up once the TS or Rust backend is stable.
+- Moving Huntaway onto the SDK. That's a follow-up once the TS backend is stable.
 
 ## Decisions
 
@@ -41,22 +47,21 @@ hand. The wire format is specified in [spec/PROTOCOL.md](../spec/PROTOCOL.md) an
   runs with `--setting-sources` limited, `--strict-mcp-config` and its own skills plugin; Codex
   gets an app-specific `CODEX_HOME` with the login linked in. The login is still the user's, and apps
   can opt in to user settings.
-- **Stores**: in-memory, JSONL file and SQLite, built into every backend. They all pass one store
+- **Stores**: in-memory, JSONL file and SQLite, built into the backend. They all pass one store
   conformance test, and apps can implement `Store` on their own database.
 - **React styling**: one stylesheet themed with CSS variables (no Tailwind needed), plus headless
   hooks for full control.
 - **The TS backend leads**: spec → Node → React → example app as a vertical slice, then Go and Rust
-  against the settled spec and fixtures.
+  against the settled spec and fixtures (since removed: see above).
 - **Naming**: npm `@dire-kiwi/agent-threads-protocol`, `@dire-kiwi/agent-threads-node` and
-  `@dire-kiwi/agent-threads-react`; Go module `github.com/dire-kiwi/agent-threads/go`; Rust crate
-  `agent-threads`; the shim binary `agent-threads-shim`.
+  `@dire-kiwi/agent-threads-react`; the shim binary `agent-threads-shim`.
 - **No publishing yet**: apps use the packages from the repository (git dependencies or workspace
   links) until the API settles.
 
 ## Architecture
 
 ```
- App backend (Go / Rust / Node)                         App frontend (React)
+ App backend (Node)                                     App frontend (React)
 ┌──────────────────────────────────┐                  ┌──────────────────────────────┐
 │ agent-threads                    │   events (JSON)  │ @dire-kiwi/agent-threads-    │
 │  Thread · Turn · Store           │ ───────────────▶ │   react                      │
@@ -77,14 +82,12 @@ hand. The wire format is specified in [spec/PROTOCOL.md](../spec/PROTOCOL.md) an
 | Path | What |
 | --- | --- |
 | `spec/` | The source of truth: JSON Schemas in `spec/schema/`, the protocol doc `spec/PROTOCOL.md`, and example events in `spec/examples/`. |
-| `spec/fixtures/` | Recorded Claude and Codex sessions, each with the normalized events they must produce: the conformance suite every backend runs ([spec/fixtures/README.md](../spec/fixtures/README.md)). `spec/tools/` has the fake CLI that replays them, and `spec/conformance/` the store conformance cases. |
+| `spec/fixtures/` | Recorded Claude and Codex sessions, each with the normalized events they must produce: the conformance suite a backend runs ([spec/fixtures/README.md](../spec/fixtures/README.md)). `spec/tools/` has the fake CLI that replays them, and `spec/conformance/` the store conformance cases. |
 | `ts/packages/protocol` | Generated TS types and the pure `applyEvent` reducer, shared by the Node backend and React. |
 | `ts/packages/node` | The Node backend (Memory, JSONL file and SQLite stores). |
 | `ts/packages/react` | React hooks and components. |
-| `go/` | Go module `github.com/dire-kiwi/agent-threads/go`, the Go backend ([go/README.md](../go/README.md)); generated types in `go/protocol`, SQLite in `go/sqlitestore`. |
-| `rust/` | Cargo workspace with the `agent-threads` crate, the Rust backend (generated types in `agent_threads::protocol`), and its `codegen`. |
 | `shim/` | `agent-threads-shim` (see below). |
-| `examples/` | A minimal chat app per backend, each with its own WebSocket transport, to show the "bring your own network" seam: `chat-node`, `chat-go` and `chat-rust`, whose servers share chat-node's React frontend ([examples/PROTOCOL.md](../examples/PROTOCOL.md)). |
+| `examples/` | A minimal chat app, `chat-node`, with its own WebSocket transport, to show the "bring your own network" seam ([examples/PROTOCOL.md](../examples/PROTOCOL.md)). |
 
 `make gen` regenerates the types from `spec/schema/`, and CI fails if they're out of date.
 
@@ -124,8 +127,8 @@ messages, steering over stdin, and run supervision and resume.
 
 **Changed**: Huntaway stores Claude's raw JSON and converts Codex into it, so Claude's format is its
 data model. The SDK has its own normalized model instead: each harness driver translates into it,
-and the raw payload can be kept alongside for debugging. That's what lets three backends and one
-set of React components agree.
+and the raw payload can be kept alongside for debugging. That's what lets backends in any language
+and one set of React components agree.
 
 ## The data model
 
@@ -150,9 +153,7 @@ app turns it on.
 
 ## Backend API
 
-The same shape in every language (TypeScript shown; Go and Rust mirror it idiomatically, with
-`context.Context`, channels and a `Tool` interface in Go, and tokio, async-trait tools and a
-broadcast channel in Rust):
+In TypeScript (a backend in another language would mirror it idiomatically):
 
 ```ts
 const sdk = new AgentThreads({
@@ -220,9 +221,8 @@ process runs a thread and with which spawner, and its `reattached_at` is set whe
 backend re-attaches; a `notice` item with code `run.reattached` (or `run.lost`, for a run it
 couldn't pick up, whose turn it ended) tells the user. A backend saves a run's offset, with what its
 driver needs to carry on reading, in the same store write as the events it made from the output
-before it, so a restart neither loses events nor makes them twice. The Node, Go and Rust backends
-have the shim spawner and `recover()`, and all their drivers re-attach (the Rust drivers' run
-checkpoints are the same as Node's).
+before it, so a restart neither loses events nor makes them twice. The Node backend has the shim
+spawner and `recover()`, and both its drivers re-attach.
 
 ## React package
 
@@ -259,11 +259,12 @@ Node backend land.
    per component fed by fixture events.
 7. **Example app (Node + React)**: a tiny chat app with a WebSocket transport, one custom tool, one
    MCP server and one skill, against real Claude and Codex.
-8. **Go backend** (SQLite via modernc.org/sqlite, no cgo) with a Go example server.
-9. **Rust backend** (tokio; SQLite via rusqlite bundled) with an axum example.
+8. **Go backend** (SQLite via modernc.org/sqlite, no cgo) with a Go example server. Removed in
+   AT-36.
+9. **Rust backend** (tokio; SQLite via rusqlite bundled) with an axum example. Removed in AT-36.
 10. **Docs**: a README per package and the "bring your own transport" guide.
 
-Follow-ups: plan moving Huntaway's thread layer onto the Rust backend and React components; start the
+Follow-ups: plan moving Huntaway's thread layer onto the SDK and its React components; start the
 Grokbot clone on the SDK.
 
 ## Risks
@@ -272,6 +273,6 @@ Grokbot clone on the SDK.
 | --- | --- |
 | Claude's stream-json control protocol (sdk MCP servers, `can_use_tool`) isn't formally documented and may change between CLI versions. | Pin a minimum CLI version, use the fixtures as regression tests, and fall back to a permission-prompt MCP tool (Huntaway's approach) if needed. |
 | Codex `dynamicTools` is experimental. | Generate types from `codex app-server generate-json-schema --experimental`, and keep the loopback-MCP fallback behind the same Tool API. |
-| Three implementations drift. | All three run the same fixtures in CI, and the types are generated from the spec, not hand-copied. |
+| Implementations in several languages drift. | They all run the same fixtures in CI, and the types are generated from the spec, not hand-copied. |
 | The normalized model loses harness detail an app wants. | The optional `raw` payload on items and events, and the `other` tool kind. |
 | The scope is large. | Build the vertical slice first; Go and Rust start once the spec has settled against a working Node and React app. |

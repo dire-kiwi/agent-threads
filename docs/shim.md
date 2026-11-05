@@ -47,7 +47,6 @@ Give the backend the shim spawner, with a directory for its runs, and call `reco
 before taking commands:
 
 ```ts
-// Node
 import { mkdirSync } from "node:fs";
 import { AgentThreads, SqliteStore, shim } from "@dire-kiwi/agent-threads-node";
 
@@ -61,37 +60,6 @@ const { reattached, lost } = await sdk.recover();
 await sdk.close(); // on shutdown: leaves the runs going, for the next start
 ```
 
-```go
-// Go
-if err := os.MkdirAll("data", 0o755); err != nil { // SQLite makes the file, not the directory
-	return err
-}
-store, err := sqlitestore.Open("data/threads.db") // or agentthreads.NewFileStore("data/threads")
-if err != nil {
-	return err
-}
-sdk := agentthreads.New(agentthreads.Options{
-	Store:   store,
-	Spawner: agentthreads.Shim("/usr/local/lib/myapp/agent-threads-shim", agentthreads.ShimOptions{RunsDir: "data/runs"}),
-})
-recovered, err := sdk.Recover(ctx)
-// ... serve clients ...
-err = sdk.Close(ctx) // leaves the runs going; sdk.Stop(ctx) stops them
-```
-
-```rust
-// Rust
-std::fs::create_dir_all("data")?; // SQLite makes the file, not the directory
-let sdk = AgentThreads::new(Options {
-    store: Some(Arc::new(SqliteStore::open("data/threads.db")?)),
-    spawner: Some(shim("/usr/local/lib/myapp/agent-threads-shim", ShimOptions::new("data/runs"))),
-    ..Default::default()
-});
-let recovered = sdk.recover().await?;
-// ... serve clients ...
-sdk.close(false).await?; // leaves the runs going; close(true) stops them
-```
-
 - **The store must last**: a `FileStore` or `SqliteStore` (or the app's own), not a memory store.
   A run's offset into its output is saved with the events made from it, which is what lets a
   restarted backend read on from exactly there.
@@ -99,12 +67,10 @@ sdk.close(false).await?; // leaves the runs going; close(true) stops them
   removing runs its store doesn't follow, so two stores sharing one would stop each other's runs.
   There's no default. A relative path is the backend's working directory's. The spawner creates
   it, as the file stores do their directory; a SQLite store's directory must exist already.
-- **`close()` leaves the runs going** (Node `close()`, Go `Close`, Rust `close(false)`): that's
-  the point. To stop them too, when the app is really going away (it's uninstalled, the user signs
-  out), use `close({ stop: true })`, `Stop` or `close(true)`.
-- `shim()` takes `keepDays` (14; Rust `keep`) for how long finished runs' directories are kept, for
-  debugging, and `killGraceMs` (Go `KillGrace`, Rust `kill_grace`) for how long a run the spawner
-  stops has between SIGTERM and SIGKILL.
+- **`close()` leaves the runs going**: that's the point. To stop them too, when the app is really
+  going away (it's uninstalled, the user signs out), use `close({ stop: true })`.
+- `shim()` takes `keepDays` (14) for how long finished runs' directories are kept, for debugging,
+  and `killGraceMs` for how long a run the spawner stops has between SIGTERM and SIGKILL.
 
 ## Recovering after a restart
 
@@ -145,7 +111,7 @@ The shim forks, calls `setsid` and runs the harness in a process group of its ow
 stdout to `out.jsonl` and stderr to `err.log` in the run's directory. The backend appends the
 harness's input to `input.jsonl`, which the shim relays to its stdin, and follows `out.jsonl`. When
 the harness exits, the shim writes `exit`. [spec/RUNDIR.md](../spec/RUNDIR.md) specifies the
-directory, so the Node, Go and Rust backends all speak it.
+directory, so any backend can speak it.
 
 Whenever a thread's events are saved, the run's offset into `out.jsonl` and what its driver needs to
 carry on reading (Claude's open control requests, Codex's pending JSON-RPC requests, the text
@@ -159,15 +125,14 @@ reboot gave its id to another process). A shim that dies without saying how its 
 
 ## Trying it
 
-The chat examples have a **Restart server** button when they run under the shim:
+The chat example has a **Restart server** button when they run under the shim:
 
 ```sh
 make shim
-cd examples/chat-node && CHAT_SHIM=1 pnpm dev     # or chat-go: CHAT_SHIM=1 go run . supervise
+cd examples/chat-node && CHAT_SHIM=1 pnpm dev
 ```
 
 Ask something that needs a permission, and while the card waits, restart the server: the thread
-says it was picked up again, and the permission can still be answered. Each backend's tests do the
+says it was picked up again, and the permission can still be answered. The backend's tests do the
 same unattended, killing a backend partway through each recorded session's turn and checking the
-next one finishes it with exactly the recording's events (`restart.test.ts`, `restart_test.go`,
-`tests/restart.rs`).
+next one finishes it with exactly the recording's events (`restart.test.ts`).

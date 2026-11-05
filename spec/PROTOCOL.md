@@ -1,6 +1,6 @@
 # The agent-threads protocol
 
-This is what every agent-threads backend (Go, Rust, Node) sends and accepts, and what the React
+This is what the agent-threads backend (Node) sends and accepts, and what the React
 package renders. A backend sends **events** and accepts **commands**, both as JSON objects; the
 app carries them over whatever transport it likes. The JSON Schemas in [schema/](schema/) are the
 source of truth for the shapes, and this document says what they mean. See
@@ -15,10 +15,10 @@ source of truth for the shapes, and this document says what they mean. See
 | [command.schema.json](schema/command.schema.json) | `Command` and its variants |
 | [snapshot.schema.json](schema/snapshot.schema.json) | `Snapshot`, `ItemPage` |
 
-`protocol.schema.json` bundles them into one schema, and the TS, Go and Rust types are generated
-from it: run `make gen` after changing a schema. [examples/](examples/) has a whole thread's events,
-the snapshot they fold into, a window of it and a page before that window, and one of each command;
-every language's tests read them.
+`protocol.schema.json` bundles them into one schema, and the TS types are generated from it: run
+`make gen` after changing a schema. [examples/](examples/) has a whole thread's events, the
+snapshot they fold into, a window of it and a page before that window, and one of each command;
+the tests read them.
 [fixtures/](fixtures/README.md) has recorded Claude and Codex sessions with the events a backend
 must make of them, which is where the translation from each harness is pinned down.
 
@@ -405,8 +405,9 @@ command) to its caller, rather than as an event.
 
 The protocol is what every app needs from a harness, the same for each. For what it leaves out,
 every backend has three ways through to the harness itself, in its API rather than in the protocol
-(an app's server uses them; it can forward what it likes to its clients). They're the same in each
-backend, with each language's names; the fixtures' `pass-through` scenarios check them.
+(an app's server uses them; it can forward what it likes to its clients). A backend in another
+language would have the same, with its language's names; the fixtures' `pass-through` scenarios
+check them.
 
 ### Raw payloads
 
@@ -428,13 +429,12 @@ With the backend's `raw` option on (it's off by default), `raw` is filled in:
 
 ### Harness messages
 
-A backend calls the app's harness message handler (`onHarnessMessage` in Node, `OnHarnessMessage`
-in Go, `on_harness_message` in Rust) with each line a thread's harness process writes to stdout, in
-order, once its driver has dealt with it, whether or not the driver made anything of it. So an app
-can read what the protocol leaves out: Claude Code's `system` messages (`status`, `task_*`...),
-`rate_limit_event`s in full, a result's `modelUsage`, Codex's `thread/tokenUsage/updated` and
-`account/rateLimits/updated` notifications, and messages a newer CLI sends that the driver doesn't
-know. It gets:
+A backend calls the app's harness message handler (`onHarnessMessage`) with each line a thread's
+harness process writes to stdout, in order, once its driver has dealt with it, whether or not the
+driver made anything of it. So an app can read what the protocol leaves out: Claude Code's
+`system` messages (`status`, `task_*`...), `rate_limit_event`s in full, a result's `modelUsage`,
+Codex's `thread/tokenUsage/updated` and `account/rateLimits/updated` notifications, and messages a
+newer CLI sends that the driver doesn't know. It gets:
 
 | Field | |
 | --- | --- |

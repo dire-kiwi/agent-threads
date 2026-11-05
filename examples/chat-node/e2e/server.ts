@@ -1,5 +1,5 @@
 // Starts the chat server for a test, on a free port with a data directory of its own. It's
-// chat-node's own unless CHAT_E2E_SERVER gives another's command (e.g. the Go or Rust example's),
+// chat-node's own unless CHAT_E2E_SERVER gives another's command,
 // with CHAT_E2E_SUPERVISED for running it under its supervisor (`$CHAT_E2E_SERVER supervise` by
 // default). Words are split on spaces. See examples/PROTOCOL.md for what such a server must do.
 //
@@ -123,7 +123,7 @@ const SOURCE: ProcessSource = process.platform === "linux" ? "proc" : "ps";
 /** A run's metadata that's older than this, or a process that started before it, isn't the run's. */
 const SLACK_MS = 2_000;
 
-/** The shim's runs in a data directory (see spec/RUNDIR.md), which all three servers keep in runs/. */
+/** The shim's runs in a data directory (see spec/RUNDIR.md), which a server keeps in runs/. */
 export function runs(data: string, source: ProcessSource = SOURCE) {
   const dir = join(data, "runs");
   if (!existsSync(dir)) return [];

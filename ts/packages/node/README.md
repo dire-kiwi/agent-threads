@@ -72,7 +72,7 @@ await sdk.close(); // on shutdown: stops the harness processes (or with the shim
 
 ## Tools and permissions
 
-[docs/tools.md](../../../docs/tools.md) has the whole story, in all three backends.
+[docs/tools.md](../../../docs/tools.md) has the whole story.
 
 - A tool returns text for the agent, or `{ text, isError?, structured? }`. `structured` also goes
   in the call's `result.structured` (harnesses pass on only the text), for the app's renderer of
